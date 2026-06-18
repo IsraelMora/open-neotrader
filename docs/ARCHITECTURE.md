@@ -98,8 +98,7 @@ neurotrader/
 │   └── sandbox/    # Python — runner de plugins
 ├── packages/
 │   ├── plugin-sdk/ # Python SDK (neurotrader-sdk 0.1.0)
-│   ├── types/      # Tipos TypeScript compartidos
-│   └── dart_sandbox/ # ⚠️ LEGACY: puente Dart para la app Flutter descartada
+│   └── types/      # Tipos TypeScript compartidos
 └── plugins/        # ~58 plugins bundled
 ```
 
@@ -164,12 +163,6 @@ Dependencias Python: pandas ≥ 2.2, numpy ≥ 1.26, scipy ≥ 1.13, scikit-lear
 `neurotrader-sdk` v0.1.0 (Python, requiere ≥ 3.11).
 Exporta: `Context` (dataclass), `@skill`, `@universe_provider`, `@discipline` (decoradores).
 Se inyecta al sandbox via `PYTHONPATH`.
-
-### packages/dart_sandbox ⚠️ LEGACY / ABANDONADO
-
-Paquete Dart que replicaba el protocolo JSON del `SandboxGateway` usando `dart:io Process`
-para una app Flutter móvil. **La app Flutter fue descartada**; este paquete ya no se usa ni
-se integra con el resto del monorepo. Candidato a purga.
 
 ---
 
@@ -374,10 +367,6 @@ Migraciones: `pnpm db:migrate` / `pnpm db:generate` (TypeORM CLI sobre Prisma).
 | ruff format | `quote-style = "double"`, `indent-style = "space"` |
 
 `ruff.toml` en la raíz del monorepo aplica a todo el código Python.
-
-### Dart (packages/dart_sandbox) — legacy, sin uso
-
-Dart SDK ≥ 3.6.0. Sin herramientas de lint configuradas en este paquete actualmente.
 
 ---
 
