@@ -62,6 +62,7 @@ export interface Dashboard {
   generated_at: string;
 }
 
+/** Agrega métricas financieras y operacionales desde BD para el dashboard: resumen, equity curve, stats de providers y plugins. */
 @Injectable()
 export class DashboardService {
   constructor(
@@ -69,6 +70,10 @@ export class DashboardService {
     private readonly plugins: PluginsService,
   ) {}
 
+  /**
+   * Construye el dashboard completo en paralelo.
+   * `equityCurveLimit`: número máximo de puntos en la equity curve (default 90).
+   */
   async getDashboard(equityCurveLimit = 90): Promise<Dashboard> {
     const [summary, equity_curve, provider_stats, plugin_stats] = await Promise.all([
       this._buildSummary(),

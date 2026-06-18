@@ -1,5 +1,6 @@
 import { parse as parseToml, type TomlTable } from 'smol-toml';
 
+/** Error semántico de validación del manifiesto TOML de un plugin. */
 export class ManifestError extends Error {}
 
 const CLASES_ACTIVO = new Set(['equity', 'etf', 'crypto', 'commodity']);
@@ -11,6 +12,13 @@ const TIPOS_DATOS = new Set([
 ]);
 const KEBAB = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
+/**
+ * Representación normalizada de un manifiesto de plugin tras su validación.
+ *
+ * `payload` contiene el bloque específico del tipo (ej. `[skill]`, `[universe]`).
+ * `configSpec` contiene los campos opcionales `fields` y `form` del bloque `[config]`.
+ * `raw` es la tabla TOML completa tal como fue parseada.
+ */
 export interface Manifest {
   id: string;
   name: string;
@@ -99,6 +107,17 @@ function extractConfigSpec(data: TomlTable): Record<string, unknown> {
   return configSpec;
 }
 
+/**
+ * Parsea y valida un manifiesto de plugin en formato TOML.
+ *
+ * Comprueba que el bloque `[plugin]` tenga todos los campos obligatorios,
+ * que el `type` sea uno de los tipos de datos admitidos, que el `id` sea
+ * kebab-case y que el bloque de payload correspondiente al tipo sea válido.
+ *
+ * @param text - Contenido TOML del manifiesto.
+ * @returns `Manifest` normalizado listo para persistir.
+ * @throws {ManifestError} Si el TOML es inválido o falla cualquier regla de negocio.
+ */
 export function parseAndValidateManifest(text: string): Manifest {
   let data: TomlTable;
   try {

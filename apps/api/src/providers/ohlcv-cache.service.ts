@@ -43,6 +43,7 @@ export class OhlcvCacheService {
 
   // ── OHLCV ────────────────────────────────────────────────────────────────────
 
+  /** Devuelve barras OHLCV desde caché si no han expirado; null si hay miss. */
   getOhlcv(provider: string, symbol: string, timeframe: string, limit: number): OhlcvBar[] | null {
     const key = `${provider}:${symbol}:${timeframe}:${limit}`;
     const entry = this.ohlcvCache.get(key);
@@ -57,6 +58,7 @@ export class OhlcvCacheService {
     return entry.data;
   }
 
+  /** Almacena barras OHLCV en caché con TTL basado en el timeframe. */
   setOhlcv(
     provider: string,
     symbol: string,
@@ -74,6 +76,7 @@ export class OhlcvCacheService {
 
   // ── Quotes ────────────────────────────────────────────────────────────────────
 
+  /** Devuelve la cotización desde caché si no ha expirado (TTL 30s); null si hay miss. */
   getQuote(provider: string, symbol: string): Quote | null {
     const key = `${provider}:${symbol}`;
     const entry = this.quoteCache.get(key);
@@ -86,6 +89,7 @@ export class OhlcvCacheService {
     return entry.data;
   }
 
+  /** Almacena una cotización en caché con TTL fijo de 30 segundos. */
   setQuote(provider: string, symbol: string, quote: Quote): void {
     if (this.quoteCache.size >= MAX_QUOTE_ENTRIES) {
       this.evictExpired(this.quoteCache);
@@ -123,6 +127,7 @@ export class OhlcvCacheService {
     this.log.log('Caché OHLCV vaciada');
   }
 
+  /** Estadísticas de uso de la caché: hits, misses, hit rate y entradas activas. */
   stats(): {
     hits: number;
     misses: number;

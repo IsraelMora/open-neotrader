@@ -70,6 +70,10 @@ const TIMEFRAME_TO_MS: Record<string, number> = {
   '1mo': 30 * 24 * 3_600_000,
 };
 
+/**
+ * Planifica y ejecuta ciclos de agente periódicamente.
+ * Incluye circuit breaker que pausa la ejecución tras 3 fallos consecutivos.
+ */
 @Injectable()
 export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
   private readonly log = new Logger(CycleSchedulerService.name);
@@ -98,6 +102,7 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
   // Config
   // ---------------------------------------------------------------------------
 
+  /** Lee la configuración actual del scheduler desde KV store. */
   async getConfig(): Promise<SchedulerConfig> {
     const raw = await this.store.get(CONFIG_KEY);
     if (!raw) return { ...DEFAULT_CONFIG };
@@ -108,6 +113,7 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Actualiza la configuración del scheduler (habilitado, intervalo override, prompt). */
   async updateConfig(
     patch: Partial<Pick<SchedulerConfig, 'enabled' | 'override_interval_ms' | 'prompt'>>,
   ): Promise<SchedulerConfig> {
@@ -136,6 +142,7 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
   // Status con información de plugins
   // ---------------------------------------------------------------------------
 
+  /** Estado completo del scheduler: config, intervalos efectivos de plugins, circuit breaker y si hay un ciclo en curso. */
   async getStatus(): Promise<SchedulerStatus> {
     const cfg = await this.getConfig();
     const pluginSchedules = await this.resolvePluginSchedules();
@@ -156,6 +163,7 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
+  /** Devuelve el estado actual del circuit breaker (closed/open/half_open). */
   async getCircuitBreaker(): Promise<CircuitBreakerState> {
     const raw = await this.store.get(CB_KEY);
     if (!raw)
@@ -179,6 +187,7 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Reinicia el circuit breaker manualmente, borrando el contador de fallos. */
   async resetCircuitBreaker(): Promise<void> {
     await this.store.delete(CB_KEY);
     this.log.log('Circuit breaker reiniciado manualmente');
@@ -336,6 +345,7 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
     await this.store.set(CB_KEY, JSON.stringify(state));
   }
 
+  /** Dispara un ciclo inmediato fuera del intervalo programado; lanza si ya hay uno en curso. */
   async runNow(prompt?: string): Promise<void> {
     if (this.running || this.panel.getRunStatus().running) {
       throw new Error('Ya hay un ciclo en ejecución. Espera a que termine.');

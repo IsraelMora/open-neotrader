@@ -73,14 +73,17 @@ export interface NeuroTraderEvents {
   'plugin.log': PluginLogEvent;
 }
 
+/** Bus de eventos tipado para la comunicación interna entre módulos (plugins, ciclos, señales). */
 @Injectable()
 export class PluginEventsService {
   constructor(private readonly emitter: EventEmitter2) {}
 
+  /** Emite un evento tipado al bus interno. */
   emit<K extends keyof NeuroTraderEvents>(event: K, payload: NeuroTraderEvents[K]): void {
     this.emitter.emit(event, payload);
   }
 
+  /** Suscribe un listener tipado a un evento del bus. */
   on<K extends keyof NeuroTraderEvents>(
     event: K,
     listener: (payload: NeuroTraderEvents[K]) => void,
@@ -88,6 +91,7 @@ export class PluginEventsService {
     this.emitter.on(event, listener);
   }
 
+  /** Cancela la suscripción de un listener. */
   off<K extends keyof NeuroTraderEvents>(
     event: K,
     listener: (payload: NeuroTraderEvents[K]) => void,

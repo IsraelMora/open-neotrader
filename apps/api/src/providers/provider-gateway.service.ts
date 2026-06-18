@@ -191,6 +191,7 @@ export class ProviderGatewayService implements OnModuleInit {
 
   // ── API pública ───────────────────────────────────────────────────────────
 
+  /** Lista todos los providers activos con su estado de credenciales. */
   listProviders(): ProviderStatus[] {
     return Array.from(this.providers.entries()).map(([id, m]) => ({
       plugin_id: id,
@@ -209,6 +210,7 @@ export class ProviderGatewayService implements OnModuleInit {
     return null;
   }
 
+  /** Obtiene velas OHLCV normalizadas para un símbolo y timeframe, con caché integrado. */
   async getOhlcv(
     pluginId: string | null,
     symbol: string,
@@ -247,6 +249,7 @@ export class ProviderGatewayService implements OnModuleInit {
     return bars;
   }
 
+  /** Obtiene la cotización en tiempo real (bid/ask/last) para un símbolo, con caché. */
   async getQuote(pluginId: string | null, symbol: string): Promise<Quote> {
     const manifest = this.resolveManifest(pluginId);
     const providerId = manifest.plugin.id;
@@ -295,6 +298,7 @@ export class ProviderGatewayService implements OnModuleInit {
     }));
   }
 
+  /** Obtiene equity, cash, buying power y posiciones abiertas del broker. */
   async getPortfolio(pluginId: string | null): Promise<Portfolio> {
     const manifest = this.resolveManifest(pluginId);
     const providerId = manifest.plugin.id;
@@ -411,6 +415,7 @@ export class ProviderGatewayService implements OnModuleInit {
     };
   }
 
+  /** Verifica la conectividad y credenciales del provider haciendo una cotización de prueba. */
   async testConnection(pluginId: string): Promise<{ ok: boolean; message: string }> {
     try {
       const manifest = this.resolveManifest(pluginId);

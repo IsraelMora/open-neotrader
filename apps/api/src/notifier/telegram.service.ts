@@ -32,6 +32,7 @@ const DEFAULT_CONFIG: TelegramConfig = {
   max_messages_per_cycle: 10,
 };
 
+/** Notificador Telegram: escucha eventos del bus y envía mensajes al chat configurado cuando el plugin está activo. */
 @Injectable()
 export class TelegramService implements OnModuleInit {
   private readonly log = new Logger(TelegramService.name);
@@ -158,6 +159,7 @@ export class TelegramService implements OnModuleInit {
   // API Telegram
   // ---------------------------------------------------------------------------
 
+  /** Envía un mensaje al chat de Telegram. No lanza si las credenciales no están configuradas. */
   async send(text: string, parseMode: 'Markdown' | 'HTML' = 'Markdown'): Promise<void> {
     if (!this.botToken || !this.chatId) return;
     try {

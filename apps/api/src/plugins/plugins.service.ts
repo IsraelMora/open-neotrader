@@ -122,6 +122,7 @@ function hydrate(p: Plugin): HydratedPlugin {
   };
 }
 
+/** Gestiona el ciclo de vida completo de los plugins: instalación git, activación/desactivación, config, skills y tools. */
 @Injectable()
 export class PluginsService {
   private readonly log = new Logger(PluginsService.name);
@@ -179,6 +180,7 @@ export class PluginsService {
 
   // ── Skills (SKILL.md) ─────────────────────────────────────────────────────
 
+  /** Devuelve nombre y descripción de todos los plugins tipo skill activos (desde manifest.toml o SKILL.md). */
   async getSkillsMetadata(): Promise<SkillMeta[]> {
     const plugins = await this.db.plugin.findMany({
       where: { active: true, type: 'skill' },
@@ -197,6 +199,7 @@ export class PluginsService {
     });
   }
 
+  /** Carga el cuerpo (sin frontmatter) del SKILL.md de un skill activo por nombre. */
   async loadSkillContent(skillName: string): Promise<string | null> {
     const plugin = await this.db.plugin.findFirst({
       where: { active: true, type: 'skill', name: skillName },
@@ -221,6 +224,7 @@ export class PluginsService {
 
   // ── Provider tools (tools.json) ───────────────────────────────────────────
 
+  /** Agrega los tools declarados en tools.json de todos los plugins activos. */
   async getProviderTools(): Promise<ProviderTool[]> {
     const plugins = await this.db.plugin.findMany({ where: { active: true } });
     const tools: ProviderTool[] = [];
@@ -288,6 +292,7 @@ export class PluginsService {
 
   // ── Symbols ───────────────────────────────────────────────────────────────
 
+  /** Devuelve los símbolos de todos los plugins tipo universe activos. */
   async getActiveSymbols(): Promise<string[]> {
     const rows = await this.db.plugin.findMany({ where: { active: true, type: 'universe' } });
     return rows.flatMap((p) => j<string[]>(p.symbols) ?? []);
@@ -490,6 +495,7 @@ export class PluginsService {
 
   // ── write_skill (learning loop) ───────────────────────────────────────────
 
+  /** Actualiza el cuerpo del SKILL.md de un skill activo preservando el frontmatter (learning loop). */
   async writeSkillContent(skillName: string, newBody: string): Promise<boolean> {
     const plugin = await this.db.plugin.findFirst({
       where: { active: true, type: 'skill', name: skillName },

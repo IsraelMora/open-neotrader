@@ -47,6 +47,7 @@ function mapItem(item: StoreItem): CatalogPlugin {
   };
 }
 
+/** Fachada de catálogo: consulta la tienda remota, enriquece con estado local (instalado/activo) e instala desde el catálogo. */
 @Injectable()
 export class RegistryService {
   private readonly log = new Logger(RegistryService.name);
@@ -58,6 +59,7 @@ export class RegistryService {
 
   // ── Catalog (desde la tienda) ─────────────────────────────────────────────
 
+  /** Lista plugins del catálogo de la tienda con filtros opcionales y flag de instalación local. */
   async listCatalog(opts: {
     type?: string;
     tag?: string;
@@ -103,6 +105,7 @@ export class RegistryService {
     };
   }
 
+  /** Obtiene los detalles de un plugin del catálogo por manifestId, incluyendo estado local. */
   async getCatalogPlugin(
     id: string,
   ): Promise<CatalogPlugin & { installed: boolean; active: boolean }> {
@@ -124,6 +127,7 @@ export class RegistryService {
 
   // ── Install desde catálogo ────────────────────────────────────────────────
 
+  /** Instala un plugin del catálogo haciendo git clone desde su repositorio declarado en el manifest. */
   async installFromCatalog(id: string): Promise<{ ok: boolean; message: string }> {
     const entry = await this.getCatalogPlugin(id);
 
@@ -151,6 +155,7 @@ export class RegistryService {
 
   // ── Estadísticas ──────────────────────────────────────────────────────────
 
+  /** Estadísticas del catálogo: total de plugins, por tipo, cuántos están instalados y verificados. */
   async catalogStats(): Promise<Record<string, unknown>> {
     const storeList = (await this.store.browse({})) as StoreList;
     const installed = await this.plugins.findAll();

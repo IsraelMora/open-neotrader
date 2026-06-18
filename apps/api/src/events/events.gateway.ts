@@ -4,6 +4,7 @@ import type { FastifyRequest, FastifyReply } from 'fastify';
 import { PluginEventsService, type NeuroTraderEvents } from '../plugins/plugin-events.service';
 import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 
+/** Controlador SSE que reenvía todos los eventos del bus interno (ciclos, plugins, señales) como Server-Sent Events. */
 @ApiTags('events')
 @ApiBearerAuth()
 @UseGuards(TotpRequiredGuard)
@@ -13,6 +14,7 @@ export class EventsGateway {
 
   @Get()
   @ApiOperation({ summary: 'Stream SSE de eventos de la plataforma (ciclos, plugins, señales)' })
+  /** Abre un stream SSE y suscribe al bus de eventos hasta que el cliente se desconecte. */
   stream(@Req() req: FastifyRequest, @Res() reply: FastifyReply) {
     const raw = reply.raw;
     raw.setHeader('Content-Type', 'text/event-stream; charset=utf-8');

@@ -26,10 +26,12 @@ export interface AuditPayload {
   meta?: Record<string, unknown>;
 }
 
+/** Registra y consulta el log inmutable de eventos del agente: ciclos, señales, decisiones y errores. */
 @Injectable()
 export class AuditService {
   constructor(private readonly db: PrismaService) {}
 
+  /** Persiste un evento de auditoría. Trunca llm_text a 2000 chars y error a 500. */
   async log(payload: AuditPayload): Promise<void> {
     await this.db.auditEntry.create({
       data: {
@@ -49,6 +51,7 @@ export class AuditService {
     });
   }
 
+  /** Consulta el log con filtros opcionales por tipo, ciclo, plugin y rango de fechas. */
   async query(opts: {
     event_type?: AuditEventType;
     cycle_id?: string;
@@ -77,6 +80,7 @@ export class AuditService {
     });
   }
 
+  /** Devuelve todos los eventos de un ciclo en orden cronológico. */
   async getCycleSummary(cycleId: string) {
     const entries = await this.db.auditEntry.findMany({
       where: { cycle_id: cycleId },
@@ -133,6 +137,7 @@ export class AuditService {
       .join('\n');
   }
 
+  /** Estadísticas del log: total de entradas, fechas extremas y conteo por tipo de evento. */
   async stats(): Promise<Record<string, unknown>> {
     const total = await this.db.auditEntry.count();
     const byType = await this.db.auditEntry.groupBy({

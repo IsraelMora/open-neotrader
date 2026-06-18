@@ -11,10 +11,23 @@ import {
   ManifestError,
 } from '../common/manifest.validator';
 
+/** Servicio de dominio para gestión del catálogo de plugins. */
 @Injectable()
 export class PluginsService {
   constructor(private readonly prisma: PrismaService) {}
 
+  /**
+   * Publica o actualiza un plugin.
+   *
+   * Parsea y valida el manifiesto TOML, crea o actualiza el registro del plugin
+   * y crea una nueva `PluginVersion`. Lanza `ConflictException` si la versión
+   * ya existe.
+   *
+   * @param publisherId   - ID del publisher autenticado.
+   * @param publicKey     - Clave pública DER en base64 del publisher.
+   * @param manifestToml  - Manifiesto del plugin en formato TOML.
+   * @param payloadBase64 - Contenido binario del plugin codificado en base64.
+   */
   async publish(
     publisherId: string,
     publicKey: string,
@@ -74,6 +87,15 @@ export class PluginsService {
     return { id: plugin.id, manifestId: m.id, version: m.version };
   }
 
+  /**
+   * Devuelve una página de plugins aplicando filtros opcionales.
+   *
+   * @param params.type     - Filtra por tipo de plugin.
+   * @param params.q        - Búsqueda de texto libre en nombre y descripción.
+   * @param params.sort     - `recent` ordena por `updatedAt`; por defecto por `createdAt`.
+   * @param params.page     - Página solicitada (base 1; mínimo 1).
+   * @param params.pageSize - Tamaño de página (mínimo 1, máximo 100; por defecto 20).
+   */
   async list(params: {
     type?: string;
     q?: string;
@@ -107,6 +129,12 @@ export class PluginsService {
     return { items, total, page, pageSize };
   }
 
+  /**
+   * Devuelve el detalle completo de un plugin con sus versiones y contadores de interacción.
+   *
+   * @param publisherId - Identificador del publisher propietario.
+   * @param manifestId  - Identificador del manifiesto del plugin.
+   */
   async detail(publisherId: string, manifestId: string) {
     const plugin = await this.prisma.plugin.findUnique({
       where: { publisherId_manifestId: { publisherId, manifestId } },
@@ -131,6 +159,13 @@ export class PluginsService {
     return { ...plugin, counts: { likes, dislikes, reports } };
   }
 
+  /**
+   * Devuelve el manifiesto TOML y el payload en base64 de una versión específica.
+   *
+   * @param publisherId - Identificador del publisher.
+   * @param manifestId  - Identificador del manifiesto del plugin.
+   * @param version     - Versión exacta a descargar.
+   */
   async download(publisherId: string, manifestId: string, version: string) {
     const plugin = await this.prisma.plugin.findUnique({
       where: { publisherId_manifestId: { publisherId, manifestId } },

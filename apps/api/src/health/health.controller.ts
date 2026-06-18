@@ -3,6 +3,7 @@ import { ApiTags, ApiOperation } from '@nestjs/swagger';
 import { Public } from '../auth/decorators/public.decorator';
 import { PrismaService } from '../prisma/prisma.service';
 
+/** Health check público (Docker/load balancer) y métricas operacionales detalladas (requiere auth). */
 @ApiTags('system')
 @Controller('health')
 export class HealthController {

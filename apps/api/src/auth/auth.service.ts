@@ -10,11 +10,13 @@ import { TotpService } from './totp.service';
 import type { User } from '@prisma/client';
 import { JwtPayload } from './strategies/jwt.strategy';
 
+/** Par de tokens devuelto tras el login: token JWT + flag que indica si TOTP es obligatorio. */
 export interface TokenPair {
   access_token: string;
   totp_required: boolean;
 }
 
+/** Gestiona el flujo completo de autenticación: registro, login, emisión de JWT y ciclo de vida TOTP. */
 @Injectable()
 export class AuthService {
   constructor(
@@ -23,6 +25,7 @@ export class AuthService {
     private readonly jwt: JwtService,
   ) {}
 
+  /** Crea el primer (y único) usuario de la instalación. */
   async register(username: string, password: string): Promise<User> {
     return this.users.create(username, password);
   }
@@ -98,6 +101,7 @@ export class AuthService {
     return { backup_codes };
   }
 
+  /** Desactiva TOTP tras validar el código actual y borra el secreto y los backup codes. */
   async disableTotp(user: User, code: string): Promise<void> {
     if (!user.totp_enabled || !user.totp_secret) {
       throw new BadRequestException('TOTP no está activado');

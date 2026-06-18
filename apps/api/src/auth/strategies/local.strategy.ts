@@ -3,6 +3,7 @@ import { PassportStrategy } from '@nestjs/passport';
 import { Strategy } from 'passport-local';
 import { UsersService } from '../../users/users.service';
 
+/** Estrategia Passport local que valida username/password y devuelve el usuario al AuthController. */
 @Injectable()
 export class LocalStrategy extends PassportStrategy(Strategy) {
   constructor(private readonly users: UsersService) {

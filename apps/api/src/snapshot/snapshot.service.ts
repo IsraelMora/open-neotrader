@@ -13,6 +13,7 @@ export interface NavEntry {
   total_pnl: number;
 }
 
+/** Persiste y consulta snapshots de NAV (equity, cash, posiciones) para la curva de equity y el dashboard. */
 @Injectable()
 export class SnapshotService {
   private readonly log = new Logger(SnapshotService.name);

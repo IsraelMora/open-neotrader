@@ -35,6 +35,10 @@ export interface PingPayload {
 
 // ── Mensajes servidor → cliente ──────────────────────────────────────────────
 
+/**
+ * Gateway WebSocket autenticado (JWT+TOTP) en el puerto WS_PORT.
+ * Reenvía eventos del bus interno a los clientes y acepta mensajes del agente via 'agent:message'.
+ */
 @WebSocketGateway({ port: parseInt(process.env['WS_PORT'] ?? '3001', 10), path: '/api/ws' })
 export class WsGateway
   implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect, OnModuleInit
@@ -97,6 +101,7 @@ export class WsGateway
 
   // ── Conexión ─────────────────────────────────────────────────────────────
 
+  /** Autentica el JWT en el handshake y registra el cliente. Cierra la conexión si el token es inválido o sin TOTP. */
   handleConnection(client: AuthClient, req: IncomingMessage) {
     try {
       const token = this.extractToken(req);
@@ -139,6 +144,7 @@ export class WsGateway
 
   // ── Mensajes ──────────────────────────────────────────────────────────────
 
+  /** Recibe un mensaje del agente, llama al LLM y emite 'agent:response' al mismo cliente. */
   @SubscribeMessage('agent:message')
   async onAgentMessage(
     @MessageBody() payload: AgentMessagePayload,

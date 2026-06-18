@@ -2,6 +2,7 @@ import { Controller, Get, Query, ParseIntPipe, DefaultValuePipe } from '@nestjs/
 import { ApiOperation, ApiQuery, ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { DashboardService } from './dashboard.service';
 
+/** Endpoints del dashboard financiero: resumen KPI, equity curve, stats de providers y estrategias. */
 @ApiTags('dashboard')
 @ApiBearerAuth()
 @Controller('dashboard')

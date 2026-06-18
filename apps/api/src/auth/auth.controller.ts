@@ -19,6 +19,7 @@ import { CurrentUser } from './decorators/current-user.decorator';
 import { RegisterDto, TotpVerifyDto, TotpActivateDto, BackupCodeDto } from './dto/auth.dto';
 import type { User } from '@prisma/client';
 
+/** Expone los endpoints de autenticación: registro, login y gestión del ciclo TOTP. */
 @ApiTags('auth')
 @Throttle({ auth: { ttl: 60_000, limit: 10 } })
 @Controller('auth')

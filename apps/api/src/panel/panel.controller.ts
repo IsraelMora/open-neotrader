@@ -20,6 +20,7 @@ import { RunCycleDto } from './dto/run-cycle.dto';
 import { ChatDto } from './dto/chat.dto';
 import { UniverseEditDto } from './dto/universe-edit.dto';
 
+/** Controlador del panel de operaciones: config, estado, ciclos, chat, portfolios, skills, universo y métricas. */
 @ApiTags('panel')
 @ApiBearerAuth()
 @Controller()

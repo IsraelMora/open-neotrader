@@ -14,6 +14,7 @@ import { ApiBearerAuth, ApiTags, ApiOperation } from '@nestjs/swagger';
 import { LlmService, LlmRequest, type CustomLlmProvider } from './llm.service';
 import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 
+/** Endpoints de gestión del LLM: completar contexto, configurar modelo/backend y administrar providers custom. */
 @ApiTags('llm')
 @ApiBearerAuth()
 @UseGuards(TotpRequiredGuard)

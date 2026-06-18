@@ -2,6 +2,7 @@ import { Controller, Get, Post, Body, Param, Query, HttpCode, HttpStatus } from 
 import { ApiBearerAuth, ApiTags, ApiOperation } from '@nestjs/swagger';
 import { StoreService } from './store.service';
 
+/** Endpoints proxy hacia la tienda remota: búsqueda, detalle, publicación, votos, reportes e identidad. */
 @ApiTags('store')
 @ApiBearerAuth()
 @Controller('store')

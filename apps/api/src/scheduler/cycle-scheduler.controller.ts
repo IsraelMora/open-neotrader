@@ -44,6 +44,7 @@ class RunNowDto {
   prompt?: string;
 }
 
+/** Endpoints de control del scheduler: configuración, estado, circuit breaker y ejecución manual. */
 @ApiTags('scheduler')
 @Controller('scheduler')
 export class CycleSchedulerController {

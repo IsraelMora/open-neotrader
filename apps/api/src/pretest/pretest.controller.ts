@@ -83,6 +83,7 @@ class RunCycleDto {
   system_prompt?: string;
 }
 
+/** Endpoints de portfolios virtuales de pretest: CRUD, ejecución de ciclos y comparativa de rendimiento. */
 @ApiTags('pretest')
 @ApiBearerAuth()
 @Controller('pretest')

@@ -2,6 +2,7 @@ import { Controller, Get, Request, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags, ApiOperation } from '@nestjs/swagger';
 import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 
+/** Endpoints de perfil de usuario (requieren JWT + TOTP verificado). */
 @ApiTags('users')
 @ApiBearerAuth()
 @UseGuards(TotpRequiredGuard)

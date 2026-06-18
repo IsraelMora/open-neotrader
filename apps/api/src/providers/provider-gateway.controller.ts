@@ -17,6 +17,7 @@ import { OhlcvCacheService } from './ohlcv-cache.service';
 import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 import { PlaceOrderDto } from './dto/place-order.dto';
 
+/** Endpoints de acceso a datos de mercado y operaciones: OHLCV, cotizaciones, noticias, portfolio y órdenes. */
 @Controller('providers')
 export class ProviderGatewayController {
   constructor(

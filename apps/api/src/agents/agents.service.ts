@@ -9,6 +9,7 @@ import { AlertsService, CreateAlertDto } from '../alerts/alerts.service';
 
 import type { LlmResponse } from '../llm/llm.service';
 
+/** Resultado completo de un ciclo del agente, incluyendo decisiones, ejecuciones en sandbox y resumen de vetos. */
 export interface AgentCycleResult {
   cycle_id: string;
   llm_text: string;
@@ -19,6 +20,7 @@ export interface AgentCycleResult {
   veto_summary: VetoSummary;
 }
 
+/** Decisión de tool call del LLM: qué función invocar y si fue aprobada (o vetada con razón). */
 export interface Decision {
   plugin_id: string;
   function: string;
@@ -27,6 +29,7 @@ export interface Decision {
   reason?: string;
 }
 
+/** Resultado de ejecutar una función de plugin en el sandbox Python. */
 export interface SandboxResult {
   plugin_id: string;
   function: string;
@@ -35,6 +38,7 @@ export interface SandboxResult {
   error?: string;
 }
 
+/** Resumen de la capa de veto: cuántas señales pasaron y cuántas fueron rechazadas por plugins discipline. */
 export interface VetoSummary {
   signals_proposed: number;
   signals_approved: number;
@@ -43,6 +47,7 @@ export interface VetoSummary {
   discipline_plugins: string[];
 }
 
+/** Orquesta el ciclo completo del agente: memoria, hooks de plugins, capa de veto, LLM y ejecución de tool calls. */
 @Injectable()
 export class AgentsService {
   private readonly log = new Logger(AgentsService.name);
@@ -56,6 +61,11 @@ export class AgentsService {
     private readonly alerts: AlertsService,
   ) {}
 
+  /**
+   * Ejecuta un ciclo completo del agente: enriquece el contexto con memoria, corre los hooks de plugins,
+   * aplica el veto de discipline plugins, consulta el LLM y ejecuta las tool calls aprobadas.
+   * `context` es el prompt/contexto inicial del ciclo; `systemPrompt` sobreescribe el system prompt del LLM.
+   */
   async runCycle(context: string, systemPrompt?: string): Promise<AgentCycleResult> {
     const cycle_id = randomUUID();
 

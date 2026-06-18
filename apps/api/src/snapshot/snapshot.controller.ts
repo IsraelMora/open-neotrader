@@ -2,6 +2,7 @@ import { Controller, Get, Post, Query, ParseIntPipe, DefaultValuePipe } from '@n
 import { ApiOperation, ApiQuery, ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { SnapshotService } from './snapshot.service';
 
+/** Endpoints de consulta de snapshots NAV: lista paginada, detalle y estadísticas por provider. */
 @ApiTags('snapshot')
 @ApiBearerAuth()
 @Controller('snapshot')

@@ -14,6 +14,7 @@ import { PluginsService } from './plugins.service';
 import type { HydratedPlugin, PluginVerification } from './plugins.service';
 import { InstallPluginDto } from './dto/install-plugin.dto';
 
+/** Endpoints CRUD de plugins: instalación, activación, config, tools, skills y verificación. */
 @ApiTags('plugins')
 @ApiBearerAuth()
 @Controller('plugins')

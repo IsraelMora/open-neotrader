@@ -41,6 +41,7 @@ class AuditQueryDto {
   limit?: number;
 }
 
+/** Endpoints de consulta del log de auditoría: filtrado, exportación JSON-L y limpieza por antigüedad. */
 @ApiTags('audit')
 @ApiBearerAuth()
 @UseGuards(TotpRequiredGuard)

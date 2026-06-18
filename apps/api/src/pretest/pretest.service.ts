@@ -125,17 +125,20 @@ export class PretestService {
     return this._hydrate(row);
   }
 
+  /** Lista todos los portfolios de pretest ordenados por fecha de creación descendente. */
   async findAll(): Promise<PretestPortfolio[]> {
     const rows = await this.db.pretestPortfolio.findMany({ orderBy: { created_at: 'desc' } });
     return rows.map((r) => this._hydrate(r));
   }
 
+  /** Devuelve un portfolio por ID; lanza NotFoundException si no existe. */
   async findOne(id: string): Promise<PretestPortfolio> {
     const row = await this.db.pretestPortfolio.findUnique({ where: { id } });
     if (!row) throw new NotFoundException(`Pretest ${id} no encontrado`);
     return this._hydrate(row);
   }
 
+  /** Actualiza metadatos o configuración de un portfolio (nombre, plugins, config, estado activo). */
   async update(
     id: string,
     dto: {
@@ -161,6 +164,7 @@ export class PretestService {
     return this._hydrate(row);
   }
 
+  /** Resetea el estado virtual del portfolio al capital inicial (borra trades y posiciones). */
   async reset(id: string): Promise<PretestPortfolio> {
     const existing = await this.findOne(id);
     const row = await this.db.pretestPortfolio.update({
@@ -174,6 +178,7 @@ export class PretestService {
     return this._hydrate(row);
   }
 
+  /** Elimina permanentemente un portfolio de pretest. */
   async delete(id: string): Promise<void> {
     await this.db.pretestPortfolio.delete({ where: { id } });
   }

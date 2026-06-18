@@ -10,6 +10,7 @@ import {
 import { ApiOperation, ApiTags, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
 import { AlertsService } from './alerts.service';
 
+/** Endpoints de consulta y resolución de alertas emitidas por plugins. */
 @ApiTags('alerts')
 @ApiBearerAuth()
 @Controller('alerts')

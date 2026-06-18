@@ -34,6 +34,7 @@ const PLATFORM_PROVIDERS: ProviderDef[] = [
   { env: 'TELEGRAM_CHAT_ID', label: 'Telegram — Chat ID', grupo: 'notificaciones', nota: '' },
 ];
 
+/** Gestiona credenciales de la plataforma y de plugins en el archivo .env (sin almacenar valores en BD). */
 @Injectable()
 export class CredentialsService {
   private readonly envPath: string;
@@ -45,6 +46,7 @@ export class CredentialsService {
     this.envPath = cfg.get<string>('DOTENV_PATH', path.resolve(process.cwd(), '.env'));
   }
 
+  /** Devuelve el estado enmascarado de todas las credenciales (plataforma + plugins). Nunca expone los valores reales. */
   async list(): Promise<{ providers: CredentialRow[]; plugin_providers: CredentialRow[] }> {
     const fromFile = this.readEnvFile();
 
@@ -123,6 +125,7 @@ export class CredentialsService {
     });
   }
 
+  /** Escribe o elimina una credencial en el .env y actualiza process.env en caliente. Valor vacío/null elimina la clave. */
   set(env: string, value: string | null | undefined): void {
     const trimmed = (value ?? '').trim();
     if (trimmed && /[\r\n]/.test(trimmed)) {

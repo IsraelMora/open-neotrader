@@ -8,6 +8,7 @@ import { PluginEventsService } from '../plugins/plugin-events.service';
 import { AuditService } from '../audit/audit.service';
 import { UniverseEditDto } from './dto/universe-edit.dto';
 
+/** Estado en memoria del último ciclo ejecutado: si está corriendo ahora y el resultado previo. */
 export interface RunState {
   running: boolean;
   last: { ok: boolean; dry_run: boolean; started_at: string; error?: string } | null;
@@ -18,6 +19,7 @@ type JsonValue = string | number | boolean | null | JsonValue[] | { [k: string]:
 // Log stream names: cualquier slug de letras minúsculas, números y guiones bajos
 const VALID_LOG_STREAM = /^[a-z][a-z0-9_]{0,63}$/;
 
+/** Fachada principal del panel: config, estado del agente, ciclos, chat, portfolios, logs y universo de activos. */
 @Injectable()
 export class PanelService {
   private readonly log = new Logger(PanelService.name);
@@ -35,6 +37,7 @@ export class PanelService {
 
   // ── Config ────────────────────────────────────────────────────────────────
 
+  /** Devuelve todos los pares clave-valor del config store, parseados como JSON cuando es posible. */
   async getConfig(): Promise<Record<string, JsonValue>> {
     const entries = await this.db.configEntry.findMany();
     return Object.fromEntries(
@@ -48,6 +51,7 @@ export class PanelService {
     );
   }
 
+  /** Persiste (upsert) un conjunto de claves en el config store y devuelve el estado completo. */
   async saveConfig(cfg: Record<string, unknown>): Promise<Record<string, JsonValue>> {
     for (const [key, value] of Object.entries(cfg)) {
       await this.db.configEntry.upsert({
@@ -59,6 +63,7 @@ export class PanelService {
     return this.getConfig();
   }
 
+  /** Elimina una clave del config store. */
   async deleteConfigKey(key: string): Promise<void> {
     await this.db.configEntry.deleteMany({ where: { key } });
   }
@@ -84,6 +89,7 @@ export class PanelService {
 
   // ── Status ─────────────────────────────────────────────────────────────────
 
+  /** Devuelve el estado general: plugins activos, portfolios y último ciclo. */
   async getStatus() {
     const activePlugins = await this.plugins.findActive();
     const portfolios = await this.db.portfolio.findMany({ orderBy: { updatedAt: 'desc' } });
@@ -102,12 +108,18 @@ export class PanelService {
     };
   }
 
+  /** Devuelve el estado en memoria del ciclo actual (sincrono, sin I/O). */
   getRunStatus() {
     return this.runState;
   }
 
   // ── Cycle ─────────────────────────────────────────────────────────────────
 
+  /**
+   * Lanza un ciclo del agente de forma asíncrona.
+   * Devuelve inmediatamente con {accepted: true} si no hay otro ciclo en curso.
+   * Si `dryRun` es true, solo ejecuta plugins sin llamar al LLM.
+   */
   runCycle(dryRun: boolean, prompt?: string): { accepted: boolean; message: string } {
     if (this.runState.running) return { accepted: false, message: 'Ya hay un ciclo en curso' };
     this.runState.running = true;
@@ -190,6 +202,7 @@ export class PanelService {
 
   // ── Chat ──────────────────────────────────────────────────────────────────
 
+  /** Envía una pregunta al LLM con historial opcional y devuelve la respuesta. */
   async chat(question: string, history?: unknown[]) {
     const context = history ? `${JSON.stringify(history)}\n\n${question}` : question;
     const res = await this.llm.complete({ context });
@@ -198,6 +211,7 @@ export class PanelService {
 
   // ── Doctor ────────────────────────────────────────────────────────────────
 
+  /** Diagnóstico de salud: sandbox alcanzable, plugins registrados y activos. */
   async doctor() {
     const [plugins, sandboxRes] = await Promise.all([
       this.plugins.findAll(),
@@ -215,6 +229,7 @@ export class PanelService {
   // ── Portfolios ────────────────────────────────────────────────────────────
   // Genérico: devuelve todos los portfolios que los plugins hayan escrito en la BD.
 
+  /** Devuelve todos los portfolios escritos por plugins como mapa nombre→datos. */
   async getPortfolios() {
     const portfolios = await this.db.portfolio.findMany({ orderBy: { updatedAt: 'desc' } });
     if (portfolios.length === 0) return {};
@@ -231,6 +246,7 @@ export class PanelService {
 
   // ── Notifications ─────────────────────────────────────────────────────────
 
+  /** Agrega notificaciones del sistema (sandbox caído) y las de plugins (clave 'notifications'). */
   async getNotifications() {
     const doctorData = await this.doctor();
     const items: { level: string; title: string; source: string; body: string; ts: string }[] = [];
@@ -260,6 +276,7 @@ export class PanelService {
   // Los plugins deciden qué streams existen escribiendo en 'logs_<stream>'.
   // La plataforma solo valida el formato del nombre para evitar inyección de claves.
 
+  /** Lee las últimas `limit` entradas de un stream de log (clave `logs_<stream>` en config store). */
   async getLogs(stream: string, limit: number) {
     if (!VALID_LOG_STREAM.test(stream)) {
       throw new BadRequestException(`nombre de stream inválido: ${JSON.stringify(stream)}`);
@@ -268,6 +285,7 @@ export class PanelService {
     return { stream, entries: raw.slice(-Math.max(1, Math.min(limit, 5000))) };
   }
 
+  /** Añade una entrada a un stream de log. Mantiene máximo 2000 entradas por stream. */
   async appendLog(stream: string, entry: Record<string, unknown>) {
     if (!VALID_LOG_STREAM.test(stream)) {
       throw new BadRequestException(`nombre de stream inválido: ${JSON.stringify(stream)}`);
@@ -284,6 +302,7 @@ export class PanelService {
   // La validación de si el símbolo existe y qué kind tiene es responsabilidad
   // del plugin provider activo.
 
+  /** Comprueba si un símbolo (normalizado a mayúsculas) existe en el universo de activos configurado. */
   async checkUniverseSymbol(symbol: string) {
     if (!symbol?.trim()) throw new BadRequestException('símbolo vacío');
     const sym = symbol.trim().toUpperCase();
@@ -297,6 +316,7 @@ export class PanelService {
     };
   }
 
+  /** Añade o elimina un símbolo del universo de activos en el config store. */
   async editUniverse(dto: UniverseEditDto) {
     const symbol = dto.symbol.trim().toUpperCase();
     const cfg = await this.getConfig();
@@ -318,12 +338,14 @@ export class PanelService {
   // ── Skills ────────────────────────────────────────────────────────────────
   // Solo lee metadatos de plugins tipo skill — la plataforma no gestiona skills manualmente.
 
+  /** Devuelve los metadatos de plugins tipo skill activos (nombre y descripción para el LLM). */
   async getSkills() {
     return this.plugins.getSkillsMetadata();
   }
 
   // ── Plugins activos por tipo ───────────────────────────────────────────────
 
+  /** Filtra los plugins activos por tipo (skill, provider, discipline, universe, stack, extra). */
   async getActiveByType(type: string) {
     const all = await this.plugins.findActive();
     return { type, plugins: all.filter((p) => p.type === type) };
@@ -332,6 +354,7 @@ export class PanelService {
   // ── NAV / métricas genéricas ───────────────────────────────────────────────
   // Los plugins escriben sus métricas en config keys; el panel las expone tal cual.
 
+  /** Lee una métrica del config store por clave. Solo acepta claves en formato snake_case. */
   async getMetrics(key: string) {
     if (!/^[a-z][a-z0-9_]{0,63}$/.test(key)) {
       throw new BadRequestException(`clave de métrica inválida: ${JSON.stringify(key)}`);

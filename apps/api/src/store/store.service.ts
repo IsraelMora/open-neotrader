@@ -1,6 +1,7 @@
 import { Injectable, Logger, BadGatewayException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
+/** Cliente HTTP para la tienda remota de plugins (STORE_URL); hace proxy de búsqueda, instalación, publicación, votos y reportes. */
 @Injectable()
 export class StoreService {
   private readonly log = new Logger(StoreService.name);
@@ -29,15 +30,18 @@ export class StoreService {
     }
   }
 
+  /** Lista plugins de la tienda con filtros opcionales (querystring). */
   browse(qs: Record<string, string>) {
     const params = new URLSearchParams(qs).toString();
     return this.fetch(`/plugins${params ? '?' + params : ''}`);
   }
 
+  /** Obtiene el detalle completo de un plugin por publisher y manifestId. */
   detail(publisherId: string, manifestId: string) {
     return this.fetch(`/plugins/${publisherId}/${manifestId}`);
   }
 
+  /** Registra una instalación de plugin en la tienda (estadísticas de descarga). */
   install(publisherId: string, manifestId: string, version: string) {
     return this.fetch('/install', {
       method: 'POST',
@@ -45,6 +49,7 @@ export class StoreService {
     });
   }
 
+  /** Publica o actualiza un plugin en la tienda remota. */
   publish(pluginId: string) {
     return this.fetch('/publish', {
       method: 'POST',
@@ -52,6 +57,7 @@ export class StoreService {
     });
   }
 
+  /** Emite un voto (like/dislike) para un plugin en la tienda. */
   vote(pluginId: string, kind: 'like' | 'dislike') {
     return this.fetch('/vote', {
       method: 'POST',
@@ -59,6 +65,7 @@ export class StoreService {
     });
   }
 
+  /** Reporta un plugin por contenido inapropiado o malicioso. */
   report(pluginId: string, reason: string) {
     return this.fetch('/report', {
       method: 'POST',
@@ -66,10 +73,12 @@ export class StoreService {
     });
   }
 
+  /** Obtiene la identidad del publicador registrada en la tienda. */
   getIdentity() {
     return this.fetch('/identity');
   }
 
+  /** Actualiza el nombre visible del publicador en la tienda. */
   setIdentity(displayName: string | null) {
     return this.fetch('/identity', {
       method: 'POST',

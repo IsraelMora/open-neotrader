@@ -22,6 +22,7 @@ export interface OnboardingStatus {
 
 const ONBOARDING_DONE_KEY = 'onboarding:completed';
 
+/** Gestiona el wizard de primera instalación: pasos completados, creación del admin y marcado de onboarding. */
 @Injectable()
 export class OnboardingService {
   constructor(
@@ -33,6 +34,7 @@ export class OnboardingService {
     private readonly cfg: ConfigService,
   ) {}
 
+  /** Devuelve el estado del onboarding: si está completo, el paso pendiente actual y todos los pasos. */
   async getStatus(): Promise<OnboardingStatus> {
     const done = await this.kv.get(ONBOARDING_DONE_KEY);
     if (done === 'true') {

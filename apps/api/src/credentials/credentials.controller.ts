@@ -3,6 +3,7 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CredentialsService } from './credentials.service';
 import { SetCredentialDto } from './dto/set-credential.dto';
 
+/** Endpoints de gestión de credenciales: listado enmascarado y escritura en .env. */
 @ApiTags('credentials')
 @ApiBearerAuth()
 @Controller('credentials')

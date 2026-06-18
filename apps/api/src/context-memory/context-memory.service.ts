@@ -47,12 +47,14 @@ const EMPTY_MEMORY: ContextMemory = {
 
 // ── Servicio ─────────────────────────────────────────────────────────────────
 
+/** Memoria persistente entre ciclos del agente: observaciones, flags y resumen de señales por símbolo. */
 @Injectable()
 export class ContextMemoryService {
   private readonly log = new Logger(ContextMemoryService.name);
 
   constructor(private readonly kv: KvService) {}
 
+  /** Lee el estado completo de la memoria desde el KV store. Devuelve estado vacío si no existe. */
   async get(): Promise<ContextMemory> {
     const raw = await this.kv.get(MEMORY_KEY);
     if (!raw) return { ...EMPTY_MEMORY };
@@ -63,11 +65,13 @@ export class ContextMemoryService {
     }
   }
 
+  /** Persiste el estado de la memoria actualizando `last_updated`. */
   async save(mem: ContextMemory): Promise<void> {
     mem.last_updated = new Date().toISOString();
     await this.kv.set(MEMORY_KEY, JSON.stringify(mem));
   }
 
+  /** Elimina toda la memoria acumulada (irreversible). */
   async reset(): Promise<void> {
     await this.kv.delete(MEMORY_KEY);
     this.log.log('Context memory reseteada');
@@ -114,6 +118,7 @@ export class ContextMemoryService {
     await this.save(mem);
   }
 
+  /** Elimina un flag persistente por clave. */
   async deleteFlag(key: string): Promise<void> {
     const mem = await this.get();
     mem.flags = mem.flags.filter((f) => f.key !== key);

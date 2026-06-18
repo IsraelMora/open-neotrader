@@ -28,6 +28,7 @@ class SetFlagDto {
   note?: string;
 }
 
+/** Endpoints de inspección y gestión de la memoria de contexto inter-ciclos del agente. */
 @ApiTags('context-memory')
 @ApiBearerAuth()
 @UseGuards(TotpRequiredGuard)

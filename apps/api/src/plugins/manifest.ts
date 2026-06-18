@@ -6,6 +6,7 @@ import * as path from 'path';
 
 export type PluginType = 'skill' | 'provider' | 'discipline' | 'universe' | 'stack' | 'extra';
 
+/** Especificación de una credencial requerida por el plugin (nombre, si es obligatoria, grupo). */
 export interface CredentialSpec {
   label: string;
   required?: boolean;
@@ -13,6 +14,7 @@ export interface CredentialSpec {
   description?: string;
 }
 
+/** Especificación de un campo de configuración del plugin con tipo, rango y valores permitidos. */
 export interface ConfigFieldSpec {
   type: 'string' | 'number' | 'boolean' | 'array';
   label?: string;
@@ -46,6 +48,7 @@ export interface StackSpec {
   requires?: string[];
 }
 
+/** Estructura completa del manifest.toml de un plugin: identidad, credentials, config, hooks y permisos. */
 export interface PluginManifest {
   plugin: {
     id: string;
@@ -68,6 +71,7 @@ export interface PluginManifest {
 
 // ── Parser ─────────────────────────────────────────────────────────────────────
 
+/** Lee y parsea el manifest.toml desde el directorio instalado del plugin. Devuelve null si no existe o es inválido. */
 export function readManifest(pluginDir: string): PluginManifest | null {
   const manifestPath = path.join(pluginDir, 'manifest.toml');
   try {
@@ -78,6 +82,7 @@ export function readManifest(pluginDir: string): PluginManifest | null {
   }
 }
 
+/** Valida los campos obligatorios y el formato del manifest. Devuelve lista de errores (vacía si es válido). */
 export function validateManifest(m: PluginManifest): string[] {
   const errors: string[] = [];
   if (!m.plugin?.id) errors.push('plugin.id es obligatorio');

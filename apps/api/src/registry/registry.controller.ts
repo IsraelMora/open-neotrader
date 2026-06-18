@@ -12,6 +12,7 @@ import { ApiBearerAuth, ApiTags, ApiOperation, ApiQuery } from '@nestjs/swagger'
 import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 import { RegistryService } from './registry.service';
 
+/** Endpoints del catálogo de plugins: listado, detalle, instalación directa y estadísticas. */
 @ApiTags('registry')
 @ApiBearerAuth()
 @UseGuards(TotpRequiredGuard)

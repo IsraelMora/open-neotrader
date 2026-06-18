@@ -2,6 +2,7 @@ import { Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { TelegramService } from './telegram.service';
 
+/** Endpoints de gestión del notificador (actualmente Telegram). */
 @ApiTags('notifier')
 @Controller('notifier')
 export class NotifierController {

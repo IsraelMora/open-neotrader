@@ -14,6 +14,7 @@ import {
   publisherIdFromPublicKey,
 } from './signature.util';
 
+/** Token de inyección para configurar la ventana anti-replay en milisegundos. */
 export const SIGNATURE_WINDOW_MS = 'SIGNATURE_WINDOW_MS';
 const DEFAULT_WINDOW_MS = 300_000;
 
@@ -26,6 +27,15 @@ interface SignedRequest {
   publicKey: string;
 }
 
+/**
+ * Guard que verifica la firma ECDSA de cada petición entrante.
+ *
+ * Valida que las cabeceras `x-publisher-id`, `x-public-key`, `x-timestamp`
+ * y `x-signature` estén presentes, que el timestamp caiga dentro de la
+ * ventana anti-replay y que la firma cubra el método, la ruta y el hash
+ * del cuerpo. Si la verificación es exitosa adjunta `publisherId` y `publicKey` a la
+ * petición para que los manejadores los consuman vía `@Publisher()`.
+ */
 @Injectable()
 export class SignatureGuard implements CanActivate {
   private readonly windowMs: number;
@@ -37,6 +47,12 @@ export class SignatureGuard implements CanActivate {
     this.windowMs = windowMs ?? DEFAULT_WINDOW_MS;
   }
 
+  /**
+   * Ejecuta la verificación de firma y anti-replay.
+   *
+   * @param context - Contexto de ejecución de NestJS.
+   * @returns `true` si la petición es válida; lanza excepción en caso contrario.
+   */
   canActivate(context: ExecutionContext): boolean {
     const req = context.switchToHttp().getRequest<SignedRequest>();
     const h = req.headers;

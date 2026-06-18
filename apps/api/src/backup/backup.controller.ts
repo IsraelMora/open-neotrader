@@ -2,6 +2,7 @@ import { Controller, Post, Get, Body } from '@nestjs/common';
 import { BackupService } from './backup.service';
 import { CreateBackupDto, RestoreBackupDto } from './dto/backup.dto';
 
+/** Endpoints de backup y restauración cifrada (AES-256-GCM) de la plataforma. */
 @Controller('backup')
 export class BackupController {
   constructor(private readonly backup: BackupService) {}

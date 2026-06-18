@@ -5,17 +5,20 @@ import { promisify } from 'util';
 import { PluginsService } from '../plugins/plugins.service';
 import { buildSubscriptionArgs } from './subscription-args';
 
+/** Petición al LLM: contexto del ciclo y prompt de sistema opcional. */
 export interface LlmRequest {
   context: string;
   system_prompt?: string;
 }
 
+/** Tool call propuesta por el LLM: qué función de qué plugin invocar y con qué argumentos. */
 export interface ToolCallRequest {
   plugin_id: string;
   function: string;
   args: Record<string, unknown>;
 }
 
+/** Respuesta normalizada del LLM independientemente del backend usado. */
 export interface LlmResponse {
   text: string;
   tool_calls: ToolCallRequest[];
@@ -39,6 +42,7 @@ export interface CustomLlmProvider {
 
 // Sin presets — el usuario define sus propios providers via POST /llm/providers
 
+/** Abstracción multi-backend del LLM: Anthropic API, OpenAI, Gemini, Claude subscription y providers custom OpenAI-compatible. */
 @Injectable()
 export class LlmService {
   private readonly log = new Logger(LlmService.name);
@@ -55,6 +59,7 @@ export class LlmService {
     this._backend = (cfg.get<string>('LLM_BACKEND', 'anthropic') as LlmBackend) ?? 'anthropic';
   }
 
+  /** Devuelve la configuración activa del LLM: modelo, backend y capacidades. */
   getConfig() {
     const caps: Record<LlmBackend, string[]> = {
       anthropic: ['text_only', 'skills_upfront'],
@@ -80,6 +85,7 @@ export class LlmService {
     return Array.from(this._customProviders.values());
   }
 
+  /** Registra un provider LLM custom compatible con OpenAI en memoria. */
   addCustomProvider(provider: Omit<CustomLlmProvider, 'id'> & { id?: string }): CustomLlmProvider {
     const id = provider.id ?? provider.name.toLowerCase().replace(/[^a-z0-9]/g, '-');
     const p: CustomLlmProvider = { ...provider, id };
@@ -93,6 +99,7 @@ export class LlmService {
     if (this._activeCustomId === id) this._activeCustomId = null;
   }
 
+  /** Cambia modelo, backend o provider custom activo en runtime sin reiniciar. */
   patchConfig(patch: { model?: string; backend?: string; custom_provider_id?: string }) {
     if (patch.model) {
       this._model = patch.model;
@@ -110,6 +117,7 @@ export class LlmService {
     return this.getConfig();
   }
 
+  /** Envía el contexto al LLM activo e inyecta los skills upfront. Selecciona el backend automáticamente. */
   async complete(req: LlmRequest): Promise<LlmResponse> {
     const useSubscription = await this.plugins.isExtraActive('claude-subscription');
     if (useSubscription || this._backend === 'subscription')

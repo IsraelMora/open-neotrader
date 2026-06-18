@@ -14,6 +14,7 @@ export interface SandboxResponse {
   error?: string;
 }
 
+/** Puerta de entrada al sandbox Python (runner.py): ejecuta plugins de forma aislada enviando JSON por stdin/stdout. */
 @Injectable()
 export class SandboxGateway {
   private readonly log = new Logger(SandboxGateway.name);
@@ -46,6 +47,7 @@ export class SandboxGateway {
     this.memMb = cfg.get<number>('SANDBOX_MEM_MB', 512);
   }
 
+  /** Envía un comando al runner.py y retorna la respuesta parseada. Mata el proceso si supera el timeout. */
   async call(req: SandboxRequest): Promise<SandboxResponse> {
     return new Promise((resolve) => {
       const existingPythonPath = process.env['PYTHONPATH'] ?? '';

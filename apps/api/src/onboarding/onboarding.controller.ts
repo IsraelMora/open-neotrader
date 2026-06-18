@@ -26,6 +26,7 @@ class CreateAdminDto {
   password!: string;
 }
 
+/** Endpoints del wizard de onboarding: estado, creación del admin, completado y reset. */
 @ApiTags('onboarding')
 @Controller('onboarding')
 export class OnboardingController {

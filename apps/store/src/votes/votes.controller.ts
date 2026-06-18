@@ -5,10 +5,18 @@ import { VotesService } from './votes.service';
 import { VoteDto } from './dto/vote.dto';
 import { ReportDto } from './dto/report.dto';
 
+/** Controlador REST para votos y reportes de plugins (`/api/plugins/:id`). */
 @Controller('plugins/:id')
 export class VotesController {
   constructor(private readonly votes: VotesService) {}
 
+  /**
+   * Registra o actualiza el voto del publisher autenticado sobre un plugin.
+   *
+   * @param id  - ID interno del plugin.
+   * @param pub - Publisher autenticado.
+   * @param dto - Tipo de voto: `like` o `dislike`.
+   */
   @Post('vote')
   @UseGuards(SignatureGuard)
   vote(
@@ -19,6 +27,13 @@ export class VotesController {
     return this.votes.vote(id, pub.id, pub.publicKey, dto.kind);
   }
 
+  /**
+   * Registra o actualiza el reporte del publisher autenticado sobre un plugin.
+   *
+   * @param id  - ID interno del plugin.
+   * @param pub - Publisher autenticado.
+   * @param dto - Motivo del reporte (máximo 500 caracteres).
+   */
   @Post('report')
   @UseGuards(SignatureGuard)
   report(

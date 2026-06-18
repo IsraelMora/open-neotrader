@@ -28,6 +28,7 @@ export class MigrationRunnerService implements OnModuleInit {
     this.runMigrations(dbPath);
   }
 
+  /** Aplica las migraciones SQL pendientes al archivo de base de datos indicado. */
   runMigrations(dbPath: string): void {
     const db = new Database(dbPath);
     try {

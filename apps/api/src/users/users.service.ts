@@ -7,10 +7,12 @@ export type { User };
 
 const BCRYPT_ROUNDS = 12;
 
+/** Repositorio de usuarios: creación (mono-usuario), consulta, validación de contraseña y gestión de TOTP/backup codes. */
 @Injectable()
 export class UsersService {
   constructor(private readonly db: PrismaService) {}
 
+  /** Crea el único usuario permitido. Lanza ConflictException si ya existe uno. */
   async create(username: string, password: string): Promise<User> {
     // Un solo usuario por instalación (local-first)
     if ((await this.db.user.count()) > 0) {
@@ -67,6 +69,7 @@ export class UsersService {
     return codes;
   }
 
+  /** Verifica y consume un backup code (lo elimina del set al usarlo). Devuelve false si no es válido. */
   async consumeBackupCode(user: User, code: string): Promise<boolean> {
     if (!user.backup_codes_hash) return false;
     const hashes = user.backup_codes_hash.split('|');
