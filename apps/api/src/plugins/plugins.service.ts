@@ -4,6 +4,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  type OnApplicationBootstrap,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { execFile } from 'child_process';
@@ -18,6 +19,7 @@ import {
   type PluginManifest,
   type ConfigFieldSpec,
 } from './manifest';
+import { scanLocalManifests } from './local-sync';
 import type { Plugin } from '@prisma/client';
 
 export type { Plugin };
@@ -124,7 +126,7 @@ function hydrate(p: Plugin): HydratedPlugin {
 
 /** Gestiona el ciclo de vida completo de los plugins: instalación git, activación/desactivación, config, skills y tools. */
 @Injectable()
-export class PluginsService {
+export class PluginsService implements OnApplicationBootstrap {
   private readonly log = new Logger(PluginsService.name);
   readonly pluginsDir: string;
 
@@ -134,6 +136,67 @@ export class PluginsService {
     cfg: ConfigService,
   ) {
     this.pluginsDir = cfg.get<string>('PLUGINS_DIR', path.resolve(process.cwd(), '../../plugins'));
+  }
+
+  /**
+   * Al arrancar (tras las migraciones), registra en la BD los plugins que viven en
+   * el directorio local `plugins/` para que estén disponibles en la UI sin pasar por
+   * `git install`. No falla el arranque si el sync no puede completarse.
+   */
+  async onApplicationBootstrap(): Promise<void> {
+    try {
+      const { registered, updated } = await this.syncLocalPlugins();
+      this.log.log(`Sync de plugins locales: ${registered} nuevos, ${updated} actualizados`);
+    } catch (err: unknown) {
+      this.log.warn(`Sync de plugins locales falló: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Escanea `pluginsDir` y sincroniza cada manifest válido con la BD: crea los que
+   * faltan (inactivos), y actualiza la metadata de los existentes SIN tocar su estado
+   * `active` ni su `config` (decisiones del usuario). Devuelve cuántos creó/actualizó.
+   */
+  async syncLocalPlugins(): Promise<{ registered: number; updated: number }> {
+    const records = scanLocalManifests(this.pluginsDir);
+    let registered = 0;
+    let updated = 0;
+
+    for (const r of records) {
+      const existing = await this.db.plugin.findUnique({ where: { id: r.id } });
+      if (existing) {
+        await this.db.plugin.update({
+          where: { id: r.id },
+          data: {
+            name: r.name,
+            description: r.description,
+            version: r.version,
+            type: r.type,
+            author: r.author,
+            installed_path: r.installed_path,
+          },
+        });
+        updated++;
+      } else {
+        await this.db.plugin.create({
+          data: {
+            id: r.id,
+            name: r.name,
+            description: r.description,
+            version: r.version,
+            type: r.type,
+            author: r.author,
+            active: false,
+            source_url: r.installed_path,
+            installed_path: r.installed_path,
+          },
+        });
+        this.events.emit('plugin.installed', { plugin_id: r.id, version: r.version });
+        registered++;
+      }
+    }
+
+    return { registered, updated };
   }
 
   // ── Queries ───────────────────────────────────────────────────────────────

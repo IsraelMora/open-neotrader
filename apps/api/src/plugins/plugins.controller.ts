@@ -47,6 +47,15 @@ export class PluginsController {
     return this.svc.getActiveSymbols();
   }
 
+  @Post('sync')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Reescanea el directorio local de plugins y los registra en la BD (sin activarlos)',
+  })
+  sync(): Promise<{ registered: number; updated: number }> {
+    return this.svc.syncLocalPlugins();
+  }
+
   @Post('install')
   @ApiOperation({ summary: 'Instalar plugin desde URL git o ruta local' })
   install(@Body() dto: InstallPluginDto): Promise<HydratedPlugin> {
