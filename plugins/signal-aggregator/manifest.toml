@@ -1,0 +1,69 @@
+[plugin]
+id          = "signal-aggregator"
+name        = "Signal Aggregator"
+version     = "1.0.0"
+type        = "discipline"
+description = "Agrega señales de múltiples skills usando votación ponderada por confianza. Genera una señal final consenso, filtra ruido, y produce decisiones de trading más robustas que cualquier skill individual. Reduce la dependencia del LLM para agregación simple."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[[tools]]
+name        = "aggregate_signals"
+description = "Agrega una lista de señales de distintos plugins en una señal consenso por símbolo."
+
+[config]
+[config.min_confidence]
+type        = "number"
+default     = 0.6
+min         = 0.4
+max         = 0.95
+label       = "Confianza mínima"
+description = "Confianza mínima para que una señal individual contribuya al voto."
+
+[config.min_agreement_pct]
+type        = "number"
+default     = 60
+min         = 50
+max         = 100
+label       = "Acuerdo mínimo (%)"
+description = "% de señales que deben coincidir en dirección para emitir señal consenso. 60 = mayoría simple, 75 = supermayoría."
+
+[config.weight_by_confidence]
+type        = "boolean"
+default     = true
+label       = "Ponderar por confianza"
+description = "Si true, señales con mayor confianza tienen más peso en el voto. Si false, voto igualitario."
+
+[config.require_min_signals]
+type        = "number"
+default     = 2
+min         = 1
+max         = 5
+label       = "Señales mínimas requeridas"
+description = "Número mínimo de señales individuales necesarias para generar un consenso."
+
+[config.max_signals_per_symbol]
+type        = "number"
+default     = 10
+min         = 2
+max         = 20
+label       = "Máx señales por símbolo"
+description = "Limita cuántas señales se procesan por símbolo (las de mayor confianza primero)."
+
+[config.conflict_resolution]
+type        = "text"
+default     = "skip"
+label       = "Resolución de conflictos"
+description = "Cuando hay señales opuestas: 'skip' = ignorar ese símbolo | 'dominant' = usar la dirección dominante."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

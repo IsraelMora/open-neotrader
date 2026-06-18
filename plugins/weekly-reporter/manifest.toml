@@ -1,0 +1,23 @@
+[plugin]
+id          = "weekly-reporter"
+name        = "Weekly/Monthly Reporter"
+version     = "1.0.0"
+type        = "extra"
+description = "Genera resúmenes periódicos de rendimiento: P&L, Sharpe ratio, max drawdown, win rate y top señales. Envía el reporte vía Telegram. Configurable para reportes semanales y/o mensuales."
+author      = "neurotrader"
+tags        = ["reporting", "telegram", "pnl", "performance", "monitoring"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+
+[config]
+weekly_report_day   = "monday"      # día de la semana para reporte semanal (monday-sunday)
+monthly_report_day  = 1             # día del mes para reporte mensual
+lookback_days       = 30            # días para calcular métricas
+min_trades          = 5             # mínimo de trades para generar reporte
+include_equity_curve = true
+
+[credentials]
+TELEGRAM_BOT_TOKEN  = { description = "Token del bot de Telegram", required = false }
+TELEGRAM_CHAT_ID    = { description = "ID del chat/canal de Telegram", required = false }

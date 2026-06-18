@@ -1,0 +1,33 @@
+[
+  {
+    "name": "analyze_wyckoff",
+    "description": "Detecta fases Wyckoff (acumulación/distribución) de un activo usando análisis precio/volumen. Identifica Springs (falsa ruptura soporte con vol bajo → alcista), Upthrusts (falsa ruptura resistencia con vol alto → bajista), SOS (Sign of Strength) y SOW (Sign of Weakness). Win rate ~65-70% en presencia de Springs/Upthrusts confirmados.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol":  {"type": "string", "description": "Ticker del activo"},
+        "closes":  {"type": "array", "items": {"type": "number"}, "description": "Precios de cierre (orden cronológico)"},
+        "highs":   {"type": "array", "items": {"type": "number"}, "description": "Máximos de cada barra"},
+        "lows":    {"type": "array", "items": {"type": "number"}, "description": "Mínimos de cada barra"},
+        "volumes": {"type": "array", "items": {"type": "number"}, "description": "Volúmenes de cada barra"},
+        "lookback_bars": {"type": "integer", "description": "Ventana de análisis (default 50)"}
+      },
+      "required": ["symbol", "closes", "volumes"]
+    }
+  },
+  {
+    "name": "detect_spring",
+    "description": "Detecta específicamente un Spring Wyckoff: price penetra soporte con bajo volumen y recupera. Es una de las señales de entrada más fiables del método Wyckoff.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol":  {"type": "string"},
+        "closes":  {"type": "array", "items": {"type": "number"}},
+        "lows":    {"type": "array", "items": {"type": "number"}},
+        "volumes": {"type": "array", "items": {"type": "number"}},
+        "support_level": {"type": "number", "description": "Nivel de soporte conocido (opcional, se calcula si no se da)"}
+      },
+      "required": ["symbol", "closes", "volumes"]
+    }
+  }
+]

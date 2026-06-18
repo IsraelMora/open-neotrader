@@ -1,0 +1,25 @@
+[plugin]
+id          = "volatility-rank"
+name        = "Volatility Rank (HV Percentile)"
+version     = "1.0.0"
+type        = "skill"
+description = "Calcula el rango de volatilidad histórica (HV Percentile) como proxy de IV Rank. Identifica cuándo la volatilidad está alta (>80% = premium selling) o baja (<20% = premium buying). Técnica de traders profesionales de opciones."
+author      = "neurotrader"
+tags        = ["skill", "volatility", "options", "iv-rank", "hv-percentile"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86_400_000
+
+[permissions]
+network     = false
+filesystem  = false
+
+[config]
+lookback_days    = { type = "integer", default = 252,  description = "Días de historia para calcular el percentil (252 = 1 año)" }
+hv_window        = { type = "integer", default = 21,   description = "Ventana de días para calcular HV (21 = ~1 mes)" }
+high_vol_pct     = { type = "integer", default = 80,   description = "Percentil de HV considerado 'volatilidad alta' (premium selling)" }
+low_vol_pct      = { type = "integer", default = 20,   description = "Percentil de HV considerado 'volatilidad baja' (premium buying)" }
+emit_on_high     = { type = "boolean", default = true,  description = "Emitir señal cuando volatilidad está alta (oportunidad de venta de premium)" }
+emit_on_low      = { type = "boolean", default = true,  description = "Emitir señal cuando volatilidad está baja (oportunidad de compra de opciones baratas)" }

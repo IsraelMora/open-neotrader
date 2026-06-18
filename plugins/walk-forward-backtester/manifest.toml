@@ -1,0 +1,18 @@
+[plugin]
+id          = "walk-forward-backtester"
+name        = "Walk-Forward Backtester"
+version     = "1.0.0"
+type        = "extra"
+description = "Validación walk-forward out-of-sample para evitar overfitting. Divide la historia en ventanas solapadas de in-sample (optimización) + out-of-sample (validación), ejecuta el backtest en cada ventana y compara métricas IS vs OOS."
+author      = "neurotrader"
+tags        = ["backtesting", "walk-forward", "overfitting", "validation", "analysis"]
+
+[scheduler]
+mode = "none"
+
+[config]
+in_sample_pct   = 0.7      # % de la ventana usado para in-sample (optimización)
+n_windows       = 5        # número de ventanas walk-forward
+min_trades      = 10       # mínimo de trades en OOS para considerar la ventana válida
+commission_pct  = 0.001    # comisión por operación (0.1%)
+slippage_pct    = 0.0005   # slippage estimado (0.05%)

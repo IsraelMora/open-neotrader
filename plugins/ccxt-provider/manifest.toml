@@ -1,0 +1,44 @@
+[plugin]
+id          = "ccxt-provider"
+name        = "CCXT Universal Provider"
+version     = "1.0.0"
+type        = "provider"
+description = "Acceso a 200+ exchanges via CCXT. Soporta spot, futuros y perpetuos en modo uniforme."
+author      = "neurotrader"
+tags        = ["provider", "crypto", "ccxt", "multi-exchange"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1h"
+interval_ms = 3_600_000
+
+[permissions]
+network     = false   # acceso a red solo via ProviderGatewayService
+filesystem  = false
+
+[api]
+format       = "ccxt"
+base_url     = "https://api.{exchange}.com"
+
+[api.auth]
+type         = "header"
+
+[api.auth.headers]
+"X-API-KEY"    = "{api_key}"
+"X-SECRET-KEY" = "{api_secret}"
+
+[api.endpoints]
+ohlcv    = "/fetchOHLCV?symbol={symbol}&timeframe={tf}&limit={limit}"
+ticker   = "/fetchTicker?symbol={symbol}"
+order    = "/createOrder"
+
+[config]
+exchange    = { type = "string",  default = "kraken",    description = "ID del exchange CCXT (kraken, kucoin, okx, bybit...)" }
+market_type = { type = "string",  default = "spot",      description = "spot | future | swap" }
+testnet     = { type = "boolean", default = false,       description = "Usar sandbox/testnet del exchange" }
+rate_limit  = { type = "integer", default = 1200,        description = "ms entre requests (respetar rate limits del exchange)" }
+symbol_fmt  = { type = "string",  default = "slash",     description = "Formato de símbolo: slash (BTC/USDT), nodash (BTCUSDT)" }
+
+[credentials]
+api_key    = { env = "CCXT_API_KEY",    description = "API key del exchange CCXT" }
+api_secret = { env = "CCXT_API_SECRET", description = "API secret del exchange CCXT" }

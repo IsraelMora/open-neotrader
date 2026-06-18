@@ -1,0 +1,50 @@
+[
+  {
+    "name": "get_ohlcv",
+    "description": "Obtiene datos OHLCV para detectar gaps de apertura (necesita al menos 15 días para calcular EMA y volumen promedio).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string" },
+        "timeframe": { "type": "string", "default": "1d" },
+        "limit": { "type": "integer", "default": 20 }
+      },
+      "required": ["symbol"]
+    }
+  },
+  {
+    "name": "get_universe",
+    "description": "Obtiene la lista de símbolos activos del universo actual.",
+    "parameters": { "type": "object", "properties": {}, "required": [] }
+  },
+  {
+    "name": "emit_gap_signal",
+    "description": "Emite una señal de gap con su tipo (fade o continuation) y dirección.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string" },
+        "action": {
+          "type": "string",
+          "enum": ["long", "short"],
+          "description": "Dirección del trade"
+        },
+        "gap_pct": {
+          "type": "number",
+          "description": "Tamaño del gap en porcentaje (+gap up, -gap down)"
+        },
+        "strategy": {
+          "type": "string",
+          "enum": ["fade", "continuation"],
+          "description": "fade=contra el gap (mean reversion); continuation=a favor del gap"
+        },
+        "confidence": { "type": "number", "description": "0.0-1.0" },
+        "volume_confirmed": {
+          "type": "boolean",
+          "description": "True si el volumen de apertura confirma el gap"
+        }
+      },
+      "required": ["symbol", "action", "gap_pct", "strategy"]
+    }
+  }
+]

@@ -1,0 +1,55 @@
+[
+  {
+    "name": "get_paper_portfolio",
+    "description": "Obtiene el estado actual del portafolio paper: cash, posiciones abiertas, PnL no realizado y resumen de rendimiento.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "get_paper_trades",
+    "description": "Lista los trades cerrados del portafolio paper con su PnL.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "description": "Número máximo de trades a devolver (más recientes primero)",
+          "default": 20
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "reset_paper_portfolio",
+    "description": "Reinicia el portafolio paper al capital inicial. Cierra todas las posiciones simuladas. Útil para empezar una nueva prueba.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "confirm": {
+          "type": "boolean",
+          "description": "Debe ser true para confirmar el reset"
+        }
+      },
+      "required": ["confirm"]
+    }
+  },
+  {
+    "name": "get_current_prices",
+    "description": "Obtiene precios actuales de los símbolos en el portafolio para calcular PnL en tiempo real.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbols": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Lista de símbolos a obtener precio"
+        }
+      },
+      "required": []
+    }
+  }
+]

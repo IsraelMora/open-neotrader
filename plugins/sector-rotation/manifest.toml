@@ -1,0 +1,52 @@
+[plugin]
+id          = "sector-rotation"
+name        = "Sector Rotation"
+version     = "1.0.0"
+type        = "skill"
+description = "Estrategia de rotación entre sectores del S&P 500 basada en momentum relativo y filtro de tendencia. Meb Faber (2007): comprar los sectores con mejor momentum y filtro MA de 10 meses reduce drawdown un 50% vs buy-and-hold. Rebalanceo mensual."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[config]
+[config.top_sectors]
+type    = "number"
+default = 3
+min     = 1
+max     = 6
+label   = "Sectores a mantener"
+description = "Número de sectores SPDR a tener en cartera. 3 es el óptimo histórico (diversificación sin diluir el momentum)."
+
+[config.ma_period_months]
+type    = "number"
+default = 10
+min     = 3
+max     = 24
+label   = "Período MA (meses)"
+description = "Período de la media móvil para el filtro de tendencia. 10 meses = estándar Faber."
+
+[config.momentum_period_months]
+type    = "number"
+default = 12
+min     = 3
+max     = 24
+label   = "Período momentum (meses)"
+description = "Período para calcular el retorno de momentum de cada sector."
+
+[config.rebalance_frequency]
+type    = "string"
+enum    = ["monthly", "quarterly"]
+default = "monthly"
+label   = "Frecuencia de rebalanceo"
+description = "Con qué frecuencia revisar los sectores. Mensual es el estándar académico."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1mo"
+interval_ms = 2592000000

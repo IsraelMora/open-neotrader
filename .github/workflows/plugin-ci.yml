@@ -1,0 +1,283 @@
+# NeuroTrader Plugin CI — validación automática de plugins de la comunidad.
+#
+# Este workflow se ejecuta en cada PR que modifica archivos de plugin.
+# Verifica: manifest.toml válido, scripts Python sin errores de sintaxis,
+# hooks ejecutables en sandbox, SKILL.md presente (si aplica).
+
+name: Plugin CI
+
+on:
+  push:
+    paths:
+      - 'plugins/**'
+  pull_request:
+    paths:
+      - 'plugins/**'
+
+jobs:
+  validate-plugins:
+    name: Validate Plugin Structure
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Detect changed plugins
+        id: changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF:   ${{ github.base_ref }}
+        run: |
+          # Validar que BASE_REF no contenga caracteres peligrosos antes de usarlo en git
+          if ! echo "$BASE_REF" | grep -qE '^[A-Za-z0-9_./\-]+$'; then
+            echo "❌ BASE_REF contiene caracteres no permitidos: $BASE_REF"
+            exit 1
+          fi
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            CHANGED=$(git diff --name-only "origin/${BASE_REF}...HEAD" -- plugins/ | \
+              sed 's|plugins/\([^/]*\)/.*|\1|' | sort -u | tr '\n' ' ')
+          else
+            CHANGED=$(git diff --name-only HEAD~1...HEAD -- plugins/ | \
+              sed 's|plugins/\([^/]*\)/.*|\1|' | sort -u | tr '\n' ' ')
+          fi
+          echo "plugins=${CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "Changed plugins: ${CHANGED}"
+
+      - name: Validate manifest.toml (all plugins)
+        run: |
+          pip install tomllib-w 2>/dev/null || true
+          python3 - <<'PYEOF'
+          import sys, os, re
+          from pathlib import Path
+
+          REQUIRED_PLUGIN_FIELDS = ["id", "name", "version", "type"]
+          VALID_TYPES = {"skill", "discipline", "universe", "provider", "stack", "extra"}
+          errors = []
+
+          for plugin_dir in sorted(Path("plugins").iterdir()):
+              if not plugin_dir.is_dir():
+                  continue
+              manifest = plugin_dir / "manifest.toml"
+              if not manifest.exists():
+                  # Permitir directorios sin manifest (e.g., legacy)
+                  continue
+              try:
+                  import tomllib
+              except ImportError:
+                  import tomllib  # Python 3.11+
+              try:
+                  with open(manifest, "rb") as f:
+                      data = tomllib.load(f)
+              except Exception as e:
+                  errors.append(f"{plugin_dir.name}/manifest.toml: TOML inválido — {e}")
+                  continue
+
+              plugin = data.get("plugin", {})
+              for field in REQUIRED_PLUGIN_FIELDS:
+                  if not plugin.get(field):
+                      errors.append(f"{plugin_dir.name}: campo '[plugin].{field}' faltante")
+
+              plugin_type = plugin.get("type", "")
+              if plugin_type not in VALID_TYPES:
+                  errors.append(f"{plugin_dir.name}: type='{plugin_type}' inválido (válidos: {VALID_TYPES})")
+
+              # Versión semver básica
+              version = plugin.get("version", "")
+              if not re.match(r'^\d+\.\d+\.\d+', version):
+                  errors.append(f"{plugin_dir.name}: version='{version}' no cumple formato semver X.Y.Z")
+
+          if errors:
+              print("❌ Errores de validación:")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+          else:
+              print(f"✅ {len(list(Path('plugins').iterdir()))} plugins validados OK")
+          PYEOF
+
+      - name: Python syntax check (all hooks and scripts)
+        run: |
+          find plugins/ -name "*.py" | while read f; do
+            python3 -m py_compile "$f" || { echo "❌ Syntax error: $f"; exit 1; }
+          done
+          echo "✅ Todos los archivos Python tienen sintaxis válida"
+
+      - name: Check SKILL.md present for skill/discipline plugins
+        run: |
+          python3 - <<'PYEOF'
+          import sys, tomllib
+          from pathlib import Path
+
+          errors = []
+          for plugin_dir in sorted(Path("plugins").iterdir()):
+              if not plugin_dir.is_dir():
+                  continue
+              manifest = plugin_dir / "manifest.toml"
+              if not manifest.exists():
+                  continue
+              try:
+                  with open(manifest, "rb") as f:
+                      data = tomllib.load(f)
+              except Exception:
+                  continue
+
+              plugin_type = data.get("plugin", {}).get("type", "")
+              if plugin_type in ("skill", "discipline") and not (plugin_dir / "SKILL.md").exists():
+                  errors.append(f"{plugin_dir.name}: SKILL.md faltante (requerido para type={plugin_type})")
+
+          if errors:
+              print("❌ SKILL.md faltante:")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+          else:
+              print("✅ SKILL.md presente en todos los plugins skill/discipline")
+          PYEOF
+
+      - name: Validate tools.json schema (if present)
+        run: |
+          python3 - <<'PYEOF'
+          import sys, json
+          from pathlib import Path
+
+          REQUIRED_TOOL_FIELDS = ["name", "description", "parameters"]
+          errors = []
+
+          for tools_file in Path("plugins").rglob("tools.json"):
+              plugin = tools_file.parent.name
+              try:
+                  with open(tools_file) as f:
+                      tools = json.load(f)
+              except json.JSONDecodeError as e:
+                  errors.append(f"{plugin}/tools.json: JSON inválido — {e}")
+                  continue
+
+              if not isinstance(tools, list):
+                  errors.append(f"{plugin}/tools.json: debe ser un array JSON")
+                  continue
+
+              for i, tool in enumerate(tools):
+                  for field in REQUIRED_TOOL_FIELDS:
+                      if field not in tool:
+                          errors.append(f"{plugin}/tools.json[{i}]: campo '{field}' faltante")
+
+                  params = tool.get("parameters", {})
+                  if params.get("type") != "object":
+                      errors.append(f"{plugin}/tools.json[{i}]: parameters.type debe ser 'object'")
+
+          if errors:
+              print("❌ Errores en tools.json:")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+          else:
+              print("✅ tools.json válidos")
+          PYEOF
+
+      - name: Run sandbox smoke test (hooks/cycle.py or hooks/on_activate.py)
+        run: |
+          python3 - <<'PYEOF'
+          import sys, json, subprocess, os
+          from pathlib import Path
+
+          failures = []
+
+          for plugin_dir in sorted(Path("plugins").iterdir()):
+              for hook in ["on_activate.py", "cycle.py"]:
+                  hook_path = plugin_dir / "hooks" / hook
+                  if not hook_path.exists():
+                      continue
+
+                  # Inyectar ctx mínimo
+                  ctx = json.dumps({
+                      "config": {},
+                      "credentials": {},
+                      "universe": ["AAPL", "MSFT"],
+                      "portfolio": {},
+                  })
+
+                  # Wrapper que llama al hook con ctx mínimo
+                  wrapper = f"""
+          import sys, json
+          sys.path.insert(0, '{plugin_dir}/scripts')
+          ctx = {ctx}
+          try:
+              import importlib.util
+              spec = importlib.util.spec_from_file_location("hook", "{hook_path}")
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              fn_name = "{'on_activate' if hook == 'on_activate.py' else 'on_cycle'}"
+              if hasattr(mod, fn_name):
+                  result = getattr(mod, fn_name)(ctx)
+                  print("OK")
+              else:
+                  print("SKIP: function not found")
+          except Exception as e:
+              print(f"ERROR: {{e}}", file=sys.stderr)
+              sys.exit(1)
+          """
+                  result = subprocess.run(
+                      ["python3", "-c", wrapper],
+                      capture_output=True, text=True, timeout=10,
+                  )
+                  if result.returncode != 0:
+                      failures.append(f"{plugin_dir.name}/{hook}: {result.stderr.strip()[:200]}")
+
+          if failures:
+              print("❌ Hooks fallaron en smoke test:")
+              for f in failures:
+                  print(f"  - {f}")
+              sys.exit(1)
+          else:
+              print("✅ Smoke tests OK")
+          PYEOF
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for hardcoded secrets in plugins
+        run: |
+          # Detectar patrones de secretos hardcodeados en código de plugins
+          PATTERNS=(
+            'api_key\s*=\s*["\x27][A-Za-z0-9_\-]{20,}'
+            'secret\s*=\s*["\x27][A-Za-z0-9_\-]{20,}'
+            'password\s*=\s*["\x27][^\x27"]{8,}'
+            'token\s*=\s*["\x27][A-Za-z0-9_\-]{20,}'
+          )
+          FOUND=0
+          for pattern in "${PATTERNS[@]}"; do
+            if grep -rniE "$pattern" plugins/ --include="*.py" --include="*.toml" 2>/dev/null | \
+               grep -v "os\.environ\|process\.env\|env_var\|api_key_env\|description"; then
+              FOUND=1
+            fi
+          done
+          if [ "$FOUND" = "1" ]; then
+            echo "❌ Posibles secretos hardcodeados detectados"
+            exit 1
+          fi
+          echo "✅ Sin secretos hardcodeados detectados"
+
+      - name: Check for network access in Python hooks
+        run: |
+          # Los hooks no deben importar módulos de red directamente
+          FORBIDDEN=("import requests" "import urllib" "import httpx" "import aiohttp" "import socket")
+          FOUND=0
+          for pattern in "${FORBIDDEN[@]}"; do
+            if grep -rn "$pattern" plugins/*/hooks/ plugins/*/scripts/ 2>/dev/null | \
+               grep -v "^#\|^\s*#"; then
+              echo "❌ Acceso a red detectado en hook/script: $pattern"
+              FOUND=1
+            fi
+          done
+          if [ "$FOUND" = "1" ]; then
+            exit 1
+          fi
+          echo "✅ Sin acceso a red en hooks/scripts"

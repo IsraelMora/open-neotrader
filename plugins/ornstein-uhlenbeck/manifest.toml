@@ -1,0 +1,20 @@
+[plugin]
+id          = "ornstein-uhlenbeck"
+name        = "Ornstein-Uhlenbeck Mean Reversion"
+version     = "1.0.0"
+type        = "skill"
+description = "Mean reversion basada en el proceso estocástico de Ornstein-Uhlenbeck (OU). Estima parámetros θ (velocidad de reversión), μ (media de largo plazo) y σ (volatilidad) por Máxima Verosimilitud. Señal cuando el precio se desvía N sigmas del equilibrio estimado. Superior al Z-score simple al capturar la dinámica temporal de la reversión. Vasicek (1977), Schwartz (1997)."
+author      = "neurotrader"
+tags        = ["mean-reversion", "statistical", "stochastic", "OU", "Vasicek", "quantitative"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+
+[config]
+entry_sigmas        = 2.0    # sigmas del equilibrio OU para entrar
+exit_sigmas         = 0.5    # sigmas del equilibrio OU para salir
+min_half_life_days  = 2      # mínimo de half-life en días (evitar activos no estacionarios)
+max_half_life_days  = 90     # máximo de half-life en días (evitar reversiones demasiado lentas)
+min_r_squared       = 0.30   # R² mínimo del fit OU (calidad del ajuste)
+lookback            = 252    # días de historia para estimar parámetros

@@ -1,0 +1,61 @@
+[plugin]
+id          = "bollinger-squeeze"
+name        = "Bollinger Band Squeeze"
+version     = "1.0.0"
+type        = "skill"
+description = "Detecta compresión de volatilidad (squeeze) en Bandas de Bollinger y genera señales de ruptura direccional. Alta precisión cuando el squeeze dura ≥5 barras. Basado en método TTM Squeeze (Carter 2002) con mejoras estadísticas."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[config]
+[config.bb_period]
+type    = "number"
+default = 20
+min     = 10
+max     = 50
+label   = "Período Bollinger"
+description = "Período de la media móvil simple base. Estándar: 20."
+
+[config.bb_std]
+type    = "number"
+default = 2.0
+min     = 1.0
+max     = 3.0
+label   = "Desviaciones estándar BB"
+description = "Multiplicador σ para las bandas de Bollinger. 2.0 = estándar (cubre ~95% de los datos)."
+
+[config.kc_period]
+type    = "number"
+default = 20
+min     = 10
+max     = 50
+label   = "Período Keltner Channel"
+description = "Período para Keltner Channel. El squeeze se detecta cuando BB está dentro de KC."
+
+[config.kc_multiplier]
+type    = "number"
+default = 1.5
+min     = 1.0
+max     = 2.5
+label   = "Multiplicador ATR Keltner"
+description = "ATR × multiplicador para ancho del Keltner Channel."
+
+[config.min_squeeze_bars]
+type    = "number"
+default = 5
+min     = 2
+max     = 20
+label   = "Mínimo de barras en squeeze"
+description = "Número mínimo de barras en squeeze antes de que la ruptura sea válida. Más barras = energía acumulada mayor."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

@@ -1,0 +1,37 @@
+[plugin]
+id          = "universe-forex-majors"
+name        = "Forex Majors Universe"
+version     = "1.0.0"
+type        = "universe"
+description = "Universo de los 7 pares de divisas principales (Forex majors). Mercado más líquido del mundo con $6.6 billones de volumen diario. Abierto 24h/5d. Ideal para estrategias de mean reversion, momentum y análisis macro."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[config]
+[config.include_crosses]
+type        = "boolean"
+default     = false
+label       = "Incluir cruces (minors)"
+description = "Añadir EUR/GBP, EUR/JPY, GBP/JPY y otros cruces populares."
+
+[config.quote_format]
+type        = "text"
+default     = "slash"
+label       = "Formato de par"
+description = "slash = EUR/USD | nodash = EURUSD | underscore = EUR_USD. Adaptar según el broker."
+
+[config.exclude_pairs]
+type        = "text"
+default     = ""
+label       = "Excluir pares"
+description = "Lista separada por comas de pares a excluir."
+
+[hooks]
+on_activate = "hooks/on_activate.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode = "none"

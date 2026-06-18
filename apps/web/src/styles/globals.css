@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+/* shadcn dark mode via .dark class (toggled by ThemeSwitcher) */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Tweakcn theme: CSS custom properties (:root / .dark) */
+@import "./theme.css";
+
+/* Tailwind @theme inline mappings + panel aliases + base + animations */
+@import "./panel.css";

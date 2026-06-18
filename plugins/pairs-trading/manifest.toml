@@ -1,0 +1,81 @@
+[plugin]
+id          = "pairs-trading"
+name        = "Pairs Trading (Statistical Arbitrage)"
+version     = "1.0.0"
+type        = "skill"
+description = "Arbitraje estadístico entre pares cointegrados. Cuando el spread supera 2σ, compra el rezagado y vende el adelantado. Market-neutral: beneficio independiente de la dirección del mercado. Base: Engle-Granger (1987), Vidyamurthy (2004)."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[[tools]]
+name        = "find_cointegrated_pairs"
+description = "Analiza un universo de símbolos y encuentra pares con alta cointegración estadística (test Engle-Granger)."
+
+[[tools]]
+name        = "compute_spread_zscore"
+description = "Calcula el Z-Score actual del spread entre dos activos cointegrados. Señal cuando |Z|>2."
+
+[config]
+[config.pairs]
+type        = "text"
+default     = ""
+label       = "Pares a monitorear"
+description = "Pares en formato 'SYM1:SYM2,SYM3:SYM4'. Vacío = detectar automáticamente del universo."
+
+[config.lookback_days]
+type        = "number"
+default     = 60
+min         = 30
+max         = 252
+label       = "Período lookback (días)"
+description = "Días de historia para calcular la relación de cointegración (beta del spread)."
+
+[config.entry_zscore]
+type        = "number"
+default     = 2.0
+min         = 1.5
+max         = 3.0
+label       = "Z-Score de entrada"
+description = "Umbral para abrir posición en el spread. 2.0 = 95% de confianza estadística."
+
+[config.exit_zscore]
+type        = "number"
+default     = 0.5
+min         = 0.0
+max         = 1.0
+label       = "Z-Score de salida"
+description = "Umbral para cerrar posición (spread volvió a la media)."
+
+[config.stop_zscore]
+type        = "number"
+default     = 3.5
+min         = 2.5
+max         = 5.0
+label       = "Z-Score de stop"
+description = "Si el spread continúa divergiendo hasta este nivel, cerrar por pérdida."
+
+[config.max_pairs_active]
+type        = "number"
+default     = 3
+min         = 1
+max         = 10
+label       = "Máx pares activos"
+description = "Número máximo de pares con posición abierta simultáneamente."
+
+[config.scheduler_interval_ms]
+type        = "number"
+default     = 86400000
+label       = "Intervalo del scheduler (ms)"
+description = "Frecuencia de análisis. Diario es suficiente para pares de acciones."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

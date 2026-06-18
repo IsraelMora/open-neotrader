@@ -1,0 +1,28 @@
+---
+import '../styles/globals.css';
+import LoginPage from '../components/Login';
+---
+
+<!doctype html>
+<html lang="es" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Login — Agente de Trading</title>
+    <script is:inline>
+      (function () {
+        try {
+          const m = localStorage.getItem('panel-mode');
+          if (m === 'light') document.documentElement.classList.remove('dark');
+          else document.documentElement.classList.add('dark');
+          if (localStorage.getItem('nt_token')) window.location.href = '/';
+        } catch {
+          /* SSR / storage blocked */
+        }
+      })();
+    </script>
+  </head>
+  <body class="font-sans antialiased bg-background text-foreground">
+    <LoginPage client:load />
+  </body>
+</html>

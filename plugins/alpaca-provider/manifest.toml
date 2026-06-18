@@ -1,0 +1,60 @@
+[plugin]
+id          = "alpaca-provider"
+name        = "Alpaca Provider"
+version     = "1.0.0"
+type        = "provider"
+description = "Proveedor de datos de mercado y broker de ejecución via Alpaca Markets API. Datos históricos OHLCV, cotizaciones y órdenes (paper y live)."
+author      = "neurotrader-community"
+license     = "MIT"
+
+# ── Credenciales ──────────────────────────────────────────────────────────────
+# La plataforma lee estas vars de process.env — nunca del código
+[credentials]
+ALPACA_API_KEY_ID     = { label = "Alpaca Key ID",     description = "API Key ID de tu cuenta Alpaca" }
+ALPACA_API_SECRET_KEY = { label = "Alpaca Secret Key", description = "Secret Key de tu cuenta Alpaca" }
+
+# ── Declaración de API (leída por ProviderGatewayService) ─────────────────────
+[api]
+format            = "alpaca"
+base_url          = "https://paper-api.alpaca.markets"
+data_url          = "https://data.alpaca.markets"
+auth_type         = "header"
+auth_key_env      = "ALPACA_API_KEY_ID"
+auth_secret_env   = "ALPACA_API_SECRET_KEY"
+auth_key_header   = "APCA-API-KEY-ID"
+auth_secret_header = "APCA-API-SECRET-KEY"
+
+[api.endpoints]
+ohlcv     = "{data_url}/v2/stocks/{symbol}/bars?timeframe={tf}&limit={limit}&adjustment=all&feed=iex"
+quote     = "{data_url}/v2/stocks/{symbol}/quotes/latest?feed=iex"
+portfolio = "{base_url}/v2/account"
+positions = "{base_url}/v2/positions"
+account   = "{base_url}/v2/account"
+orders    = "{base_url}/v2/orders"
+
+# ── Config ajustable desde UI ─────────────────────────────────────────────────
+[config]
+[config.paper_trading]
+type        = "boolean"
+default     = true
+label       = "Paper Trading"
+description = "true = simulado; false = real. Cambiar la base_url manualmente para live."
+
+[config.request_timeout_ms]
+type        = "number"
+default     = 10000
+min         = 3000
+max         = 30000
+label       = "Timeout (ms)"
+description = "Timeout para requests a Alpaca."
+
+[hooks]
+on_activate   = "hooks/on_activate.py"
+on_deactivate = "hooks/on_deactivate.py"
+
+[permissions]
+network     = true
+emit_events = false
+
+[scheduler]
+mode = "reactive"

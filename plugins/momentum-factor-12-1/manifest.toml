@@ -1,0 +1,52 @@
+[plugin]
+id          = "momentum-factor-12-1"
+name        = "Momentum Factor 12-1"
+version     = "1.0.0"
+type        = "skill"
+description = "Estrategia de momentum cross-sectional basada en retorno de 12 meses excluyendo el último mes (12-1). Probada académicamente por Jegadeesh & Titman (1993) con Sharpe ~0.5-0.7 anualizado en mercados desarrollados."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[config]
+[config.lookback_months]
+type    = "number"
+default = 12
+min     = 6
+max     = 24
+label   = "Meses de lookback"
+description = "Período de cálculo del retorno de momentum. 12 meses es el estándar académico."
+
+[config.skip_months]
+type    = "number"
+default = 1
+min     = 0
+max     = 3
+label   = "Meses a omitir (reversal de corto plazo)"
+description = "Omite el último N meses del cálculo para evitar el efecto de reversión de corto plazo. Valor estándar: 1."
+
+[config.top_pct]
+type    = "number"
+default = 20
+min     = 5
+max     = 50
+label   = "% top a comprar"
+description = "Porcentaje superior del universo a incluir en la posición larga (ej. 20 = top 20%)."
+
+[config.rebalance_frequency]
+type    = "string"
+enum    = ["weekly", "monthly", "quarterly"]
+default = "monthly"
+label   = "Frecuencia de rebalanceo"
+description = "Con qué frecuencia actualizar las posiciones. Mensual es el estándar académico."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

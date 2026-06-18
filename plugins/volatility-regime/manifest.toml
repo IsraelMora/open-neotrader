@@ -1,0 +1,53 @@
+[plugin]
+id          = "volatility-regime"
+name        = "Volatility Regime Detection"
+version     = "1.0.0"
+type        = "skill"
+description = "Detecta el régimen de volatilidad del mercado (baja/media/alta/crisis) usando VIX, ATR histórico y percentil de volatilidad realizada. Cambia automáticamente el comportamiento del agente: momentum en baja volatilidad, mean reversion en alta volatilidad. Matemáticamente probado por Ang et al. (2006)."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[config]
+[config.vix_low_threshold]
+type    = "number"
+default = 15
+min     = 5
+max     = 25
+label   = "VIX bajo (régimen tranquilo)"
+description = "VIX por debajo de este valor = mercado tranquilo, estrategias momentum funcionan bien."
+
+[config.vix_high_threshold]
+type    = "number"
+default = 25
+min     = 15
+max     = 40
+label   = "VIX alto (régimen volátil)"
+description = "VIX por encima de este valor = volatilidad elevada, preferir mean reversion o reducir exposición."
+
+[config.vix_crisis_threshold]
+type    = "number"
+default = 40
+min     = 30
+max     = 80
+label   = "VIX crisis"
+description = "VIX por encima de este valor = crisis. Señal de máxima cautela."
+
+[config.vol_lookback_days]
+type    = "number"
+default = 252
+min     = 60
+max     = 504
+label   = "Días de lookback para percentil de volatilidad"
+description = "Número de días para calcular el percentil de volatilidad actual vs histórico."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

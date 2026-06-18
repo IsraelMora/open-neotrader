@@ -1,0 +1,43 @@
+[
+  {
+    "name": "get_dca_portfolio",
+    "description": "Devuelve el resumen del portafolio DCA: total invertido, valor actual, PnL no realizado, coste medio por activo y número de compras realizadas.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "description": "Filtrar por símbolo específico (opcional, sin valor = todo el portafolio)"
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "simulate_dca",
+    "description": "Simula el resultado de una estrategia DCA en histórico: qué coste medio se habría obtenido comprando X USD cada N días durante M meses.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "description": "Ticker a simular"
+        },
+        "amount": {
+          "type": "number",
+          "description": "Importe a invertir por ciclo (USD)"
+        },
+        "frequency_days": {
+          "type": "integer",
+          "description": "Cada cuántos días comprar"
+        },
+        "months_back": {
+          "type": "integer",
+          "description": "Meses hacia atrás para la simulación (default 12)",
+          "default": 12
+        }
+      },
+      "required": ["symbol", "amount", "frequency_days"]
+    }
+  }
+]

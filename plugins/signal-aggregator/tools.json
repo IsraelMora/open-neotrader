@@ -1,0 +1,73 @@
+[
+  {
+    "name": "get_pending_signals",
+    "description": "Obtiene todas las señales pendientes de procesar en este ciclo, emitidas por skills.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "min_confidence": {
+          "type": "number",
+          "description": "Filtrar señales con confidence menor a este umbral (0.0-1.0). Default: 0.",
+          "default": 0
+        },
+        "actions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Filtrar por acción: long, short, exit, hold. Si no se especifica, devuelve todas."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "get_plugin_weights",
+    "description": "Obtiene los pesos configurados para cada skill en el sistema de votación ponderada.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "emit_consensus_signal",
+    "description": "Emite una señal de consenso resultado del agregado ponderado.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string", "description": "Símbolo del activo" },
+        "action": {
+          "type": "string",
+          "enum": ["long", "short", "exit", "hold"],
+          "description": "Acción de consenso"
+        },
+        "confidence": {
+          "type": "number",
+          "description": "Confianza del consenso (0.0-1.0)"
+        },
+        "contributing_skills": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Lista de plugin_ids que contribuyeron al consenso"
+        },
+        "vote_breakdown": {
+          "type": "object",
+          "description": "Desglose de votos: { long: 0.6, short: 0.1, hold: 0.3 }"
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Datos adicionales para la señal de consenso"
+        }
+      },
+      "required": ["symbol", "action", "confidence"]
+    }
+  },
+  {
+    "name": "get_portfolio",
+    "description": "Obtiene el estado actual del portafolio para contexto en la agregación.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  }
+]

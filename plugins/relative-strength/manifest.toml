@@ -1,0 +1,25 @@
+[plugin]
+id          = "relative-strength"
+name        = "Relative Strength vs Index"
+version     = "1.0.0"
+type        = "skill"
+description = "Relative Strength de Levy (1968) y O'Neil (CANSLIM): compara retorno del activo vs benchmark en N periodos. Activos con RS > 1.0 tienden a outperform. Win rate ~62% sobre S&P500."
+author      = "NeuroTrader"
+tags        = ["momentum", "relative-strength", "canslim", "ranking"]
+
+[config]
+periods         = [63, 126, 189, 252]   # 3m, 6m, 9m, 12m (IBD style)
+weights         = [0.4, 0.2, 0.2, 0.2]  # más peso al período más reciente
+benchmark       = "SPY"                  # ETF de referencia
+rs_threshold    = 1.05                   # RS mínimo para señal long (5% sobre benchmark)
+top_percentile  = 80                     # solo activos en el top 20% de RS
+timeframe       = "1d"
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000     # 24h — solo necesita actualizarse una vez al día
+
+[permissions]
+network    = false
+filesystem = false

@@ -1,0 +1,61 @@
+[plugin]
+id          = "max-drawdown-circuit-breaker"
+name        = "Max Drawdown Circuit Breaker"
+version     = "1.0.0"
+type        = "discipline"
+description = "Discipline de seguridad crítica. Monitorea el drawdown del portfolio en tiempo real y activa un circuit breaker si supera los umbrales configurados. Reduce tamaño de posición gradualmente o detiene el trading por completo. Basado en gestión de riesgo institucional."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[config]
+[config.warning_drawdown_pct]
+type    = "number"
+default = 5.0
+min     = 1.0
+max     = 20.0
+label   = "Drawdown de aviso (%)"
+description = "Al superar este drawdown desde el máximo del equity, se reduce el tamaño de posición al 50%. Default: 5%."
+
+[config.danger_drawdown_pct]
+type    = "number"
+default = 10.0
+min     = 5.0
+max     = 30.0
+label   = "Drawdown de peligro (%)"
+description = "Al superar este drawdown, se reduce el tamaño al 25% y se activa alerta crítica. Default: 10%."
+
+[config.circuit_breaker_pct]
+type    = "number"
+default = 15.0
+min     = 10.0
+max     = 50.0
+label   = "Drawdown de circuit breaker (%)"
+description = "Al superar este umbral, se cancela TODO el trading nuevo hasta revisión manual. Default: 15%."
+
+[config.recovery_threshold_pct]
+type    = "number"
+default = 3.0
+min     = 1.0
+max     = 10.0
+label   = "Recuperación para reset (%)"
+description = "El drawdown debe bajar este porcentaje desde el peor punto para resetear a operación normal. Default: 3%."
+
+[config.daily_loss_limit_pct]
+type    = "number"
+default = 3.0
+min     = 0.5
+max     = 10.0
+label   = "Pérdida diaria máxima (%)"
+description = "Si el portfolio pierde este % en el día, se detiene el trading hasta mañana. Default: 3%."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

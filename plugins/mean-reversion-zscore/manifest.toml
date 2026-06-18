@@ -1,0 +1,74 @@
+[plugin]
+id          = "mean-reversion-zscore"
+name        = "Mean Reversion Z-Score"
+version     = "1.0.0"
+type        = "skill"
+description = "Detecta activos con precio estadísticamente alejado de su media histórica. Z-Score > 2.0 σ indica sobreventa/sobrecompra con alta probabilidad de reversión. Sólida base estadística (Jegadeesh 1990, Lo&MacKinlay 1988)."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[[tools]]
+name        = "compute_zscore"
+description = "Calcula el Z-Score del precio actual respecto a su media histórica. Valores > 2 o < -2 indican oportunidad."
+
+[[tools]]
+name        = "detect_mean_reversion"
+description = "Analiza serie de precios y retorna señal de reversión si el Z-Score supera el umbral configurado."
+
+[config]
+[config.lookback_days]
+type        = "number"
+default     = 20
+min         = 10
+max         = 60
+label       = "Período lookback (días)"
+description = "Número de días para calcular la media y desviación estándar. 20 días = un mes de trading."
+
+[config.entry_zscore]
+type        = "number"
+default     = 2.0
+min         = 1.5
+max         = 3.0
+label       = "Z-Score de entrada"
+description = "Umbral de Z-Score para generar señal. 2.0 = 95% confianza estadística. Más alto = menos señales pero más fiables."
+
+[config.exit_zscore]
+type        = "number"
+default     = 0.5
+min         = 0.0
+max         = 1.0
+label       = "Z-Score de salida"
+description = "Z-Score al que se considera que el precio volvió a la media. Salir de la posición."
+
+[config.min_history_days]
+type        = "number"
+default     = 30
+min         = 20
+max         = 90
+label       = "Historial mínimo (días)"
+description = "Mínimo de datos históricos necesarios para que el cálculo sea estadísticamente significativo."
+
+[config.symbols]
+type        = "text"
+default     = ""
+label       = "Símbolos a analizar"
+description = "Lista separada por comas. Vacío = usa todos los del universo activo."
+
+# Campo configurable desde UI para el scheduler
+[config.scheduler_interval_ms]
+type        = "number"
+default     = 86400000
+label       = "Intervalo del scheduler (ms)"
+description = "Frecuencia de ejecución. 86400000 = 1 día. 3600000 = 1 hora."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

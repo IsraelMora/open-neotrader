@@ -1,0 +1,19 @@
+[plugin]
+id          = "kalman-filter"
+name        = "Kalman Filter Trend Following"
+version     = "1.0.0"
+type        = "skill"
+description = "Trend following usando el Filtro de Kalman discreto para estimar el estado oculto (tendencia) del precio. Supera al EMA porque adapta su ganancia dinámicamente según la relación ruido/señal. Las señales se generan cuando el precio cruza el estado estimado por el filtro. Welch & Bishop (1995), Zacks (2009) 'Optimal Control'."
+author      = "neurotrader"
+tags        = ["trend", "kalman", "adaptive", "signal-processing", "state-space"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+
+[config]
+process_noise     = 0.01    # Q: varianza del ruido de proceso (cuánto puede cambiar la tendencia)
+observation_noise = 1.0     # R: varianza del ruido de observación (cuánto ruido hay en el precio)
+initial_variance  = 1.0     # P_0: varianza inicial del estado
+entry_threshold   = 0.002   # 0.2% de diferencia entre precio y estado para señal
+min_observations  = 30      # mínimo de observaciones para señal confiable

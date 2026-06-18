@@ -1,0 +1,13 @@
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]
+
+[lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"setup.py" = ["F401"]
+
+[format]
+quote-style = "double"
+indent-style = "space"

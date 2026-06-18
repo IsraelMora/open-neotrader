@@ -1,0 +1,17 @@
+[plugin]
+id          = "claude-subscription"
+name        = "Claude Subscription (CLI)"
+version     = "1.0.0"
+type        = "extra"
+description = "Enruta el orquestador LLM a tu suscripción de Claude vía el CLI de Claude Code (claude -p) en lugar de una API key. Costo operativo cercano a cero para ciclos 24/7. Al activar este plugin, la plataforma usa el backend 'subscription' automáticamente."
+author      = "neurotrader"
+tags        = ["llm", "claude", "subscription", "cost", "cli"]
+
+# Sin scheduler propio: este plugin no corre ciclos, solo cambia el backend del LLM.
+[scheduler]
+mode        = "none"
+
+# El modelo y el timeout del backend de suscripción se controlan desde Configuración LLM
+# (PATCH /llm/config { model }). Aquí solo queda un recordatorio informativo.
+[config]
+cost_note = "El modelo (Haiku para barato, Opus para potente) se elige en Configuración LLM, no aquí. El CLI usa la sesión OAuth de Claude Code; no se necesita ANTHROPIC_API_KEY."

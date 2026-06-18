@@ -1,0 +1,26 @@
+{
+  "tools": [
+    {
+      "name": "subscription_status",
+      "description": "Devuelve el estado del backend de suscripción de Claude tal como lo ve la plataforma: nombre del backend, modelo configurado y notas operativas. No accede a la red (el CLI corre en la capa NestJS, no en el sandbox).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Modelo configurado en Configuración LLM (ej: claude-haiku-4-5-20251001)"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "backend":          { "type": "string" },
+          "model":            { "type": "string" },
+          "requires_api_key": { "type": "boolean" },
+          "note":             { "type": "string" }
+        }
+      }
+    }
+  ]
+}

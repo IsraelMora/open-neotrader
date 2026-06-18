@@ -1,0 +1,42 @@
+{
+  "tools": [
+    {
+      "name": "analyze_ou",
+      "description": "Analiza un activo con el proceso estocástico Ornstein-Uhlenbeck. Estima parámetros por OLS (θ velocidad, μ equilibrio, σ volatilidad). Superior al Z-score simple: captura la dinámica temporal de la reversión. Da señal solo si el modelo es estadísticamente válido (R² y half-life dentro de rango).",
+      "input_schema": {
+        "type": "object",
+        "required": ["symbol", "prices"],
+        "properties": {
+          "symbol": { "type": "string" },
+          "prices": {
+            "type": "array", "items": { "type": "number" },
+            "description": "Serie de precios de cierre en orden cronológico. Mínimo 50 puntos, recomendado 252."
+          },
+          "config": {
+            "type": "object",
+            "properties": {
+              "entry_sigmas":       { "type": "number", "default": 2.0 },
+              "exit_sigmas":        { "type": "number", "default": 0.5 },
+              "min_half_life_days": { "type": "number", "default": 2 },
+              "max_half_life_days": { "type": "number", "default": 90 },
+              "min_r_squared":      { "type": "number", "default": 0.30 },
+              "lookback":           { "type": "integer", "default": 252 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "estimate_ou_params",
+      "description": "Estima los parámetros del proceso OU (θ, μ, σ, half-life, R²) para una serie de precios.",
+      "input_schema": {
+        "type": "object",
+        "required": ["prices"],
+        "properties": {
+          "prices": { "type": "array", "items": { "type": "number" } },
+          "dt":     { "type": "number", "default": 1.0, "description": "Intervalo entre observaciones en días" }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+[plugin]
+id          = "universe-crypto-defi"
+name        = "Crypto DeFi Top 20"
+version     = "1.0.0"
+type        = "universe"
+description = "Universo de los 20 principales tokens DeFi (Finanzas Descentralizadas), excluyendo BTC y ETH. Incluye protocolos de lending, DEX, derivados y yield. Alta volatilidad y correlación con el ciclo cripto."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[config]
+[config.include_eth]
+type        = "boolean"
+default     = false
+label       = "Incluir ETH"
+description = "Añadir ETH como activo de referencia del ecosistema DeFi."
+
+[config.quote_asset]
+type        = "text"
+default     = "USDT"
+label       = "Asset de cotización"
+description = "USDT o BUSD para Binance. Adaptar según el provider."
+
+[config.exclude_tokens]
+type        = "text"
+default     = ""
+label       = "Excluir tokens"
+description = "Lista separada por comas de tokens a excluir."
+
+[config.format]
+type        = "text"
+default     = "binance"
+label       = "Formato de símbolo"
+description = "binance = UNIUSDT | slash = UNI/USDT | base_only = UNI"
+
+[hooks]
+on_activate = "hooks/on_activate.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode = "none"

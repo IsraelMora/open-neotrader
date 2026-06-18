@@ -1,0 +1,24 @@
+[plugin]
+id          = "backtester"
+name        = "Backtester"
+version     = "1.0.0"
+type        = "extra"
+description = "Motor de backtesting integrado. Permite testear estrategias con datos históricos usando numpy puro (sin dependencias externas). Calcula Sharpe, max drawdown, win rate, profit factor y curva de equity."
+author      = "neurotrader"
+tags        = ["backtesting", "analysis", "performance", "extra"]
+
+[scheduler]
+mode        = "none"   # se ejecuta bajo demanda via API
+
+[permissions]
+network     = false
+filesystem  = false
+
+[config]
+initial_capital   = { type = "number",  default = 10000,  description = "Capital inicial en USD" }
+commission_pct    = { type = "number",  default = 0.001,  description = "Comisión por operación (0.001 = 0.1%)" }
+slippage_pct      = { type = "number",  default = 0.0005, description = "Slippage estimado por operación" }
+risk_per_trade    = { type = "number",  default = 0.01,   description = "Riesgo por trade como fracción del capital (0.01 = 1%)" }
+max_positions     = { type = "integer", default = 5,      description = "Máximo de posiciones simultáneas" }
+benchmark         = { type = "string",  default = "SPY",  description = "Símbolo benchmark para comparar rendimiento" }
+output_equity_curve = { type = "boolean", default = true, description = "Incluir curva de equity en resultado" }

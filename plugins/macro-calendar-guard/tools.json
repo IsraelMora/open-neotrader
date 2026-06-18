@@ -1,0 +1,63 @@
+[
+  {
+    "name": "get_pending_signals",
+    "description": "Obtiene las señales pendientes de ejecución en este ciclo.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "inject_macro_event",
+    "description": "Permite al LLM inyectar un evento macro no incluido en el calendario embebido (e.g., un anuncio sorpresa de la Fed, una intervención del banco central).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Nombre del evento (e.g., 'Fed Emergency Meeting')"
+        },
+        "date": {
+          "type": "string",
+          "description": "Fecha ISO: YYYY-MM-DD"
+        },
+        "time_utc": {
+          "type": "string",
+          "description": "Hora UTC: HH:MM"
+        },
+        "category": {
+          "type": "string",
+          "enum": ["fed", "cpi", "nfp", "ecb", "other"],
+          "description": "Categoría del evento"
+        },
+        "impact": {
+          "type": "string",
+          "enum": ["high", "medium"],
+          "default": "high"
+        },
+        "affected": {
+          "type": "string",
+          "enum": ["all", "equities", "forex", "crypto"],
+          "default": "all"
+        }
+      },
+      "required": ["name", "date", "time_utc"]
+    }
+  },
+  {
+    "name": "get_upcoming_events",
+    "description": "Lista los próximos eventos macro en los siguientes N días.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "days_ahead": {
+          "type": "integer",
+          "description": "Número de días a mirar hacia adelante",
+          "default": 7
+        }
+      },
+      "required": []
+    }
+  }
+]

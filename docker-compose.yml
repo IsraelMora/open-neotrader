@@ -1,0 +1,93 @@
+name: neurotrader
+
+# Variables de entorno necesarias en .env (ver .env.example):
+#   ANTHROPIC_API_KEY, JWT_SECRET, TOTP_ISSUER
+# API keys de providers van en la UI después del setup.
+
+services:
+
+  # ── Backend NestJS ────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      NODE_ENV: production
+      DB_PATH: /data/neurotrader.db
+      # Sandbox Python
+      SANDBOX_RUNNER_PATH: /sandbox/runner.py
+      SANDBOX_TIMEOUT_MS: ${SANDBOX_TIMEOUT_MS:-60000}
+      SANDBOX_CPU_SECONDS: ${SANDBOX_CPU_SECONDS:-60}
+      SANDBOX_MEM_MB: ${SANDBOX_MEM_MB:-512}
+      PLUGINS_DIR: /plugins
+      PLUGIN_SDK_PATH: /opt/plugin-sdk
+      # Auth
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET requerido en .env}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      TOTP_ISSUER: ${TOTP_ISSUER:-NeuroTrader}
+      # LLM — la API key se inyecta desde el host; nunca queda en la imagen
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-6}
+      # CORS — separar por comas si hay múltiples origins
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+    ports:
+      - "${API_PORT:-127.0.0.1:3000}:3000"
+    volumes:
+      - api-data:/data
+      - plugins-vol:/plugins
+      - ./apps/sandbox/runner.py:/sandbox/runner.py:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q '\"status\"' || exit 1"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+    networks:
+      - internal
+    restart: unless-stopped
+
+  # ── Panel web (Nginx sirviendo el build estático de Flutter/Astro) ─────────
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    ports:
+      - "${WEB_PORT:-127.0.0.1:8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - internal
+    restart: unless-stopped
+
+  # ── Inicialización de plugins (ejecutar una vez al instalar) ───────────────
+  # Uso: docker compose --profile init run --rm sandbox-init
+  sandbox-init:
+    build:
+      context: ./apps/sandbox
+      dockerfile: Dockerfile
+    command: ["python3", "-c", "import tomllib; print('sandbox OK')"]
+    volumes:
+      - plugins-vol:/plugins
+    profiles:
+      - init
+    networks:
+      - internal
+
+networks:
+  # Red interna — el API no tiene acceso a internet desde Docker
+  # (para el sandbox Python sin red, usar SANDBOX_NETWORK=none en runtime)
+  internal:
+    driver: bridge
+    internal: false   # true = sin acceso a internet (útil en producción)
+
+volumes:
+  api-data:     # Base de datos SQLite + config persistente
+  plugins-vol:  # Plugins instalados (compartido entre API y sandbox-init)

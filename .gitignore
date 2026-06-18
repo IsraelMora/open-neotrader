@@ -1,0 +1,26 @@
+node_modules/
+dist/
+.next/
+.turbo/
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.local
+.env.*.local
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage/
+# NestJS build
+apps/api/dist/
+# Astro build
+apps/web/dist/
+apps/web/.astro/
+# Flutter (descartado)
+apps/app/.dart_tool/
+apps/app/build/

@@ -1,0 +1,197 @@
+import { parse as parseToml, type TomlTable } from 'smol-toml';
+
+export class ManifestError extends Error {}
+
+const CLASES_ACTIVO = new Set(['equity', 'etf', 'crypto', 'commodity']);
+const TIPOS_DATOS = new Set([
+  'skill',
+  'universe',
+  'preset',
+  'discipline-profile',
+]);
+const KEBAB = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+export interface Manifest {
+  id: string;
+  name: string;
+  type: string;
+  version: string;
+  author: string;
+  description: string;
+  repository?: string;
+  payload: Record<string, unknown>;
+  configSpec: Record<string, unknown>;
+  raw: Record<string, unknown>;
+}
+
+const REQUIRED_PLUGIN_FIELDS = [
+  'id',
+  'name',
+  'type',
+  'version',
+  'author',
+  'description',
+] as const;
+
+type PluginBlock = Record<string, unknown>;
+
+function isNonNullObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null;
+}
+
+function requireStringField(
+  obj: Record<string, unknown>,
+  field: string,
+  prefix: string,
+): string {
+  const val = obj[field];
+  if (typeof val !== 'string' || !val.trim()) {
+    throw new ManifestError(`${prefix}.${field} requerido`);
+  }
+  return val;
+}
+
+function extractPluginBlock(data: TomlTable): PluginBlock {
+  const meta = data['plugin'];
+  if (!isNonNullObject(meta)) throw new ManifestError('falta [plugin]');
+  return meta;
+}
+
+function validatePluginFields(meta: PluginBlock): void {
+  for (const c of REQUIRED_PLUGIN_FIELDS) {
+    requireStringField(meta, c, '[plugin]');
+  }
+}
+
+function validatePluginType(meta: PluginBlock): string {
+  const type = meta['type'] as string;
+  if (type === 'provider')
+    throw new ManifestError('type=provider es fase 2 (código)');
+  if (!TIPOS_DATOS.has(type))
+    throw new ManifestError(`type '${type}' desconocido`);
+  return type;
+}
+
+const PAYLOAD_BLOCK_MAP: Record<string, string> = {
+  skill: 'skill',
+  universe: 'universe',
+  preset: 'preset',
+  'discipline-profile': 'discipline',
+};
+
+function extractPayload(
+  data: TomlTable,
+  type: string,
+): Record<string, unknown> {
+  const blockName = PAYLOAD_BLOCK_MAP[type];
+  const payload = data[blockName];
+  if (!isNonNullObject(payload)) {
+    throw new ManifestError(`falta el bloque [${blockName}]`);
+  }
+  return payload;
+}
+
+function extractConfigSpec(data: TomlTable): Record<string, unknown> {
+  const cfg = isNonNullObject(data['config']) ? data['config'] : {};
+  const configSpec: Record<string, unknown> = {};
+  if (cfg['fields'] != null) configSpec['fields'] = cfg['fields'];
+  if (cfg['form'] != null) configSpec['form'] = cfg['form'];
+  return configSpec;
+}
+
+export function parseAndValidateManifest(text: string): Manifest {
+  let data: TomlTable;
+  try {
+    data = parseToml(text);
+  } catch (e) {
+    throw new ManifestError(`TOML inválido: ${(e as Error).message}`);
+  }
+
+  const meta = extractPluginBlock(data);
+  validatePluginFields(meta);
+
+  const id = meta['id'] as string;
+  const type = validatePluginType(meta);
+
+  if (!KEBAB.test(id)) throw new ManifestError(`id '${id}' no es kebab-case`);
+
+  const payload = extractPayload(data, type);
+  validatePayload(type, payload);
+
+  const configSpec = extractConfigSpec(data);
+
+  const rawRepository = meta['repository'];
+  const repository =
+    typeof rawRepository === 'string' && rawRepository.trim()
+      ? rawRepository.trim()
+      : undefined;
+
+  return {
+    id,
+    name: meta['name'] as string,
+    type,
+    version: meta['version'] as string,
+    author: meta['author'] as string,
+    description: meta['description'] as string,
+    repository,
+    payload,
+    configSpec,
+    raw: data,
+  };
+}
+
+function validateUniverse(payload: Record<string, unknown>): void {
+  const syms = payload['symbols'];
+  if (!isNonNullObject(syms) || !Object.keys(syms).length) {
+    throw new ManifestError('[universe].symbols debe ser un objeto no vacío');
+  }
+  for (const [sym, clase] of Object.entries(syms)) {
+    if (!CLASES_ACTIVO.has(String(clase))) {
+      throw new ManifestError(`clase '${String(clase)}' inválida para ${sym}`);
+    }
+  }
+}
+
+function validateSkill(payload: Record<string, unknown>): void {
+  if (typeof payload['name'] !== 'string')
+    throw new ManifestError('[skill].name requerido');
+  const file = payload['file'];
+  if (typeof file === 'string') {
+    const partes = file.split('/');
+    if (file.startsWith('/') || partes.includes('..')) {
+      throw new ManifestError('[skill].file debe ser relativo sin ".."');
+    }
+  }
+  if (typeof payload['prompt'] !== 'string' && typeof file !== 'string') {
+    throw new ManifestError('[skill] necesita prompt o file');
+  }
+}
+
+function validatePreset(payload: Record<string, unknown>): void {
+  const cfg = payload['config'];
+  if (!isNonNullObject(cfg) || !Object.keys(cfg).length) {
+    throw new ManifestError('[preset].config no vacío requerido');
+  }
+}
+
+const DISCIPLINE_FIELDS: [string, string][] = [
+  ['dsr_threshold', 'number'],
+  ['min_sources', 'number'],
+  ['stress_windows', 'object'],
+  ['ex_ante_discount', 'number'],
+  ['require_preregistration', 'boolean'],
+];
+
+function validateDisciplineProfile(payload: Record<string, unknown>): void {
+  for (const [campo, t] of DISCIPLINE_FIELDS) {
+    if (typeof payload[campo] !== t)
+      throw new ManifestError(`[discipline].${campo} inválido`);
+  }
+}
+
+function validatePayload(type: string, payload: Record<string, unknown>): void {
+  if (type === 'universe') return validateUniverse(payload);
+  if (type === 'skill') return validateSkill(payload);
+  if (type === 'preset') return validatePreset(payload);
+  if (type === 'discipline-profile') return validateDisciplineProfile(payload);
+}

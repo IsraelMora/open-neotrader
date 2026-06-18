@@ -1,0 +1,71 @@
+[plugin]
+id          = "portfolio-risk-manager"
+name        = "Portfolio Risk Manager"
+version     = "1.0.0"
+type        = "discipline"
+description = "Gestión de riesgo a nivel de cartera completa. Controla exposición total, concentración por sector/activo, número máximo de posiciones y ratio de liquidez. Complementa el Circuit Breaker (que actúa por drawdown) y Kelly (que dimensiona individualmente)."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[[tools]]
+name        = "check_portfolio_risk"
+description = "Evalúa el riesgo global de la cartera y ajusta o bloquea señales que excedan los límites."
+
+[config]
+[config.max_total_exposure_pct]
+type        = "number"
+default     = 80
+min         = 20
+max         = 100
+label       = "Exposición total máxima (%)"
+description = "% máximo del capital total que puede estar invertido simultáneamente. El 20% restante es buffer de liquidez."
+
+[config.max_single_position_pct]
+type        = "number"
+default     = 15
+min         = 2
+max         = 30
+label       = "Posición máxima individual (%)"
+description = "% máximo del capital en un solo activo."
+
+[config.max_positions]
+type        = "number"
+default     = 10
+min         = 1
+max         = 50
+label       = "Posiciones máximas"
+description = "Número máximo de posiciones abiertas simultáneamente."
+
+[config.max_sector_exposure_pct]
+type        = "number"
+default     = 30
+min         = 10
+max         = 60
+label       = "Exposición máxima por sector (%)"
+description = "% máximo del capital en un sector/clase de activo (tech, crypto, forex, etc.)."
+
+[config.min_cash_pct]
+type        = "number"
+default     = 20
+min         = 5
+max         = 50
+label       = "Mínimo de efectivo (%)"
+description = "% mínimo del capital que debe permanecer en efectivo/no invertido."
+
+[config.warn_only]
+type        = "boolean"
+default     = false
+label       = "Solo advertencias (sin bloqueo)"
+description = "Si true, solo emite warnings sin cancelar señales. Útil para monitoreo antes de activar el control real."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

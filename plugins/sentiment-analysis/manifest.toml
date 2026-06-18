@@ -1,0 +1,40 @@
+[plugin]
+id          = "sentiment-analysis"
+name        = "Sentiment Analysis"
+version     = "1.0.0"
+type        = "skill"
+description = "Analiza el sentimiento de noticias financieras usando el LLM. El LLM lee titulares y resúmenes y devuelve un score de sentimiento por símbolo. Las noticias se obtienen via ProviderGatewayService desde NewsAPI (requiere clave gratuita)."
+author      = "neurotrader"
+tags        = ["skill", "sentiment", "nlp", "news", "llm"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "4h"
+interval_ms = 14_400_000   # 4 horas (noticias no cambian cada minuto)
+
+[permissions]
+network     = false   # noticias via ProviderGatewayService
+filesystem  = false
+
+[api]
+format   = "generic"
+base_url = "https://newsapi.org"
+
+[api.auth]
+type    = "query_param"
+param   = "apiKey"
+env     = "NEWSAPI_KEY"
+
+[api.endpoints]
+headlines = "/v2/everything?q={query}&language=en&sortBy=publishedAt&pageSize={limit}&from={from_date}"
+top       = "/v2/top-headlines?q={query}&language=en&pageSize={limit}"
+
+[config]
+min_articles     = { type = "integer", default = 3,     description = "Mínimo de artículos para emitir señal" }
+lookback_hours   = { type = "integer", default = 24,    description = "Horas de noticias a analizar" }
+min_score        = { type = "number",  default = 0.6,   description = "Score mínimo para emitir señal (0-1)" }
+sentiment_weight = { type = "number",  default = 0.3,   description = "Peso del sentimiento en señal final (0-1)" }
+symbols_per_cycle = { type = "integer", default = 5,    description = "Símbolos a analizar por ciclo (limita llamadas API)" }
+
+[credentials]
+newsapi_key = { env = "NEWSAPI_KEY", description = "API key de NewsAPI.org (capa gratuita: 100 req/día)" }

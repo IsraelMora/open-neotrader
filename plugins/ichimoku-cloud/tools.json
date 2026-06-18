@@ -1,0 +1,40 @@
+[
+  {
+    "name": "analyze_ichimoku",
+    "description": "Calcula los 5 componentes Ichimoku (Tenkan, Kijun, Senkou A/B, Chikou) y determina si el precio está sobre/bajo/dentro de la nube. Genera señal con sistema de puntuación multi-confirmación.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "description": "Ticker del activo"
+        },
+        "require_cloud_confirmation": {
+          "type": "boolean",
+          "description": "Requiere que el precio esté sobre/bajo la nube para señal",
+          "default": true
+        },
+        "require_chikou_confirmation": {
+          "type": "boolean",
+          "description": "Requiere que el Chikou confirme la dirección",
+          "default": true
+        }
+      },
+      "required": ["symbol"]
+    }
+  },
+  {
+    "name": "get_kumo_levels",
+    "description": "Devuelve los niveles actuales de la nube Ichimoku (Senkou A y B) para usar como soporte/resistencia dinámico.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "description": "Ticker del activo"
+        }
+      },
+      "required": ["symbol"]
+    }
+  }
+]

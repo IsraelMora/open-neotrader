@@ -1,0 +1,38 @@
+{
+  "tools": [
+    {
+      "name": "analyze_kalman",
+      "description": "Estima la tendencia del precio con el Filtro de Kalman. Adapta su ganancia dinámicamente. Señal cuando el precio se desvía de la tendencia estimada en la dirección correcta. Superior al EMA al adaptar el weight de nuevas observaciones según la relación ruido/señal (Q/R).",
+      "input_schema": {
+        "type": "object",
+        "required": ["symbol", "prices"],
+        "properties": {
+          "symbol": { "type": "string" },
+          "prices": { "type": "array", "items": { "type": "number" }, "minItems": 10 },
+          "config": {
+            "type": "object",
+            "properties": {
+              "process_noise":     { "type": "number", "default": 0.01, "description": "Q: mayor = tendencia más volátil = filtro más reactivo" },
+              "observation_noise": { "type": "number", "default": 1.0, "description": "R: mayor = precio más ruidoso = filtro más suave" },
+              "entry_threshold":   { "type": "number", "default": 0.002, "description": "Desviación mínima precio-Kalman para señal (fracción)" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "kalman_filter",
+      "description": "Aplica el filtro de Kalman y devuelve la estimación del estado y la ganancia en cada paso.",
+      "input_schema": {
+        "type": "object",
+        "required": ["prices"],
+        "properties": {
+          "prices": { "type": "array", "items": { "type": "number" } },
+          "Q":      { "type": "number", "default": 0.01 },
+          "R":      { "type": "number", "default": 1.0 },
+          "P0":     { "type": "number", "default": 1.0 }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+[plugin]
+id          = "data-quality"
+name        = "Data Quality — Validación de Datos de Mercado"
+version     = "1.0.0"
+type        = "discipline"
+description = "Valida la calidad de los datos de precio antes de permitir señales. Detecta: precios obsoletos (>24h), gaps en series históricas, outliers estadísticos (>4σ), precios negativos/cero, y discrepancias entre providers. Vetoes señales de símbolos con datos sospechosos y emite alertas."
+author      = "neurotrader"
+tags        = ["data-quality", "validation", "risk", "outlier-detection", "discipline"]
+
+[scheduler]
+mode      = "polling"
+timeframe = "1h"
+
+[config]
+max_price_age_hours     = 24        # vetear si el precio tiene más de N horas
+outlier_sigma_threshold = 4.0       # vetear si el precio está a N sigma de la media histórica
+min_history_bars        = 10        # mínimo de barras históricas requeridas para validar
+gap_threshold_pct       = 0.15      # gap >15% entre barras → dato sospechoso
+veto_on_quality_fail    = true      # true=vetear señal; false=solo advertir
+cross_provider_max_diff = 0.005     # divergencia máxima entre providers (0.5%)

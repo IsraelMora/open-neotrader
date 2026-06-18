@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.sqlite
+*.sqlite3
+.env
+.env.*
+coverage/
+
+/generated/prisma
+dev.db
+test.db

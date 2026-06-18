@@ -1,0 +1,21 @@
+[plugin]
+id          = "ensemble-signal-voting"
+name        = "Ensemble Signal Voting + Vol-Targeting"
+version     = "1.0.0"
+type        = "skill"
+description = "Ensemble de 12 variantes: EMA × 4 lookbacks + Donchian Channel × 4 + Time-Series Momentum × 4. Voto por mayoría. Vol-targeting: escala la posición inversamente a la volatilidad realizada para mantener un riesgo constante del 10% anual."
+author      = "neurotrader"
+tags        = ["ensemble", "momentum", "trend", "vol-targeting", "diversification"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+
+[config]
+lookbacks           = [20, 60, 120, 250]   # días: 1m, 3m, 6m, 12m
+vol_target_annual   = 0.10                 # 10% volatilidad anual objetivo
+vol_lookback        = 21                   # días para calcular volatilidad realizada
+min_votes           = 7                    # mínimo de votos coincidentes (de 12) para señal
+use_donchian        = true
+use_ema             = true
+use_tsmom           = true

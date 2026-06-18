@@ -1,0 +1,63 @@
+[plugin]
+id          = "binance-provider"
+name        = "Binance Provider"
+version     = "1.0.0"
+type        = "provider"
+description = "Proveedor de datos y ejecución para crypto via Binance API. Datos históricos OHLCV, libro de órdenes, trades en tiempo real. Soporta testnet y mainnet. El exchange de mayor volumen de crypto del mundo."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[credentials]
+BINANCE_API_KEY    = { label = "Binance API Key",    description = "API Key de tu cuenta Binance" }
+BINANCE_API_SECRET = { label = "Binance API Secret", description = "Secret de tu cuenta Binance" }
+
+# ── Declaración de API (leída por ProviderGatewayService) ─────────────────────
+[api]
+format            = "binance"
+base_url          = "https://api.binance.com"
+testnet_url       = "https://testnet.binance.vision"
+auth_type         = "header"
+auth_key_env      = "BINANCE_API_KEY"
+auth_secret_env   = "BINANCE_API_SECRET"
+auth_key_header   = "X-MBX-APIKEY"
+
+[api.endpoints]
+ohlcv     = "{base_url}/api/v3/klines?symbol={symbol}&interval={tf}&limit={limit}"
+quote     = "{base_url}/api/v3/ticker/price?symbol={symbol}"
+depth     = "{base_url}/api/v3/depth?symbol={symbol}&limit=20"
+portfolio = "{base_url}/fapi/v2/account"
+positions = "{base_url}/fapi/v2/positionRisk"
+account   = "{base_url}/api/v3/account"
+orders    = "{base_url}/api/v3/order"
+
+[config]
+[config.testnet]
+type        = "boolean"
+default     = true
+label       = "Testnet"
+description = "true = Binance Testnet (sin dinero real); false = Mainnet."
+
+[config.quote_asset]
+type        = "text"
+default     = "USDT"
+label       = "Asset de cotización"
+description = "USDT, BUSD o BTC. Todos los pares se construyen como {symbol}{quote_asset}."
+
+[config.request_timeout_ms]
+type        = "number"
+default     = 10000
+min         = 3000
+max         = 30000
+label       = "Timeout (ms)"
+description = "Timeout para requests a Binance."
+
+[hooks]
+on_activate   = "hooks/on_activate.py"
+on_deactivate = "hooks/on_deactivate.py"
+
+[permissions]
+network     = true
+emit_events = false
+
+[scheduler]
+mode = "reactive"

@@ -1,0 +1,26 @@
+[plugin]
+id          = "macd-signal"
+name        = "MACD Signal"
+version     = "1.0.0"
+type        = "skill"
+description = "MACD clásico (Gerald Appel, 1979): línea MACD, señal EMA, histograma y detección de divergencias. Win rate ~54% en tendencias, ~48% sin filtro de tendencia."
+author      = "NeuroTrader"
+tags        = ["momentum", "trend", "macd", "ema"]
+
+[config]
+fast_period      = 12      # EMA rápida
+slow_period      = 26      # EMA lenta
+signal_period    = 9       # EMA de la línea MACD
+timeframe        = "1d"
+min_histogram    = 0.0     # histograma mínimo para filtrar señales débiles
+require_crossover = true   # solo señal en el cruce, no cuando ya está por encima
+divergence_bars  = 14      # ventana para detectar divergencias
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 3600000      # 1 hora (ciclo diario)
+
+[permissions]
+network   = false
+filesystem = false

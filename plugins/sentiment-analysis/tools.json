@@ -1,0 +1,83 @@
+[
+  {
+    "name": "get_news",
+    "description": "Obtiene noticias financieras recientes para un símbolo via NewsAPI. Requiere NEWSAPI_KEY configurada.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "description": "Símbolo del activo (e.g., 'AAPL', 'Bitcoin', 'Tesla')"
+        },
+        "hours_back": {
+          "type": "integer",
+          "description": "Horas hacia atrás para buscar noticias",
+          "default": 24
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Número máximo de artículos",
+          "default": 10
+        }
+      },
+      "required": ["symbol"]
+    }
+  },
+  {
+    "name": "evaluate_sentiment",
+    "description": "Evalúa el sentimiento de noticias de un símbolo. El LLM debe llamar esta herramienta con los scores resultantes de analizar los titulares.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "description": "Símbolo evaluado"
+        },
+        "scores": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "Lista de scores -1.0 a +1.0, uno por artículo, en el mismo orden que get_news devolvió"
+        }
+      },
+      "required": ["symbol", "scores"]
+    }
+  },
+  {
+    "name": "get_universe",
+    "description": "Obtiene la lista de símbolos activos del universo configurado.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "emit_sentiment_signal",
+    "description": "Emite una señal basada en sentimiento de noticias.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string" },
+        "action": {
+          "type": "string",
+          "enum": ["long", "short"],
+          "description": "Dirección basada en sentimiento: bullish=long, bearish=short"
+        },
+        "sentiment_score": {
+          "type": "number",
+          "description": "Score compuesto de sentimiento (-1.0 a +1.0)"
+        },
+        "confidence": {
+          "type": "number",
+          "description": "Confianza en el análisis (0.0-1.0)"
+        },
+        "top_headlines": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Titulares más relevantes que sustentan la señal"
+        }
+      },
+      "required": ["symbol", "action", "sentiment_score", "confidence"]
+    }
+  }
+]

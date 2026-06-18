@@ -1,0 +1,41 @@
+[
+  {
+    "name": "get_ohlcv",
+    "description": "Obtiene datos OHLCV históricos para un símbolo de renta variable.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string", "description": "Ticker (ej. AAPL, SPY)" },
+        "timeframe": { "type": "string", "description": "1Min, 5Min, 1Hour, 1Day" },
+        "limit": { "type": "integer", "description": "Número de velas (máx 1000)" }
+      },
+      "required": ["symbol", "timeframe"]
+    }
+  },
+  {
+    "name": "get_quote",
+    "description": "Obtiene la cotización actual (bid/ask/last) de un símbolo.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string" }
+      },
+      "required": ["symbol"]
+    }
+  },
+  {
+    "name": "place_order",
+    "description": "Envía una orden de compra o venta (paper o live según configuración).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string" },
+        "qty": { "type": "number", "description": "Cantidad de acciones" },
+        "side": { "type": "string", "enum": ["buy", "sell"] },
+        "type": { "type": "string", "enum": ["market", "limit", "stop_limit"] },
+        "limit_price": { "type": "number", "description": "Precio límite (solo para limit/stop_limit)" }
+      },
+      "required": ["symbol", "qty", "side", "type"]
+    }
+  }
+]

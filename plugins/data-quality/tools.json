@@ -1,0 +1,37 @@
+[
+  {
+    "name": "check_data_quality",
+    "description": "Valida la calidad de datos de precio para un conjunto de símbolos. Detecta precios obsoletos, outliers estadísticos (>4σ), gaps históricos y divergencias entre providers. Devuelve un reporte por símbolo con issues y veredicto PASSED/FAILED.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "prices": {
+          "type": "object",
+          "description": "Mapa símbolo→precio actual. Ej: {\"AAPL\": 185.5, \"BTC\": 65000}"
+        },
+        "price_timestamps": {
+          "type": "object",
+          "description": "Mapa símbolo→timestamp Unix (segundos) del precio. Opcional."
+        },
+        "price_history": {
+          "type": "object",
+          "description": "Mapa símbolo→lista de cierres diarios (orden cronológico). Opcional pero recomendado para detección de outliers."
+        },
+        "alt_prices": {
+          "type": "object",
+          "description": "Precios de un provider secundario para validación cruzada. Opcional."
+        }
+      },
+      "required": ["prices"]
+    }
+  },
+  {
+    "name": "get_quality_report",
+    "description": "Obtiene el reporte de calidad de datos del último ciclo. Incluye símbolos con flags, issues detectados y señales vetadas por calidad de datos.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  }
+]

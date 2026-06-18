@@ -1,0 +1,75 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Publisher {
+  id          String   @id            // base64url(sha256(publicKey))
+  publicKey   String   @unique        // Ed25519, base64
+  displayName String?                 // opt-in
+  createdAt   DateTime @default(now())
+  plugins     Plugin[]
+  votes       Vote[]
+  reports     Report[]
+}
+
+model Plugin {
+  id            String          @id @default(uuid())
+  publisherId   String
+  publisher     Publisher       @relation(fields: [publisherId], references: [id])
+  manifestId    String
+  type          String          // skill|universe|preset|discipline-profile
+  name          String
+  description   String
+  latestVersion String
+  repository    String?                          // URL del repositorio git (GitHub, GitLab, etc.)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  versions      PluginVersion[]
+  votes         Vote[]
+  reports       Report[]
+  @@unique([publisherId, manifestId])
+}
+
+model PluginVersion {
+  id           String   @id @default(uuid())
+  pluginId     String
+  plugin       Plugin   @relation(fields: [pluginId], references: [id])
+  version      String
+  manifestToml String
+  payload      Bytes
+  checksum     String
+  signature    String
+  publishedAt  DateTime @default(now())
+  @@unique([pluginId, version])
+}
+
+model Vote {
+  id        String    @id @default(uuid())
+  pluginId  String
+  plugin    Plugin    @relation(fields: [pluginId], references: [id])
+  voterId   String
+  voter     Publisher @relation(fields: [voterId], references: [id])
+  kind      String    // like|dislike
+  createdAt DateTime  @default(now())
+  @@unique([pluginId, voterId])
+}
+
+model Report {
+  id         String    @id @default(uuid())
+  pluginId   String
+  plugin     Plugin    @relation(fields: [pluginId], references: [id])
+  reporterId String
+  reporter   Publisher @relation(fields: [reporterId], references: [id])
+  reason     String
+  createdAt  DateTime  @default(now())
+  @@unique([pluginId, reporterId])
+}

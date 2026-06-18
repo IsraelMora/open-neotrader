@@ -1,0 +1,19 @@
+[plugin]
+id          = "funding-rate-arb"
+name        = "Funding Rate Arbitrage (Crypto)"
+version     = "1.0.0"
+type        = "skill"
+description = "Estrategia de ingresos pasivos en crypto: detecta oportunidades de arbitraje entre tasas de financiamiento (funding rates) de futuros perpetuos y spot. Long spot + Short perp = capturar funding rate sin riesgo de precio. Rendimiento objetivo: 15-40% APR en tasas altas. Basado en la mecánica de funding de Bitmex/Binance Futures."
+author      = "neurotrader"
+tags        = ["crypto", "arbitrage", "funding-rate", "neutral", "passive-income", "perp-futures"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "8h"    # funding se paga cada 8h en la mayoría de exchanges
+
+[config]
+min_rate_annual       = 0.20    # mínimo 20% APR para entrar (0.0067% / 8h)
+max_rate_annual       = 5.00    # descartar tasas extremas (probable manipulación)
+min_oi_usd            = 1000000 # mínimo de Open Interest en USD para liquidez
+funding_interval_h    = 8       # intervalo de funding en horas
+annualization_factor  = 1095    # número de períodos por año (365 × 3 para 8h)

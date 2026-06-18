@@ -1,0 +1,25 @@
+[plugin]
+id          = "paper-trading"
+name        = "Paper Trading"
+version     = "1.0.0"
+type        = "discipline"
+description = "Simula ejecución de órdenes en modo paper (sin dinero real). Intercepta señales y las ejecuta en un portafolio virtual con precios reales. Calcula PnL diario, acumulado y métricas de rendimiento. Permite validar estrategias en live sin riesgo."
+author      = "neurotrader"
+tags        = ["discipline", "paper", "simulation", "testing", "risk-free"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86_400_000
+
+[permissions]
+network     = false
+filesystem  = false
+
+[config]
+initial_capital     = { type = "number",  default = 10000, description = "Capital inicial del portafolio paper" }
+commission_pct      = { type = "number",  default = 0.001, description = "Comisión simulada por operación (0.001 = 0.1%)" }
+slippage_pct        = { type = "number",  default = 0.001, description = "Slippage simulado por operación" }
+report_interval     = { type = "string",  default = "daily", description = "Frecuencia de reporte: 'cycle' | 'daily' | 'weekly'" }
+intercept_live      = { type = "boolean", default = false, description = "Si true: intercepta señales que irían a live y las redirige a paper. Si false: solo simula señales explícitas." }
+max_position_pct    = { type = "number",  default = 20,   description = "Máximo % del capital en una posición" }

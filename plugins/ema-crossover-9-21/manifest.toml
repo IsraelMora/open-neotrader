@@ -1,0 +1,60 @@
+[plugin]
+id          = "ema-crossover-9-21"
+name        = "EMA Crossover 9/21"
+version     = "1.0.0"
+type        = "skill"
+description = "Estrategia de cruce de medias exponenciales 9/21 periodos. Señal de entrada cuando EMA rápida (9) cruza por encima de EMA lenta (21). Clásico sistema de seguimiento de tendencia con Sharpe histórico ~0.6-0.8 en mercados con tendencia."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[config]
+[config.fast_period]
+type    = "number"
+default = 9
+min     = 3
+max     = 20
+label   = "Período EMA rápida"
+description = "Número de periodos para la EMA rápida. Estándar: 9."
+
+[config.slow_period]
+type    = "number"
+default = 21
+min     = 10
+max     = 50
+label   = "Período EMA lenta"
+description = "Número de periodos para la EMA lenta. Estándar: 21."
+
+[config.timeframe]
+type    = "string"
+enum    = ["1m", "5m", "15m", "1h", "4h", "1d"]
+default = "1d"
+label   = "Timeframe"
+description = "Temporalidad de las velas. Diario (1d) reduce el ruido; intradiario aumenta frecuencia pero requiere gestión activa."
+
+[config.confirmation_bars]
+type    = "number"
+default = 1
+min     = 0
+max     = 3
+label   = "Barras de confirmación"
+description = "Número de cierres consecutivos por encima del cruce para confirmar la señal. 0 = señal inmediata (más whipsaws). 1 = estándar."
+
+[config.atr_stop_multiplier]
+type    = "number"
+default = 2.0
+min     = 1.0
+max     = 4.0
+label   = "Multiplicador ATR para stop loss"
+description = "Stop loss dinámico = precio_entrada - ATR(14) × multiplicador. 2.0 es el estándar para diario."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

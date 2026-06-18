@@ -1,0 +1,29 @@
+[plugin]
+id          = "macro-calendar-guard"
+name        = "Macro Calendar Guard"
+version     = "1.0.0"
+type        = "discipline"
+description = "Disciplina de seguridad: suprime o reduce señales en ventanas de alta incertidumbre macro (Fed, CPI, NFP, ECB, earnings season peaks). Evita el slippage y reversiones bruscas post-evento."
+author      = "neurotrader"
+tags        = ["discipline", "macro", "risk", "calendar", "events"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86_400_000   # una vez al día es suficiente
+
+[permissions]
+network     = false
+filesystem  = false
+
+[config]
+blackout_hours_before  = { type = "integer", default = 4,    description = "Horas antes del evento para suprimir señales" }
+blackout_hours_after   = { type = "integer", default = 2,    description = "Horas después del evento para suprimir señales" }
+reduce_size_pct        = { type = "integer", default = 50,   description = "% de reducción de tamaño en zona gris (no blackout total)" }
+warn_only              = { type = "boolean", default = false, description = "Solo advertir sin suprimir señales" }
+affected_assets        = { type = "string",  default = "all", description = "all | equities | forex | crypto" }
+fed_events             = { type = "boolean", default = true,  description = "Cubrir FOMC meetings y press conferences" }
+cpi_events             = { type = "boolean", default = true,  description = "Cubrir publicaciones de CPI y PCE" }
+nfp_events             = { type = "boolean", default = true,  description = "Cubrir Non-Farm Payrolls (primer viernes del mes)" }
+ecb_events             = { type = "boolean", default = true,  description = "Cubrir decisiones del BCE" }
+earnings_peak          = { type = "boolean", default = false, description = "Reducir actividad en peaks de earnings season" }

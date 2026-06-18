@@ -1,0 +1,74 @@
+[plugin]
+id          = "position-sizing-pyramid"
+name        = "Position Sizing Pyramid"
+version     = "1.0.0"
+type        = "discipline"
+description = "Pirámide de posicionamiento: entra en tranches y añade capital a posiciones ganadoras. Reduce el coste medio en ganadores sin aumentar el riesgo inicial. Base matemática: Van Tharp (1999), Ed Seykota."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[[tools]]
+name        = "calculate_tranches"
+description = "Calcula las tranches de entrada para una señal dada la configuración de pirámide."
+
+[[tools]]
+name        = "get_add_signal"
+description = "Dado el estado de una posición abierta, determina si se debe añadir una tranche adicional."
+
+[config]
+[config.entry_pct]
+type        = "number"
+default     = 40
+min         = 20
+max         = 60
+label       = "% inicial de entrada"
+description = "Porcentaje del tamaño total a entrar en la primera tranche. El resto se añade al avanzar el precio."
+
+[config.add_pct]
+type        = "number"
+default     = 30
+min         = 10
+max         = 40
+label       = "% por add"
+description = "Porcentaje del tamaño total a añadir en cada tranche adicional (se suman a entry_pct)."
+
+[config.max_tranches]
+type        = "number"
+default     = 3
+min         = 2
+max         = 5
+label       = "Tranches máximas"
+description = "Número máximo de veces que se puede añadir a una posición. Total = entry + (max_tranches-1)*add."
+
+[config.add_trigger_r]
+type        = "number"
+default     = 1.0
+min         = 0.5
+max         = 3.0
+label       = "Trigger de add (múltiplo R)"
+description = "Cuántos R (ATR) debe avanzar el precio para añadir la siguiente tranche. R=1 significa que avance 1×ATR desde la entrada."
+
+[config.trail_stop_after_add]
+type        = "boolean"
+default     = true
+label       = "Trail stop al añadir"
+description = "Mover el stop loss al breakeven (o trailing) al añadir la segunda tranche, para proteger capital."
+
+# Campo configurable desde UI para el scheduler
+[config.scheduler_interval_ms]
+type        = "number"
+default     = 86400000
+label       = "Intervalo del scheduler (ms)"
+description = "Frecuencia de ejecución del ciclo. 86400000 = 1 día. Configurable por el usuario."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

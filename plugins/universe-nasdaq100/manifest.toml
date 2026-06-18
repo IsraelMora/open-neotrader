@@ -1,0 +1,47 @@
+[plugin]
+id          = "universe-nasdaq100"
+name        = "Nasdaq-100 Universe"
+version     = "1.0.0"
+type        = "universe"
+description = "Universo de los 100 principales activos del índice Nasdaq-100 (QQQ). Dominado por tecnología y growth. Ideal para estrategias momentum, EMA crossover y mean reversion en activos de alta capitalización."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[config]
+[config.include_etf]
+type        = "boolean"
+default     = true
+label       = "Incluir ETF QQQ"
+description = "Añadir QQQ como símbolo de referencia del índice."
+
+[config.min_price]
+type        = "number"
+default     = 10
+min         = 1
+max         = 100
+label       = "Precio mínimo ($)"
+description = "Excluir activos por debajo de este precio."
+
+[config.exclude_symbols]
+type        = "text"
+default     = ""
+label       = "Excluir símbolos"
+description = "Lista separada por comas de tickers a excluir del universo."
+
+[config.subset_size]
+type        = "number"
+default     = 100
+min         = 10
+max         = 100
+label       = "Tamaño del subset"
+description = "Limitar el universo a los N primeros del índice por capitalización."
+
+[hooks]
+on_activate = "hooks/on_activate.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode        = "none"

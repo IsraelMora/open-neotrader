@@ -1,0 +1,29 @@
+[
+  {
+    "name": "get_market_breadth",
+    "description": "Calcula indicadores de amplitud del mercado: Advance/Decline Ratio, % activos sobre MA200, McClellan Oscillator, NH/NL Ratio, Breadth Thrust de Zweig. Devuelve un score 0-100 y régimen (bullish/neutral/bearish). Detecta divergencias precio/breadth que señalan techos o suelos.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "advances":      {"type": "array", "items": {"type": "number"}, "description": "Activos que subieron en cada día (orden cronológico)"},
+        "declines":      {"type": "array", "items": {"type": "number"}, "description": "Activos que bajaron"},
+        "price_history": {"type": "object", "description": "Historial de precios por símbolo para calcular % sobre MA200"},
+        "index_prices":  {"type": "array",  "items": {"type": "number"}, "description": "Precio del índice para detectar divergencias"}
+      },
+      "required": ["advances", "declines"]
+    }
+  },
+  {
+    "name": "check_breadth_divergence",
+    "description": "Detecta divergencias entre el precio del índice y la amplitud del mercado. Bearish divergence: índice en máximos pero breadth deteriorando → posible techo. Bullish divergence: índice en mínimos pero breadth mejorando → posible suelo.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "advances":      {"type": "array", "items": {"type": "number"}},
+        "declines":      {"type": "array", "items": {"type": "number"}},
+        "index_prices":  {"type": "array", "items": {"type": "number"}}
+      },
+      "required": ["advances", "declines", "index_prices"]
+    }
+  }
+]

@@ -1,0 +1,25 @@
+[plugin]
+id          = "universe-etf-thematic"
+name        = "Universe — ETF Temáticos"
+version     = "1.0.0"
+type        = "universe"
+description = "Universo de ETFs temáticos de alto crecimiento: ARK Innovation, semiconductores, ciberseguridad, clean energy, inteligencia artificial, biotecnología y cloud computing."
+author      = "neurotrader"
+tags        = ["universe", "etf", "thematic", "growth", "tech"]
+
+[scheduler]
+mode        = "none"
+
+[permissions]
+network     = false
+filesystem  = false
+
+[config]
+include_ark        = { type = "boolean", default = true,  description = "Incluir ETFs ARK (ARKK, ARKW, ARKG, ARKF, ARKX)" }
+include_semis      = { type = "boolean", default = true,  description = "Incluir ETFs de semiconductores (SOXX, SMH, SOXQ)" }
+include_cyber      = { type = "boolean", default = true,  description = "Incluir ETFs de ciberseguridad (HACK, CIBR, BUG)" }
+include_energy     = { type = "boolean", default = true,  description = "Incluir ETFs de energía limpia (ICLN, QCLN, TAN, FAN)" }
+include_ai         = { type = "boolean", default = true,  description = "Incluir ETFs de IA (BOTZ, ROBO, AIQ, QTUM)" }
+include_biotech    = { type = "boolean", default = false, description = "Incluir ETFs de biotecnología (XBI, IBB, LABU — alta volatilidad)" }
+include_cloud      = { type = "boolean", default = true,  description = "Incluir ETFs de cloud (WCLD, SKYY, BUZ)" }
+include_fintech    = { type = "boolean", default = false, description = "Incluir ETFs de fintech (FINX, ARKF)" }

@@ -1,0 +1,46 @@
+{
+  "tools": [
+    {
+      "name": "journal_entry",
+      "description": "Registra un cambio de parámetros en el journal. Requiere una justificación (reason) y una hipótesis testeable (hypothesis) de al menos 50 caracteres. Activa un lock de N ciclos.",
+      "input_schema": {
+        "type": "object",
+        "required": ["plugin_id", "params_before", "params_after", "reason", "hypothesis", "cycle_id"],
+        "properties": {
+          "plugin_id":     { "type": "string" },
+          "params_before": { "type": "object" },
+          "params_after":  { "type": "object" },
+          "reason":        { "type": "string" },
+          "hypothesis":    { "type": "string", "description": "Hipótesis testeable: ¿qué debería mejorar con este cambio y por qué?" },
+          "cycle_id":      { "type": "string" },
+          "journal":       { "type": "array", "description": "Journal actual (del contexto: ctx.param_journal)" },
+          "config":        { "type": "object" }
+        }
+      }
+    },
+    {
+      "name": "check_lock",
+      "description": "Verifica si un plugin está en período de lock (no se pueden cambiar sus parámetros). Devuelve locked=true/false y los ciclos restantes.",
+      "input_schema": {
+        "type": "object",
+        "required": ["plugin_id"],
+        "properties": {
+          "plugin_id": { "type": "string" },
+          "journal":   { "type": "array" },
+          "config":    { "type": "object" }
+        }
+      }
+    },
+    {
+      "name": "get_journal",
+      "description": "Devuelve el historial de cambios de parámetros. Opcionalmente filtrado por plugin_id.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "plugin_id": { "type": "string", "description": "Si se omite, devuelve el journal completo" },
+          "journal":   { "type": "array" }
+        }
+      }
+    }
+  ]
+}

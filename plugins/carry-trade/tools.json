@@ -1,0 +1,83 @@
+[
+  {
+    "name": "get_ohlcv",
+    "description": "Obtiene datos históricos OHLCV para calcular momentum de un par forex.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "description": "Símbolo del par forex (e.g., 'AUDJPY', 'NZDUSD')"
+        },
+        "timeframe": {
+          "type": "string",
+          "description": "Timeframe: 1d, 4h, 1h",
+          "default": "1d"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Número de barras a obtener",
+          "default": 90
+        }
+      },
+      "required": ["symbol"]
+    }
+  },
+  {
+    "name": "get_market_context",
+    "description": "Obtiene contexto de mercado incluyendo VIX y modo risk-on/risk-off.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "emit_carry_signal",
+    "description": "Emite una señal de carry trade con el par y dirección recomendada.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "description": "Par forex (e.g., 'AUDJPY')"
+        },
+        "action": {
+          "type": "string",
+          "enum": ["long", "short", "exit"],
+          "description": "Dirección del trade: long = comprar divisa de mayor rendimiento"
+        },
+        "carry_rate": {
+          "type": "number",
+          "description": "Diferencial de tasas anualizado en puntos porcentuales"
+        },
+        "momentum_ok": {
+          "type": "boolean",
+          "description": "Si el filtro de momentum está favorable"
+        },
+        "risk_off": {
+          "type": "boolean",
+          "description": "Si el mercado está en modo risk-off (VIX elevado)"
+        },
+        "confidence": {
+          "type": "number",
+          "description": "Confianza en la señal (0.0-1.0)"
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Datos adicionales: tasas base/quote, ranking carry"
+        }
+      },
+      "required": ["symbol", "action", "carry_rate", "momentum_ok", "risk_off"]
+    }
+  },
+  {
+    "name": "get_active_carries",
+    "description": "Obtiene las posiciones carry actualmente abiertas para gestión.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  }
+]

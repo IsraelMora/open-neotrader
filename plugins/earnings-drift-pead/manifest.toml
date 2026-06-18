@@ -1,0 +1,65 @@
+[plugin]
+id          = "earnings-drift-pead"
+name        = "Earnings Drift (PEAD)"
+version     = "1.0.0"
+type        = "skill"
+description = "Post-Earnings Announcement Drift: tendencia de las acciones a continuar moviéndose en la dirección de la sorpresa de earnings durante 30-60 días. Una de las anomalías más persistentes y documentadas en finanzas (Ball & Brown 1968, Bernard & Thomas 1989)."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[[tools]]
+name        = "compute_earnings_surprise"
+description = "Calcula la sorpresa de earnings: (EPS_real - EPS_estimado) / |EPS_estimado|. Retorna el percentil de sorpresa y la señal PEAD."
+
+[[tools]]
+name        = "analyze_price_reaction"
+description = "Analiza la reacción del precio al earnings: gap de apertura, continuación del movimiento, volumen anómalo."
+
+[config]
+[config.min_surprise_pct]
+type        = "number"
+default     = 5.0
+min         = 2.0
+max         = 20.0
+label       = "Sorpresa mínima (%)"
+description = "Sorpresa de EPS mínima para activar señal PEAD. 5% = sorpresa moderada. Más alto = menos señales, más fiables."
+
+[config.hold_days]
+type        = "number"
+default     = 30
+min         = 10
+max         = 60
+label       = "Días de mantenimiento"
+description = "Cuántos días mantener la posición después del earnings. PEAD se disipa en ~60 días."
+
+[config.min_market_cap_b]
+type        = "number"
+default     = 1.0
+min         = 0.5
+max         = 10.0
+label       = "Cap mínima (miles de millones $)"
+description = "Excluir empresas pequeñas donde PEAD es menos fiable por iliquidez."
+
+[config.use_price_gap]
+type        = "boolean"
+default     = true
+label       = "Usar gap de precio"
+description = "Confirmar la sorpresa con el gap de apertura. Gap > 3% en dirección de la sorpresa = señal más fiable."
+
+[config.scheduler_interval_ms]
+type        = "number"
+default     = 86400000
+label       = "Intervalo del scheduler (ms)"
+description = "Frecuencia de ejecución. Diario es suficiente — PEAD es señal de medio plazo."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

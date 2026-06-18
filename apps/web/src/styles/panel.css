@@ -1,0 +1,126 @@
+/* Panel-specific Tailwind mappings + base layer + utilities
+   Extiende el @theme inline estándar de shadcn con overrides del panel. */
+
+@theme inline {
+    /* Fuentes y tipografía */
+    --font-sans: Tomorrow, ui-sans-serif, sans-serif, system-ui;
+    --font-mono: JetBrains Mono, monospace;
+    --font-serif: BioRhyme, ui-serif, serif;
+    --tracking-normal: var(--tracking-normal);
+    --tracking-tighter: calc(var(--tracking-normal) - 0.05em);
+    --tracking-tight: calc(var(--tracking-normal) - 0.025em);
+    --tracking-wide: calc(var(--tracking-normal) + 0.025em);
+    --tracking-wider: calc(var(--tracking-normal) + 0.05em);
+    --tracking-widest: calc(var(--tracking-normal) + 0.1em);
+
+    /* Radios */
+    --radius: 0.15rem;
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+
+    /* Sombras */
+    --shadow-2xl: var(--shadow-2xl);
+    --shadow-xl: var(--shadow-xl);
+    --shadow-lg: var(--shadow-lg);
+    --shadow-md: var(--shadow-md);
+    --shadow: var(--shadow);
+    --shadow-sm: var(--shadow-sm);
+    --shadow-xs: var(--shadow-xs);
+    --shadow-2xs: var(--shadow-2xs);
+    --color-shadow-color: var(--shadow-color);
+    --shadow-opacity: var(--shadow-opacity);
+    --shadow-blur: var(--shadow-blur);
+    --shadow-spread: var(--shadow-spread);
+    --shadow-offset-x: var(--shadow-offset-x);
+    --shadow-offset-y: var(--shadow-offset-y);
+
+    /* Colores canónicos shadcn */
+    --color-background: var(--background);
+    --color-foreground: var(--foreground);
+    --color-card: var(--card);
+    --color-card-foreground: var(--card-foreground);
+    --color-popover: var(--popover);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-primary: var(--primary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-secondary: var(--secondary);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-muted: var(--muted);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-destructive: var(--destructive);
+    --color-destructive-foreground: var(--destructive-foreground);
+    --color-border: var(--border);
+    --color-input: var(--input);
+    --color-ring: var(--ring);
+    --color-chart-1: var(--chart-1);
+    --color-chart-2: var(--chart-2);
+    --color-chart-3: var(--chart-3);
+    --color-chart-4: var(--chart-4);
+    --color-chart-5: var(--chart-5);
+    --color-sidebar: var(--sidebar);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-ring: var(--sidebar-ring);
+
+    /* OVERRIDE: en el panel "accent" = teal de marca (= primary), no el gris de shadcn.
+       Permite usar bg-accent/90, text-accent, badge bg-accent/10 con el color de marca.
+       El accent gris de shadcn queda accesible como --color-accent-2. */
+    --color-accent: var(--primary);
+    --color-accent-foreground: var(--primary-foreground);
+    --color-accent-2: var(--accent);
+    --color-accent-2-foreground: var(--accent-foreground);
+
+    /* Alias semánticos del panel */
+    --color-bg: var(--background);
+    --color-panel: var(--card);
+    --color-edge: var(--border);
+    --color-ink: var(--foreground);
+    --color-mut: var(--muted-foreground);
+    --color-warn: var(--warn);
+    --color-danger: var(--destructive);
+    --color-info: var(--info);
+}
+
+@layer base {
+    * { border-color: var(--border); }
+    html { font-feature-settings: "cv01","ss01"; }
+    body {
+        background: var(--background);
+        color: var(--foreground);
+        font-family: var(--font-sans);
+        min-height: 100vh;
+        letter-spacing: var(--tracking-normal);
+        transition: background-color .3s ease, color .3s ease;
+    }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 6px; }
+    ::-webkit-scrollbar-thumb:hover {
+        background: color-mix(in oklab, var(--muted-foreground) 50%, transparent);
+    }
+}
+
+/* Números monoespaciados */
+.num {
+    font-variant-numeric: tabular-nums;
+    font-family: var(--font-mono), ui-monospace, monospace;
+}
+
+/* Animación de entrada escalonada para listas */
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: none; }
+}
+.stagger > * { animation: fadeIn .4s ease both; }
+.stagger > *:nth-child(2) { animation-delay: .05s; }
+.stagger > *:nth-child(3) { animation-delay: .1s; }
+.stagger > *:nth-child(4) { animation-delay: .15s; }
+.stagger > *:nth-child(5) { animation-delay: .2s; }

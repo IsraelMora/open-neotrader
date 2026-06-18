@@ -1,0 +1,118 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { ProviderGatewayService, Portfolio } from '../providers/provider-gateway.service';
+
+export interface NavEntry {
+  id: string;
+  ts: Date;
+  cycle_id: string | null;
+  provider_id: string | null;
+  equity: number;
+  cash: number;
+  positions: unknown[];
+  total_pnl: number;
+}
+
+@Injectable()
+export class SnapshotService {
+  private readonly log = new Logger(SnapshotService.name);
+
+  constructor(
+    private readonly db: PrismaService,
+    private readonly gateway: ProviderGatewayService,
+  ) {}
+
+  /** Toma un snapshot del NAV actual desde el provider por defecto. */
+  async takeSnapshot(cycleId?: string): Promise<NavEntry | null> {
+    let portfolio: Portfolio;
+    try {
+      portfolio = await this.gateway.getPortfolio(null);
+    } catch (err) {
+      this.log.warn(`No se pudo obtener portfolio para snapshot: ${err}`);
+      return null;
+    }
+
+    const entry = await this.db.navSnapshot.create({
+      data: {
+        cycle_id: cycleId ?? null,
+        provider_id: portfolio.provider_id,
+        equity: portfolio.equity,
+        cash: portfolio.cash,
+        positions: JSON.stringify(portfolio.positions),
+        total_pnl: portfolio.total_pnl,
+      },
+    });
+
+    return this._hydrate(entry);
+  }
+
+  /** Últimos N snapshots en orden cronológico. */
+  async getHistory(limit = 90): Promise<NavEntry[]> {
+    const rows = await this.db.navSnapshot.findMany({
+      orderBy: { ts: 'asc' },
+      take: limit,
+    });
+    return rows.map((r) => this._hydrate(r));
+  }
+
+  /** Snapshot más reciente. */
+  async getLatest(): Promise<NavEntry | null> {
+    const row = await this.db.navSnapshot.findFirst({ orderBy: { ts: 'desc' } });
+    return row ? this._hydrate(row) : null;
+  }
+
+  /**
+   * Equity curve como lista de [ts, equity] para el frontend.
+   * Útil para gráficos y para el weekly-reporter.
+   */
+  async getEquityCurve(limit = 252): Promise<{ ts: string; equity: number }[]> {
+    const rows = await this.db.navSnapshot.findMany({
+      orderBy: { ts: 'asc' },
+      take: limit,
+      select: { ts: true, equity: true },
+    });
+    return rows.map((r) => ({ ts: r.ts.toISOString(), equity: r.equity }));
+  }
+
+  /** Estadísticas rápidas del NAV histórico. */
+  async stats(): Promise<Record<string, unknown>> {
+    const total = await this.db.navSnapshot.count();
+    const first = await this.db.navSnapshot.findFirst({ orderBy: { ts: 'asc' } });
+    const last = await this.db.navSnapshot.findFirst({ orderBy: { ts: 'desc' } });
+
+    const pnl =
+      last && first && first.equity > 0 ? (last.equity - first.equity) / first.equity : null;
+
+    return {
+      total_snapshots: total,
+      first_ts: first?.ts,
+      last_ts: last?.ts,
+      equity_start: first?.equity,
+      equity_current: last?.equity,
+      total_return_pct: pnl != null ? Math.round(pnl * 10000) / 100 : null,
+    };
+  }
+
+  private _hydrate(row: {
+    id: string;
+    ts: Date;
+    cycle_id: string | null;
+    provider_id: string | null;
+    equity: number;
+    cash: number;
+    positions: string;
+    total_pnl: number;
+    meta: string | null;
+  }): NavEntry {
+    return {
+      id: row.id,
+      ts: row.ts,
+      cycle_id: row.cycle_id,
+      provider_id: row.provider_id,
+      equity: row.equity,
+      cash: row.cash,
+      positions: row.positions ? (JSON.parse(row.positions) as unknown[]) : [],
+      total_pnl: row.total_pnl,
+    };
+  }
+}

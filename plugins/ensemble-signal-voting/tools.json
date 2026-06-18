@@ -1,0 +1,63 @@
+{
+  "tools": [
+    {
+      "name": "analyze_ensemble",
+      "description": "Analiza un símbolo con 12 variantes de señal (EMA × 4 lookbacks + Donchian × 4 + TSMOM × 4). Devuelve señal consolidada (+1=long, -1=short, 0=neutral), conviction score y factor de escala vol-targeting.",
+      "input_schema": {
+        "type": "object",
+        "required": ["symbol", "prices"],
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "description": "Ticker del activo (ej: AAPL, BTC-USD)"
+          },
+          "prices": {
+            "type": "array",
+            "items": { "type": "number" },
+            "description": "Serie histórica de precios de cierre ajustados, orden cronológico ascendente. Mínimo max(lookbacks)+2 puntos.",
+            "minItems": 252
+          },
+          "config": {
+            "type": "object",
+            "description": "Parámetros opcionales (sobreescriben los del manifest.toml)",
+            "properties": {
+              "lookbacks":        { "type": "array", "items": { "type": "integer" }, "default": [20, 60, 120, 250] },
+              "vol_target_annual": { "type": "number", "default": 0.10, "description": "Objetivo de vol anual (fracción, ej: 0.10 = 10%)" },
+              "vol_lookback":     { "type": "integer", "default": 21 },
+              "min_votes":        { "type": "integer", "default": 7 },
+              "use_ema":          { "type": "boolean", "default": true },
+              "use_donchian":     { "type": "boolean", "default": true },
+              "use_tsmom":        { "type": "boolean", "default": true }
+            }
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "symbol":          { "type": "string" },
+          "signal":          { "type": "integer", "enum": [-1, 0, 1] },
+          "votes_long":      { "type": "integer" },
+          "votes_short":     { "type": "integer" },
+          "votes_neutral":   { "type": "integer" },
+          "total_variants":  { "type": "integer" },
+          "conviction":      { "type": "number", "description": "0-1. Fracción de variantes alineadas con la señal ganadora." },
+          "vol_annual":      { "type": "number", "description": "Volatilidad realizada anual (std log-retornos × √252)" },
+          "position_scale":  { "type": "number", "description": "Factor de escala posición por vol-targeting. Máx 2.0." },
+          "variants":        {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type":     { "type": "string" },
+                "lookback": { "type": "integer" },
+                "signal":   { "type": "integer" }
+              }
+            }
+          },
+          "error": { "type": "string", "description": "Presente si hubo un error (ej: datos insuficientes)" }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+[plugin]
+id          = "tiingo-provider"
+name        = "Tiingo Provider"
+version     = "1.0.0"
+type        = "provider"
+description = "Proveedor de datos históricos OHLCV y fundamentales via Tiingo API. Alternativa a Alpaca para datos — sin capacidad de ejecución de órdenes. API gratuita disponible con token."
+author      = "neurotrader-community"
+license     = "MIT"
+
+# ── Credenciales ──────────────────────────────────────────────────────────────
+[credentials]
+TIINGO_API_TOKEN = { label = "Tiingo API Token", description = "Token de la API de Tiingo (https://www.tiingo.com)" }
+
+# ── Declaración de API (leída por ProviderGatewayService) ─────────────────────
+[api]
+format          = "tiingo"
+base_url        = "https://api.tiingo.com"
+auth_type       = "query_param"
+auth_key_env    = "TIINGO_API_TOKEN"
+auth_key_param  = "token"
+
+[api.endpoints]
+ohlcv   = "{base_url}/daily/{symbol}/prices?startDate={start_date}&resampleFreq={tf}&columns=date,open,high,low,close,volume&token={auth_key}"
+ohlcv_intraday = "{base_url}/iex/{symbol}/prices?resampleFreq={tf}&columns=open,high,low,close,volume&token={auth_key}"
+quote   = "{base_url}/iex/{symbol}?token={auth_key}"
+fundamentals = "{base_url}/fundamentals/{symbol}/daily?token={auth_key}"
+
+# ── Config ajustable desde UI ─────────────────────────────────────────────────
+[config]
+[config.request_timeout_ms]
+type        = "number"
+default     = 10000
+min         = 3000
+max         = 30000
+label       = "Timeout (ms)"
+description = "Timeout para requests a Tiingo."
+
+[hooks]
+on_activate   = "hooks/on_activate.py"
+on_deactivate = "hooks/on_deactivate.py"
+
+[permissions]
+network     = true
+emit_events = false
+
+[scheduler]
+mode = "reactive"

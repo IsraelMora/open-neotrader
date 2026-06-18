@@ -1,0 +1,44 @@
+---
+import '../styles/globals.css';
+import AppShell from '../components/AppSidebar.tsx';
+const { title = 'Panel', page = 'dashboard' } = Astro.props;
+const path = Astro.url.pathname;
+---
+
+<!doctype html>
+<html lang="es" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title} — Agente de Trading</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Tomorrow:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=BioRhyme:wght@400;700&display=swap"
+      rel="stylesheet"
+    />
+    <script is:inline>
+      (function () {
+        try {
+          const m = localStorage.getItem('panel-mode');
+          // Por defecto oscuro (el tema luce mejor en oscuro); solo claro si se eligió.
+          if (m === 'light') document.documentElement.classList.remove('dark');
+          else document.documentElement.classList.add('dark');
+        } catch {
+          // ignore storage errors in SSR or restricted environments
+        }
+      })();
+    </script>
+  </head>
+  <body class="font-sans antialiased">
+    <AppShell client:load title={title} path={path} page={page} />
+    <script>
+      const upd = () => {
+        const c = document.getElementById('clock');
+        if (c) c.textContent = new Date().toLocaleString('es');
+      };
+      setInterval(upd, 1000);
+      setTimeout(upd, 200);
+    </script>
+  </body>
+</html>

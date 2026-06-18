@@ -1,0 +1,66 @@
+[plugin]
+id          = "telegram-notifier"
+name        = "Telegram Notifier"
+version     = "1.0.0"
+type        = "extra"
+description = "Envía alertas en tiempo real a Telegram. Notifica señales de trading, inicio/fin de ciclos, estado del circuit breaker, y cualquier evento crítico. Esencial para el modelo de ingresos pasivos — te mantienes informado sin mirar la pantalla."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[credentials]
+TELEGRAM_BOT_TOKEN = { label = "Bot Token", required = true, description = "Token del bot de Telegram. Obtener de @BotFather con /newbot" }
+TELEGRAM_CHAT_ID   = { label = "Chat ID", required = true, description = "ID del chat/canal donde enviar mensajes. Usar @userinfobot para obtenerlo" }
+
+[config]
+[config.notify_cycle_start]
+type    = "boolean"
+default = false
+label   = "Notificar inicio de ciclo"
+description = "Si true, envía mensaje cuando inicia un ciclo del agente."
+
+[config.notify_cycle_complete]
+type    = "boolean"
+default = true
+label   = "Notificar fin de ciclo"
+description = "Si true, envía resumen de señales al completar un ciclo."
+
+[config.notify_signals]
+type    = "boolean"
+default = true
+label   = "Notificar señales de trading"
+description = "Si true, envía cada señal de compra/venta generada."
+
+[config.notify_circuit_breaker]
+type    = "boolean"
+default = true
+label   = "Notificar circuit breaker"
+description = "Si true, envía alerta crítica cuando el circuit breaker se activa."
+
+[config.notify_errors]
+type    = "boolean"
+default = true
+label   = "Notificar errores"
+description = "Si true, envía errores críticos del agente."
+
+[config.min_confidence]
+type    = "number"
+default = 0.5
+min     = 0.0
+max     = 1.0
+label   = "Confianza mínima para notificar señal"
+description = "Solo notificar señales con confidence >= este valor. Reduce ruido."
+
+[config.max_messages_per_cycle]
+type    = "number"
+default = 10
+min     = 1
+max     = 50
+label   = "Máximo mensajes por ciclo"
+description = "Limita el número de mensajes Telegram por ciclo para evitar spam."
+
+[permissions]
+network     = true
+emit_events = false
+
+[scheduler]
+mode = "none"

@@ -1,0 +1,51 @@
+[plugin]
+id          = "vwap-reversion"
+name        = "VWAP Reversion"
+version     = "1.0.0"
+type        = "skill"
+description = "Estrategia de mean reversion intradiaria. El VWAP (Volume Weighted Average Price) actúa como imán de precio durante el día. Las desviaciones de 2σ del VWAP revierten con alta probabilidad. Win rate ~62%, payoff ratio ~1.4. Requiere datos intradiarios con volumen."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[config]
+[config.deviation_bands]
+type    = "number"
+default = 2.0
+min     = 1.0
+max     = 3.0
+label   = "Bandas de desviación (σ)"
+description = "Entrada cuando el precio está a N desviaciones del VWAP. 2.0 es el estándar."
+
+[config.min_volume_ratio]
+type    = "number"
+default = 0.8
+min     = 0.3
+max     = 2.0
+label   = "Ratio mínimo de volumen"
+description = "El volumen acumulado debe ser al menos X veces el promedio para señal válida. Filtra señales de baja liquidez."
+
+[config.target_vwap_pct]
+type    = "number"
+default = 50
+min     = 25
+max     = 100
+label   = "% de recorrido objetivo al VWAP"
+description = "Take profit cuando el precio recupera este % del camino de vuelta al VWAP. 50 = a mitad de camino."
+
+[config.timeframe]
+type    = "string"
+enum    = ["1m", "5m", "15m"]
+default = "5m"
+label   = "Timeframe"
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+[scheduler]
+mode        = "polling"
+timeframe   = "5m"
+interval_ms = 300000

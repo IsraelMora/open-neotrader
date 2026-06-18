@@ -1,0 +1,30 @@
+[
+  {
+    "name": "analyze_kama",
+    "description": "Calcula el KAMA (Kaufman Adaptive Moving Average) para un símbolo. Adapta su velocidad según la Efficiency Ratio: rápido en tendencias, lento en laterales. Detecta cruces precio/KAMA solo en régimen tendencial (ER>0.6). Superior al EMA en mercados reales.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol":    {"type": "string", "description": "Ticker del activo"},
+        "prices":    {"type": "array",  "items": {"type": "number"}, "description": "Cierres diarios (orden cronológico, mínimo 30 barras)"},
+        "period":    {"type": "integer","description": "Periodo ER (default 10)"},
+        "fast_period": {"type": "integer", "description": "EMA rápida en ER=1 (default 2)"},
+        "slow_period": {"type": "integer", "description": "EMA lenta en ER=0 (default 30)"}
+      },
+      "required": ["symbol", "prices"]
+    }
+  },
+  {
+    "name": "get_efficiency_ratio",
+    "description": "Calcula solo la Efficiency Ratio actual de un símbolo. ER>0.6 = mercado tendencial, ER<0.3 = lateral/caótico. Útil para decidir qué tipo de estrategia aplicar.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol":  {"type": "string"},
+        "prices":  {"type": "array", "items": {"type": "number"}},
+        "period":  {"type": "integer", "description": "Ventana ER (default 10)"}
+      },
+      "required": ["symbol", "prices"]
+    }
+  }
+]

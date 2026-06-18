@@ -1,0 +1,59 @@
+[
+  {
+    "name": "apply_risk_envelope",
+    "description": "Aplica veto duro matemático sobre una lista de propuestas de trade generadas por la IA. Filtra cortos prohibidos, reescala posiciones que superan el límite por activo, veta trades que superen la exposición máxima o el número de posiciones. Devuelve qué aprobó, qué vetó y qué reescaló, con razones.",
+    "script": "scripts/risk_envelope.py",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "proposals": {
+          "type": "array",
+          "description": "Lista de trades propuestos por la IA",
+          "items": {
+            "type": "object",
+            "properties": {
+              "symbol": { "type": "string" },
+              "action": { "type": "string", "enum": ["buy", "sell", "short", "cover", "close"] },
+              "qty": { "type": "number" },
+              "price": { "type": "number" }
+            },
+            "required": ["symbol", "action", "qty", "price"]
+          }
+        },
+        "portfolio_value": { "type": "number", "description": "Valor total del portafolio en USD" },
+        "positions": {
+          "type": "array",
+          "description": "Posiciones actuales abiertas",
+          "items": {
+            "type": "object",
+            "properties": {
+              "symbol": { "type": "string" },
+              "qty": { "type": "number" },
+              "current_price": { "type": "number" },
+              "market_value": { "type": "number" }
+            }
+          }
+        },
+        "config": {
+          "type": "object",
+          "description": "Override de parámetros del envelope (opcional)"
+        }
+      },
+      "required": ["proposals", "portfolio_value"]
+    }
+  },
+  {
+    "name": "check_portfolio_health",
+    "description": "Diagnóstico del portafolio actual contra los límites del risk envelope. Detecta posiciones sobreponderadas, exposición excesiva y exceso de posiciones abiertas.",
+    "script": "scripts/risk_envelope.py",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "portfolio_value": { "type": "number" },
+        "positions": { "type": "array", "items": { "type": "object" } },
+        "config": { "type": "object" }
+      },
+      "required": ["portfolio_value", "positions"]
+    }
+  }
+]

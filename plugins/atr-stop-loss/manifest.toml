@@ -1,0 +1,59 @@
+[plugin]
+id          = "atr-stop-loss"
+name        = "ATR Dynamic Stop Loss"
+version     = "1.0.0"
+type        = "discipline"
+description = "Discipline plugin que calcula stops dinámicos basados en ATR (Average True Range). Adapta el stop a la volatilidad actual del activo, evitando stops demasiado ajustados en alta volatilidad y demasiado amplios en baja volatilidad. Compatible con cualquier señal de entrada."
+author      = "neurotrader-community"
+license     = "MIT"
+
+[config]
+[config.atr_period]
+type    = "number"
+default = 14
+min     = 5
+max     = 30
+label   = "Período ATR"
+description = "Número de periodos para calcular el ATR. 14 es el estándar de Wilder."
+
+[config.stop_multiplier]
+type    = "number"
+default = 2.0
+min     = 1.0
+max     = 4.0
+label   = "Multiplicador ATR para stop"
+description = "Stop loss = precio_entrada - ATR × multiplicador. 2.0 para diario, 1.5 para intradiario."
+
+[config.trailing_multiplier]
+type    = "number"
+default = 1.5
+min     = 1.0
+max     = 3.0
+label   = "Multiplicador ATR para trailing stop"
+description = "El stop sigue al precio al alza: stop = max_price - ATR × trailing_multiplier."
+
+[config.timeframe]
+type    = "string"
+enum    = ["1m", "5m", "15m", "1h", "4h", "1d"]
+default = "1d"
+label   = "Timeframe"
+description = "Temporalidad para obtener datos ATR."
+
+[tools]
+[tools.calculate_atr_stop]
+description = "Calcula stop loss dinámico ATR para un activo. Llama antes de ejecutar una señal de entrada."
+
+[tools.update_trailing_stop]
+description = "Actualiza el trailing stop de una posición abierta. Llama en cada ciclo para posiciones abiertas."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

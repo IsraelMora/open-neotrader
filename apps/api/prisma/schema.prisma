@@ -1,0 +1,139 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// Un único usuario por instalación (local-first, no multiusuario)
+model User {
+  id                String   @id @default(uuid())
+  username          String   @unique
+  password_hash     String
+  totp_secret       String?
+  totp_enabled      Boolean  @default(false)
+  backup_codes_hash String?
+  is_active         Boolean  @default(true)
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
+}
+
+// type: skill | universe | discipline | stack | provider
+// verification: unverified | pending | verified | rejected
+// skills, stack_plugins, symbols, config stored as JSON strings (SQLite has no JSON type)
+model Plugin {
+  id             String   @id
+  name           String
+  description    String?
+  version        String
+  type           String
+  active         Boolean  @default(false)
+  verification   String   @default("unverified")
+  author         String?
+  source_url     String?
+  git_url        String?
+  stack_plugins  String?
+  skills         String?
+  symbols        String?
+  config         String?
+  installed_path String?
+  installed_at   DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  @@map("plugins")
+}
+
+model ConfigEntry {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+
+  @@map("config")
+}
+
+model Portfolio {
+  name      String   @id
+  data      String
+  updatedAt DateTime @updatedAt
+
+  @@map("portfolio")
+}
+
+// Registro periódico del NAV (Net Asset Value) de la cartera
+// Se escribe al final de cada ciclo del agente
+model NavSnapshot {
+  id           String   @id @default(uuid())
+  ts           DateTime @default(now())
+  cycle_id     String?                   // ciclo que generó el snapshot
+  provider_id  String?                   // provider consultado
+  equity       Float                     // valor total (cash + posiciones)
+  cash         Float
+  positions    String                    // JSON: Position[]
+  total_pnl    Float    @default(0)
+  meta         String?                   // JSON libre
+
+  @@index([ts])
+  @@map("nav_snapshots")
+}
+
+// Alerta proactiva de riesgo generada por el AlertEngine
+model AlertEntry {
+  id         String   @id @default(uuid())
+  ts         DateTime @default(now())
+  type       String                      // "DRAWDOWN" | "FLASH_CRASH" | "CORRELATION_SPIKE" | "VOLUME_ANOMALY" | "MACRO_EVENT"
+  severity   String                      // "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
+  symbol     String?
+  message    String
+  meta       String?
+  resolved   Boolean  @default(false)
+  resolved_at DateTime?
+
+  @@index([ts])
+  @@index([type])
+  @@map("alerts")
+}
+
+// Audit log — registro inmutable de decisiones del agente LLM
+// Cada entrada representa un ciclo completo o una decisión individual
+model AuditEntry {
+  id              String   @id @default(uuid())
+  ts              DateTime @default(now())
+  cycle_id        String?               // UUID del ciclo al que pertenece
+  event_type      String                // "cycle_start" | "cycle_complete" | "cycle_fail" | "signal" | "decision"
+  plugin_id       String?               // plugin que generó el evento
+  symbol          String?               // activo relacionado (si aplica)
+  action          String?               // "long" | "exit" | "cancelled" | ...
+  llm_text        String?               // texto de respuesta del LLM (truncado a 2000 chars)
+  signals_count   Int?
+  skills_read     String?               // JSON array de skills leídos
+  skills_written  String?               // JSON array de skills escritos
+  sandbox_ok      Boolean?
+  error           String?
+  meta            String?               // JSON libre para datos adicionales
+
+  @@index([ts])
+  @@index([cycle_id])
+  @@index([event_type])
+  @@map("audit_log")
+}
+
+// Cartera virtual de pretest — permite probar configuraciones distintas antes de usar dinero real
+// Cada pretest es independiente: tiene sus propios plugins activos, config y estado de cartera virtual
+model PretestPortfolio {
+  id              String   @id @default(uuid())
+  name            String   @unique
+  description     String?
+  initial_capital Float    @default(10000)
+  plugin_ids      String                    // JSON: string[] — plugins a ejecutar en este pretest
+  plugin_configs  String?                   // JSON: Record<plugin_id, config_override>
+  state           String                    // JSON: PretestState (equity, cash, positions, trades)
+  run_count       Int      @default(0)
+  last_run_at     DateTime?
+  is_active       Boolean  @default(true)
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  @@map("pretest_portfolios")
+}

@@ -1,0 +1,34 @@
+[plugin]
+id          = "yahoo-finance-provider"
+name        = "Yahoo Finance Provider"
+version     = "1.0.0"
+type        = "provider"
+description = "Datos OHLCV gratuitos via Yahoo Finance (API no oficial). Sin API key necesaria. Limitado a datos históricos diarios y datos en tiempo diferido (~15 min). Ideal como fallback cuando no hay otros providers."
+author      = "neurotrader"
+tags        = ["provider", "yahoo", "free", "fallback", "equities"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86_400_000
+
+[permissions]
+network     = false   # acceso a red solo via ProviderGatewayService
+filesystem  = false
+
+[api]
+format   = "generic"
+base_url = "https://query1.finance.yahoo.com"
+
+[api.auth]
+type = "none"   # sin autenticación
+
+[api.endpoints]
+ohlcv    = "{base_url}/v8/finance/chart/{symbol}?interval={tf}&range={range}&includeAdjustedClose=true"
+quote    = "{base_url}/v8/finance/chart/{symbol}?interval=1d&range=1d"
+
+[config]
+adjusted_close  = { type = "boolean", default = true,  description = "Usar precios ajustados por dividendos y splits" }
+fallback_only   = { type = "boolean", default = true,  description = "Solo usar si no hay otro provider activo disponible" }
+
+# Sin credenciales — API pública (no oficial, puede cambiar sin aviso)

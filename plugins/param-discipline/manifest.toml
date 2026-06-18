@@ -1,0 +1,18 @@
+[plugin]
+id          = "param-discipline"
+name        = "Param Discipline — Journal y Lock de Parámetros"
+version     = "1.0.0"
+type        = "discipline"
+description = "Evita el overfitting accidental: cualquier cambio de parámetros de un plugin requiere entrada en el journal (razón + hipótesis), luego se registra el cambio, y el sistema queda bloqueado para nuevos cambios hasta que el ciclo siguiente confirme la hipótesis. Patrón: journal → cambio → relock → validación."
+author      = "neurotrader"
+tags        = ["risk", "governance", "params", "overfitting", "discipline"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+
+[config]
+lock_after_change_cycles = 3        # ciclos que deben pasar antes de permitir otro cambio
+require_hypothesis       = true     # requiere hipótesis al cambiar parámetros
+min_hypothesis_length    = 50       # mínimo de caracteres en la hipótesis
+max_changes_per_week     = 5        # máximo de cambios permitidos por semana
