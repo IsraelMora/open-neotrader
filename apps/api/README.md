@@ -126,7 +126,7 @@ No hay `.env.example` en `apps/api/`; el archivo raíz del proyecto documenta la
 | `OPENAI_API_KEY` | — | API key de OpenAI (backend `openai`) |
 | `GEMINI_API_KEY` | — | API key de Google (backend `gemini`) |
 | `PLUGINS_DIR` | `../../../../plugins` (relativo al build) | Directorio raíz de plugins |
-| `PYTHON3_BIN` | `/usr/bin/python3` | Intérprete Python para el sandbox |
+| `PYTHON3_BIN` | `python3` | Intérprete Python para el sandbox (resuelto por PATH; override para Docker/venv) |
 | `SANDBOX_RUNNER_PATH` | `../../../../sandbox/runner.py` | Ruta al script del sandbox |
 | `SANDBOX_TIMEOUT_MS` | `30000` | Timeout por llamada al sandbox (ms) |
 | `SANDBOX_CPU_SECONDS` | `60` | Límite de CPU para el proceso Python |

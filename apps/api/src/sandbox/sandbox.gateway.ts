@@ -25,11 +25,11 @@ export class SandboxGateway {
 
   private readonly cpuSeconds: number;
   private readonly memMb: number;
-  /** Ruta absoluta al intérprete Python. Configurable por portabilidad (Docker/venv/distro). */
+  /** Intérprete Python. Default resuelto por PATH (respeta venvs/pyenv); override con PYTHON3_BIN. */
   private readonly python3Bin: string;
 
   constructor(cfg: ConfigService) {
-    this.python3Bin = cfg.get<string>('PYTHON3_BIN', '/usr/bin/python3');
+    this.python3Bin = cfg.get<string>('PYTHON3_BIN', 'python3');
     this.timeout = cfg.get<number>('SANDBOX_TIMEOUT_MS', 30_000);
     this.runnerPath = cfg.get<string>(
       'SANDBOX_RUNNER_PATH',
