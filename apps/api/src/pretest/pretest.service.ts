@@ -17,14 +17,7 @@
  * not cost-basis. getQuote failures are handled gracefully: skip fill or fallback to
  * last-known current_price / avg_price for MTM.
  */
-import {
-  Injectable,
-  Logger,
-  NotFoundException,
-  Inject,
-  forwardRef,
-  Optional,
-} from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, Inject, forwardRef } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { SandboxGateway } from '../sandbox/sandbox.gateway';
 import { PluginsService, HydratedPlugin } from '../plugins/plugins.service';
@@ -119,11 +112,11 @@ export interface GateResult {
   metrics: SignificanceMetrics;
 }
 
-/** Result of a PretestService.promote() call — three possible outcomes. */
+/** Result of a PretestService.promote() call — four possible outcomes. */
 export interface PromoteResult {
   ok: boolean;
   /** Set when ok is false — explains the rejection. */
-  reason?: 'gate_not_ready' | 'needs_confirmation';
+  reason?: 'gate_not_ready' | 'needs_confirmation' | 'gate_error';
   /** Reasons from the significance gate when reason === 'gate_not_ready'. */
   gate_reasons?: string[];
   /** Pending plugin set when reason === 'needs_confirmation'. */
@@ -180,8 +173,7 @@ export class PretestService {
     @Inject(forwardRef(() => AgentsService))
     private readonly agents: AgentsService,
     private readonly kv: KvService,
-    @Optional()
-    private readonly audit?: AuditService,
+    private readonly audit: AuditService,
   ) {}
 
   // ── CRUD ─────────────────────────────────────────────────────────────────────
@@ -618,9 +610,20 @@ export class PretestService {
     const pf = await this.findOne(id);
 
     // Step 2: GATE HARD CHECK — cannot be bypassed.
-    const g = await this.gate(id);
+    // gate() throw (unexpected error) → fail-closed with gate_error; does NOT activate/setConfig.
+    let g: GateResult;
+    try {
+      g = await this.gate(id);
+    } catch (gateErr: unknown) {
+      const errMsg = gateErr instanceof Error ? gateErr.message : String(gateErr);
+      await this.audit.log({
+        event_type: 'promotion_gate_blocked',
+        meta: { pretest_id: id, error: errMsg },
+      });
+      return { ok: false, reason: 'gate_error' };
+    }
     if (!g.ready) {
-      await this.audit?.log({
+      await this.audit.log({
         event_type: 'promotion_gate_blocked',
         meta: { pretest_id: id, reasons: g.reasons },
       });
@@ -652,7 +655,7 @@ export class PretestService {
     const failedIds = failed.map((f) => f.plugin_id);
 
     // Step 5: Single audit event for the full apply.
-    await this.audit?.log({
+    await this.audit.log({
       event_type: 'pretest_promoted',
       meta: {
         pretest_id: id,

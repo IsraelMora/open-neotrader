@@ -1019,6 +1019,7 @@ describe('PretestService.runCycle — __pretest_policy__ exclusion (fix 3)', () 
       gateway,
       mockAgents,
       makeStubKv(),
+      makeStubAudit(),
     );
 
     await svc.runCycle('port-1');
@@ -1349,6 +1350,7 @@ describe('PretestService.runCycle — uses agents.runGovernedTurn (PR3)', () => 
       gateway,
       mockAgents,
       makeStubKv(),
+      makeStubAudit(),
     );
 
     await svc.runCycle(PORTFOLIO_ID);
@@ -1552,6 +1554,7 @@ describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
       DEFAULT_GATEWAY,
       makeStubAgents(),
       kv,
+      makeStubAudit(),
     );
 
     const result = await svc.gate('port-gate-test');
@@ -1610,6 +1613,7 @@ describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
       DEFAULT_GATEWAY,
       makeStubAgents(),
       kv,
+      makeStubAudit(),
     );
 
     const result = await svc.gate('sharpe-test');
@@ -1668,6 +1672,7 @@ describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
       DEFAULT_GATEWAY,
       makeStubAgents(),
       kv,
+      makeStubAudit(),
     );
 
     const result = await svc.gate('dd-test');
@@ -1747,6 +1752,7 @@ describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
       DEFAULT_GATEWAY,
       makeStubAgents(),
       kv,
+      makeStubAudit(),
     );
 
     const result = await svc.gate('ready-test');
@@ -1835,6 +1841,7 @@ describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
       DEFAULT_GATEWAY,
       makeStubAgents(),
       kv,
+      makeStubAudit(),
     );
 
     const result = await svc.gate('override-test');
@@ -1915,6 +1922,7 @@ describe('PretestService significance gate — all-wins overfit protection (jd-f
       DEFAULT_GATEWAY,
       makeStubAgents(),
       kv,
+      makeStubAudit(),
     );
 
     const result = await svc.gate('all-wins-test');
@@ -1993,6 +2001,7 @@ describe('PretestService significance gate — all-wins overfit protection (jd-f
       DEFAULT_GATEWAY,
       makeStubAgents(),
       kv,
+      makeStubAudit(),
     );
 
     const result = await svc.gate('enough-losses-test');
@@ -2060,6 +2069,7 @@ describe('PretestService significance gate — all-wins overfit protection (jd-f
       DEFAULT_GATEWAY,
       makeStubAgents(),
       kv,
+      makeStubAudit(),
     );
 
     const result = await svc.gate('override-loss-test');
@@ -2279,6 +2289,7 @@ describe('PretestService.compare — win_rate consistency (jd-fix-3)', () => {
       DEFAULT_GATEWAY,
       makeStubAgents(),
       kv,
+      makeStubAudit(),
     );
 
     const result = await svc.compare();
@@ -2517,6 +2528,7 @@ describe('PretestService.compare gate_status (Phase 4.1.9-4.1.10)', () => {
       DEFAULT_GATEWAY,
       makeStubAgents(),
       kv,
+      makeStubAudit(),
     );
 
     const result = await svc.compare();
@@ -2609,6 +2621,7 @@ describe('PretestService.compare gate_status (Phase 4.1.9-4.1.10)', () => {
       DEFAULT_GATEWAY,
       makeStubAgents(),
       kv,
+      makeStubAudit(),
     );
 
     const result = await svc.compare();
@@ -2951,5 +2964,132 @@ describe('F4-S4 Phase 2 — PretestService.promote() — partial apply', () => {
 
     const xEntry = result.applied!.find((a) => a.plugin_id === 'plugin-x');
     expect(xEntry?.config_set).toBe(false);
+  });
+});
+
+// ── F4-S4 Hardening: gate() throw → fail-closed gate_error ───────────────────
+//
+// IMPORTANT: gate() throws (unexpected error) must NOT propagate as an unhandled
+// 500. promote() must catch, audit 'promotion_gate_blocked', and return
+// {ok:false, reason:'gate_error'} without calling activate or setConfig.
+
+describe('F4-S4 Hardening — promote() gate() throws → fail-closed gate_error', () => {
+  it('H.1 — gate() throws → promote returns {ok:false, reason:"gate_error"}; activate NOT called; setConfig NOT called', async () => {
+    const { svc, activateMock, setConfigMock } = makePromoteService({
+      gateReady: true, // will be overridden below
+      kvValues: {},
+    });
+
+    // Override the spied gate to throw instead
+    jest.spyOn(svc, 'gate').mockRejectedValue(new Error('unexpected gate failure'));
+
+    const result: PromoteResult = await svc.promote('pf-1');
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('gate_error');
+    expect(activateMock).not.toHaveBeenCalled();
+    expect(setConfigMock).not.toHaveBeenCalled();
+  });
+
+  it('H.2 — gate() throws → audit "promotion_gate_blocked" is called once', async () => {
+    const { svc, auditLogFn } = makePromoteService({
+      gateReady: true,
+      kvValues: {},
+    });
+
+    jest.spyOn(svc, 'gate').mockRejectedValue(new Error('gate internal error'));
+
+    await svc.promote('pf-1');
+
+    const blockedCalls = (auditLogFn.mock.calls as Array<[Record<string, unknown>]>).filter(
+      ([arg]) => arg['event_type'] === 'promotion_gate_blocked',
+    );
+    expect(blockedCalls).toHaveLength(1);
+  });
+
+  it('H.3 — gate not ready → activate NOT called; setConfig NOT called (existing coverage explicit)', async () => {
+    const { svc, activateMock, setConfigMock } = makePromoteService({
+      gateReady: false,
+      gateReasons: ['min_trades not met: 5 < 20'],
+      kvValues: { 'promotion.require_human_confirm': 'false' },
+    });
+
+    const result: PromoteResult = await svc.promote('pf-1');
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('gate_not_ready');
+    expect(activateMock).not.toHaveBeenCalled();
+    expect(setConfigMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── F4-S4 Hardening: _applyPlugins setConfig throws after activate succeeds ──
+//
+// IMPORTANT: activate('A') succeeds but setConfig('A') throws →
+// applied must contain {plugin_id:'A', activated:true, config_set:false}
+// AND failed must contain {plugin_id:'A', step:'setConfig', error:...}.
+// Loop must continue to next plugin. Single audit.log('pretest_promoted') call.
+
+describe('F4-S4 Hardening — _applyPlugins: activate succeeds but setConfig throws', () => {
+  it('H.4 — activate("A") ok, setConfig("A") throws → applied:{activated:true,config_set:false}; failed:{step:"setConfig"}; loop continues to "B"', async () => {
+    const portfolio: import('./pretest.service').PretestPortfolio = {
+      id: 'pf-setconfig-throw',
+      name: 'SetConfig Throw Test',
+      description: null,
+      initial_capital: 10_000,
+      plugin_ids: ['plugin-a', 'plugin-b'],
+      plugin_configs: {
+        'plugin-a': { pa: 1 },
+        'plugin-b': { pb: 2 },
+      },
+      state: makeState(),
+      run_count: 5,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+    };
+
+    const { svc, auditLogFn, activateMock, setConfigMock } = makePromoteService({
+      findOneResult: portfolio,
+      gateReady: true,
+      kvValues: { 'promotion.require_human_confirm': 'false' },
+      activateFn: (_id: string): Promise<{ id: string; active: boolean }> =>
+        Promise.resolve({ id: _id, active: true }),
+      setConfigFn: (id: string, _cfg: Record<string, unknown>): Promise<unknown> => {
+        if (id === 'plugin-a') return Promise.reject(new Error('config schema mismatch'));
+        return Promise.resolve({ id, config: {} });
+      },
+    });
+
+    const result: PromoteResult = await svc.promote('pf-setconfig-throw');
+
+    expect(result.ok).toBe(true);
+
+    // plugin-a: activate succeeded, setConfig failed
+    const aApplied = result.applied!.find((a) => a.plugin_id === 'plugin-a');
+    expect(aApplied).toBeDefined();
+    expect(aApplied!.activated).toBe(true);
+    expect(aApplied!.config_set).toBe(false);
+
+    const aFailed = result.failed!.find((f) => f.plugin_id === 'plugin-a');
+    expect(aFailed).toBeDefined();
+    expect(aFailed!.step).toBe('setConfig');
+    expect(aFailed!.error).toContain('config schema mismatch');
+
+    // plugin-b: loop continued; both activate and setConfig called
+    expect(activateMock).toHaveBeenCalledWith('plugin-b');
+    expect(setConfigMock).toHaveBeenCalledWith('plugin-b', { pb: 2 });
+
+    const bApplied = result.applied!.find((a) => a.plugin_id === 'plugin-b');
+    expect(bApplied!.activated).toBe(true);
+    expect(bApplied!.config_set).toBe(true);
+
+    // Single pretest_promoted audit event
+    const promotedCalls = (auditLogFn.mock.calls as Array<[Record<string, unknown>]>).filter(
+      ([arg]) => arg['event_type'] === 'pretest_promoted',
+    );
+    expect(promotedCalls).toHaveLength(1);
+    const meta = promotedCalls[0][0]['meta'] as Record<string, unknown>;
+    expect(meta['partial']).toBe(true);
   });
 });
