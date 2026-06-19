@@ -11,6 +11,11 @@
  *   - Cada pretest tiene su propio conjunto de plugins (no los globalmente activos)
  *   - No hay ejecución de órdenes reales en ningún caso
  *   - El objetivo es encontrar la mejor config antes del despliegue real
+ *
+ * PR1 changes: fill prices now come from ProviderGatewayService.getQuote(null,symbol).last
+ * (not from LLM tool-call args). Equity is mark-to-market (live quote per open position),
+ * not cost-basis. getQuote failures are handled gracefully: skip fill or fallback to
+ * last-known current_price / avg_price for MTM.
  */
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
@@ -18,6 +23,7 @@ import { SandboxGateway } from '../sandbox/sandbox.gateway';
 import { PluginsService, HydratedPlugin } from '../plugins/plugins.service';
 import { LlmService } from '../llm/llm.service';
 import { ContextMemoryService } from '../context-memory/context-memory.service';
+import { ProviderGatewayService } from '../providers/provider-gateway.service';
 
 export interface PretestTrade {
   ts: string;
@@ -100,6 +106,7 @@ export class PretestService {
     private readonly plugins: PluginsService,
     private readonly llm: LlmService,
     private readonly memory: ContextMemoryService,
+    private readonly gateway: ProviderGatewayService,
   ) {}
 
   // ── CRUD ─────────────────────────────────────────────────────────────────────
@@ -189,7 +196,8 @@ export class PretestService {
    * Ejecuta un ciclo de pretest para un portfolio virtual.
    * - Corre los skill plugins del pretest (no los globalmente activos)
    * - Pasa las señales al LLM en modo pretest (sin ejecución real)
-   * - Simula el fill de órdenes a precio de mercado en el estado virtual
+   * - Simula el fill de órdenes a precio de mercado real (ProviderGateway.getQuote)
+   * - Actualiza equity mark-to-market (MTM) usando quotes reales por posición
    */
   async runCycle(
     id: string,
@@ -250,11 +258,13 @@ export class PretestService {
 
     const llmResponse = await this.llm.complete({ context });
 
-    // ── Simular fills ─────────────────────────────────────────────────────────
-    const trades = this._simulateFills(llmResponse.tool_calls, portfolio.state);
+    // ── Simular fills (async: price from getQuote.last) ───────────────────────
+    const trades = await this._simulateFills(llmResponse.tool_calls, portfolio.state);
 
-    // Actualizar estado virtual
+    // Actualizar estado virtual (sync trade application, async MTM equity)
     const newState = this._applyTrades(portfolio.state, trades);
+    await this._updateEquityMetrics(newState);
+
     await this.db.pretestPortfolio.update({
       where: { id },
       data: {
@@ -321,10 +331,15 @@ export class PretestService {
 
   // ── Simulación de fills ───────────────────────────────────────────────────────
 
-  private _simulateFills(
+  /**
+   * Resolves fill prices via ProviderGateway.getQuote(null, symbol).last.
+   * LLM-fabricated args['price'] is NEVER used.
+   * On getQuote rejection: skip the trade entirely (log warning, no throw).
+   */
+  async _simulateFills(
     toolCalls: Array<{ plugin_id: string; function: string; args: Record<string, unknown> }>,
     state: PretestState,
-  ): PretestTrade[] {
+  ): Promise<PretestTrade[]> {
     const trades: PretestTrade[] = [];
     for (const tc of toolCalls) {
       const args = tc.args;
@@ -334,8 +349,18 @@ export class PretestService {
         | 'sell'
         | 'close'
         | undefined;
-      const price = args['price'] as number | undefined;
-      if (!symbol || !action || !price || !['buy', 'sell', 'close'].includes(action)) continue;
+      if (!symbol || !action || !['buy', 'sell', 'close'].includes(action)) continue;
+
+      let price: number;
+      try {
+        const quote = await this.gateway.getQuote(null, symbol);
+        price = quote.last;
+      } catch (err) {
+        this.log.warn(`Fill skipped for ${symbol}: getQuote failed — ${String(err)}`);
+        continue;
+      }
+
+      if (price <= 0) continue;
 
       const quantity = this._calcQuantity(action, symbol, price, state);
       if (quantity <= 0) continue;
@@ -375,7 +400,8 @@ export class PretestService {
       }
     }
 
-    this._updateEquityMetrics(next);
+    // Note: _updateEquityMetrics is now async and must be awaited by callers (runCycle).
+    // It is NOT called here — callers must await _updateEquityMetrics(state) after this.
     return next;
   }
 
@@ -413,13 +439,48 @@ export class PretestService {
     if (pos.quantity <= 0) state.positions.splice(posIdx, 1);
   }
 
-  private _updateEquityMetrics(state: PretestState): void {
-    const posValue = state.positions.reduce((sum, p) => sum + p.avg_price * p.quantity, 0);
+  /**
+   * Mark-to-market equity: for each open position fetch live quote and compute
+   * current_price + unrealized_pnl. Falls back to last-known current_price
+   * (or avg_price if no current_price) on getQuote rejection.
+   * Never throws — failures are logged as warnings.
+   */
+  async _updateEquityMetrics(state: PretestState): Promise<void> {
+    await Promise.all(
+      state.positions.map(async (pos) => {
+        let marketPrice: number;
+        try {
+          const quote = await this.gateway.getQuote(null, pos.symbol);
+          marketPrice = quote.last;
+        } catch (err) {
+          // Fallback: use last-known current_price if available, else avg_price (cost basis)
+          marketPrice = pos.current_price ?? pos.avg_price;
+          this.log.warn(
+            `MTM fallback for ${pos.symbol}: using ${marketPrice} — getQuote failed: ${String(err)}`,
+          );
+        }
+
+        pos.current_price = marketPrice;
+        pos.unrealized_pnl = (marketPrice - pos.avg_price) * pos.quantity;
+      }),
+    );
+
+    // MTM equity = cash + Σ(current_price * quantity) for all open positions
+    const posValue = state.positions.reduce(
+      (sum, p) => sum + (p.current_price ?? p.avg_price) * p.quantity,
+      0,
+    );
     state.equity = state.cash + posValue;
-    if (state.equity > state.max_equity) state.max_equity = state.equity;
+
+    if (state.equity > state.max_equity) {
+      state.max_equity = state.equity;
+    }
+
     const dd =
       state.max_equity > 0 ? ((state.max_equity - state.equity) / state.max_equity) * 100 : 0;
-    if (dd > state.max_drawdown_pct) state.max_drawdown_pct = dd;
+    if (dd > state.max_drawdown_pct) {
+      state.max_drawdown_pct = dd;
+    }
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────────
