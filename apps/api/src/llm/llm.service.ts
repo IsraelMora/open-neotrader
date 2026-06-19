@@ -4,6 +4,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { PluginsService } from '../plugins/plugins.service';
 import { buildSubscriptionArgs } from './subscription-args';
+import { parseToolCalls } from './kernel-parser';
 
 /** Petición al LLM: contexto del ciclo y prompt de sistema opcional. */
 export interface LlmRequest {
@@ -120,12 +121,24 @@ export class LlmService {
   /** Envía el contexto al LLM activo e inyecta los skills upfront. Selecciona el backend automáticamente. */
   async complete(req: LlmRequest): Promise<LlmResponse> {
     const useSubscription = await this.plugins.isExtraActive('claude-subscription');
-    if (useSubscription || this._backend === 'subscription')
-      return this.completeViaSubscription(req);
-    if (this._backend === 'openai') return this.completeViaOpenAi(req);
-    if (this._backend === 'gemini') return this.completeViaGemini(req);
-    if (this._backend === 'custom') return this.completeViaCustom(req);
-    return this.completeViaApi(req);
+
+    let res: LlmResponse;
+    if (useSubscription || this._backend === 'subscription') {
+      res = await this.completeViaSubscription(req);
+    } else if (this._backend === 'openai') {
+      res = await this.completeViaOpenAi(req);
+    } else if (this._backend === 'gemini') {
+      res = await this.completeViaGemini(req);
+    } else if (this._backend === 'custom') {
+      res = await this.completeViaCustom(req);
+    } else {
+      res = await this.completeViaApi(req);
+    }
+
+    // Parse tool_calls from the response text exactly once, backend-agnostically.
+    res.tool_calls = parseToolCalls(res.text);
+
+    return res;
   }
 
   private get model(): string {
