@@ -313,8 +313,66 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
           run_count: cfg.run_count + 1,
         }),
       );
+
+      // After a successful cycle, check if it's time to trigger a reflection turn.
+      // Route via PanelService.reflectNow() — reusing the existing scheduler→panel edge
+      // to avoid any circular module dependency (do NOT inject AgentsService here directly).
+      await this._maybeReflect();
     } catch (err) {
       await this.handleTickError(err, cb);
+    }
+  }
+
+  /**
+   * Checks the reflection cadence and triggers a reflection via PanelService.reflectNow()
+   * if the counter has reached the configured threshold.
+   *
+   * Config (KV key "reflection" JSON): { every_n_cycles: number }  default: 10
+   * Counter (KV key "reflection.cycle_counter"): integer string, default "0"
+   *
+   * Routing via panel.reflectNow() avoids injecting AgentsService into the scheduler
+   * (which would risk circular module dependency). The scheduler→panel edge already exists.
+   */
+  private async _maybeReflect(): Promise<void> {
+    // Skip if a cycle is still in progress (runCycle is fire-and-forget; panel tracks the flag).
+    if (this.panel.getRunStatus().running) {
+      return;
+    }
+
+    // Read cadence config.
+    const REFLECTION_CADENCE_DEFAULT = 10;
+    let everyNCycles = REFLECTION_CADENCE_DEFAULT;
+    try {
+      const raw = await this.store.get('reflection');
+      if (raw) {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        const configured = parsed['every_n_cycles'];
+        if (typeof configured === 'number') {
+          everyNCycles = configured;
+        }
+      }
+    } catch {
+      everyNCycles = REFLECTION_CADENCE_DEFAULT;
+    }
+
+    // 0 = disabled.
+    if (everyNCycles === 0) return;
+
+    // Read and increment counter.
+    const rawCounter = await this.store.get('reflection.cycle_counter');
+    const counter = (parseInt(rawCounter ?? '0', 10) || 0) + 1;
+
+    if (counter >= everyNCycles) {
+      // Threshold reached: reset counter and trigger reflection.
+      await this.store.set('reflection.cycle_counter', '0');
+      try {
+        await this.panel.reflectNow();
+      } catch (err: unknown) {
+        // Log but don't propagate — reflection failure must not disrupt the cycle scheduler.
+        this.log.warn(`_maybeReflect: panel.reflectNow() error — ${String(err)}`);
+      }
+    } else {
+      await this.store.set('reflection.cycle_counter', String(counter));
     }
   }
 
