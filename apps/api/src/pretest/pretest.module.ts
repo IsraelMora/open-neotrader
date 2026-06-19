@@ -6,9 +6,17 @@ import { SandboxModule } from '../sandbox/sandbox.module';
 import { PluginsModule } from '../plugins/plugins.module';
 import { LlmModule } from '../llm/llm.module';
 import { ContextMemoryModule } from '../context-memory/context-memory.module';
+import { ProvidersModule } from '../providers/providers.module';
 
 @Module({
-  imports: [PrismaModule, SandboxModule, PluginsModule, LlmModule, ContextMemoryModule],
+  imports: [
+    PrismaModule,
+    SandboxModule,
+    PluginsModule,
+    LlmModule,
+    ContextMemoryModule,
+    ProvidersModule,
+  ],
   providers: [PretestService],
   controllers: [PretestController],
   exports: [PretestService],
