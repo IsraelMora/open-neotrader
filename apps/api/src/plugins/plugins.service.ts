@@ -321,6 +321,54 @@ export class PluginsService implements OnApplicationBootstrap {
     return tools;
   }
 
+  /**
+   * Returns the decision prompt from the single active plugin that declares a [decision] manifest
+   * section. Behavior:
+   *   - 0 active decision plugins → null (no log)
+   *   - 1 active decision plugin  → prompt string verbatim (prompt wins over prompt_file)
+   *   - >1 active decision plugins → null + Logger.error("[CRITICAL] ...")
+   * Never throws.
+   */
+  async getActiveDecisionPrompt(): Promise<string | null> {
+    try {
+      const active = await this.findActive();
+      const decisionPlugins = active.filter((p) => {
+        const manifest = this.getManifest(p.installed_path);
+        return manifest?.decision && (manifest.decision.prompt || manifest.decision.prompt_file);
+      });
+
+      if (decisionPlugins.length === 0) return null;
+
+      if (decisionPlugins.length > 1) {
+        const ids = decisionPlugins.map((p) => p.id).join(', ');
+        this.log.error(
+          `[CRITICAL] multiple decision plugins active: ${ids}. No decision prompt injected this cycle.`,
+        );
+        return null;
+      }
+
+      // Exactly one.
+      const plugin = decisionPlugins[0];
+      const manifest = this.getManifest(plugin.installed_path)!;
+      const decision = manifest.decision!;
+
+      if (decision.prompt) return decision.prompt;
+
+      if (decision.prompt_file && plugin.installed_path) {
+        const safeName = path.basename(decision.prompt_file);
+        try {
+          return fs.readFileSync(path.join(plugin.installed_path, safeName), 'utf8');
+        } catch {
+          return null;
+        }
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Devuelve los tools.json de un plugin específico. */
   async getPluginTools(id: string): Promise<ProviderTool[]> {
     const p = await this.findById(id);
