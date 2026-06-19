@@ -310,6 +310,35 @@ describe('PluginManifest llm_writable field', () => {
   });
 });
 
+// ── s2 Task 1.3: PluginManifest.reflection capability block type test ────────
+
+describe('PluginManifest reflection block', () => {
+  it('s2-1.3 — compiles with reflection: { prompt } and is accessible as typed optional', () => {
+    // Compile-time gate: tsc will reject this if the 'reflection' block is not on PluginManifest.
+    const manifest: PluginManifest = {
+      plugin: { id: 'reflect-plugin', name: 'Reflector', version: '1.0.0', type: 'skill' },
+      reflection: { prompt: 'Analyze your recent decisions.' },
+    };
+    // Runtime: the field must be accessible
+    expect(manifest.reflection?.prompt).toBe('Analyze your recent decisions.');
+  });
+
+  it('s2-1.3 — compiles with reflection: { prompt_file } only', () => {
+    const manifest: PluginManifest = {
+      plugin: { id: 'reflect-file', name: 'Reflector File', version: '1.0.0', type: 'skill' },
+      reflection: { prompt_file: 'REFLECT.md' },
+    };
+    expect(manifest.reflection?.prompt_file).toBe('REFLECT.md');
+  });
+
+  it('s2-1.3 — is undefined when omitted (absent means no reflection capability)', () => {
+    const manifest: PluginManifest = {
+      plugin: { id: 'no-reflect', name: 'No Reflect', version: '1.0.0', type: 'skill' },
+    };
+    expect(manifest.reflection).toBeUndefined();
+  });
+});
+
 // ── Phase 2.1: writeSkillGuarded unit tests ───────────────────────────────────
 
 describe('PluginsService.writeSkillGuarded', () => {

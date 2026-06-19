@@ -80,6 +80,11 @@ export interface PluginManifest {
     prompt?: string;
     prompt_file?: string;
   };
+  /** Optional reflection capability: supplies the reflection policy prompt for runReflectionTurn. */
+  reflection?: {
+    prompt?: string;
+    prompt_file?: string;
+  };
 }
 
 // ── Parser ─────────────────────────────────────────────────────────────────────
