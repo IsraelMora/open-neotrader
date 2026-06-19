@@ -9,7 +9,9 @@ export type AuditEventType =
   | 'decision'
   | 'plugin_activate'
   | 'plugin_deactivate'
-  | 'credential_set';
+  | 'credential_set'
+  | 'tool_call_dropped'
+  | 'parse_miss';
 
 export interface AuditPayload {
   cycle_id?: string;

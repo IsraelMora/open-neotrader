@@ -67,6 +67,11 @@ export interface PluginManifest {
   hooks?: HooksSpec;
   permissions?: PermissionsSpec;
   stack?: StackSpec;
+  /** Optional decision capability: supplies the decision prompt for LLM system prompt injection. */
+  decision?: {
+    prompt?: string;
+    prompt_file?: string;
+  };
 }
 
 // ── Parser ─────────────────────────────────────────────────────────────────────
