@@ -91,20 +91,20 @@ describe('PluginsController — GET :id/trust-report (F3-s1)', () => {
   afterEach(() => jest.clearAllMocks());
 
   it('f3s1-4.5 — GET /plugins/:id/trust-report with stored scan_result → returns { scan_result: {...} }', async () => {
-    svc.getTrustReport.mockResolvedValue({ scan_result: STORED_SCAN });
+    svc.getTrustReport.mockResolvedValue({ scan_result: STORED_SCAN, smoke_test_result: null });
 
     const result = await controller.trustReport('my-plugin');
 
     expect(svc.getTrustReport).toHaveBeenCalledWith('my-plugin');
-    expect(result).toEqual({ scan_result: STORED_SCAN });
+    expect(result).toEqual({ scan_result: STORED_SCAN, smoke_test_result: null });
   });
 
   it('f3s1-4.6 — GET /plugins/:id/trust-report with null scan_result → returns { scan_result: null }', async () => {
-    svc.getTrustReport.mockResolvedValue({ scan_result: null });
+    svc.getTrustReport.mockResolvedValue({ scan_result: null, smoke_test_result: null });
 
     const result = await controller.trustReport('unscanned-plugin');
 
     expect(svc.getTrustReport).toHaveBeenCalledWith('unscanned-plugin');
-    expect(result).toEqual({ scan_result: null });
+    expect(result).toEqual({ scan_result: null, smoke_test_result: null });
   });
 });
