@@ -114,3 +114,25 @@ def test_max_messages_per_cycle_caps_intents():
     assert len(intents) <= 2, (
         f"Expected at most 2 intents due to max_messages_per_cycle=2, got: {len(intents)}"
     )
+
+
+# ── Missing confidence key: no crash, signal is skipped ───────────────────────
+
+def test_signal_without_confidence_is_skipped_no_crash():
+    """Signal entry missing 'confidence' key defaults to 0.0 → filtered out, no exception."""
+    mod = _load_on_cycle()
+
+    ctx = {
+        "signals": [
+            {"symbol": "ETH", "action": "buy"},  # no 'confidence' key
+        ],
+        "plugin_config": {"min_confidence": 0.7, "max_messages_per_cycle": 10},
+    }
+
+    result = mod.on_cycle(ctx)
+
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}"
+    intents = result.get("notify_intents", [])
+    assert len(intents) == 0, (
+        f"Signal without confidence must be skipped (treated as 0.0), got intents: {intents}"
+    )
