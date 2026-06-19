@@ -187,9 +187,18 @@ export class PluginsController {
   }
 
   @Get(':id/trust-report')
-  @ApiOperation({ summary: 'F3-s1: Get current trust report (scan_result) for a plugin' })
+  @ApiOperation({
+    summary:
+      'F3-s1/s2/s3: Get current trust report (scan_result, smoke_test_result, reputation_score) for a plugin',
+  })
   trustReport(@Param('id') id: string) {
     return this.svc.getTrustReport(id);
+  }
+
+  @Get(':id/reputation')
+  @ApiOperation({ summary: 'F3-s3: Get persisted reputation score for a plugin (null = unrated)' })
+  reputation(@Param('id') id: string) {
+    return this.svc.getReputation(id);
   }
 
   @Delete(':id')
