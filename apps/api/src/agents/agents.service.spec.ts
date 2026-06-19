@@ -724,6 +724,152 @@ describe('AgentsService._executeCycle — findActive called exactly once per cyc
   });
 });
 
+// ── PR3: _validateToolCalls with virtual_only guard ───────────────────────────
+
+/**
+ * callValidateVirtual — calls _validateToolCalls with virtual_only + preloadedActivePlugins.
+ * Used for PR3 tests where activePlugins must be pre-loaded (virtual_only guard reads .type).
+ */
+async function callValidateVirtual(
+  service: AgentsService,
+  cycleId: string,
+  calls: ToolCallRequest[],
+  virtualOnly: boolean,
+  activePlugins: import('../plugins/plugins.service').HydratedPlugin[],
+): Promise<ToolCallRequest[]> {
+  return (
+    service as unknown as {
+      _validateToolCalls: (
+        c: string,
+        t: ToolCallRequest[],
+        hoistedTools: undefined,
+        preloadedActivePlugins: import('../plugins/plugins.service').HydratedPlugin[],
+        virtualOnly: boolean,
+      ) => Promise<ToolCallRequest[]>;
+    }
+  )._validateToolCalls(cycleId, calls, undefined, activePlugins, virtualOnly);
+}
+
+describe('AgentsService._validateToolCalls — virtual_only guard (PR3)', () => {
+  const CYCLE_ID = 'virtual-test-001';
+
+  it('3.1.1 — virtual_only:true + provider plugin → call dropped + audit virtual_mode_provider_blocked', async () => {
+    const providerPlugin = { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' };
+    const plugins = makePlugins(['alpaca-provider'], ['alpaca-provider__place_order']);
+    (plugins.findActive as jest.Mock).mockResolvedValue([providerPlugin]);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'alpaca-provider', function: 'place_order', args: { symbol: 'AAPL' } },
+    ];
+
+    const result = await callValidateVirtual(service, CYCLE_ID, calls, true, [
+      providerPlugin,
+    ] as import('../plugins/plugins.service').HydratedPlugin[]);
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cycle_id: CYCLE_ID,
+        event_type: 'tool_call_dropped',
+        plugin_id: 'alpaca-provider',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ reason: 'virtual_mode_provider_blocked' }),
+      }),
+    );
+  });
+
+  it('3.1.2 — virtual_only:true + extra-type plugin → NOT dropped by virtual guard', async () => {
+    const extraPlugin = { id: 'backtester', type: 'extra', name: 'Backtester' };
+    const plugins = makePlugins(['backtester'], ['backtester__run']);
+    (plugins.findActive as jest.Mock).mockResolvedValue([extraPlugin]);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [{ plugin_id: 'backtester', function: 'run', args: {} }];
+
+    const result = await callValidateVirtual(service, CYCLE_ID, calls, true, [
+      extraPlugin,
+    ] as import('../plugins/plugins.service').HydratedPlugin[]);
+
+    // Should pass the virtual guard and reach active/declared checks → valid
+    expect(result).toHaveLength(1);
+    expect(result[0].plugin_id).toBe('backtester');
+  });
+
+  it('3.1.3 — virtual_only:false + provider plugin → behavior unchanged (no provider block)', async () => {
+    const providerPlugin = { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' };
+    const plugins = makePlugins(['alpaca-provider'], ['alpaca-provider__place_order']);
+    (plugins.findActive as jest.Mock).mockResolvedValue([providerPlugin]);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'alpaca-provider', function: 'place_order', args: { symbol: 'AAPL' } },
+    ];
+
+    const result = await callValidateVirtual(service, CYCLE_ID, calls, false, [
+      providerPlugin,
+    ] as import('../plugins/plugins.service').HydratedPlugin[]);
+
+    // virtual_only is false → provider passes through validation normally
+    expect(result).toHaveLength(1);
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ reason: 'virtual_mode_provider_blocked' }),
+      }),
+    );
+  });
+});
+
+describe('AgentsService.runGovernedTurn — pretest source (PR3)', () => {
+  it('3.1.4 — source:pretest + virtual_only:true → emits pretest_turn audit event', async () => {
+    const llm = makeLlm('pretest response');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    await service.runGovernedTurn({
+      source: 'pretest',
+      context: 'Evaluate pretest signals',
+      virtual_only: true,
+    });
+
+    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const pretestTurnCall = calls.find(([arg]) => arg['event_type'] === 'pretest_turn');
+    expect(pretestTurnCall).toBeDefined();
+    expect(pretestTurnCall![0]).toMatchObject({
+      event_type: 'pretest_turn',
+    });
+  });
+
+  it('3.1.5 — existing callers without source field compile and behave unchanged', async () => {
+    // source is now optional with a default — existing callers pass no source and get cycle behavior
+    const llm = makeLlm('cycle response');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    // TypeScript: source should be optional (no TS error when omitted) — no source passed here
+    const result = await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'cycle context',
+    });
+
+    expect(result.text).toBe('cycle response');
+    // No pretest_turn audit for a cycle source
+    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const pretestTurnCall = calls.find(([arg]) => arg['event_type'] === 'pretest_turn');
+    expect(pretestTurnCall).toBeUndefined();
+  });
+});
+
 // ── Fix #4: veto ordering — LLM sees only post-veto signals ──────────────────
 
 describe('AgentsService._executeCycle — veto ordering: LLM sees only post-veto signals', () => {

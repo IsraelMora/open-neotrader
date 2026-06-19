@@ -11,6 +11,7 @@ import type { SandboxGateway } from '../sandbox/sandbox.gateway';
 import type { PluginsService } from '../plugins/plugins.service';
 import type { LlmService } from '../llm/llm.service';
 import type { ContextMemoryService } from '../context-memory/context-memory.service';
+import type { AgentsService } from '../agents/agents.service';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -59,13 +60,13 @@ function makeRejectingGateway(
   } as unknown as jest.Mocked<Pick<ProviderGatewayService, 'getQuote'>> & ProviderGatewayService;
 }
 
-function makeService(gateway: ProviderGatewayService): PretestService {
+function makeService(gateway: ProviderGatewayService, agents?: AgentsService): PretestService {
   const db = {} as unknown as PrismaService;
   const sandbox = {} as unknown as SandboxGateway;
   const plugins = {} as unknown as PluginsService;
   const llm = {} as unknown as LlmService;
   const memory = {} as unknown as ContextMemoryService;
-  return new PretestService(db, sandbox, plugins, llm, memory, gateway);
+  return new PretestService(db, sandbox, plugins, llm, memory, gateway, agents);
 }
 
 // ── Phase 1.1: RED tests — fills use getQuote.last ────────────────────────────
@@ -937,6 +938,27 @@ describe('PretestService.runCycle — __pretest_policy__ exclusion (fix 3)', () 
 
     const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
 
+    const mockAgents = {
+      runGovernedTurn: jest.fn().mockResolvedValue({
+        cycle_id: 'fix3-cycle',
+        text: '',
+        tool_calls: [],
+        decisions: [],
+        sandbox_results: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+        llm_response: {
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        },
+        signalsEmitted: [],
+      }),
+    } as unknown as import('../agents/agents.service').AgentsService;
+
     const svc = new (await import('./pretest.service')).PretestService(
       db,
       sandbox,
@@ -944,6 +966,7 @@ describe('PretestService.runCycle — __pretest_policy__ exclusion (fix 3)', () 
       llm,
       memory,
       gateway,
+      mockAgents,
     );
 
     await svc.runCycle('port-1');
@@ -1184,5 +1207,102 @@ describe('PretestService._calcQuantity — commission-aware sizing (fix 5)', () 
       expect(trades).toHaveLength(1);
       expect(trades[0].quantity).toBe(5); // floor(500/100) = 5, unchanged
     });
+  });
+});
+
+// ── PR3 (3.1.6): PretestService.runCycle calls agents.runGovernedTurn ─────────
+//
+// PretestService must use agents.runGovernedTurn({source:'pretest', virtual_only:true})
+// instead of llm.complete(). llm.complete must NEVER be called from PretestService.runCycle.
+
+describe('PretestService.runCycle — uses agents.runGovernedTurn (PR3)', () => {
+  it('3.1.6 — runCycle calls agents.runGovernedTurn with source:pretest + virtual_only:true; llm.complete is never called', async () => {
+    const PORTFOLIO_ID = 'portfolio-pr3';
+
+    const governedTurnResult = {
+      cycle_id: 'cycle-pr3',
+      text: 'pretest llm analysis',
+      tool_calls: [],
+      decisions: [],
+      sandbox_results: [],
+      backend: 'api' as const,
+      skills_read: [],
+      skills_written: [],
+      llm_response: {
+        text: '',
+        tool_calls: [],
+        backend: 'api' as const,
+        skills_read: [],
+        skills_written: [],
+      },
+      signalsEmitted: [],
+    };
+
+    const mockAgents = {
+      runGovernedTurn: jest.fn().mockResolvedValue(governedTurnResult),
+    } as unknown as AgentsService;
+
+    const mockLlm = {
+      complete: jest.fn().mockResolvedValue({ text: '', tool_calls: [], backend: 'api' }),
+    } as unknown as LlmService;
+
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', 150)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = { findActive: jest.fn().mockResolvedValue([]) } as unknown as PluginsService;
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+    } as unknown as SandboxGateway;
+
+    const portfolioRow = {
+      id: PORTFOLIO_ID,
+      name: 'PR3 Portfolio',
+      description: null,
+      initial_capital: 10000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify({
+        equity: 10000,
+        cash: 10000,
+        positions: [],
+        trades: [],
+        max_equity: 10000,
+        max_drawdown_pct: 0,
+        realized_pnl: 0,
+        win_trades: 0,
+        loss_trades: 0,
+      }),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        update: jest.fn().mockResolvedValue(portfolioRow),
+      },
+    } as unknown as PrismaService;
+
+    // Build service with both llm AND agents injected
+    const svc = new PretestService(db, sandbox, plugins, mockLlm, memory, gateway, mockAgents);
+
+    await svc.runCycle(PORTFOLIO_ID);
+
+    // agents.runGovernedTurn must have been called with source:'pretest' and virtual_only:true
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(mockAgents.runGovernedTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: 'pretest',
+        virtual_only: true,
+      }),
+    );
+
+    // llm.complete must NEVER be called from PretestService
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(mockLlm.complete).not.toHaveBeenCalled();
   });
 });
