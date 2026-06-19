@@ -8,6 +8,8 @@ import {
   Body,
   HttpCode,
   HttpStatus,
+  UseGuards,
+  ConflictException,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import {
@@ -23,6 +25,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { PretestService } from './pretest.service';
+import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 
 class CreatePretestDto {
   @IsString()
@@ -81,6 +84,13 @@ class RunCycleDto {
   @IsString()
   @MaxLength(4000)
   system_prompt?: string;
+}
+
+/** DTO for POST /pretest/:id/promote — operator confirm flag. */
+class PromotePretestDto {
+  @IsOptional()
+  @IsBoolean()
+  confirm?: boolean;
 }
 
 /** Endpoints de portfolios virtuales de pretest: CRUD, ejecución de ciclos y comparativa de rendimiento. */
@@ -161,5 +171,26 @@ export class PretestController {
   @ApiOperation({ summary: 'Eliminar un portfolio de pretest' })
   delete(@Param('id') id: string) {
     return this.svc.delete(id);
+  }
+
+  /**
+   * Promotes a gate-ready pretest portfolio to live.
+   * Requires TOTP second factor — this operation activates real trading plugins.
+   *
+   * Response:
+   *  - 409 ConflictException: gate not ready (state precondition not met).
+   *  - 200 {ok:false, reason:'needs_confirmation', pending}: human confirm required.
+   *  - 200 {ok:true, applied, failed}: promotion applied (partial or full).
+   */
+  @Post(':id/promote')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TotpRequiredGuard)
+  @ApiOperation({ summary: 'Promote a gate-ready pretest portfolio to live (requires TOTP)' })
+  async promote(@Param('id') id: string, @Body() dto: PromotePretestDto) {
+    const result = await this.svc.promote(id, { confirm: dto.confirm });
+    if (result.reason === 'gate_not_ready') {
+      throw new ConflictException(result);
+    }
+    return result;
   }
 }

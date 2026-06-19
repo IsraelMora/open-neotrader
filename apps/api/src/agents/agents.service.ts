@@ -1,4 +1,11 @@
-import { Injectable, Logger, Optional, Inject, forwardRef } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  Optional,
+  Inject,
+  forwardRef,
+  NotFoundException,
+} from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { LlmService } from '../llm/llm.service';
 import { SandboxGateway } from '../sandbox/sandbox.gateway';
@@ -170,6 +177,28 @@ const KERNEL_RUN_PRETEST_COMPARE_TOOL: import('../plugins/plugins.service').Prov
 };
 
 /**
+ * Schema definition for the kernel__promote_pretest tool.
+ * Injected into the LLM tool schema ONLY when source === 'reflection'.
+ * Calls PretestService.promote() WITHOUT confirm, so with require_human_confirm=true (default)
+ * the LLM always lands in needs_confirmation and CANNOT auto-apply to live.
+ * Only a TOTP-authenticated REST call with confirm:true can actually apply.
+ */
+const KERNEL_PROMOTE_PRETEST_TOOL: import('../plugins/plugins.service').ProviderTool = {
+  plugin_id: 'kernel',
+  name: 'kernel__promote_pretest',
+  description:
+    'Requests promotion of a gate-ready pretest to live. Requires human confirmation by default; the LLM can only request, never auto-deploy.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      pretest_id: { type: 'string' },
+      rationale: { type: 'string' },
+    },
+    required: ['pretest_id'],
+  },
+};
+
+/**
  * Maximum number of active pretest portfolios allowed. Enforced at dispatch time by
  * counting all portfolios via PretestService.findAll() before calling create().
  * Bounds parallel simulation cost and prevents LLM-driven portfolio explosion.
@@ -185,6 +214,7 @@ const KERNEL_TOOL_REGISTRY: Set<string> = new Set([
   'write_skill',
   'create_pretest_variant',
   'run_pretest_compare',
+  'promote_pretest',
 ]);
 
 /** Orquesta el ciclo completo del agente: memoria, hooks de plugins, capa de veto, LLM y ejecución de tool calls. */
@@ -262,6 +292,7 @@ export class AgentsService {
             KERNEL_WRITE_SKILL_TOOL,
             KERNEL_CREATE_PRETEST_VARIANT_TOOL,
             KERNEL_RUN_PRETEST_COMPARE_TOOL,
+            KERNEL_PROMOTE_PRETEST_TOOL,
           ]
         : [];
     const effectiveTools = [...providerTools, ...kernelTools];
@@ -829,6 +860,8 @@ export class AgentsService {
       await this._kernelCreatePretestVariant(cycle_id, tc, decisions, sandbox_results);
     } else if (tc.function === 'run_pretest_compare') {
       await this._kernelRunPretestCompare(cycle_id, tc, decisions, sandbox_results);
+    } else if (tc.function === 'promote_pretest') {
+      await this._kernelPromotePretest(cycle_id, tc, decisions, sandbox_results);
     } else {
       this.log.warn(`_dispatchKernelTool: unknown kernel function '${tc.function}' — dropped`);
       decisions.push({ ...tc, allowed: false, reason: 'unknown_kernel_tool' });
@@ -978,6 +1011,78 @@ export class AgentsService {
           gate_status: p.gate_status,
         })),
       },
+    });
+  }
+
+  /**
+   * Handles kernel__promote_pretest dispatch.
+   * Calls PretestService.promote(pretest_id) WITHOUT confirm — so with default
+   * require_human_confirm=true the LLM always gets needs_confirmation and CANNOT auto-apply.
+   * NEVER calls sandbox (kernel bypass). Catches NotFoundException → ok:false error:'not_found'.
+   */
+  private async _kernelPromotePretest(
+    cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+  ): Promise<void> {
+    // 1. Pretest-unavailable guard (same shape as s3 helpers).
+    if (!this.pretest) {
+      decisions.push({ ...tc, allowed: false, reason: 'pretest_unavailable' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'pretest_unavailable',
+      });
+      return;
+    }
+
+    // 2. Coerce and validate pretest_id.
+    const rawId = tc.args['pretest_id'];
+    const pretest_id = typeof rawId === 'string' ? rawId : '';
+    if (!pretest_id) {
+      decisions.push({ ...tc, allowed: false, reason: 'invalid_promote_args' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'invalid_promote_args',
+      });
+      return;
+    }
+
+    // 3. Audit the LLM's intent BEFORE calling promote (intent is always recorded).
+    const rationale = typeof tc.args['rationale'] === 'string' ? tc.args['rationale'] : undefined;
+    await this.audit.log({
+      cycle_id,
+      event_type: 'pretest_promote_requested',
+      meta: { pretest_id, rationale },
+    });
+
+    // 4. Call promote() WITHOUT confirm — safety: LLM cannot auto-apply with default config.
+    let result: import('../pretest/pretest.service').PromoteResult;
+    try {
+      result = await this.pretest.promote(pretest_id);
+    } catch (err: unknown) {
+      const isNotFound = err instanceof NotFoundException;
+      decisions.push({ ...tc, allowed: false, reason: isNotFound ? 'not_found' : String(err) });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: isNotFound ? 'not_found' : String(err),
+      });
+      return;
+    }
+
+    // 5. Push result to decisions and sandbox_results. NEVER calls sandbox.
+    decisions.push({ ...tc, allowed: result.ok });
+    sandbox_results.push({
+      plugin_id: 'kernel',
+      function: tc.function,
+      ok: result.ok,
+      result,
     });
   }
 

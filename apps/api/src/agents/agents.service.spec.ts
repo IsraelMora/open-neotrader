@@ -3697,3 +3697,292 @@ describe('F4-S3 Task 1.7 — source-gate regression: new kernel tools dropped in
     );
   });
 });
+
+// ── F4-S4 Phase 3 — kernel__promote_pretest ──────────────────────────────────
+
+/** Extend PretestMock with a promote() mock */
+function makePretestMockWithPromote(opts: {
+  findAllLength?: number;
+  promoteResult?: import('../pretest/pretest.service').PromoteResult;
+  promoteShouldThrow?: Error;
+  compareResult?: Partial<import('../pretest/pretest.service').PretestCompare>;
+}) {
+  const base = makePretestMock({
+    findAllLength: opts.findAllLength ?? 0,
+    compareResult: opts.compareResult ?? undefined,
+  });
+  const promote = opts.promoteShouldThrow
+    ? jest.fn().mockRejectedValue(opts.promoteShouldThrow)
+    : jest.fn().mockResolvedValue(
+        opts.promoteResult ?? {
+          ok: false,
+          reason: 'needs_confirmation',
+          pending: { plugin_ids: ['p1'], plugin_configs: {} },
+        },
+      );
+  return { ...base, promote };
+}
+
+/** Reuses makeServiceWithPretest — same signature, just accepts promote-extended mock. */
+const makeServiceWithPretestPromote = (
+  auditMock: ReturnType<typeof makeAudit>,
+  pretestMock: ReturnType<typeof makePretestMockWithPromote>,
+  sandboxMock?: ReturnType<typeof makeSandbox>,
+): AgentsService => makeServiceWithPretest(auditMock, pretestMock, sandboxMock);
+
+describe('F4-S4 Phase 3 — parseToolCalls split: kernel__promote_pretest', () => {
+  it('3.1 — kernel__promote_pretest parses to {plugin_id:"kernel", function:"promote_pretest"}', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"kernel__promote_pretest","args":{"pretest_id":"pf-1"}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('emit tools.', []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const logCalls: Array<[Record<string, unknown>]> = [];
+    (audit.log as jest.Mock).mockImplementation((arg: Record<string, unknown>) => {
+      logCalls.push([arg]);
+      return Promise.resolve(undefined);
+    });
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    const droppedCall = logCalls.find(
+      ([arg]) => arg['event_type'] === 'tool_call_dropped' && arg['plugin_id'] === 'kernel',
+    );
+    expect(droppedCall).toBeDefined();
+    const meta = droppedCall![0]['meta'] as Record<string, unknown>;
+    expect(meta['function']).toBe('promote_pretest');
+  });
+});
+
+describe('F4-S4 Phase 3 — reflection: kernel__promote_pretest in effectiveTools', () => {
+  function buildCapturingService(capturedSchema: { tools: string }[]): AgentsService {
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+        const sp = opts.system_prompt ?? '';
+        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+        capturedSchema.push({ tools: match ? match[1] : '' });
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api' as const,
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+    const plugins = makeFullPlugins('Use tools via JSON.', []);
+    return new AgentsService(
+      llm as unknown as LlmService,
+      makeSandbox() as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      makeMemory() as unknown as ContextMemoryService,
+      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+  }
+
+  it('3.2 — source:reflection → kernel__promote_pretest in effectiveTools; 4 kernel tools total', async () => {
+    const captured: { tools: string }[] = [];
+    const service = buildCapturingService(captured);
+
+    await service.runGovernedTurn({ source: 'reflection' as const, context: 'x' });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).toContain('kernel__promote_pretest');
+    expect(captured[0].tools).toContain('kernel__write_skill');
+    expect(captured[0].tools).toContain('kernel__create_pretest_variant');
+    expect(captured[0].tools).toContain('kernel__run_pretest_compare');
+  });
+
+  it('3.3 — source:chat → kernel__promote_pretest NOT in effectiveTools', async () => {
+    const captured: { tools: string }[] = [];
+    const service = buildCapturingService(captured);
+
+    await service.runGovernedTurn({ source: 'chat', context: 'x' });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).not.toContain('kernel__promote_pretest');
+  });
+});
+
+describe('F4-S4 Phase 3 — _dispatchKernelTool: promote_pretest', () => {
+  const CYCLE_ID = 's4-promote-001';
+
+  it('3.4 — LLM cannot auto-apply by default: dispatch promote_pretest → promote() called WITHOUT confirm → needs_confirmation; activate/setConfig NOT called', async () => {
+    const audit = makeAudit();
+    const pretest = makePretestMockWithPromote({
+      promoteResult: {
+        ok: false,
+        reason: 'needs_confirmation',
+        pending: { plugin_ids: ['p1'], plugin_configs: {} },
+      },
+    });
+    const sandbox = makeSandbox();
+    const service = makeServiceWithPretestPromote(audit, pretest, sandbox);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'promote_pretest',
+      args: { pretest_id: 'pf-abc', rationale: 'gate passed' },
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await callDispatchKernelTool(service, CYCLE_ID, tc, decisions, sandboxResults);
+
+    // promote() called WITHOUT opts.confirm
+    expect(pretest.promote).toHaveBeenCalledWith('pf-abc');
+    expect(pretest.promote).not.toHaveBeenCalledWith(
+      'pf-abc',
+      expect.objectContaining({ confirm: true }),
+    );
+
+    // audit pretest_promote_requested emitted
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_promote_requested' }),
+    );
+
+    // result is needs_confirmation — no activate/setConfig (sandbox NOT called)
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+  });
+
+  it('3.5 — pretest unavailable: allowed:false reason:pretest_unavailable; no throw', async () => {
+    const audit = makeAudit();
+    // Build service WITHOUT pretest (undefined)
+    const sandbox = makeSandbox();
+    const serviceNoPretest = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+    ) => AgentsService)(
+      {},
+      sandbox,
+      {
+        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+        getProviderTools: jest.fn().mockResolvedValue([]),
+        findActive: jest.fn().mockResolvedValue([]),
+        writeSkillGuarded: jest.fn(),
+      },
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'promote_pretest',
+      args: { pretest_id: 'pf-1' },
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await expect(
+      callDispatchKernelTool(serviceNoPretest, CYCLE_ID, tc, decisions, sandboxResults),
+    ).resolves.not.toThrow();
+
+    expect(decisions[0].allowed).toBe(false);
+    expect(decisions[0].reason).toBe('pretest_unavailable');
+  });
+
+  it('3.6 — empty pretest_id: dropped invalid_promote_args; promote() NOT called', async () => {
+    const audit = makeAudit();
+    const pretest = makePretestMockWithPromote({});
+    const service = makeServiceWithPretestPromote(audit, pretest);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'promote_pretest',
+      args: { pretest_id: '' },
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await callDispatchKernelTool(service, CYCLE_ID, tc, decisions, sandboxResults);
+
+    expect(pretest.promote).not.toHaveBeenCalled();
+    expect(decisions[0].reason).toBe('invalid_promote_args');
+  });
+
+  it('3.7 — promote() throws NotFoundException: caught → ok:false error:"not_found"; no re-throw', async () => {
+    const { NotFoundException: NFE } = await import('@nestjs/common');
+    const audit = makeAudit();
+    const pretest = makePretestMockWithPromote({
+      promoteShouldThrow: new NFE('Pretest not found'),
+    });
+    const service = makeServiceWithPretestPromote(audit, pretest);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'promote_pretest',
+      args: { pretest_id: 'missing-id' },
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await expect(
+      callDispatchKernelTool(service, CYCLE_ID, tc, decisions, sandboxResults),
+    ).resolves.not.toThrow();
+
+    expect(decisions[0].allowed).toBe(false);
+    const sr = sandboxResults.find((r) => r.plugin_id === 'kernel');
+    expect(sr?.ok).toBe(false);
+    expect((sr as unknown as Record<string, unknown>)?.['error']).toBe('not_found');
+  });
+
+  it('3.8 — promote_pretest dispatch: sandbox.callPlugin NOT called (kernel bypass)', async () => {
+    const audit = makeAudit();
+    const pretest = makePretestMockWithPromote({
+      promoteResult: { ok: true, applied: [], failed: [] },
+    });
+    const sandbox = makeSandbox();
+    const service = makeServiceWithPretestPromote(audit, pretest, sandbox);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'promote_pretest',
+      args: { pretest_id: 'pf-x' },
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await callDispatchKernelTool(service, CYCLE_ID, tc, decisions, sandboxResults);
+
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+  });
+
+  it('3.9 — unknown kernel fn kernel__bogus → still unknown_kernel_tool (registry regression with 4 entries)', async () => {
+    const plugins = makePlugins([], []);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'bogus_kernel_fn', args: {} },
+    ];
+
+    const result = await callValidateWithHoisted(service, 'cycle-bogus', calls, [], 'reflection');
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'kernel',
+        meta: expect.objectContaining({ reason: 'unknown_kernel_tool' }) as unknown,
+      }),
+    );
+  });
+});

@@ -23,7 +23,10 @@ export type AuditEventType =
   | 'reflection_turn'
   | 'pretest_variant_created'
   | 'pretest_compared'
-  | 'pretest_cap_reached';
+  | 'pretest_cap_reached'
+  | 'pretest_promoted'
+  | 'pretest_promote_requested'
+  | 'promotion_gate_blocked';
 
 export interface AuditPayload {
   cycle_id?: string;

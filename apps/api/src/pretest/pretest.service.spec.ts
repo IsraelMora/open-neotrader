@@ -92,10 +92,15 @@ function makeStubKv(overrides: Record<string, string | null> = {}): KvService {
   } as unknown as KvService;
 }
 
+function makeStubAudit() {
+  return { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService;
+}
+
 function makeService(
   gateway: ProviderGatewayService,
   agents?: AgentsService,
   kv?: KvService,
+  audit?: AuditService,
 ): PretestService {
   const db = {} as unknown as PrismaService;
   const sandbox = {} as unknown as SandboxGateway;
@@ -111,6 +116,7 @@ function makeService(
     gateway,
     agents ?? makeStubAgents(),
     kv ?? makeStubKv(),
+    audit ?? makeStubAudit(),
   );
 }
 
@@ -2614,5 +2620,336 @@ describe('PretestService.compare gate_status (Phase 4.1.9-4.1.10)', () => {
     result.portfolios.forEach((p) => {
       expect(['READY', 'NOT_READY']).toContain(p.gate_status);
     });
+  });
+});
+
+// ── F4-S4 Phase 1: AuditEventType additions ──────────────────────────────────
+
+import type { AuditService } from '../audit/audit.service';
+
+describe('F4-S4 Phase 1 — AuditEventType additions (compile-level)', () => {
+  it('1.1 — audit.log accepts event_type "pretest_promoted"', () => {
+    const logFn = jest.fn().mockResolvedValue(undefined);
+    const audit = { log: logFn } as unknown as AuditService;
+    // TypeScript compile check: this call must typecheck
+    void audit.log({ event_type: 'pretest_promoted', meta: { test: true } });
+    expect(logFn).toHaveBeenCalledWith(expect.objectContaining({ event_type: 'pretest_promoted' }));
+  });
+
+  it('1.2 — audit.log accepts event_type "pretest_promote_requested"', () => {
+    const logFn = jest.fn().mockResolvedValue(undefined);
+    const audit = { log: logFn } as unknown as AuditService;
+    void audit.log({ event_type: 'pretest_promote_requested', meta: { test: true } });
+    expect(logFn).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_promote_requested' }),
+    );
+  });
+
+  it('1.3 — audit.log accepts event_type "promotion_gate_blocked"', () => {
+    const logFn = jest.fn().mockResolvedValue(undefined);
+    const audit = { log: logFn } as unknown as AuditService;
+    void audit.log({ event_type: 'promotion_gate_blocked', meta: { test: true } });
+    expect(logFn).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'promotion_gate_blocked' }),
+    );
+  });
+});
+
+// ── F4-S4 Phase 2: PretestService.promote() ──────────────────────────────────
+
+import type { PromoteResult } from './pretest.service';
+
+/** Build a PretestService with mocked findOne, gate, kv, and plugins for promote() tests */
+function makePromoteService(opts: {
+  findOneResult?: import('./pretest.service').PretestPortfolio;
+  gateReady?: boolean;
+  gateReasons?: string[];
+  kvValues?: Record<string, string | null>;
+  activateFn?: (id: string) => Promise<unknown>;
+  setConfigFn?: (id: string, cfg: Record<string, unknown>) => Promise<unknown>;
+}) {
+  const portfolio: import('./pretest.service').PretestPortfolio = opts.findOneResult ?? {
+    id: 'pf-1',
+    name: 'Test Portfolio',
+    description: null,
+    initial_capital: 10_000,
+    plugin_ids: ['plugin-a', 'plugin-b'],
+    plugin_configs: {
+      'plugin-a': { param: 1 },
+      'plugin-b': { param: 2 },
+    },
+    state: makeState(),
+    run_count: 5,
+    last_run_at: null,
+    is_active: true,
+    created_at: new Date(),
+  };
+
+  const db = {
+    pretestPortfolio: {
+      findUnique: jest.fn().mockResolvedValue({
+        id: portfolio.id,
+        name: portfolio.name,
+        description: portfolio.description,
+        initial_capital: portfolio.initial_capital,
+        plugin_ids: JSON.stringify(portfolio.plugin_ids),
+        plugin_configs: JSON.stringify(portfolio.plugin_configs),
+        state: JSON.stringify(portfolio.state),
+        run_count: portfolio.run_count,
+        last_run_at: portfolio.last_run_at,
+        is_active: portfolio.is_active,
+        created_at: portfolio.created_at,
+        updated_at: new Date(),
+      }),
+    },
+  } as unknown as import('../prisma/prisma.service').PrismaService;
+
+  const kv = makeStubKv(opts.kvValues ?? {});
+
+  const auditLogFn = jest.fn().mockResolvedValue(undefined);
+  const auditSpy = { log: auditLogFn } as unknown as AuditService;
+
+  const activateMock = jest.fn(
+    opts.activateFn ?? (() => Promise.resolve({ id: 'x', active: true })),
+  );
+  const setConfigMock = jest.fn(
+    opts.setConfigFn ?? (() => Promise.resolve({ id: 'x', config: {} })),
+  );
+
+  const pluginsMock = {
+    activate: activateMock,
+    setConfig: setConfigMock,
+  } as unknown as import('../plugins/plugins.service').PluginsService;
+
+  // Build real PretestService but override gate() to return controlled result
+  const svc = new PretestService(
+    db,
+    {} as unknown as import('../sandbox/sandbox.gateway').SandboxGateway,
+    pluginsMock,
+    {} as unknown as import('../llm/llm.service').LlmService,
+    {} as unknown as import('../context-memory/context-memory.service').ContextMemoryService,
+    DEFAULT_GATEWAY,
+    makeStubAgents(),
+    kv,
+    auditSpy,
+  );
+
+  // Override gate() to return controlled result
+  const gateReady = opts.gateReady ?? true;
+  const gateReasons = opts.gateReasons ?? [];
+  jest.spyOn(svc, 'gate').mockResolvedValue({
+    ready: gateReady,
+    reasons: gateReasons,
+    metrics: {
+      sharpe: 1.5,
+      profit_factor: 2.0,
+      win_rate: 0.6,
+      max_dd: 5,
+      n_trades: 30,
+      loss_trades: 12,
+    },
+  });
+
+  return { svc, auditSpy, auditLogFn, activateMock, setConfigMock, db };
+}
+
+// DEFAULT_GATEWAY is already declared above (line 1401 area); reuse it.
+
+describe('F4-S4 Phase 2 — PretestService.promote() — gate not ready', () => {
+  it('2.1 — gate not ready: returns {ok:false,reason:"gate_not_ready",gate_reasons}; activate NOT called; setConfig NOT called', async () => {
+    const { svc, activateMock, setConfigMock } = makePromoteService({
+      gateReady: false,
+      gateReasons: ['min_trades not met: 3 < 20'],
+    });
+
+    const result: PromoteResult = await svc.promote('pf-1');
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('gate_not_ready');
+    expect(result.gate_reasons).toEqual(['min_trades not met: 3 < 20']);
+    expect(activateMock).not.toHaveBeenCalled();
+    expect(setConfigMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('F4-S4 Phase 2 — PretestService.promote() — needs_confirmation', () => {
+  it('2.2 — gate ready + default require_human_confirm (null) + no opts.confirm → needs_confirmation; activate NOT called', async () => {
+    const { svc, activateMock, setConfigMock } = makePromoteService({
+      gateReady: true,
+      kvValues: {}, // null → default → true
+    });
+
+    const result: PromoteResult = await svc.promote('pf-1');
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('needs_confirmation');
+    expect(result.pending).toBeDefined();
+    expect(result.pending!.plugin_ids).toEqual(['plugin-a', 'plugin-b']);
+    expect(activateMock).not.toHaveBeenCalled();
+    expect(setConfigMock).not.toHaveBeenCalled();
+  });
+
+  it('2.7a — require_human_confirm="true" → treated as true (fail-safe)', async () => {
+    const { svc, activateMock } = makePromoteService({
+      gateReady: true,
+      kvValues: { 'promotion.require_human_confirm': 'true' },
+    });
+    const result = await svc.promote('pf-1');
+    expect(result.reason).toBe('needs_confirmation');
+    expect(activateMock).not.toHaveBeenCalled();
+  });
+
+  it('2.7b — require_human_confirm="yes" → treated as true (fail-safe)', async () => {
+    const { svc, activateMock } = makePromoteService({
+      gateReady: true,
+      kvValues: { 'promotion.require_human_confirm': 'yes' },
+    });
+    const result = await svc.promote('pf-1');
+    expect(result.reason).toBe('needs_confirmation');
+    expect(activateMock).not.toHaveBeenCalled();
+  });
+
+  it('2.7c — require_human_confirm=null → treated as true (fail-safe)', async () => {
+    const { svc, activateMock } = makePromoteService({
+      gateReady: true,
+      kvValues: { 'promotion.require_human_confirm': null },
+    });
+    const result = await svc.promote('pf-1');
+    expect(result.reason).toBe('needs_confirmation');
+    expect(activateMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('F4-S4 Phase 2 — PretestService.promote() — operator disabled confirm', () => {
+  it('2.3 — gate ready + require_human_confirm="false" + no opts.confirm → applies; audit pretest_promoted with confirmed_by:"operator_disabled"', async () => {
+    const { svc, auditLogFn, activateMock, setConfigMock } = makePromoteService({
+      gateReady: true,
+      kvValues: { 'promotion.require_human_confirm': 'false' },
+    });
+
+    const result: PromoteResult = await svc.promote('pf-1');
+
+    expect(result.ok).toBe(true);
+    expect(activateMock).toHaveBeenCalledWith('plugin-a');
+    expect(activateMock).toHaveBeenCalledWith('plugin-b');
+    expect(setConfigMock).toHaveBeenCalledWith('plugin-a', { param: 1 });
+    expect(setConfigMock).toHaveBeenCalledWith('plugin-b', { param: 2 });
+
+    expect(auditLogFn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'pretest_promoted',
+        meta: expect.objectContaining({ confirmed_by: 'operator_disabled' }) as unknown,
+      }),
+    );
+  });
+});
+
+describe('F4-S4 Phase 2 — PretestService.promote() — confirmed by human', () => {
+  it('2.4 — gate ready + require_human_confirm default + opts.confirm:true → applies; audit pretest_promoted with confirmed_by:"human"', async () => {
+    const { svc, auditLogFn, activateMock, setConfigMock } = makePromoteService({
+      gateReady: true,
+      kvValues: {},
+    });
+
+    const result: PromoteResult = await svc.promote('pf-1', { confirm: true });
+
+    expect(result.ok).toBe(true);
+    expect(result.failed).toHaveLength(0);
+    expect(activateMock).toHaveBeenCalledWith('plugin-a');
+    expect(activateMock).toHaveBeenCalledWith('plugin-b');
+    expect(setConfigMock).toHaveBeenCalledWith('plugin-a', { param: 1 });
+    expect(setConfigMock).toHaveBeenCalledWith('plugin-b', { param: 2 });
+
+    expect(auditLogFn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'pretest_promoted',
+        meta: expect.objectContaining({ confirmed_by: 'human', partial: false }) as unknown,
+      }),
+    );
+  });
+});
+
+describe('F4-S4 Phase 2 — PretestService.promote() — partial apply', () => {
+  it('2.5 — plugin B activate throws → loop continues; applied has A+C, failed has B; ok:true; single pretest_promoted with partial:true', async () => {
+    const portfolio: import('./pretest.service').PretestPortfolio = {
+      id: 'pf-partial',
+      name: 'Partial Test',
+      description: null,
+      initial_capital: 10_000,
+      plugin_ids: ['plugin-a', 'plugin-b', 'plugin-c'],
+      plugin_configs: {
+        'plugin-a': { pa: 1 },
+        'plugin-b': { pb: 2 },
+        'plugin-c': { pc: 3 },
+      },
+      state: makeState(),
+      run_count: 5,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+    };
+
+    const { svc, auditLogFn, setConfigMock } = makePromoteService({
+      findOneResult: portfolio,
+      gateReady: true,
+      kvValues: { 'promotion.require_human_confirm': 'false' },
+      activateFn: (id: string): Promise<{ id: string; active: boolean }> => {
+        if (id === 'plugin-b') return Promise.reject(new Error('manifest dep missing'));
+        return Promise.resolve({ id, active: true });
+      },
+    });
+
+    const result: PromoteResult = await svc.promote('pf-partial');
+
+    expect(result.ok).toBe(true);
+    expect(result.applied!.some((a) => a.plugin_id === 'plugin-a' && a.activated)).toBe(true);
+    expect(result.applied!.some((a) => a.plugin_id === 'plugin-c' && a.activated)).toBe(true);
+    expect(result.failed!.some((f) => f.plugin_id === 'plugin-b' && f.step === 'activate')).toBe(
+      true,
+    );
+
+    // Only ONE pretest_promoted audit event
+    const promotedCalls = (auditLogFn.mock.calls as Array<[Record<string, unknown>]>).filter(
+      ([arg]) => arg['event_type'] === 'pretest_promoted',
+    );
+    expect(promotedCalls).toHaveLength(1);
+    const promotedMeta = promotedCalls[0][0]['meta'] as Record<string, unknown>;
+    expect(promotedMeta['partial']).toBe(true);
+
+    // plugin-b's setConfig must NOT have been called (since activate failed)
+    expect(setConfigMock).not.toHaveBeenCalledWith('plugin-b', expect.anything());
+  });
+
+  it('2.6 — plugin_configs missing key for plugin X → activate(X) called; setConfig(X) NOT called; config_set:false', async () => {
+    const portfolio: import('./pretest.service').PretestPortfolio = {
+      id: 'pf-noconfig',
+      name: 'No Config Test',
+      description: null,
+      initial_capital: 10_000,
+      plugin_ids: ['plugin-x', 'plugin-y'],
+      plugin_configs: {
+        'plugin-y': { py: 1 }, // plugin-x missing
+      },
+      state: makeState(),
+      run_count: 5,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+    };
+
+    const { svc, activateMock, setConfigMock } = makePromoteService({
+      findOneResult: portfolio,
+      gateReady: true,
+      kvValues: { 'promotion.require_human_confirm': 'false' },
+    });
+
+    const result: PromoteResult = await svc.promote('pf-noconfig');
+
+    expect(result.ok).toBe(true);
+    expect(activateMock).toHaveBeenCalledWith('plugin-x');
+    expect(setConfigMock).not.toHaveBeenCalledWith('plugin-x', expect.anything());
+
+    const xEntry = result.applied!.find((a) => a.plugin_id === 'plugin-x');
+    expect(xEntry?.config_set).toBe(false);
   });
 });
