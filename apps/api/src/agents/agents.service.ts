@@ -130,7 +130,28 @@ export class AgentsService {
       pendingSignals,
     );
 
-    // ── 4. LLM: proponer acciones con señales aprobadas en contexto ───────────
+    // ── 4. Decision prompt + tool schema injection (read-not-interpret) ──────
+    // Hoist getProviderTools() ONCE — shared between schema injection and validation.
+    const providerTools = await this.plugins.getProviderTools();
+    const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
+
+    let builtSystemPrompt = systemPrompt ?? '';
+    if (decisionPrompt !== null) {
+      const toolSchemaJson = JSON.stringify(providerTools);
+      if (toolSchemaJson.length > 8000) {
+        this.log.warn(
+          `token-budget guard: injected tool schema is ${toolSchemaJson.length} chars — consider reducing active tools`,
+        );
+      }
+      const parts: string[] = [
+        `[DECISION]\n${decisionPrompt}`,
+        `[TOOL SCHEMA]\n${toolSchemaJson}`,
+      ];
+      if (builtSystemPrompt) parts.push(builtSystemPrompt);
+      builtSystemPrompt = parts.join('\n\n');
+    }
+
+    // ── 5. LLM: proponer acciones con señales aprobadas en contexto ───────────
     const approvedSignals: unknown[] = Array.isArray(vetoCtx['pending_signals'])
       ? (vetoCtx['pending_signals'] as unknown[])
       : [];
@@ -142,7 +163,7 @@ export class AgentsService {
 
     const llmResponse = await this.llm.complete({
       context: enrichedContext + signalSummary,
-      system_prompt: systemPrompt,
+      system_prompt: builtSystemPrompt || undefined,
     });
 
     // Parse tool_calls from LLM text here (governed cycle), so WS/panel paths stay inert.
@@ -169,8 +190,9 @@ export class AgentsService {
       },
     });
 
-    // ── 5. Validar tool calls contra manifests activos, luego ejecutar ───────
-    const validatedCalls = await this._validateToolCalls(cycle_id, llmResponse.tool_calls);
+    // ── 6. Validar tool calls contra manifests activos, luego ejecutar ───────
+    // Pass hoisted providerTools to avoid a second getProviderTools() call.
+    const validatedCalls = await this._validateToolCalls(cycle_id, llmResponse.tool_calls, providerTools);
     const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
       cycle_id,
       validatedCalls,
@@ -267,6 +289,7 @@ export class AgentsService {
   private async _validateToolCalls(
     cycle_id: string,
     calls: import('../llm/llm.service').ToolCallRequest[],
+    hoistedTools?: import('../plugins/plugins.service').ProviderTool[],
   ): Promise<import('../llm/llm.service').ToolCallRequest[]> {
     if (calls.length === 0) return [];
 
@@ -274,7 +297,8 @@ export class AgentsService {
       // Build lookup structures once.
       const activePlugins = await this.plugins.findActive();
       const activeIds = new Set(activePlugins.map((p: HydratedPlugin) => p.id));
-      const providerTools = await this.plugins.getProviderTools();
+      // Use hoisted tools when provided (from _executeCycle) to avoid a second DB round-trip.
+      const providerTools = hoistedTools ?? (await this.plugins.getProviderTools());
       const validToolNames = new Set(providerTools.map((t) => t.name)); // "pluginId__fn"
 
       const valid: import('../llm/llm.service').ToolCallRequest[] = [];

@@ -226,13 +226,16 @@ describe('AgentsService._executeCycle — parse wiring', () => {
     )._executeCycle(cycleId, context, undefined);
   }
 
-  function makeFullPlugins(): jest.Mocked<
-    Pick<PluginsService, 'findActive' | 'getProviderTools' | 'getSkillsMetadata'>
+  function makeFullPlugins(
+    decisionPrompt: string | null = null,
+  ): jest.Mocked<
+    Pick<PluginsService, 'findActive' | 'getProviderTools' | 'getSkillsMetadata' | 'getActiveDecisionPrompt'>
   > {
     return {
       findActive: jest.fn().mockResolvedValue([]),
       getProviderTools: jest.fn().mockResolvedValue([]),
       getSkillsMetadata: jest.fn().mockResolvedValue([]),
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(decisionPrompt),
     };
   }
 
@@ -316,5 +319,176 @@ describe('AgentsService._executeCycle — parse wiring', () => {
       cycle_id: CYCLE_ID,
       event_type: 'parse_miss',
     });
+  });
+});
+
+// ── AgentsService._executeCycle — decision prompt + tool schema injection ─────
+
+describe('AgentsService._executeCycle — decision prompt injection (Phase 6.3)', () => {
+  const CYCLE_ID = 'decision-cycle-001';
+
+  async function callExecuteCycle(
+    service: AgentsService,
+    cycleId: string,
+    context: string,
+    systemPrompt?: string,
+  ): ReturnType<AgentsService['runCycle']> {
+    return (
+      service as unknown as {
+        _executeCycle: (
+          c: string,
+          ctx: string,
+          sp?: string,
+        ) => ReturnType<AgentsService['runCycle']>;
+      }
+    )._executeCycle(cycleId, context, systemPrompt);
+  }
+
+  function makeSandbox(): jest.Mocked<Pick<SandboxGateway, 'runCycle' | 'callPlugin'>> {
+    return {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    };
+  }
+
+  function makeMemory(): jest.Mocked<
+    Pick<ContextMemoryService, 'toContextString' | 'appendObservation' | 'trackSignal'>
+  > {
+    return {
+      toContextString: jest.fn().mockResolvedValue(''),
+      appendObservation: jest.fn().mockResolvedValue(undefined),
+      trackSignal: jest.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  function makeFullPlugins(
+    decisionPrompt: string | null = null,
+    tools: { plugin_id: string; name: string; description: string; input_schema: object }[] = [],
+  ): jest.Mocked<
+    Pick<
+      PluginsService,
+      'findActive' | 'getProviderTools' | 'getSkillsMetadata' | 'getActiveDecisionPrompt'
+    >
+  > {
+    return {
+      findActive: jest.fn().mockResolvedValue([]),
+      getProviderTools: jest.fn().mockResolvedValue(tools),
+      getSkillsMetadata: jest.fn().mockResolvedValue([]),
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(decisionPrompt),
+    };
+  }
+
+  function buildService(
+    plugins: ReturnType<typeof makeFullPlugins>,
+    capturedSystemPrompts: string[],
+  ): AgentsService {
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+        capturedSystemPrompts.push(opts.system_prompt ?? '');
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+
+    return new AgentsService(
+      llm as unknown as LlmService,
+      makeSandbox() as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      makeMemory() as unknown as ContextMemoryService,
+      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+  }
+
+  it('prepends decision prompt to system_prompt when a decision plugin is active', async () => {
+    const decisionPrompt =
+      'Emit tool_calls as JSON inside <tool_calls></tool_calls> using the provided tool schema.';
+    const tools = [
+      {
+        plugin_id: 'my-provider',
+        name: 'my-provider__do_thing',
+        description: 'Does the thing.',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ];
+    const plugins = makeFullPlugins(decisionPrompt, tools);
+    const captured: string[] = [];
+    const service = buildService(plugins, captured);
+
+    await callExecuteCycle(service, CYCLE_ID, 'some context');
+
+    expect(captured).toHaveLength(1);
+    const sentPrompt = captured[0];
+    // Decision prompt must be present.
+    expect(sentPrompt).toContain(decisionPrompt);
+    // Compact tool schema must be present (no pretty-printing).
+    expect(sentPrompt).toContain('my-provider__do_thing');
+    // Compact JSON: no newlines inside the schema portion.
+    const schemaJson = JSON.stringify(tools);
+    expect(sentPrompt).toContain(schemaJson);
+  });
+
+  it('does NOT inject decision prompt or tool schema when no decision plugin is active', async () => {
+    const plugins = makeFullPlugins(null /* no decision prompt */);
+    const captured: string[] = [];
+    const service = buildService(plugins, captured);
+
+    await callExecuteCycle(service, CYCLE_ID, 'some context');
+
+    // system_prompt passed to LLM must be undefined or empty (no injection).
+    const sentPrompt = captured[0];
+    // No decision content.
+    expect(sentPrompt).not.toContain('[TOOL SCHEMA]');
+    expect(sentPrompt).not.toContain('[DECISION]');
+  });
+
+  it('calls getProviderTools ONCE per cycle regardless of how many tool_calls are parsed', async () => {
+    const decisionPrompt = 'Format: emit tool_calls.';
+    const tools = [
+      {
+        plugin_id: 'prov',
+        name: 'prov__act',
+        description: 'action',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ];
+    const plugins = makeFullPlugins(decisionPrompt, tools);
+    // Also make the tool valid so validation keeps it.
+    plugins.findActive.mockResolvedValue([{ id: 'prov', type: 'provider' }] as never);
+    const captured: string[] = [];
+    const service = buildService(plugins, captured);
+
+    await callExecuteCycle(service, CYCLE_ID, 'ctx');
+
+    // getProviderTools must be called exactly once (hoisted — shared between injection + validation).
+    expect(plugins.getProviderTools).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs a warn when the injected tool schema exceeds the token-budget guard (~8000 chars)', async () => {
+    // Build a large tool schema that exceeds 8000 chars.
+    const bigDescription = 'x'.repeat(8100);
+    const tools = [
+      {
+        plugin_id: 'prov',
+        name: 'prov__big',
+        description: bigDescription,
+        input_schema: { type: 'object', properties: {} },
+      },
+    ];
+    const decisionPrompt = 'Use tools.';
+    const plugins = makeFullPlugins(decisionPrompt, tools);
+    const captured: string[] = [];
+    const service = buildService(plugins, captured);
+
+    const logWarnSpy = jest.spyOn(service['log'], 'warn');
+
+    await callExecuteCycle(service, CYCLE_ID, 'ctx');
+
+    expect(logWarnSpy).toHaveBeenCalledWith(expect.stringContaining('token-budget'));
   });
 });
