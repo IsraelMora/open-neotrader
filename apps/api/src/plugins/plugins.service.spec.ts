@@ -339,6 +339,168 @@ describe('PluginManifest reflection block', () => {
   });
 });
 
+// ── s2 Task 1.5: PluginsService.getActiveReflectionPrompt tests ───────────────
+
+/** Build PluginsService configured for getActiveReflectionPrompt tests. */
+function makeReflectionService(
+  activePlugins: { id: string; installed_path: string | null }[],
+  manifestMap: Record<string, PluginManifest | null>,
+): PluginsService {
+  const db = {
+    plugin: {
+      findMany: jest.fn().mockImplementation(({ where }: { where?: { active?: boolean } }) => {
+        if (where?.active === true) return Promise.resolve(activePlugins);
+        return Promise.resolve([]);
+      }),
+      findUnique: jest.fn(),
+      findFirst: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+      delete: jest.fn(),
+    },
+  } as unknown as import('../prisma/prisma.service').PrismaService;
+
+  const events = { emit: jest.fn() } as unknown as import('./plugin-events.service').PluginEventsService;
+  const cfg = { get: jest.fn().mockReturnValue('/var/plugins') } as unknown as import('@nestjs/config').ConfigService;
+
+  const service = new PluginsService(db, events, cfg);
+
+  service.getManifest = jest.fn().mockImplementation((installedPath: string | null) => {
+    if (!installedPath) return null;
+    return manifestMap[installedPath] ?? null;
+  });
+
+  return service;
+}
+
+function makeReflectionManifest(id: string, reflectionSection?: PluginManifest['reflection']): PluginManifest {
+  return {
+    plugin: { id, name: id, version: '1.0.0', type: 'extra' },
+    reflection: reflectionSection,
+  };
+}
+
+describe('PluginsService.getActiveReflectionPrompt', () => {
+  beforeEach(() => jest.restoreAllMocks());
+
+  it('s2-1.5a — returns null when 0 active plugins declare a [reflection] section', async () => {
+    const service = makeReflectionService(
+      [{ id: 'some-plugin', installed_path: '/plugins/some-plugin' }],
+      { '/plugins/some-plugin': makeManifest('some-plugin') /* no reflection */ },
+    );
+    const logSpy = jest.spyOn(service['log'], 'error');
+
+    const result = await service.getActiveReflectionPrompt();
+
+    expect(result).toBeNull();
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it('s2-1.5b — returns reflection.prompt verbatim when exactly 1 plugin has [reflection] with prompt', async () => {
+    const prompt = 'Analyze your recent trade decisions and find patterns to improve.';
+    const service = makeReflectionService(
+      [{ id: 'my-reflector', installed_path: '/plugins/my-reflector' }],
+      { '/plugins/my-reflector': makeReflectionManifest('my-reflector', { prompt }) },
+    );
+
+    const result = await service.getActiveReflectionPrompt();
+
+    expect(result).toBe(prompt);
+  });
+
+  it('s2-1.5c — reads reflection.prompt_file relative to installed_path when prompt is absent', async () => {
+    const fileContent = 'Reflection instructions from file.';
+    const readFileSyncSpy = (fs.readFileSync as jest.Mock).mockReturnValue(fileContent);
+
+    const service = makeReflectionService(
+      [{ id: 'file-reflector', installed_path: '/plugins/file-reflector' }],
+      {
+        '/plugins/file-reflector': makeReflectionManifest('file-reflector', {
+          prompt_file: 'REFLECT.md',
+        }),
+      },
+    );
+
+    const result = await service.getActiveReflectionPrompt();
+
+    expect(result).toBe(fileContent);
+    // Must use path.join(installed_path, basename) — no path traversal.
+    expect(readFileSyncSpy).toHaveBeenCalledWith(
+      path.join('/plugins/file-reflector', 'REFLECT.md'),
+      'utf8',
+    );
+    readFileSyncSpy.mockReset();
+    (fs.readFileSync as jest.Mock).mockImplementation(
+      jest.requireActual<typeof import('fs')>('fs').readFileSync,
+    );
+  });
+
+  it('s2-1.5d — returns null and logs CRITICAL when >1 active plugins declare [reflection]', async () => {
+    const service = makeReflectionService(
+      [
+        { id: 'reflector-a', installed_path: '/plugins/reflector-a' },
+        { id: 'reflector-b', installed_path: '/plugins/reflector-b' },
+      ],
+      {
+        '/plugins/reflector-a': makeReflectionManifest('reflector-a', { prompt: 'Prompt A' }),
+        '/plugins/reflector-b': makeReflectionManifest('reflector-b', { prompt: 'Prompt B' }),
+      },
+    );
+    const logSpy = jest.spyOn(service['log'], 'error');
+
+    const result = await service.getActiveReflectionPrompt();
+
+    expect(result).toBeNull();
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    const logMessage: string = (logSpy.mock.calls[0] as string[])[0];
+    expect(logMessage).toContain('[CRITICAL]');
+    expect(logMessage).toContain('reflector-a');
+    expect(logMessage).toContain('reflector-b');
+  });
+
+  it('s2-1.5e — never throws (returns null when prompt_file read fails)', async () => {
+    (fs.readFileSync as jest.Mock).mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+
+    const service = makeReflectionService(
+      [{ id: 'bad-file', installed_path: '/plugins/bad-file' }],
+      { '/plugins/bad-file': makeReflectionManifest('bad-file', { prompt_file: 'MISSING.md' }) },
+    );
+
+    const result = await service.getActiveReflectionPrompt();
+    expect(result).toBeNull();
+
+    (fs.readFileSync as jest.Mock).mockImplementation(
+      jest.requireActual<typeof import('fs')>('fs').readFileSync,
+    );
+  });
+
+  it('s2-1.5f — prefers reflection.prompt over reflection.prompt_file when both present', async () => {
+    const prompt = 'Inline reflection prompt wins.';
+    const readFileSyncSpy = fs.readFileSync as jest.Mock;
+
+    const service = makeReflectionService(
+      [{ id: 'both-set', installed_path: '/plugins/both-set' }],
+      {
+        '/plugins/both-set': makeReflectionManifest('both-set', {
+          prompt,
+          prompt_file: 'REFLECT.md',
+        }),
+      },
+    );
+
+    const result = await service.getActiveReflectionPrompt();
+
+    expect(result).toBe(prompt);
+    const calls = readFileSyncSpy.mock.calls as unknown[][];
+    const relevantCalls = calls.filter(
+      (args) => typeof args[0] === 'string' && (args[0] as string).includes('REFLECT'),
+    );
+    expect(relevantCalls).toHaveLength(0);
+  });
+});
+
 // ── Phase 2.1: writeSkillGuarded unit tests ───────────────────────────────────
 
 describe('PluginsService.writeSkillGuarded', () => {
