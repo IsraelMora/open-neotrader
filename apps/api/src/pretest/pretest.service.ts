@@ -25,6 +25,22 @@ import { LlmService } from '../llm/llm.service';
 import { ContextMemoryService } from '../context-memory/context-memory.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
 
+/**
+ * Per-portfolio fill policy. Stored under plugin_configs['__pretest_policy__'].
+ * Defaults reproduce the original hardcoded behavior: 5% sizing, no slippage, no commission.
+ */
+export interface PretestPolicy {
+  sizing_pct: number; // fraction of cash per buy order (default 0.05)
+  slippage_pct: number; // adverse price adjustment on fill (default 0)
+  commission_pct: number; // fee on notional, charged to cash (default 0)
+}
+
+const POLICY_DEFAULTS: PretestPolicy = {
+  sizing_pct: 0.05,
+  slippage_pct: 0,
+  commission_pct: 0,
+};
+
 export interface PretestTrade {
   ts: string;
   symbol: string;
@@ -258,11 +274,14 @@ export class PretestService {
 
     const llmResponse = await this.llm.complete({ context });
 
-    // ── Simular fills (async: price from getQuote.last) ───────────────────────
-    const trades = await this._simulateFills(llmResponse.tool_calls, portfolio.state);
+    // ── Leer política de fills del portfolio ──────────────────────────────────
+    const policy = this._readPolicy(portfolio);
 
-    // Actualizar estado virtual (sync trade application, async MTM equity)
-    const newState = this._applyTrades(portfolio.state, trades);
+    // ── Simular fills (async: price from getQuote.last + slippage) ────────────
+    const trades = await this._simulateFills(llmResponse.tool_calls, portfolio.state, policy);
+
+    // Actualizar estado virtual (sync trade application + commission, async MTM equity)
+    const newState = this._applyTrades(portfolio.state, trades, policy);
     await this._updateEquityMetrics(newState);
 
     await this.db.pretestPortfolio.update({
@@ -332,13 +351,46 @@ export class PretestService {
   // ── Simulación de fills ───────────────────────────────────────────────────────
 
   /**
+   * Reads the fill policy for a portfolio.
+   * Merges defaults with plugin_configs['__pretest_policy__'] (if present).
+   * All fields are numeric-coerced and clamped: 0 <= pct <= 1; sizing_pct > 0.
+   * The '__pretest_policy__' key is reserved config — it is NOT a plugin id
+   * and is never passed to the plugin_ids loop in runCycle.
+   */
+  _readPolicy(portfolio: Pick<PretestPortfolio, 'plugin_configs'>): PretestPolicy {
+    const raw = portfolio.plugin_configs['__pretest_policy__'] ?? {};
+
+    const coerce = (v: unknown, fallback: number): number => {
+      const n = Number(v);
+      return isFinite(n) ? n : fallback;
+    };
+
+    const sizing_pct = Math.max(
+      Number.EPSILON,
+      Math.min(1, coerce(raw['sizing_pct'], POLICY_DEFAULTS.sizing_pct)),
+    );
+    const slippage_pct = Math.max(
+      0,
+      Math.min(1, coerce(raw['slippage_pct'], POLICY_DEFAULTS.slippage_pct)),
+    );
+    const commission_pct = Math.max(
+      0,
+      Math.min(1, coerce(raw['commission_pct'], POLICY_DEFAULTS.commission_pct)),
+    );
+
+    return { sizing_pct, slippage_pct, commission_pct };
+  }
+
+  /**
    * Resolves fill prices via ProviderGateway.getQuote(null, symbol).last.
    * LLM-fabricated args['price'] is NEVER used.
+   * Slippage is applied at fill time: buy = last*(1+slippage_pct), sell = last*(1-slippage_pct).
    * On getQuote rejection: skip the trade entirely (log warning, no throw).
    */
   async _simulateFills(
     toolCalls: Array<{ plugin_id: string; function: string; args: Record<string, unknown> }>,
     state: PretestState,
+    policy: PretestPolicy = POLICY_DEFAULTS,
   ): Promise<PretestTrade[]> {
     const trades: PretestTrade[] = [];
     for (const tc of toolCalls) {
@@ -351,18 +403,22 @@ export class PretestService {
         | undefined;
       if (!symbol || !action || !['buy', 'sell', 'close'].includes(action)) continue;
 
-      let price: number;
+      let last: number;
       try {
         const quote = await this.gateway.getQuote(null, symbol);
-        price = quote.last;
+        last = quote.last;
       } catch (err) {
         this.log.warn(`Fill skipped for ${symbol}: getQuote failed — ${String(err)}`);
         continue;
       }
 
-      if (price <= 0) continue;
+      if (last <= 0) continue;
 
-      const quantity = this._calcQuantity(action, symbol, price, state);
+      // Apply slippage: buy fills at a higher price, sell fills at a lower price
+      const price =
+        action === 'buy' ? last * (1 + policy.slippage_pct) : last * (1 - policy.slippage_pct);
+
+      const quantity = this._calcQuantity(action, symbol, price, state, policy);
       if (quantity <= 0) continue;
 
       trades.push({ ts: new Date().toISOString(), symbol, action, price, quantity });
@@ -375,17 +431,22 @@ export class PretestService {
     symbol: string,
     price: number,
     state: PretestState,
+    policy: PretestPolicy = POLICY_DEFAULTS,
   ): number {
     if (action === 'buy') {
-      // Usar 5% del equity disponible por orden (conservative sizing)
-      const budget = state.cash * 0.05;
+      // Use policy.sizing_pct of available cash per order
+      const budget = state.cash * policy.sizing_pct;
       return price > 0 ? Math.floor(budget / price) : 0;
     }
     const pos = state.positions.find((p) => p.symbol === symbol);
     return pos?.quantity ?? 0;
   }
 
-  private _applyTrades(state: PretestState, trades: PretestTrade[]): PretestState {
+  private _applyTrades(
+    state: PretestState,
+    trades: PretestTrade[],
+    policy: PretestPolicy = POLICY_DEFAULTS,
+  ): PretestState {
     const next: PretestState = {
       ...state,
       // trades list is populated on success inside _applyBuy/_applySell; not pre-appended here.
@@ -395,9 +456,9 @@ export class PretestService {
 
     for (const trade of trades) {
       if (trade.action === 'buy') {
-        this._applyBuy(next, trade);
+        this._applyBuy(next, trade, policy.commission_pct);
       } else if (trade.action === 'sell' || trade.action === 'close') {
-        this._applySell(next, trade);
+        this._applySell(next, trade, policy.commission_pct);
       }
     }
 
@@ -406,10 +467,11 @@ export class PretestService {
     return next;
   }
 
-  private _applyBuy(state: PretestState, trade: PretestTrade): void {
+  private _applyBuy(state: PretestState, trade: PretestTrade, commission_pct = 0): void {
     const cost = trade.price * trade.quantity;
-    if (cost > state.cash) return; // insufficient funds — skip, do NOT record to state.trades
-    state.cash -= cost;
+    const total_cost = cost + cost * commission_pct;
+    if (total_cost > state.cash) return; // insufficient funds — skip, do NOT record to state.trades
+    state.cash -= total_cost;
     // Record only after confirming the trade executes
     state.trades.push(trade);
     const existing = state.positions.find((p) => p.symbol === trade.symbol);
@@ -427,14 +489,16 @@ export class PretestService {
     }
   }
 
-  private _applySell(state: PretestState, trade: PretestTrade): void {
+  private _applySell(state: PretestState, trade: PretestTrade, commission_pct = 0): void {
     const posIdx = state.positions.findIndex((p) => p.symbol === trade.symbol);
     if (posIdx < 0) return; // no position to sell — skip, do NOT record to state.trades
     const pos = state.positions[posIdx];
     const qty = Math.min(trade.quantity, pos.quantity);
-    const pnl = (trade.price - pos.avg_price) * qty;
+    const proceeds = trade.price * qty;
+    const commission_cost = proceeds * commission_pct;
+    const pnl = (trade.price - pos.avg_price) * qty - commission_cost;
     trade.pnl = pnl;
-    state.cash += trade.price * qty;
+    state.cash += proceeds - commission_cost;
     state.realized_pnl += pnl;
     if (pnl > 0) state.win_trades++;
     else state.loss_trades++;
