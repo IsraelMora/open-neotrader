@@ -4,18 +4,18 @@ import { PretestController } from './pretest.controller';
 import { PrismaModule } from '../prisma/prisma.module';
 import { SandboxModule } from '../sandbox/sandbox.module';
 import { PluginsModule } from '../plugins/plugins.module';
-import { LlmModule } from '../llm/llm.module';
 import { ContextMemoryModule } from '../context-memory/context-memory.module';
 import { ProvidersModule } from '../providers/providers.module';
+import { AgentsModule } from '../agents/agents.module';
 
 @Module({
   imports: [
     PrismaModule,
     SandboxModule,
     PluginsModule,
-    LlmModule,
     ContextMemoryModule,
     ProvidersModule,
+    AgentsModule,
   ],
   providers: [PretestService],
   controllers: [PretestController],

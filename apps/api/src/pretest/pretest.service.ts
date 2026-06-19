@@ -24,6 +24,7 @@ import { PluginsService, HydratedPlugin } from '../plugins/plugins.service';
 import { LlmService } from '../llm/llm.service';
 import { ContextMemoryService } from '../context-memory/context-memory.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
+import { AgentsService } from '../agents/agents.service';
 
 /**
  * Per-portfolio fill policy. Stored under plugin_configs['__pretest_policy__'].
@@ -123,6 +124,7 @@ export class PretestService {
     private readonly llm: LlmService,
     private readonly memory: ContextMemoryService,
     private readonly gateway: ProviderGatewayService,
+    private readonly agents?: AgentsService,
   ) {}
 
   // ── CRUD ─────────────────────────────────────────────────────────────────────
@@ -272,13 +274,20 @@ export class PretestService {
       .filter(Boolean)
       .join('\n\n');
 
-    const llmResponse = await this.llm.complete({ context });
+    // Route the LLM call through the governed turn kernel (audit, tool validation, virtual guard).
+    // virtual_only:true ensures no provider (broker) tool-calls reach the sandbox.
+    const turnResult = await this.agents!.runGovernedTurn({
+      source: 'pretest',
+      context,
+      virtual_only: true,
+    });
 
     // ── Leer política de fills del portfolio ──────────────────────────────────
     const policy = this._readPolicy(portfolio);
 
     // ── Simular fills (async: price from getQuote.last + slippage) ────────────
-    const trades = await this._simulateFills(llmResponse.tool_calls, portfolio.state, policy);
+    // Use validated tool_calls from the governed turn (providers already dropped by virtual guard).
+    const trades = await this._simulateFills(turnResult.tool_calls, portfolio.state, policy);
 
     // Actualizar estado virtual (sync trade application + commission, async MTM equity)
     const newState = this._applyTrades(portfolio.state, trades, policy);
@@ -296,7 +305,7 @@ export class PretestService {
     return {
       portfolio: { ...portfolio, state: newState },
       signals,
-      llm_text: llmResponse.text,
+      llm_text: turnResult.text,
       trades_simulated: trades,
     };
   }
