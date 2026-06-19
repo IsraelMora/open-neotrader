@@ -2271,3 +2271,180 @@ describe('F4-S1 Fix — kernel tool DROPPED when source !== reflection (dispatch
     expect(droppedCall).toBeDefined();
   });
 });
+
+// ── F4-S2 Task 1.7/1.8 — source:'reflection' union activation ────────────────
+//
+// These tests verify that adding 'reflection' to GovernedTurnInput.source union
+// (task 1.8) activates the dormant s1 kernel-tool gate without changing existing
+// cycle/chat/pretest behavior.
+
+describe('F4-S2 Task 1.7 — GovernedTurnInput.source union accepts reflection (compile-guard)', () => {
+  it('s2-1.7a — source:reflection compiles without a type cast (union extended)', () => {
+    // Compile-time gate: tsc rejects this if 'reflection' is not in the union.
+    // In s1 this required `as unknown as 'chat'` cast — in s2 it must compile directly.
+    const input: import('./agents.service').GovernedTurnInput = {
+      source: 'reflection',
+      context: 'reflection context',
+    };
+    expect(input.source).toBe('reflection');
+  });
+
+  it('s2-1.7b — kernel__write_skill IS in effectiveTools when source=reflection (activation)', async () => {
+    // With source:'reflection' now in the union, runGovernedTurn MUST inject the kernel tool.
+    const captured: { tools: string }[] = [];
+
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+        const sp = opts.system_prompt ?? '';
+        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+        captured.push({ tools: match ? match[1] : '' });
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+
+    const plugins = makeFullPlugins('Use tools via JSON.', []);
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      makeSandbox() as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      makeMemory() as unknown as ContextMemoryService,
+      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    // source:'reflection' — now a valid union member (no cast needed)
+    await service.runGovernedTurn({ source: 'reflection', context: 'reflect on decisions' });
+
+    expect(captured).toHaveLength(1);
+    // kernel__write_skill MUST be present in the tool schema for reflection turns
+    expect(captured[0].tools).toContain('kernel__write_skill');
+  });
+
+  it('s2-1.7c — _validateToolCalls: source:reflection → kernel__write_skill passes (allowKernelTools=true)', async () => {
+    const plugins = makePlugins([], []);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
+    ];
+
+    // source:'reflection' now in union — no cast needed
+    const result = await callValidateWithHoisted(service, 'reflect-001', calls, [], 'reflection');
+
+    expect(result).toHaveLength(1);
+    expect(result[0].plugin_id).toBe('kernel');
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'tool_call_dropped', plugin_id: 'kernel' }),
+    );
+  });
+
+  it('s2-1.7d (regression) — source:cycle → kernel__write_skill still ABSENT from effectiveTools', async () => {
+    // Regression guard: adding 'reflection' must NOT change cycle behavior.
+    const captured: { tools: string }[] = [];
+
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+        const sp = opts.system_prompt ?? '';
+        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+        captured.push({ tools: match ? match[1] : '' });
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+
+    const plugins = makeFullPlugins('Use tools.', []);
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      makeSandbox() as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      makeMemory() as unknown as ContextMemoryService,
+      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'cycle run' });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).not.toContain('kernel__write_skill');
+  });
+
+  it('s2-1.7e (regression) — source:chat → kernel__write_skill ABSENT', async () => {
+    const captured: { tools: string }[] = [];
+
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+        const sp = opts.system_prompt ?? '';
+        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+        captured.push({ tools: match ? match[1] : '' });
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+
+    const plugins = makeFullPlugins('Use tools.', []);
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      makeSandbox() as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      makeMemory() as unknown as ContextMemoryService,
+      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    await service.runGovernedTurn({ source: 'chat', context: 'ask something' });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).not.toContain('kernel__write_skill');
+  });
+
+  it('s2-1.7f (regression) — source:pretest → kernel__write_skill ABSENT', async () => {
+    const captured: { tools: string }[] = [];
+
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+        const sp = opts.system_prompt ?? '';
+        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+        captured.push({ tools: match ? match[1] : '' });
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+
+    const plugins = makeFullPlugins('Use tools.', []);
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      makeSandbox() as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      makeMemory() as unknown as ContextMemoryService,
+      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    await service.runGovernedTurn({ source: 'pretest', context: 'pretest run' });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).not.toContain('kernel__write_skill');
+  });
+});
