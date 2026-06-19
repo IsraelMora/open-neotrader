@@ -5,6 +5,8 @@ import type { PrismaService } from '../prisma/prisma.service';
 import type { PluginEventsService } from './plugin-events.service';
 import type { ConfigService } from '@nestjs/config';
 import type { KvService } from '../common/kv.service';
+import type { AuditService } from '../audit/audit.service';
+import type { Plugin } from '@prisma/client';
 
 // Mock fs so readFileSync is interceptable in all tests.
 jest.mock('fs', () => {
@@ -18,6 +20,19 @@ jest.mock('fs', () => {
   };
 });
 import * as fs from 'fs';
+
+// Mock child_process so git operations are interceptable in update()/install() tests.
+jest.mock('child_process', () => ({
+  execFile: jest.fn(),
+}));
+import { execFile as execFileMock } from 'child_process';
+
+// Mock ./manifest so install() tests can control readManifest/validateManifest.
+jest.mock('./manifest', () => ({
+  readManifest: jest.fn().mockReturnValue(null),
+  validateManifest: jest.fn().mockReturnValue([]),
+}));
+import { readManifest, validateManifest } from './manifest';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -971,5 +986,492 @@ describe('PluginsService.getTrustReport — F3-s3 reputation_score extension', (
     const report = await svc.getTrustReport('plugin-unrated-trust');
 
     expect(report.reputation_score).toBeNull();
+  });
+});
+
+// ── F3-s4 Phase 4: RED → GREEN — Integration tests for service wiring ────────
+
+// Private method type for spying on PluginsService internals without `any`.
+type SvcPrivate = {
+  gitClone: (url: string, dest: string) => Promise<void>;
+  _scanOnInstall: (id: string) => Promise<void>;
+  _smokeTestOnActivate: (id: string) => Promise<void>;
+  log: { warn: (msg: string) => void };
+  db: { plugin: { findUnique: jest.Mock; update: jest.Mock } };
+};
+
+// Helper: build a PluginsService instance wired for PR2 wiring tests.
+function makePluginsSvcForWiring(opts: {
+  pluginRow: Plugin | null;
+  kv?: Pick<KvService, 'get'>;
+  audit?: Pick<AuditService, 'log'>;
+  dbUpdateMock?: jest.Mock;
+}): {
+  svc: PluginsService;
+  dbUpdateSpy: jest.Mock;
+  dbCreateSpy: jest.Mock;
+} {
+  const dbUpdateSpy = opts.dbUpdateMock ?? jest.fn().mockResolvedValue(undefined);
+  const dbCreateSpy = jest.fn().mockResolvedValue(opts.pluginRow ?? { id: 'p1', version: '1.0.0' });
+
+  const db = {
+    plugin: {
+      findUnique: jest.fn().mockResolvedValue(opts.pluginRow),
+      findMany: jest.fn().mockResolvedValue(opts.pluginRow ? [opts.pluginRow] : []),
+      findFirst: jest.fn().mockResolvedValue(opts.pluginRow),
+      create: dbCreateSpy,
+      update: dbUpdateSpy,
+      delete: jest.fn(),
+    },
+  } as unknown as PrismaServiceForPlugins;
+
+  const events = { emit: jest.fn() } as unknown as PluginEventsService;
+  const cfg = {
+    get: jest.fn().mockReturnValue('/var/plugins'),
+  } as unknown as ConfigService;
+
+  const svc = new PluginsService(
+    db,
+    events,
+    cfg,
+    opts.kv as KvService | undefined,
+    opts.audit as AuditService | undefined,
+  );
+  svc.getManifest = jest.fn().mockReturnValue(null);
+
+  return { svc, dbUpdateSpy, dbCreateSpy };
+}
+
+// Minimal KV stub returning null (default weights/threshold)
+function makeDefaultKv(): Pick<KvService, 'get'> {
+  return { get: jest.fn().mockResolvedValue(null) };
+}
+
+// Typed call-finder for db.plugin.update mock — avoids unsafe `any` array indexing.
+function findUpdateCallWithKey(
+  spy: jest.Mock,
+  key: string,
+): { data: Record<string, unknown> } | undefined {
+  return (spy.mock.calls as Array<[{ data: Record<string, unknown> }]>).find(
+    (c) => key in c[0].data,
+  )?.[0];
+}
+
+// ── Task 4.1: install() stores content_checksum ───────────────────────────────
+
+describe('F3-s4 — install() content_checksum wiring', () => {
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    (readManifest as unknown as jest.Mock).mockReturnValue(null);
+    (validateManifest as unknown as jest.Mock).mockReturnValue([]);
+    (execFileMock as unknown as jest.Mock).mockImplementation(
+      (
+        _cmd: string,
+        _args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        cb(null, { stdout: '', stderr: '' });
+      },
+    );
+  });
+
+  it('4.1a — install() calls db.plugin.update with computed content_checksum after create', async () => {
+    const row = makePluginRow('my-plugin');
+    const { svc, dbUpdateSpy, dbCreateSpy } = makePluginsSvcForWiring({ pluginRow: row });
+
+    (readManifest as unknown as jest.Mock).mockReturnValue({
+      plugin: { id: 'my-plugin', name: 'My Plugin', version: '1.0.0', type: 'skill' },
+    });
+    // No conflict on duplicate check
+    (svc as unknown as SvcPrivate).db.plugin.findUnique = jest.fn().mockResolvedValue(null);
+    dbCreateSpy.mockResolvedValue(makePluginRow('my-plugin'));
+    // Bypass actual git clone and sandbox scan
+    jest.spyOn(svc as unknown as SvcPrivate, 'gitClone').mockResolvedValue(undefined);
+    jest.spyOn(svc as unknown as SvcPrivate, '_scanOnInstall').mockResolvedValue(undefined);
+    jest.spyOn(svc, 'computeContentChecksum').mockReturnValue('abc123hash');
+
+    await svc.install('https://github.com/user/my-plugin.git');
+
+    const call = findUpdateCallWithKey(dbUpdateSpy, 'content_checksum');
+    expect(call).toBeDefined();
+    expect(call!.data.content_checksum).toBe('abc123hash');
+  });
+
+  it('4.1b — install() succeeds even when computeContentChecksum throws', async () => {
+    const row = makePluginRow('my-plugin');
+    const { svc, dbCreateSpy } = makePluginsSvcForWiring({ pluginRow: row });
+
+    (readManifest as unknown as jest.Mock).mockReturnValue({
+      plugin: { id: 'my-plugin', name: 'My Plugin', version: '1.0.0', type: 'skill' },
+    });
+    (svc as unknown as SvcPrivate).db.plugin.findUnique = jest.fn().mockResolvedValue(null);
+    dbCreateSpy.mockResolvedValue(makePluginRow('my-plugin'));
+    jest.spyOn(svc as unknown as SvcPrivate, 'gitClone').mockResolvedValue(undefined);
+    jest.spyOn(svc as unknown as SvcPrivate, '_scanOnInstall').mockResolvedValue(undefined);
+    jest.spyOn(svc, 'computeContentChecksum').mockImplementation(() => {
+      throw new Error('disk read failure');
+    });
+
+    // install() must NOT throw — neutral-kernel principle
+    await expect(svc.install('https://github.com/user/my-plugin.git')).resolves.toBeDefined();
+  });
+});
+
+// ── Task 4.2: update() checksum change detection ──────────────────────────────
+
+describe('F3-s4 — update() checksum change detection', () => {
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    (readManifest as unknown as jest.Mock).mockReturnValue(null);
+    (execFileMock as unknown as jest.Mock).mockImplementation(
+      (
+        _cmd: string,
+        _args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        cb(null, { stdout: 'Already up to date.', stderr: '' });
+      },
+    );
+  });
+
+  // Helper: build an update-wired service with a git-installed plugin row.
+  function makeUpdateSvc(opts: {
+    storedChecksum: string | null;
+    computedChecksum: string | null;
+    auditLogMock?: jest.Mock;
+  }): { svc: PluginsService; dbUpdateSpy: jest.Mock; auditLog: jest.Mock } {
+    const base = makePluginRow('git-plugin', { content_checksum: opts.storedChecksum });
+    // Plugin.git_url and installed_path are not in makePluginRow overrides; cast to extend.
+    const row = {
+      ...base,
+      git_url: 'https://github.com/user/git-plugin.git',
+      installed_path: '/plugins/git-plugin',
+    } as Plugin;
+
+    const auditLog = opts.auditLogMock ?? jest.fn().mockResolvedValue(undefined);
+    const { svc, dbUpdateSpy } = makePluginsSvcForWiring({
+      pluginRow: row,
+      audit: { log: auditLog },
+    });
+    jest.spyOn(svc, 'computeContentChecksum').mockReturnValue(opts.computedChecksum);
+    return { svc, dbUpdateSpy, auditLog };
+  }
+
+  it('4.2a — update() unchanged checksum → no audit.log for content_changed, checksum refreshed', async () => {
+    const { svc, dbUpdateSpy, auditLog } = makeUpdateSvc({
+      storedChecksum: 'aabbcc',
+      computedChecksum: 'aabbcc',
+    });
+
+    const result = await svc.update('git-plugin');
+
+    expect(result.ok).toBe(true);
+    // unchanged checksum → content_changed event must NOT be logged
+    expect(auditLog).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'plugin_content_changed' }),
+    );
+    // checksum persisted with same value
+    const call = findUpdateCallWithKey(dbUpdateSpy, 'content_checksum');
+    expect(call).toBeDefined();
+    expect(call!.data.content_checksum).toBe('aabbcc');
+  });
+
+  it('4.2b — update() changed checksum → audit plugin_content_changed + new checksum persisted', async () => {
+    const auditLog = jest.fn().mockResolvedValue(undefined);
+    const { svc, dbUpdateSpy } = makeUpdateSvc({
+      storedChecksum: 'old-hash',
+      computedChecksum: 'new-hash',
+      auditLogMock: auditLog,
+    });
+
+    const result = await svc.update('git-plugin');
+
+    expect(result.ok).toBe(true);
+    const metaMatcher: unknown = expect.objectContaining({ old: 'old-hash', new: 'new-hash' });
+    expect(auditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'plugin_content_changed',
+        plugin_id: 'git-plugin',
+        meta: metaMatcher,
+      }),
+    );
+    const call = findUpdateCallWithKey(dbUpdateSpy, 'content_checksum');
+    expect(call).toBeDefined();
+    expect(call!.data.content_checksum).toBe('new-hash');
+  });
+
+  it('4.2c — update() computeContentChecksum throws → update still proceeds, no rethrow', async () => {
+    const base = makePluginRow('git-plugin', { content_checksum: 'old' });
+    const row = {
+      ...base,
+      git_url: 'https://github.com/user/git-plugin.git',
+      installed_path: '/plugins/git-plugin',
+    } as Plugin;
+    const { svc } = makePluginsSvcForWiring({ pluginRow: row });
+    jest.spyOn(svc, 'computeContentChecksum').mockImplementation(() => {
+      throw new Error('checksum failure');
+    });
+
+    await expect(svc.update('git-plugin')).resolves.toEqual(expect.objectContaining({ ok: true }));
+  });
+});
+
+// ── Task 4.3: getTrustReport() extended (F3-s4) ──────────────────────────────
+
+describe('F3-s4 — getTrustReport() extended with trust_score + badge + breakdown', () => {
+  beforeEach(() => jest.restoreAllMocks());
+
+  function makeTrustReportSvc(rowOverrides: Parameters<typeof makePluginRow>[1] = {}): {
+    svc: PluginsService;
+    dbUpdateSpy: jest.Mock;
+  } {
+    const row = makePluginRow('p1', rowOverrides);
+    const dbUpdateSpy = jest.fn().mockResolvedValue(undefined);
+    const { svc } = makePluginsSvcForWiring({
+      pluginRow: row,
+      kv: makeDefaultKv(),
+      dbUpdateMock: dbUpdateSpy,
+    });
+    return { svc, dbUpdateSpy };
+  }
+
+  it('4.3a — row with all 4 signals → report includes trust_score, badge, content_checksum, breakdown', async () => {
+    const { svc } = makeTrustReportSvc({
+      scan_result: JSON.stringify({ findings: [] }),
+      smoke_test_result: JSON.stringify({ result: 'passed' }),
+      reputation_score: 80,
+      votes_net: 0,
+      content_checksum: 'abc123',
+    });
+
+    const report = await svc.getTrustReport('p1');
+
+    expect(report).toHaveProperty('trust_score');
+    expect(typeof report.trust_score).toBe('number');
+    expect(report).toHaveProperty('badge');
+    expect(typeof report.badge).toBe('boolean');
+    expect(report).toHaveProperty('content_checksum', 'abc123');
+    expect(report.breakdown).toHaveProperty('inputs');
+    expect(report.breakdown).toHaveProperty('weights_used');
+    expect(report.breakdown).toHaveProperty('threshold');
+  });
+
+  it('4.3b — stored trust_score differs from computed → db.plugin.update called opportunistically', async () => {
+    const { svc, dbUpdateSpy } = makeTrustReportSvc({
+      scan_result: JSON.stringify({ findings: [] }),
+      smoke_test_result: JSON.stringify({ result: 'passed' }),
+      reputation_score: 80,
+      votes_net: 0,
+      trust_score: 999, // clearly stale → triggers opportunistic persist
+    });
+
+    await svc.getTrustReport('p1');
+
+    // Wait for the fire-and-forget promise to settle
+    await Promise.resolve();
+    const call = findUpdateCallWithKey(dbUpdateSpy, 'trust_score');
+    expect(call).toBeDefined();
+  });
+
+  it('4.3c — opportunistic db.plugin.update throws → result is still returned, no rethrow', async () => {
+    const dbUpdateSpy = jest.fn().mockRejectedValue(new Error('DB write failed'));
+    const row = makePluginRow('p1', {
+      scan_result: JSON.stringify({ findings: [] }),
+      smoke_test_result: JSON.stringify({ result: 'passed' }),
+      reputation_score: 80,
+      votes_net: 0,
+      trust_score: 999, // stale → triggers persist
+    });
+    const { svc } = makePluginsSvcForWiring({
+      pluginRow: row,
+      kv: makeDefaultKv(),
+      dbUpdateMock: dbUpdateSpy,
+    });
+
+    // Must not throw — fire-and-forget
+    const report = await svc.getTrustReport('p1');
+    expect(report).toHaveProperty('trust_score');
+  });
+
+  it('4.3d — new plugin (all null signals) → trust_score=50, badge=false', async () => {
+    const { svc } = makeTrustReportSvc({
+      scan_result: null,
+      smoke_test_result: null,
+      reputation_score: null,
+      votes_net: 0,
+      trust_score: null,
+    });
+
+    const report = await svc.getTrustReport('p1');
+
+    expect(report.trust_score).toBe(50);
+    expect(report.badge).toBe(false);
+  });
+});
+
+// ── Task 4.4: findAll() surfaces trust_score + badge ─────────────────────────
+
+describe('F3-s4 — findAll() surfaces trust_score + badge per plugin', () => {
+  beforeEach(() => jest.restoreAllMocks());
+
+  function makeFindAllSvc(rows: Plugin[], kv: Pick<KvService, 'get'>): PluginsService {
+    const db = {
+      plugin: {
+        findUnique: jest.fn(),
+        findMany: jest.fn().mockResolvedValue(rows),
+        findFirst: jest.fn(),
+        create: jest.fn(),
+        update: jest.fn(),
+        delete: jest.fn(),
+      },
+    } as unknown as PrismaServiceForPlugins;
+    const events = { emit: jest.fn() } as unknown as PluginEventsService;
+    const cfg = { get: jest.fn().mockReturnValue('/var/plugins') } as unknown as ConfigService;
+    const svc = new PluginsService(db, events, cfg, kv as KvService);
+    svc.getManifest = jest.fn().mockReturnValue(null);
+    return svc;
+  }
+
+  it('4.4a — each returned plugin has trust_score + badge computed', async () => {
+    const rows = [
+      makePluginRow('p1', { scan_result: JSON.stringify({ findings: [] }), reputation_score: 80 }),
+      makePluginRow('p2', { scan_result: null, reputation_score: null }),
+    ];
+    const svc = makeFindAllSvc(rows, makeDefaultKv());
+
+    const plugins = await svc.findAll();
+
+    for (const p of plugins) {
+      expect(p).toHaveProperty('trust_score');
+      expect(p).toHaveProperty('badge');
+    }
+  });
+
+  it('4.4b — _readTrustConfig called exactly once per findAll() regardless of list size', async () => {
+    const rows = [makePluginRow('p1'), makePluginRow('p2'), makePluginRow('p3')];
+    const kvGetSpy = jest.fn().mockResolvedValue(null);
+    const svc = makeFindAllSvc(rows, { get: kvGetSpy });
+
+    await svc.findAll();
+
+    // _readTrustConfig calls kv.get exactly twice (trust.weights + trust.badge_threshold)
+    // for 3 plugins — single shared call, not per-plugin.
+    expect(kvGetSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('4.4c — all-zero weights → trust_score null → badge false', async () => {
+    const rows = [makePluginRow('p1', { scan_result: null, reputation_score: null })];
+    const kvGet = jest.fn().mockImplementation((key: string) => {
+      if (key === 'trust.weights')
+        return Promise.resolve(JSON.stringify({ scan: 0, smoke: 0, reputation: 0, votes: 0 }));
+      return Promise.resolve(null);
+    });
+    const svc = makeFindAllSvc(rows, { get: kvGet });
+
+    const plugins = await svc.findAll();
+
+    expect(plugins[0].badge).toBe(false);
+  });
+});
+
+// ── Task 4.5: "nothing blocks" guard tests ────────────────────────────────────
+
+describe('F3-s4 — "nothing blocks" guard tests (AC-14)', () => {
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    (readManifest as unknown as jest.Mock).mockReturnValue(null);
+    (validateManifest as unknown as jest.Mock).mockReturnValue([]);
+    (execFileMock as unknown as jest.Mock).mockImplementation(
+      (
+        _cmd: string,
+        _args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        cb(null, { stdout: 'ok', stderr: '' });
+      },
+    );
+  });
+
+  it('4.5a — scan all-warn + smoke failed + reputation null → install() still succeeds', async () => {
+    const row = makePluginRow('heavy-plugin', {
+      scan_result: JSON.stringify({
+        findings: Array(11).fill({ severity: 'warning', message: 'bad' }),
+      }),
+      smoke_test_result: JSON.stringify({ result: 'failed' }),
+      reputation_score: null,
+    });
+    const { svc, dbCreateSpy } = makePluginsSvcForWiring({ pluginRow: row });
+
+    (readManifest as unknown as jest.Mock).mockReturnValue({
+      plugin: { id: 'heavy-plugin', name: 'Heavy Plugin', version: '1.0.0', type: 'skill' },
+    });
+    (svc as unknown as SvcPrivate).db.plugin.findUnique = jest.fn().mockResolvedValue(null);
+    dbCreateSpy.mockResolvedValue(makePluginRow('heavy-plugin'));
+    jest.spyOn(svc as unknown as SvcPrivate, 'gitClone').mockResolvedValue(undefined);
+    jest.spyOn(svc as unknown as SvcPrivate, '_scanOnInstall').mockResolvedValue(undefined);
+    jest.spyOn(svc, 'computeContentChecksum').mockReturnValue(null);
+
+    // Must succeed — NEVER blocked by trust/scan/smoke state
+    await expect(svc.install('https://github.com/user/heavy-plugin.git')).resolves.toBeDefined();
+  });
+
+  it('4.5b — trust_score=0, badge=false → activate() still succeeds', async () => {
+    const row = makePluginRow('zero-trust', { trust_score: 0 });
+    const { svc } = makePluginsSvcForWiring({ pluginRow: row });
+    jest.spyOn(svc as unknown as SvcPrivate, '_smokeTestOnActivate').mockResolvedValue(undefined);
+
+    // activate NEVER gates on trust_score
+    await expect(svc.activate('zero-trust')).resolves.toBeDefined();
+  });
+
+  it('4.5c — checksum mismatch on update → update() still returns ok', async () => {
+    const base = makePluginRow('mismatch-plugin', { content_checksum: 'old' });
+    const row = {
+      ...base,
+      git_url: 'https://github.com/user/mismatch-plugin.git',
+      installed_path: '/plugins/mismatch-plugin',
+    } as Plugin;
+    const { svc } = makePluginsSvcForWiring({
+      pluginRow: row,
+      audit: { log: jest.fn().mockResolvedValue(undefined) },
+    });
+    jest.spyOn(svc, 'computeContentChecksum').mockReturnValue('new-hash');
+
+    const result = await svc.update('mismatch-plugin');
+    expect(result.ok).toBe(true);
+  });
+});
+
+// ── Task 4.6: KV weight override applied in getTrustReport ───────────────────
+
+describe('F3-s4 — KV weight override in getTrustReport (AC-6)', () => {
+  beforeEach(() => jest.restoreAllMocks());
+
+  it('4.6a — custom KV weights override default weights → trust_score uses new weights', async () => {
+    // KV weights: scan=0.5, smoke=0.3, reputation=0.2, votes=0
+    // Plugin: scan 0 warnings → 100; smoke passed → 100; reputation 80; votes weight=0 (excluded)
+    // Expected: denom=1.0, raw = 0.5*100 + 0.3*100 + 0.2*80 = 96
+    const row = makePluginRow('kv-plugin', {
+      scan_result: JSON.stringify({ findings: [] }),
+      smoke_test_result: JSON.stringify({ result: 'passed' }),
+      reputation_score: 80,
+      votes_net: 0,
+      trust_score: null,
+    });
+    const kvGet = jest.fn().mockImplementation((key: string) => {
+      if (key === 'trust.weights')
+        return Promise.resolve(
+          JSON.stringify({ scan: 0.5, smoke: 0.3, reputation: 0.2, votes: 0 }),
+        );
+      if (key === 'trust.badge_threshold') return Promise.resolve('80');
+      return Promise.resolve(null);
+    });
+    const { svc } = makePluginsSvcForWiring({ pluginRow: row, kv: { get: kvGet } });
+
+    const report = await svc.getTrustReport('kv-plugin');
+
+    expect(report.trust_score).toBeCloseTo(96, 0);
+    expect(report.badge).toBe(true);
+    expect(report.breakdown.weights_used).not.toHaveProperty('votes');
   });
 });
