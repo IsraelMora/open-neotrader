@@ -358,6 +358,429 @@ describe('PretestService._updateEquityMetrics — zero-quote guard (fix 1)', () 
   });
 });
 
+// ── Phase 2.1: RED tests — Policy Config Extraction ──────────────────────────
+//
+// These tests define the behavior of _readPolicy, and verify that _calcQuantity,
+// _simulateFills (_applyBuy/_applySell) integrate the policy for sizing,
+// slippage, and commission. All will fail until Phase 2.2 is implemented.
+
+import { PretestPolicy } from './pretest.service';
+
+describe('PretestService._readPolicy (Phase 2)', () => {
+  describe('2.1.1 — no __pretest_policy__ key returns defaults', () => {
+    it('returns { sizing_pct:0.05, slippage_pct:0, commission_pct:0 } when plugin_configs has no policy key', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: {},
+      } as unknown as import('./pretest.service').PretestPortfolio;
+
+      const policy = (
+        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
+      )._readPolicy(portfolio);
+
+      expect(policy).toEqual({ sizing_pct: 0.05, slippage_pct: 0, commission_pct: 0 });
+    });
+  });
+
+  describe('2.1.2 — partial override merges with defaults, coerce and clamp', () => {
+    it('overrides sizing_pct and leaves others at default', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: { __pretest_policy__: { sizing_pct: 0.1 } },
+      } as unknown as import('./pretest.service').PretestPortfolio;
+
+      const policy = (
+        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
+      )._readPolicy(portfolio);
+
+      expect(policy.sizing_pct).toBeCloseTo(0.1);
+      expect(policy.slippage_pct).toBe(0);
+      expect(policy.commission_pct).toBe(0);
+    });
+
+    it('clamps sizing_pct to (0, 1]: value 0 is clamped to a minimum positive value', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: { __pretest_policy__: { sizing_pct: 0 } },
+      } as unknown as import('./pretest.service').PretestPortfolio;
+
+      const policy = (
+        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
+      )._readPolicy(portfolio);
+
+      expect(policy.sizing_pct).toBeGreaterThan(0);
+    });
+
+    it('clamps slippage_pct to [0, 1]: negative becomes 0', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: { __pretest_policy__: { slippage_pct: -0.5 } },
+      } as unknown as import('./pretest.service').PretestPortfolio;
+
+      const policy = (
+        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
+      )._readPolicy(portfolio);
+
+      expect(policy.slippage_pct).toBe(0);
+    });
+
+    it('clamps commission_pct to [0, 1]: value > 1 becomes 1', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: { __pretest_policy__: { commission_pct: 5 } },
+      } as unknown as import('./pretest.service').PretestPortfolio;
+
+      const policy = (
+        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
+      )._readPolicy(portfolio);
+
+      expect(policy.commission_pct).toBe(1);
+    });
+
+    it('coerces string numbers to numeric values', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: { __pretest_policy__: { sizing_pct: '0.10', commission_pct: '0.001' } },
+      } as unknown as import('./pretest.service').PretestPortfolio;
+
+      const policy = (
+        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
+      )._readPolicy(portfolio);
+
+      expect(policy.sizing_pct).toBeCloseTo(0.1);
+      expect(policy.commission_pct).toBeCloseTo(0.001);
+    });
+  });
+
+  describe('2.1.3 — buy quantity uses state.cash * policy.sizing_pct, not hardcoded 0.05', () => {
+    it('with sizing_pct=0.10, quantity is based on cash*0.10 budget', async () => {
+      const PRICE = 100;
+      const CASH = 10_000;
+      // sizing_pct=0.10 → budget=1000 → qty=floor(1000/100)=10
+      // sizing_pct=0.05 (old) → budget=500 → qty=5
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', PRICE)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: { __pretest_policy__: { sizing_pct: 0.1 } },
+      } as unknown as import('./pretest.service').PretestPortfolio;
+      const state = makeState({ cash: CASH });
+
+      const trades = await (
+        svc as unknown as {
+          _simulateFills: (
+            tc: unknown[],
+            s: PretestState,
+            policy: PretestPolicy,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._simulateFills(
+        [makeToolCall('AAPL', 'buy')],
+        state,
+        (svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy })._readPolicy(
+          portfolio,
+        ),
+      );
+
+      expect(trades).toHaveLength(1);
+      // qty = floor(cash * 0.10 / price) = floor(10000 * 0.10 / 100) = 10
+      expect(trades[0].quantity).toBe(10);
+    });
+
+    it('with default sizing_pct=0.05, quantity matches legacy behavior', async () => {
+      const PRICE = 100;
+      const CASH = 10_000;
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', PRICE)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: {},
+      } as unknown as import('./pretest.service').PretestPortfolio;
+      const state = makeState({ cash: CASH });
+
+      const trades = await (
+        svc as unknown as {
+          _simulateFills: (
+            tc: unknown[],
+            s: PretestState,
+            policy: PretestPolicy,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._simulateFills(
+        [makeToolCall('AAPL', 'buy')],
+        state,
+        (svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy })._readPolicy(
+          portfolio,
+        ),
+      );
+
+      expect(trades).toHaveLength(1);
+      // qty = floor(cash * 0.05 / price) = floor(10000 * 0.05 / 100) = 5
+      expect(trades[0].quantity).toBe(5);
+    });
+  });
+
+  describe('2.1.4 — slippage applied to fill price', () => {
+    it('buy fill price = last * (1 + slippage_pct)', async () => {
+      const LAST = 100;
+      const SLIPPAGE = 0.01; // 1%
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', LAST)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: { __pretest_policy__: { slippage_pct: SLIPPAGE } },
+      } as unknown as import('./pretest.service').PretestPortfolio;
+      const state = makeState({ cash: 10_000 });
+
+      const trades = await (
+        svc as unknown as {
+          _simulateFills: (
+            tc: unknown[],
+            s: PretestState,
+            policy: PretestPolicy,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._simulateFills(
+        [makeToolCall('AAPL', 'buy')],
+        state,
+        (svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy })._readPolicy(
+          portfolio,
+        ),
+      );
+
+      expect(trades).toHaveLength(1);
+      // fill price = 100 * (1 + 0.01) = 101
+      expect(trades[0].price).toBeCloseTo(LAST * (1 + SLIPPAGE));
+    });
+
+    it('sell fill price = last * (1 - slippage_pct)', async () => {
+      const LAST = 200;
+      const SLIPPAGE = 0.005; // 0.5%
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('TSLA', LAST)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: { __pretest_policy__: { slippage_pct: SLIPPAGE } },
+      } as unknown as import('./pretest.service').PretestPortfolio;
+      const state = makeState({
+        cash: 5_000,
+        positions: [{ symbol: 'TSLA', quantity: 5, avg_price: 180 }],
+      });
+
+      const trades = await (
+        svc as unknown as {
+          _simulateFills: (
+            tc: unknown[],
+            s: PretestState,
+            policy: PretestPolicy,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._simulateFills(
+        [makeToolCall('TSLA', 'sell')],
+        state,
+        (svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy })._readPolicy(
+          portfolio,
+        ),
+      );
+
+      expect(trades).toHaveLength(1);
+      // fill price = 200 * (1 - 0.005) = 199
+      expect(trades[0].price).toBeCloseTo(LAST * (1 - SLIPPAGE));
+    });
+
+    it('with zero slippage (default), fill price equals quote.last exactly', async () => {
+      const LAST = 150;
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', LAST)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: {},
+      } as unknown as import('./pretest.service').PretestPortfolio;
+      const state = makeState({ cash: 10_000 });
+
+      const trades = await (
+        svc as unknown as {
+          _simulateFills: (
+            tc: unknown[],
+            s: PretestState,
+            policy: PretestPolicy,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._simulateFills(
+        [makeToolCall('AAPL', 'buy')],
+        state,
+        (svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy })._readPolicy(
+          portfolio,
+        ),
+      );
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].price).toBe(LAST); // no slippage
+    });
+  });
+
+  describe('2.1.5 — commission deducted from cash on buy and sell', () => {
+    it('buy: cash deducted by cost + cost * commission_pct', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+
+      // Manually apply a buy trade with commission
+      const FILL_PRICE = 100;
+      const QTY = 5;
+      const COMMISSION = 0.001; // 0.1%
+      const INITIAL_CASH = 10_000;
+      const state = makeState({ cash: INITIAL_CASH });
+
+      const trade: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'AAPL',
+        action: 'buy',
+        price: FILL_PRICE,
+        quantity: QTY,
+      };
+
+      (
+        svc as unknown as {
+          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+        }
+      )._applyBuy(state, trade, COMMISSION);
+
+      const cost = FILL_PRICE * QTY; // 500
+      // cash = 10000 - cost - cost * commission_pct = 10000 - 500 - 0.5 = 9499.5
+      expect(state.cash).toBeCloseTo(INITIAL_CASH - cost - cost * COMMISSION);
+    });
+
+    it('sell: cash increased by proceeds - proceeds * commission_pct', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+
+      const FILL_PRICE = 200;
+      const QTY = 5;
+      const COMMISSION = 0.001;
+      const INITIAL_CASH = 5_000;
+      const state = makeState({
+        cash: INITIAL_CASH,
+        positions: [{ symbol: 'TSLA', quantity: QTY, avg_price: 180 }],
+      });
+
+      const trade: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'TSLA',
+        action: 'sell',
+        price: FILL_PRICE,
+        quantity: QTY,
+      };
+
+      (
+        svc as unknown as {
+          _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+        }
+      )._applySell(state, trade, COMMISSION);
+
+      const proceeds = FILL_PRICE * QTY; // 1000
+      // cash = 5000 + proceeds - proceeds * commission_pct = 5000 + 1000 - 1 = 5999
+      expect(state.cash).toBeCloseTo(INITIAL_CASH + proceeds - proceeds * COMMISSION);
+    });
+
+    it('with zero commission (default), cash matches legacy behavior exactly', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+
+      const FILL_PRICE = 100;
+      const QTY = 5;
+      const INITIAL_CASH = 10_000;
+      const state = makeState({ cash: INITIAL_CASH });
+
+      const trade: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'AAPL',
+        action: 'buy',
+        price: FILL_PRICE,
+        quantity: QTY,
+      };
+
+      (
+        svc as unknown as {
+          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+        }
+      )._applyBuy(state, trade, 0);
+
+      const cost = FILL_PRICE * QTY; // 500
+      // cash = 10000 - 500 = 9500 (same as before)
+      expect(state.cash).toBeCloseTo(INITIAL_CASH - cost);
+    });
+  });
+
+  describe('2.1.6 — commission subtracted from realized PnL on sell', () => {
+    it('realized_pnl includes commission deduction on sell', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+
+      const AVG_PRICE = 180;
+      const FILL_PRICE = 200;
+      const QTY = 5;
+      const COMMISSION = 0.001; // 0.1%
+      const state = makeState({
+        cash: 5_000,
+        positions: [{ symbol: 'TSLA', quantity: QTY, avg_price: AVG_PRICE }],
+        realized_pnl: 0,
+      });
+
+      const trade: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'TSLA',
+        action: 'sell',
+        price: FILL_PRICE,
+        quantity: QTY,
+      };
+
+      (
+        svc as unknown as {
+          _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+        }
+      )._applySell(state, trade, COMMISSION);
+
+      const proceeds = FILL_PRICE * QTY; // 1000
+      const gross_pnl = (FILL_PRICE - AVG_PRICE) * QTY; // (200-180)*5 = 100
+      const commission_cost = proceeds * COMMISSION; // 1000 * 0.001 = 1
+      // realized_pnl = gross_pnl - commission = 100 - 1 = 99
+      expect(state.realized_pnl).toBeCloseTo(gross_pnl - commission_cost);
+    });
+
+    it('with zero commission (default), realized_pnl = gross_pnl (legacy behavior)', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+
+      const AVG_PRICE = 180;
+      const FILL_PRICE = 200;
+      const QTY = 5;
+      const state = makeState({
+        cash: 5_000,
+        positions: [{ symbol: 'TSLA', quantity: QTY, avg_price: AVG_PRICE }],
+        realized_pnl: 0,
+      });
+
+      const trade: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'TSLA',
+        action: 'sell',
+        price: FILL_PRICE,
+        quantity: QTY,
+      };
+
+      (
+        svc as unknown as {
+          _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+        }
+      )._applySell(state, trade, 0);
+
+      const gross_pnl = (FILL_PRICE - AVG_PRICE) * QTY; // 100
+      expect(state.realized_pnl).toBeCloseTo(gross_pnl);
+    });
+  });
+});
+
 // ── Fix 2: Ghost-trade guard in _applyTrades ─────────────────────────────────
 //
 // Currently _applyTrades appends ALL trades to state.trades BEFORE calling
