@@ -15,8 +15,13 @@ import { parseToolCalls } from '../llm/kernel-parser';
  * interactive chat (source='chat') and scheduled cycle delegation (source='cycle').
  */
 export interface GovernedTurnInput {
-  /** Discriminator: 'chat' emits a chat_turn audit event; 'cycle' skips it (cycle owns its own audit). */
-  source: 'chat' | 'cycle';
+  /**
+   * Discriminator for the caller:
+   * - 'chat' emits a chat_turn audit event (interactive turns).
+   * - 'cycle' skips the audit (cycle owns its own cycle_start/cycle_complete events).
+   * - 'pretest' emits a pretest_turn audit event (virtual portfolio evaluation).
+   */
+  source: 'chat' | 'cycle' | 'pretest';
   /** User/cycle prompt (already enriched by the caller if needed). */
   context: string;
   /** Optional caller base system prompt; decision prompt + tool schema will be prepended by the kernel. */
@@ -29,6 +34,12 @@ export interface GovernedTurnInput {
    * Only used when source === 'cycle'.
    */
   _activePlugins?: import('../plugins/plugins.service').HydratedPlugin[];
+  /**
+   * When true, instructs _validateToolCalls to drop any tool call targeting a plugin
+   * with type === 'provider' BEFORE sandbox dispatch. Used by pretest to guarantee
+   * no real broker orders are placed even if a provider tool-call slips through.
+   */
+  virtual_only?: boolean;
 }
 
 /** Result of a single governed LLM turn (validate + dispatch + audit). */
@@ -178,6 +189,7 @@ export class AgentsService {
       llmResponse.tool_calls,
       providerTools,
       input._activePlugins,
+      input.virtual_only,
     );
     const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
       cycle_id,
@@ -195,6 +207,20 @@ export class AgentsService {
         signals_count: validatedCalls.length,
         meta: {
           tools_called: validatedCalls.map((t) => `${t.plugin_id}.${t.function}`),
+        },
+      });
+    } else if (input.source === 'pretest') {
+      // Pretest virtual evaluation — mirrors chat_turn with pretest_turn event type.
+      await this.audit.log({
+        cycle_id,
+        event_type: 'pretest_turn',
+        llm_text: llmResponse.text?.slice(0, 2000),
+        skills_read,
+        skills_written,
+        signals_count: validatedCalls.length,
+        meta: {
+          tools_called: validatedCalls.map((t) => `${t.plugin_id}.${t.function}`),
+          virtual_only: input.virtual_only ?? false,
         },
       });
     } else if (input.source === 'cycle') {
@@ -373,18 +399,49 @@ export class AgentsService {
   }
 
   /**
+   * Resolves the drop reason for a single tool call given validation context.
+   * Returns null when the call is valid (should proceed to dispatch).
+   * Pure/sync — extracted to keep _validateToolCalls within complexity budget.
+   */
+  private _resolveDropReason(
+    call: import('../llm/llm.service').ToolCallRequest,
+    activePlugins: HydratedPlugin[],
+    activeIds: Set<string>,
+    validToolNames: Set<string>,
+    providerTools: import('../plugins/plugins.service').ProviderTool[],
+    virtual_only: boolean,
+  ): string | null {
+    // FIRST: virtual_only guard — drop provider tool-calls before any other check.
+    if (virtual_only) {
+      const plugin = activePlugins.find((p) => p.id === call.plugin_id);
+      if (plugin?.type === 'provider') return 'virtual_mode_provider_blocked';
+    }
+    // Active/declared checks.
+    if (!activeIds.has(call.plugin_id)) {
+      const isKnown = providerTools.some((t) => t.plugin_id === call.plugin_id);
+      return isKnown ? 'plugin_inactive' : 'plugin_not_found';
+    }
+    if (!validToolNames.has(`${call.plugin_id}__${call.function}`)) {
+      return 'function_not_declared';
+    }
+    return null;
+  }
+
+  /**
    * Validates parsed tool_calls against active plugin manifests.
    * Drops calls whose plugin is not active or whose function is not declared in tools.json.
    * Each dropped call is audited with event_type 'tool_call_dropped' and a specific reason.
    * Returns only valid calls. Never throws.
    *
    * @param preloadedActivePlugins - When provided (cycle path), skips the findActive() DB call.
+   * @param virtual_only - When true, drops provider-type plugin calls before dispatch (pretest).
    */
   private async _validateToolCalls(
     cycle_id: string,
     calls: import('../llm/llm.service').ToolCallRequest[],
     hoistedTools?: import('../plugins/plugins.service').ProviderTool[],
     preloadedActivePlugins?: import('../plugins/plugins.service').HydratedPlugin[],
+    virtual_only?: boolean,
   ): Promise<import('../llm/llm.service').ToolCallRequest[]> {
     if (calls.length === 0) return [];
 
@@ -399,16 +456,14 @@ export class AgentsService {
       const valid: import('../llm/llm.service').ToolCallRequest[] = [];
 
       for (const call of calls) {
-        let reason: string | null = null;
-
-        if (!activeIds.has(call.plugin_id)) {
-          // Unknown plugin (never registered/installed) vs inactive (registered but disabled).
-          // Both cases where the plugin is not found in active set.
-          const isKnownPlugin = providerTools.some((t) => t.plugin_id === call.plugin_id);
-          reason = isKnownPlugin ? 'plugin_inactive' : 'plugin_not_found';
-        } else if (!validToolNames.has(`${call.plugin_id}__${call.function}`)) {
-          reason = 'function_not_declared';
-        }
+        const reason = this._resolveDropReason(
+          call,
+          activePlugins,
+          activeIds,
+          validToolNames,
+          providerTools,
+          virtual_only ?? false,
+        );
 
         if (reason) {
           await this.audit.log({
@@ -426,6 +481,12 @@ export class AgentsService {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log.warn(`_validateToolCalls error — dropping all calls: ${msg}`);
+      await this.audit.log({
+        cycle_id,
+        event_type: 'cycle_fail',
+        error: msg,
+        meta: { stage: '_validateToolCalls' },
+      });
       return [];
     }
   }
