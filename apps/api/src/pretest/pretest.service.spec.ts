@@ -43,15 +43,20 @@ function makeToolCall(
 
 function makeGateway(
   getQuoteImpl: (pluginId: string | null, symbol: string) => Promise<Quote>,
-): ProviderGatewayService {
-  return { getQuote: jest.fn(getQuoteImpl) } as unknown as ProviderGatewayService;
+): jest.Mocked<Pick<ProviderGatewayService, 'getQuote'>> & ProviderGatewayService {
+  return { getQuote: jest.fn(getQuoteImpl) } as unknown as jest.Mocked<
+    Pick<ProviderGatewayService, 'getQuote'>
+  > &
+    ProviderGatewayService;
 }
 
 /** Returns a gateway whose getQuote always rejects with the given message. */
-function makeRejectingGateway(message: string): ProviderGatewayService {
+function makeRejectingGateway(
+  message: string,
+): jest.Mocked<Pick<ProviderGatewayService, 'getQuote'>> & ProviderGatewayService {
   return {
     getQuote: jest.fn().mockRejectedValue(new Error(message)),
-  } as unknown as ProviderGatewayService;
+  } as unknown as jest.Mocked<Pick<ProviderGatewayService, 'getQuote'>> & ProviderGatewayService;
 }
 
 function makeService(gateway: ProviderGatewayService): PretestService {
@@ -275,5 +280,165 @@ describe('PretestService — cost-basis tests updated for MTM (spec backward-com
     // NOT cost-basis equity = 9000 + 100*10 = 10000
     expect(stateAfterTrade.positions[0].current_price).toBe(MARKET_PRICE);
     expect(stateAfterTrade.equity).toBeCloseTo(9_000 + MARKET_PRICE * 10);
+  });
+});
+
+// ── Fix 1: Zero-quote guard in _updateEquityMetrics ──────────────────────────
+//
+// When getQuote RESOLVES (not rejects) with last === 0, the try/catch does NOT
+// fire, so marketPrice would be 0, collapsing equity. The fix must treat
+// quote.last <= 0 the same as a rejection: route into the existing fallback
+// (current_price ?? avg_price) with a warning.
+
+describe('PretestService._updateEquityMetrics — zero-quote guard (fix 1)', () => {
+  describe('fix1.1 — getQuote resolves with last=0: fallback to current_price', () => {
+    it('uses last-known current_price when quote.last is 0, equity does not collapse', async () => {
+      const gateway = makeGateway((_pluginId, _symbol) => Promise.resolve(makeQuote('AAPL', 0)));
+      const svc = makeService(gateway);
+      const LAST_KNOWN = 95;
+      const AVG = 100;
+      const QTY = 10;
+      const CASH = 5_000;
+      const state = makeState({
+        cash: CASH,
+        positions: [{ symbol: 'AAPL', quantity: QTY, avg_price: AVG, current_price: LAST_KNOWN }],
+      });
+
+      await (
+        svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
+      )._updateEquityMetrics(state);
+
+      // Must NOT use 0 as price — must fall back to current_price = 95
+      expect(state.positions[0].current_price).toBe(LAST_KNOWN);
+      // equity = 5000 + 95*10 = 5950 (not 5000 + 0*10 = 5000)
+      expect(state.equity).toBeCloseTo(CASH + LAST_KNOWN * QTY);
+    });
+  });
+
+  describe('fix1.2 — getQuote resolves with last=0: fallback to avg_price when no current_price', () => {
+    it('uses avg_price when quote.last is 0 and no current_price is set', async () => {
+      const gateway = makeGateway((_pluginId, _symbol) => Promise.resolve(makeQuote('TSLA', 0)));
+      const svc = makeService(gateway);
+      const AVG = 200;
+      const QTY = 5;
+      const CASH = 2_000;
+      const state = makeState({
+        cash: CASH,
+        positions: [{ symbol: 'TSLA', quantity: QTY, avg_price: AVG }],
+      });
+
+      await (
+        svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
+      )._updateEquityMetrics(state);
+
+      // Must fall back to avg_price = 200
+      expect(state.positions[0].current_price).toBe(AVG);
+      // equity = 2000 + 200*5 = 3000 (not 2000)
+      expect(state.equity).toBeCloseTo(CASH + AVG * QTY);
+    });
+  });
+
+  describe('fix1.3 — getQuote called with (null, symbol) signature', () => {
+    it('calls getQuote with null as first arg and symbol as second', async () => {
+      const SYMBOL = 'NVDA';
+      const gateway = makeGateway((_pluginId, _symbol) => Promise.resolve(makeQuote(SYMBOL, 120)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        cash: 1_000,
+        positions: [{ symbol: SYMBOL, quantity: 1, avg_price: 100 }],
+      });
+
+      await (
+        svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
+      )._updateEquityMetrics(state);
+
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(gateway.getQuote).toHaveBeenCalledWith(null, SYMBOL);
+    });
+  });
+});
+
+// ── Fix 2: Ghost-trade guard in _applyTrades ─────────────────────────────────
+//
+// Currently _applyTrades appends ALL trades to state.trades BEFORE calling
+// _applyBuy/_applySell. _applyBuy silently returns when cost > cash, leaving
+// a ghost trade (recorded but never executed) in state.trades. The fix: only
+// record a trade when it actually executes. _applyBuy/_applySell push on
+// success; _applyTrades does NOT pre-append.
+
+describe('PretestService._applyTrades — ghost-trade guard (fix 2)', () => {
+  describe('fix2.1 — two buys, combined cost > cash: only executed trade is recorded', () => {
+    it('state.trades contains only the first (affordable) buy, not the rejected second', () => {
+      // cash=1000, price=500, 5% budget = 50 → qty = Math.floor(50/500) = 0 ... use price 100
+      // cash=1000, 5% budget=50, price=10 → qty=5, cost=50 ✓
+      // second buy same symbol: remaining cash=950, budget=47.5, qty=4, cost=40 ✓
+      // Let's use a bigger price so the second fails:
+      // cash=600, price=100 → budget=30, qty=0... need qty > 0
+      // Easiest: build trades manually (simulate already-filled by _simulateFills)
+      // cash=600, trade1: price=500 qty=1 cost=500 → passes (600>=500), remaining=100
+      // trade2: price=200 qty=1 cost=200 → fails (100<200) → ghost without fix
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 0)));
+      const svc = makeService(gateway);
+      const state = makeState({ cash: 600 });
+
+      const trade1: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'AAPL',
+        action: 'buy',
+        price: 500,
+        quantity: 1,
+      };
+      const trade2: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'MSFT',
+        action: 'buy',
+        price: 200,
+        quantity: 1, // cost=200 > remaining cash=100 after trade1 → should be rejected
+      };
+
+      const result = (
+        svc as unknown as {
+          _applyTrades: (s: PretestState, trades: PretestTrade[]) => PretestState;
+        }
+      )._applyTrades(state, [trade1, trade2]);
+
+      // Only trade1 executed — state.trades must have exactly 1 entry
+      expect(result.trades).toHaveLength(1);
+      expect(result.trades[0].symbol).toBe('AAPL');
+
+      // Cash = 600 - 500 = 100 (not 600 - 500 - 200)
+      expect(result.cash).toBeCloseTo(100);
+
+      // Only AAPL position, no MSFT
+      expect(result.positions).toHaveLength(1);
+      expect(result.positions[0].symbol).toBe('AAPL');
+    });
+  });
+
+  describe('fix2.2 — rejected buy leaves cash unchanged', () => {
+    it('cash is not affected by a trade that was not executed', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 0)));
+      const svc = makeService(gateway);
+      const INITIAL_CASH = 50;
+
+      const state = makeState({ cash: INITIAL_CASH });
+      const unaffordable: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'GOOG',
+        action: 'buy',
+        price: 3_000,
+        quantity: 1, // cost 3000 > cash 50
+      };
+
+      const result = (
+        svc as unknown as {
+          _applyTrades: (s: PretestState, trades: PretestTrade[]) => PretestState;
+        }
+      )._applyTrades(state, [unaffordable]);
+
+      expect(result.cash).toBe(INITIAL_CASH);
+      expect(result.trades).toHaveLength(0);
+      expect(result.positions).toHaveLength(0);
+    });
   });
 });
