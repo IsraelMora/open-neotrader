@@ -342,6 +342,7 @@ export class AgentsService {
     } = turnResult;
 
     // ── 3c. POST-stage extra plugins (after LLM turn) ─────────────────────────
+    // Result carries _collected_notify_intents; PR B will consume it from this return value.
     await this._runPostExtras(postExtras, runningCtx, cycle_id);
 
     // ── Persistir en memoria inter-ciclos ─────────────────────────────────────
@@ -370,24 +371,38 @@ export class AgentsService {
 
   /**
    * Merges extra hook output additively into the running cycle context.
-   * Trading-decision keys (pending_signals) are NOT overwritten by extra hooks.
-   * cycle_abort is handled before this merge is called.
+   *
+   * PROTECTED_KEYS: never overwritten — extras must not influence the veto-approved
+   * trade-decision state or inject credentials/decisions into subsequent extras.
+   *   - pending_signals  : veto-approved signals; extras must not tamper
+   *   - credentials      : kernel-injected secrets; must not bleed across extras
+   *   - tool_calls       : LLM-decided calls; extras must not inject fake calls
+   *   - decisions        : validated decisions; extras must not override
+   *   - veto_reasons     : discipline layer output; extras must not alter
+   *
+   * SKIP_KEYS: handled specially outside this merge.
+   *   - notify_intents   : accumulated into _collected_notify_intents, not shallow-merged
+   *   - cycle_abort      : handled before merge is called
+   *   - cycle_abort_reason
    */
   private _mergeExtraCtx(
     base: Record<string, unknown>,
     extra: Record<string, unknown>,
   ): Record<string, unknown> {
-    const PROTECTED_KEYS = new Set(['pending_signals']);
+    const PROTECTED_KEYS = new Set([
+      'pending_signals',
+      'credentials',
+      'tool_calls',
+      'decisions',
+      'veto_reasons',
+    ]);
+    const SKIP_KEYS = new Set(['notify_intents', 'cycle_abort', 'cycle_abort_reason']);
     const merged: Record<string, unknown> = { ...base };
     for (const [k, v] of Object.entries(extra)) {
       if (PROTECTED_KEYS.has(k)) continue;
+      if (SKIP_KEYS.has(k)) continue;
       if (k === 'log' && Array.isArray(base['log']) && Array.isArray(v)) {
         merged['log'] = [...(base['log'] as unknown[]), ...(v as unknown[])];
-      } else if (k === 'notify_intents') {
-        // Collected externally — skip in shallow merge to avoid duplication
-        continue;
-      } else if (k === 'cycle_abort' || k === 'cycle_abort_reason') {
-        continue; // handled before merge
       } else {
         merged[k] = v;
       }
@@ -416,8 +431,8 @@ export class AgentsService {
       const res = await this.sandbox.runExtraCycleHook(extra.id, ctx);
       const extraCtx = res.ok && res.result ? (res.result as Record<string, unknown>) : {};
       await this._persistPluginAlerts(extraCtx, cycle_id);
-      this._logNotifyIntents(extra.id, extraCtx);
       ctx = this._mergeExtraCtx(ctx, extraCtx);
+      this._logNotifyIntents(extra.id, extraCtx, ctx);
       if (extraCtx['cycle_abort'] === true) {
         await this.audit.log({
           cycle_id,
@@ -451,12 +466,13 @@ export class AgentsService {
    * Runs all POST-stage extra plugins sequentially.
    * Enriches context with equity_curve from SnapshotService (degrades gracefully if absent).
    * cycle_abort from POST extras is ignored (warn only).
+   * Returns the final merged context (includes _collected_notify_intents for PR B consumption).
    */
   private async _runPostExtras(
     postExtras: HydratedPlugin[],
     baseCtx: Record<string, unknown>,
     cycle_id: string,
-  ): Promise<void> {
+  ): Promise<Record<string, unknown>> {
     let postCtx: Record<string, unknown> = { ...baseCtx };
     try {
       if (this.snapshot) {
@@ -475,17 +491,29 @@ export class AgentsService {
         );
       }
       await this._persistPluginAlerts(extraCtx, cycle_id);
-      this._logNotifyIntents(extra.id, extraCtx);
       postCtx = this._mergeExtraCtx(postCtx, extraCtx);
+      this._logNotifyIntents(extra.id, extraCtx, postCtx);
     }
+    return postCtx;
   }
 
-  /** Logs received notify_intents count; dispatch is a no-op until PR B. */
-  private _logNotifyIntents(pluginId: string, extraCtx: Record<string, unknown>): void {
-    if (Array.isArray(extraCtx['notify_intents']) && extraCtx['notify_intents'].length > 0) {
+  /**
+   * Logs received notify_intents and accumulates them into runningCtx._collected_notify_intents
+   * so PR B has a single consumption point.
+   */
+  private _logNotifyIntents(
+    pluginId: string,
+    extraCtx: Record<string, unknown>,
+    runningCtx: Record<string, unknown>,
+  ): void {
+    const intents = extraCtx['notify_intents'];
+    if (Array.isArray(intents) && intents.length > 0) {
       this.log.debug(
-        `[extra:${pluginId}] ${String(extraCtx['notify_intents'].length)} notify_intent(s) received — dispatch pending PR B`,
+        `[extra:${pluginId}] ${String(intents.length)} notify_intent(s) received — dispatch pending PR B`,
       );
+      const existing = runningCtx['_collected_notify_intents'];
+      const existingArr = Array.isArray(existing) ? (existing as unknown[]) : [];
+      runningCtx['_collected_notify_intents'] = [...existingArr, ...(intents as unknown[])];
     }
   }
 
