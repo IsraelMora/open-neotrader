@@ -66,8 +66,73 @@ PLUGINS_DIR = Path(os.environ.get("NEUROTRADER_PLUGINS_DIR", "/opt/neurotrader/p
 
 
 # ---------------------------------------------------------------------------
+# Isolation — applied after resource limits and before any plugin load
+# ---------------------------------------------------------------------------
+try:
+    import isolation as _isolation
+except ImportError:
+    _isolation = None  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def resolve_permitted_function(
+    declared_keys: set[str],
+    plugin_id: str,
+    requested: str,
+) -> str:
+    """
+    Determine whether `requested` is a permitted function for `plugin_id`.
+
+    Resolution rules (in order):
+    1. Exact full-key match: `requested` == `f"{plugin_id}.{fn}"` for some
+       declared key → permitted; returns the bare function name.
+    2. Exact full-key match on `requested` itself (caller already sent the
+       full qualified key, e.g. "my-plugin.analyze") → permitted if the key
+       is in declared_keys; returns the last segment.
+    3. Back-compat bare-name: `requested` has no dot AND exactly ONE declared
+       key ends with `.{requested}` AND that key belongs to `plugin_id`
+       → permitted (with implicit deprecation note); returns `requested`.
+    4. Ambiguous bare-name: bare `requested` matches >1 declared key → DENY.
+    5. No match → DENY.
+
+    Raises PermissionError on denial.
+    """
+    # Rule 2: requested is already the full qualified key
+    full_qualified = f"{plugin_id}.{requested}"
+
+    if full_qualified in declared_keys:
+        # Full key constructed from plugin_id + requested matches
+        return requested
+
+    if requested in declared_keys:
+        # Caller sent the full key directly (e.g. "my-plugin.analyze")
+        return requested.split(".")[-1]
+
+    # Rules 3 & 4: bare-name back-compat (no dot in requested).
+    # Only keys belonging to THIS plugin_id are eligible for back-compat.
+    if "." not in requested:
+        matches = [
+            k for k in declared_keys
+            if k.endswith(f".{requested}") and k.startswith(f"{plugin_id}.")
+        ]
+        if len(matches) == 1:
+            # Unambiguous — allow but caller should migrate to full key
+            return requested
+        elif len(matches) > 1:
+            raise PermissionError(
+                f"[sandbox] Function '{requested}' is ambiguous — matches "
+                f"{len(matches)} declared keys for plugin '{plugin_id}'. "
+                "Send the fully-qualified key (e.g. 'plugin-id.function_name')."
+            )
+
+    raise PermissionError(
+        f"[sandbox] Function '{requested}' (plugin '{plugin_id}') is not declared "
+        "in manifest.skills.keys — execution denied."
+    )
 
 
 def _read_manifest(plugin_id: str) -> dict[str, Any]:
@@ -184,12 +249,9 @@ def cmd_call_plugin(req: dict) -> Any:
 
     m = _read_manifest(plugin_id)
     allowed_keys: set[str] = set(m.get("skills", {}).get("keys", []))
-    # allowed if function is referenced by any skill key suffix
-    short_keys = {k.split(".")[-1] for k in allowed_keys}
-    if fn_name not in short_keys and fn_name not in allowed_keys:
-        raise PermissionError(
-            f"Function '{fn_name}' is not declared in manifest.skills — execution denied"
-        )
+    # Full-key exact matching (closes suffix-collision namespace bug).
+    # resolve_permitted_function raises PermissionError on denial.
+    fn_name = resolve_permitted_function(allowed_keys, plugin_id, fn_name)
 
     mod = _load_module(plugin_id)
     fn = getattr(mod, fn_name, None)
@@ -386,6 +448,12 @@ COMMANDS = {
 
 
 def main() -> None:
+    # Apply in-process isolation guards AFTER resource limits and BEFORE any
+    # plugin module is loaded.  Gated by SANDBOX_STRICT (default: true).
+    if _isolation is not None:
+        _strict = os.environ.get("SANDBOX_STRICT", "true").lower() != "false"
+        _isolation.apply(strict=_strict, allowed_roots=[PLUGINS_DIR])
+
     try:
         raw = sys.stdin.read()
         req = json.loads(raw)
