@@ -268,4 +268,9 @@ export class SandboxGateway {
   listPlugins(activeIds: string[]): Promise<SandboxResponse> {
     return this.call({ cmd: 'list_plugins', active_ids: activeIds });
   }
+
+  /** F3-s1: Executes static AST analysis on a plugin via runner cmd=analyze_plugin */
+  analyzePlugin(pluginId: string): Promise<SandboxResponse> {
+    return this.call({ cmd: 'analyze_plugin', plugin_id: pluginId });
+  }
 }

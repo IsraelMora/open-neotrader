@@ -179,6 +179,19 @@ export class PluginsController {
     return result;
   }
 
+  @Post(':id/scan')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'F3-s1: Re-run static AST analysis for a plugin (manual rescan)' })
+  scan(@Param('id') id: string) {
+    return this.svc.rescan(id);
+  }
+
+  @Get(':id/trust-report')
+  @ApiOperation({ summary: 'F3-s1: Get current trust report (scan_result) for a plugin' })
+  trustReport(@Param('id') id: string) {
+    return this.svc.getTrustReport(id);
+  }
+
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Desinstalar plugin' })

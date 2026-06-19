@@ -39,6 +39,7 @@ model Plugin {
   symbols        String?
   config         String?
   installed_path String?
+  scan_result    String?  // JSON: ScanResult from F3-s1 static AST analysis; null = not yet scanned
   installed_at   DateTime @default(now())
   updated_at     DateTime @updatedAt
 
