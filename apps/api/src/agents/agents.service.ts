@@ -10,6 +10,34 @@ import { AlertsService, CreateAlertDto } from '../alerts/alerts.service';
 import type { LlmResponse } from '../llm/llm.service';
 import { parseToolCalls } from '../llm/kernel-parser';
 
+/**
+ * Input for a single governed LLM turn. Used by runGovernedTurn for both
+ * interactive chat (source='chat') and scheduled cycle delegation (source='cycle').
+ */
+export interface GovernedTurnInput {
+  /** Discriminator: 'chat' emits a chat_turn audit event; 'cycle' skips it (cycle owns its own audit). */
+  source: 'chat' | 'cycle';
+  /** User/cycle prompt (already enriched by the caller if needed). */
+  context: string;
+  /** Optional caller base system prompt; decision prompt + tool schema will be prepended by the kernel. */
+  system_prompt?: string;
+  /** Reuse the caller's cycle_id; if absent, a new UUID is generated. */
+  cycle_id?: string;
+}
+
+/** Result of a single governed LLM turn (validate + dispatch + audit). */
+export interface GovernedTurnResult {
+  cycle_id: string;
+  text: string;
+  tool_calls: import('../llm/llm.service').ToolCallRequest[];
+  decisions: Decision[];
+  sandbox_results: SandboxResult[];
+  backend: 'api' | 'subscription';
+  skills_read: string[];
+  skills_written: string[];
+  llm_response: LlmResponse;
+}
+
 /** Resultado completo de un ciclo del agente, incluyendo decisiones, ejecuciones en sandbox y resumen de vetos. */
 export interface AgentCycleResult {
   cycle_id: string;
@@ -86,6 +114,86 @@ export class AgentsService {
       await this.audit.log({ cycle_id, event_type: 'cycle_fail', error });
       throw err;
     }
+  }
+
+  /**
+   * Executes a single governed LLM turn: build system prompt (decision prompt + tool schema
+   * from a single hoisted getProviderTools call) → llm.complete → parseToolCalls (with
+   * parse_miss audit) → _validateToolCalls → _executeToolCalls → audit the turn.
+   *
+   * When source === 'chat', emits a 'chat_turn' audit entry so interactive turns are
+   * distinguishable from scheduled cycles. When source === 'cycle', skips the chat_turn
+   * audit (the caller owns cycle_start/cycle_complete).
+   */
+  async runGovernedTurn(input: GovernedTurnInput): Promise<GovernedTurnResult> {
+    const cycle_id = input.cycle_id ?? randomUUID();
+
+    // ── Hoist getProviderTools ONCE — shared between schema injection and validation ──
+    const providerTools = await this.plugins.getProviderTools();
+    const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
+
+    let builtSystemPrompt = input.system_prompt ?? '';
+    if (decisionPrompt !== null) {
+      const toolSchemaJson = JSON.stringify(providerTools);
+      if (toolSchemaJson.length > 8000) {
+        this.log.warn(
+          `token-budget guard: injected tool schema is ${toolSchemaJson.length} chars — consider reducing active tools`,
+        );
+      }
+      const parts: string[] = [`[DECISION]\n${decisionPrompt}`, `[TOOL SCHEMA]\n${toolSchemaJson}`];
+      if (builtSystemPrompt) parts.push(builtSystemPrompt);
+      builtSystemPrompt = parts.join('\n\n');
+    }
+
+    // ── LLM call ─────────────────────────────────────────────────────────────
+    const llmResponse = await this.llm.complete({
+      context: input.context,
+      system_prompt: builtSystemPrompt || undefined,
+    });
+
+    // ── Parse tool_calls with parse_miss audit ────────────────────────────────
+    const auditFn = (raw: string): void => {
+      void this.audit.log({
+        cycle_id,
+        event_type: 'parse_miss',
+        meta: { raw_block: raw.slice(0, 500) },
+      });
+    };
+    llmResponse.tool_calls = parseToolCalls(llmResponse.text, auditFn);
+
+    const skills_read = llmResponse.skills_read ?? [];
+    const skills_written = llmResponse.skills_written ?? [];
+
+    // ── Validate and dispatch ─────────────────────────────────────────────────
+    const validatedCalls = await this._validateToolCalls(cycle_id, llmResponse.tool_calls, providerTools);
+    const { decisions, sandbox_results } = await this._executeToolCalls(cycle_id, validatedCalls);
+
+    // ── Audit the turn (only for chat source) ────────────────────────────────
+    if (input.source === 'chat') {
+      await this.audit.log({
+        cycle_id,
+        event_type: 'chat_turn',
+        llm_text: llmResponse.text?.slice(0, 2000),
+        skills_read,
+        skills_written,
+        signals_count: validatedCalls.length,
+        meta: {
+          tools_called: validatedCalls.map((t) => `${t.plugin_id}.${t.function}`),
+        },
+      });
+    }
+
+    return {
+      cycle_id,
+      text: llmResponse.text,
+      tool_calls: validatedCalls,
+      decisions,
+      sandbox_results,
+      backend: (llmResponse.backend ?? 'api') as 'api' | 'subscription',
+      skills_read,
+      skills_written,
+      llm_response: llmResponse,
+    };
   }
 
   private async _executeCycle(

@@ -464,3 +464,117 @@ describe('AgentsService._executeCycle — decision prompt injection (Phase 6.3)'
     expect(logWarnSpy).toHaveBeenCalledWith(expect.stringContaining('token-budget'));
   });
 });
+
+// ── AgentsService.runGovernedTurn ─────────────────────────────────────────────
+
+describe('AgentsService.runGovernedTurn — no-decision-plugin (source: chat)', () => {
+  it('returns text, empty tool_calls, backend; emits chat_turn audit; does not dispatch', async () => {
+    const llm = makeLlm('Hello from the model');
+    const audit = makeAudit();
+    // No decision plugin active, no tools.
+    const plugins = makeFullPlugins(null, []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const result = await service.runGovernedTurn({
+      source: 'chat',
+      context: 'What is the market doing?',
+    });
+
+    expect(result.text).toBe('Hello from the model');
+    expect(result.tool_calls).toEqual([]);
+    expect(result.backend).toBeDefined();
+
+    // audit.log must have been called with chat_turn.
+    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const chatTurnCall = calls.find(([arg]) => arg['event_type'] === 'chat_turn');
+    expect(chatTurnCall).toBeDefined();
+
+    // sandbox.callPlugin must NOT have been called.
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentsService.runGovernedTurn — valid tool call dispatched (source: chat)', () => {
+  it('dispatches a valid tool call and includes it in result; audits chat_turn', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","qty":1}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const tools = [
+      {
+        plugin_id: 'alpaca-provider',
+        name: 'alpaca-provider__place_order',
+        description: 'Place an order',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ];
+    const plugins = makeFullPlugins('Emit tool calls as JSON.', tools);
+    // Plugin must appear active.
+    plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const result = await service.runGovernedTurn({
+      source: 'chat',
+      context: 'Buy AAPL',
+    });
+
+    // The validated call must have been dispatched.
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+
+    // Result must include the dispatched tool_call.
+    expect(result.tool_calls).toHaveLength(1);
+    expect(result.tool_calls[0].plugin_id).toBe('alpaca-provider');
+
+    // chat_turn audit must be present.
+    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const chatTurnCall = calls.find(([arg]) => arg['event_type'] === 'chat_turn');
+    expect(chatTurnCall).toBeDefined();
+  });
+});
+
+describe('AgentsService.runGovernedTurn — hallucinated/inactive tool dropped (source: chat)', () => {
+  it('drops call to inactive plugin; audits tool_call_dropped; does not dispatch', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"ghost-plugin__ghost_fn","args":{}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    // ghost-plugin is NOT active and has no declared tools.
+    const plugins = makeFullPlugins('Emit tool calls as JSON.', [
+      {
+        plugin_id: 'alpaca-provider',
+        name: 'alpaca-provider__place_order',
+        description: 'Place an order',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ]);
+    // No active plugins — ghost-plugin won't pass validation.
+    plugins.findActive.mockResolvedValue([]);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const result = await service.runGovernedTurn({
+      source: 'chat',
+      context: 'Do something invalid',
+    });
+
+    // The dropped call must NOT have been dispatched.
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+
+    // Result tool_calls must be empty (dropped before dispatch).
+    expect(result.tool_calls).toEqual([]);
+
+    // tool_call_dropped audit must be present.
+    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const droppedCall = calls.find(([arg]) => arg['event_type'] === 'tool_call_dropped');
+    expect(droppedCall).toBeDefined();
+    expect(droppedCall![0]).toMatchObject({
+      event_type: 'tool_call_dropped',
+      plugin_id: 'ghost-plugin',
+    });
+  });
+});
