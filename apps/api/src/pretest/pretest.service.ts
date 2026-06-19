@@ -388,7 +388,8 @@ export class PretestService {
   private _applyTrades(state: PretestState, trades: PretestTrade[]): PretestState {
     const next: PretestState = {
       ...state,
-      trades: [...state.trades, ...trades],
+      // trades list is populated on success inside _applyBuy/_applySell; not pre-appended here.
+      trades: [...state.trades],
       positions: [...state.positions],
     };
 
@@ -407,8 +408,10 @@ export class PretestService {
 
   private _applyBuy(state: PretestState, trade: PretestTrade): void {
     const cost = trade.price * trade.quantity;
-    if (cost > state.cash) return;
+    if (cost > state.cash) return; // insufficient funds — skip, do NOT record to state.trades
     state.cash -= cost;
+    // Record only after confirming the trade executes
+    state.trades.push(trade);
     const existing = state.positions.find((p) => p.symbol === trade.symbol);
     if (existing) {
       const total_qty = existing.quantity + trade.quantity;
@@ -426,7 +429,7 @@ export class PretestService {
 
   private _applySell(state: PretestState, trade: PretestTrade): void {
     const posIdx = state.positions.findIndex((p) => p.symbol === trade.symbol);
-    if (posIdx < 0) return;
+    if (posIdx < 0) return; // no position to sell — skip, do NOT record to state.trades
     const pos = state.positions[posIdx];
     const qty = Math.min(trade.quantity, pos.quantity);
     const pnl = (trade.price - pos.avg_price) * qty;
@@ -437,6 +440,8 @@ export class PretestService {
     else state.loss_trades++;
     pos.quantity -= qty;
     if (pos.quantity <= 0) state.positions.splice(posIdx, 1);
+    // Record only after the sell executes
+    state.trades.push(trade);
   }
 
   /**
@@ -451,7 +456,17 @@ export class PretestService {
         let marketPrice: number;
         try {
           const quote = await this.gateway.getQuote(null, pos.symbol);
-          marketPrice = quote.last;
+          if (!isFinite(quote.last) || quote.last <= 0) {
+            // Provider resolved but returned an unusable price (e.g. last=0 for unknown format).
+            // Treat the same as a rejection: fall back to last-known price.
+            const fallback = pos.current_price ?? pos.avg_price;
+            this.log.warn(
+              `MTM fallback for ${pos.symbol}: quote.last=${quote.last} is not a positive finite number, using ${fallback}`,
+            );
+            marketPrice = fallback;
+          } else {
+            marketPrice = quote.last;
+          }
         } catch (err) {
           // Fallback: use last-known current_price if available, else avg_price (cost basis)
           marketPrice = pos.current_price ?? pos.avg_price;
