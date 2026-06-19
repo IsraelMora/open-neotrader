@@ -117,6 +117,19 @@ export class PretestController {
     return this.svc.runAllActive();
   }
 
+  @Get(':id/gate')
+  @ApiOperation({ summary: 'Evaluate significance gate for a pretest portfolio (read-only)' })
+  getGate(@Param('id') id: string) {
+    return this.svc.gate(id);
+  }
+
+  @Post(':id/gate')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Evaluate significance gate for a pretest portfolio' })
+  postGate(@Param('id') id: string) {
+    return this.svc.gate(id);
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Obtener un portfolio de pretest por ID' })
   findOne(@Param('id') id: string) {

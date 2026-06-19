@@ -7,6 +7,7 @@ import { PluginsModule } from '../plugins/plugins.module';
 import { ContextMemoryModule } from '../context-memory/context-memory.module';
 import { ProvidersModule } from '../providers/providers.module';
 import { AgentsModule } from '../agents/agents.module';
+import { KvService } from '../common/kv.service';
 
 @Module({
   imports: [
@@ -17,7 +18,7 @@ import { AgentsModule } from '../agents/agents.module';
     ProvidersModule,
     AgentsModule,
   ],
-  providers: [PretestService],
+  providers: [PretestService, KvService],
   controllers: [PretestController],
   exports: [PretestService],
 })
