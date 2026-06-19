@@ -1485,6 +1485,68 @@ describe('AgentsService — notify_intents accumulation (Fix #3)', () => {
       expect(collected![0]).toMatchObject({ message: 'Doctor check complete' });
     }
   });
+
+  it('Fix#signals — POST extra receives ctx[signals] equal to post-veto pending_signals', async () => {
+    // Arrange: baseCtx has pending_signals (post-veto approved signals with confidence).
+    // Assert: runExtraCycleHook is called with a ctx containing signals === pending_signals.
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    plugins.findActive.mockResolvedValue([
+      { id: 'telegram-notifier', type: 'extra', name: 'Telegram Notifier' },
+    ] as never);
+
+    const pendingSignals = [
+      { symbol: 'AAPL', action: 'buy', confidence: 0.85 },
+      { symbol: 'TSLA', action: 'sell', confidence: 0.9 },
+    ];
+
+    const runExtraCycleHook = jest.fn().mockResolvedValue({ ok: true, result: {} });
+
+    const sandbox: ExtraSandboxStub = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true }),
+      call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+      runExtraCycleHook,
+    };
+
+    const service = new AgentsService(
+      {} as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      makeMemory() as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    const baseCtx: Record<string, unknown> = {
+      cycle_id: 'signals-inject-001',
+      pending_signals: pendingSignals,
+    };
+
+    await (
+      service as unknown as {
+        _runPostExtras: (
+          postExtras: import('../plugins/plugins.service').HydratedPlugin[],
+          baseCtx: Record<string, unknown>,
+          cycleId: string,
+        ) => Promise<Record<string, unknown>>;
+      }
+    )._runPostExtras(
+      [
+        { id: 'telegram-notifier', type: 'extra', name: 'Telegram Notifier' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+      baseCtx,
+      'signals-inject-001',
+    );
+
+    // runExtraCycleHook must have been called with ctx containing signals = pending_signals
+    expect(runExtraCycleHook).toHaveBeenCalledTimes(1);
+    expect(runExtraCycleHook).toHaveBeenCalledWith(
+      'telegram-notifier',
+      expect.objectContaining({ signals: pendingSignals }),
+    );
+  });
 });
 
 // ── PR B Phase B1: _persistNotificationIntents + bridge injection (B1.3 / B1.4) ─

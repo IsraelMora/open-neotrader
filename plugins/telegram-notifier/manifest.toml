@@ -63,4 +63,5 @@ network     = true
 emit_events = false
 
 [scheduler]
-mode = "none"
+mode  = "polling"
+stage = "post"

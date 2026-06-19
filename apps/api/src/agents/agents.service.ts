@@ -480,6 +480,11 @@ export class AgentsService {
     cycle_id: string,
   ): Promise<Record<string, unknown>> {
     let postCtx: Record<string, unknown> = { ...baseCtx };
+    // Inject cycle signals so POST policy plugins (e.g. telegram-notifier) can filter them.
+    // Source: post-veto pending_signals (approved signals that carry confidence).
+    postCtx['signals'] = Array.isArray(baseCtx['pending_signals'])
+      ? baseCtx['pending_signals']
+      : [];
     try {
       if (this.snapshot) {
         const equityCurveRaw = await this.snapshot.getEquityCurve(50);

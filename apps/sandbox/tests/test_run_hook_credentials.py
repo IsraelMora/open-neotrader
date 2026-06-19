@@ -129,48 +129,49 @@ def test_run_hook_delivers_credentials_to_hook(echo_plugin, plugins_dir):
 # ---------------------------------------------------------------------------
 
 
-def test_weekly_reporter_hook_forwards_credentials(monkeypatch):
+def test_weekly_reporter_hook_emits_notify_intent_not_network(monkeypatch):
     """
-    weekly-reporter's run(ctx) must forward ctx['credentials'] to generate_and_send
-    via _context so that TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are used from
-    context rather than os.environ (which is empty in SANDBOX_STRICT mode).
+    PR C — weekly-reporter's on_cycle hook must NOT call network directly.
+    Instead it emits a notify_intent so the kernel's NotifierBridge handles
+    delivery. Credentials are no longer needed inside the hook.
 
-    RED: before fix, generate_and_send is called without _context, so
-    credentials are never delivered.
+    Updated from the old test_weekly_reporter_hook_forwards_credentials after
+    PR C removed generate_and_send and urllib.
     """
-    received: dict = {}
-
-    def capturing_generate_and_send(args, _context=None):
-        received["_context"] = _context
-        return {"ok": False, "reason": "test", "telegram_sent": False}
-
     # Load the hook module fresh with sys.modules registration
     hook_mod = _load_hook_module(WEEKLY_REPORTER_HOOK, "wr_hook_cred_test")
 
-    # Patch generate_and_send on the hook module (it imported it at load time)
-    monkeypatch.setattr(hook_mod, "generate_and_send", capturing_generate_and_send)
+    # The hook must NOT have generate_and_send — that function is gone (PR C)
+    assert not hasattr(hook_mod, "generate_and_send"), (
+        "generate_and_send still present in on_cycle.py — should have been removed in PR C"
+    )
 
     WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
     today = WEEKDAYS[time.gmtime().tm_wday]
 
-    creds = {"TELEGRAM_BOT_TOKEN": "tok123", "TELEGRAM_CHAT_ID": "chat456"}
     ctx = {
-        "credentials": creds,
-        "closed_trades": [],
-        "equity_curve": [1.0],
-        "plugin_config": {"weekly_report_day": today, "min_trades": 0},
+        "closed_trades": [
+            {"symbol": "AAPL", "action": "buy", "pnl": 1.0, "ts": "2026-01-01"},
+            {"symbol": "TSLA", "action": "sell", "pnl": -0.5, "ts": "2026-01-02"},
+            {"symbol": "NVDA", "action": "buy", "pnl": 2.0, "ts": "2026-01-03"},
+            {"symbol": "MSFT", "action": "buy", "pnl": 0.8, "ts": "2026-01-04"},
+            {"symbol": "GOOG", "action": "sell", "pnl": -0.3, "ts": "2026-01-05"},
+        ],
+        "equity_curve": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0],
+        "plugin_config": {"weekly_report_day": today, "min_trades": 5},
     }
 
-    hook_mod.on_cycle(ctx)
+    result = hook_mod.on_cycle(ctx)
 
-    assert received.get("_context") is not None, (
-        "generate_and_send was called without _context — credentials never delivered"
+    # Should emit notify_intents instead of making network calls
+    intents = result.get("notify_intents", [])
+    assert len(intents) >= 1, (
+        f"Expected notify_intents from weekly-reporter hook, got: {intents}"
     )
-    ctx_obj = received["_context"]
-    delivered = ctx_obj.metadata.get("credentials", {}) if hasattr(ctx_obj, "metadata") else {}
-    assert delivered == creds, (
-        f"generate_and_send received wrong credentials. Got: {delivered!r}"
+    assert intents[0].get("channel") == "telegram", (
+        f"Expected channel='telegram', got: {intents[0]}"
     )
+    assert intents[0].get("text"), "notify_intent text must be non-empty"
 
 
 # ---------------------------------------------------------------------------
