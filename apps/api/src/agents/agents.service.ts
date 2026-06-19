@@ -9,6 +9,7 @@ import { AlertsService, CreateAlertDto } from '../alerts/alerts.service';
 import { SnapshotService } from '../snapshot/snapshot.service';
 import { NotifierBridge } from '../notifier/notifier-bridge';
 import { ConfigService } from '@nestjs/config';
+import type { PretestService } from '../pretest/pretest.service';
 
 import type { LlmResponse } from '../llm/llm.service';
 import { parseToolCalls } from '../llm/kernel-parser';
@@ -102,6 +103,18 @@ export interface VetoSummary {
   discipline_plugins: string[];
 }
 
+/**
+ * Result of a runReflectionTurn call.
+ * skipped:true means reflection was skipped (no plugin, cycle in progress, etc.).
+ * skipped:false means the governed turn ran.
+ */
+export interface ReflectionTurnResult {
+  skipped: boolean;
+  reason?: string;
+  cycle_id?: string;
+  skills_written?: number;
+}
+
 // ── Kernel tool constants (Phase 3.6) ─────────────────────────────────────────
 
 /**
@@ -145,6 +158,12 @@ export class AgentsService {
     private readonly snapshot?: SnapshotService,
     _cfg?: ConfigService,
     private readonly notifierBridge?: NotifierBridge,
+    // PretestService injected optionally so existing unit-tests that don't provide
+    // it continue compiling; _assembleReflectionContext degrades gracefully.
+    private readonly pretest?: PretestService,
+    // Panel reference for the cycle-running guard (injected by AgentsModule via forwardRef
+    // or provided directly in tests). Kept optional to avoid circular dep issues.
+    private readonly _panelRef?: { getRunStatus: () => { running: boolean } },
   ) {}
 
   /**
@@ -869,6 +888,190 @@ export class AgentsService {
         this.log.warn(`_persistNotificationIntents: audit.log threw — ${String(err)}`);
       }
     }
+  }
+
+  // ── F4-S2: Reflection Turn ────────────────────────────────────────────────────
+
+  /**
+   * Assembles a bounded outcome context string for the reflection turn.
+   * Hard budget: 4,000 chars total. Four labeled sections, each try/catch → '(unavailable)'.
+   * Per-section caps + global slice are BOTH enforced (defense in depth).
+   *
+   * Sections:
+   *   AUDIT  — recent cycle/signal/skill audit one-liners    (~1200 chars cap)
+   *   EQUITY — last-20 equity data points, comma-joined      (~400 chars cap)
+   *   VETO   — recent veto summary from audit decision meta  (~800 chars cap)
+   *   PRETEST— compare() top-5 portfolios + winners         (~1200 chars cap)
+   */
+  private async _assembleReflectionContext(): Promise<string> {
+    const BUDGET = 4000;
+    const AUDIT_CAP = 1200;
+    const EQUITY_CAP = 400;
+    const VETO_CAP = 800;
+    const PRETEST_CAP = 1200;
+
+    // Section: AUDIT
+    let auditSection = '(unavailable)';
+    try {
+      const entries = await this.audit.query({
+        limit: 20,
+      });
+      const relevantTypes = new Set([
+        'signal',
+        'decision',
+        'cycle_complete',
+        'skill_written',
+        'reflection_turn',
+      ]);
+      const lines = (entries as Array<{ event_type: string; symbol?: string | null; action?: string | null }>)
+        .filter((e) => relevantTypes.has(e.event_type))
+        .map((e) => `${e.event_type} ${e.symbol ?? ''} ${e.action ?? ''}`.trim());
+      auditSection = lines.join('\n').slice(0, AUDIT_CAP);
+    } catch {
+      auditSection = '(unavailable)';
+    }
+
+    // Section: EQUITY
+    let equitySection = '(unavailable)';
+    try {
+      if (this.snapshot) {
+        const curve = await this.snapshot.getEquityCurve(20);
+        equitySection = curve
+          .map((e) => String(e.equity))
+          .join(',')
+          .slice(0, EQUITY_CAP);
+      } else {
+        equitySection = '(unavailable)';
+      }
+    } catch {
+      equitySection = '(unavailable)';
+    }
+
+    // Section: VETO
+    let vetoSection = '(unavailable)';
+    try {
+      const decisions = await this.audit.query({ limit: 10 });
+      const vetoEntries = (
+        decisions as Array<{
+          event_type: string;
+          meta?: string | null;
+        }>
+      ).filter((e) => e.event_type === 'decision');
+
+      const vetoLines: string[] = [];
+      for (const entry of vetoEntries) {
+        if (!entry.meta) continue;
+        try {
+          const meta = JSON.parse(entry.meta) as Record<string, unknown>;
+          const vs = meta['veto_summary'] as Record<string, unknown> | undefined;
+          if (vs) {
+            const proposed = vs['signals_proposed'] ?? 0;
+            const approved = vs['signals_approved'] ?? 0;
+            const vetoed = vs['signals_vetoed'] ?? 0;
+            const reasons = Array.isArray(vs['veto_reasons'])
+              ? (vs['veto_reasons'] as string[]).slice(0, 3).join('; ')
+              : '';
+            vetoLines.push(
+              `proposed:${proposed} approved:${approved} vetoed:${vetoed}${reasons ? ` reasons:${reasons}` : ''}`,
+            );
+          }
+        } catch {
+          // skip unparseable meta
+        }
+      }
+      vetoSection = (vetoLines.length > 0 ? vetoLines.join('\n') : '(none)').slice(0, VETO_CAP);
+    } catch {
+      vetoSection = '(unavailable)';
+    }
+
+    // Section: PRETEST
+    let pretestSection = '(unavailable)';
+    try {
+      if (this.pretest) {
+        const cmp = await this.pretest.compare();
+        const top5 = cmp.portfolios.slice(0, 5);
+        const portfolioLines = top5
+          .map(
+            (p) =>
+              `${p.name}: return=${String(p.return_pct?.toFixed?.(2) ?? p.return_pct)}% gate=${String(p.gate_status)}`,
+          )
+          .join('\n');
+        pretestSection =
+          `winner_return:${cmp.winner_by_return} winner_risk_adj:${cmp.winner_by_risk_adj}\n${portfolioLines}`.slice(
+            0,
+            PRETEST_CAP,
+          );
+      } else {
+        pretestSection = '(unavailable)';
+      }
+    } catch {
+      pretestSection = '(unavailable)';
+    }
+
+    const assembled = [
+      `[AUDIT RECENT]\n${auditSection}`,
+      `[EQUITY CURVE]\n${equitySection}`,
+      `[VETO SUMMARY]\n${vetoSection}`,
+      `[PRETEST COMPARE]\n${pretestSection}`,
+    ].join('\n\n');
+
+    // Hard global budget slice (defense in depth after per-section caps)
+    return assembled.slice(0, BUDGET);
+  }
+
+  /**
+   * Executes a reflection turn:
+   * 1. Check cycle-in-progress guard.
+   * 2. Resolve active reflection-policy plugin prompt.
+   * 3. Assemble bounded context.
+   * 4. runGovernedTurn({source:'reflection'}).
+   * 5. Emit reflection_turn audit.
+   * 6. Return ReflectionTurnResult.
+   */
+  async runReflectionTurn(cycleId?: string): Promise<ReflectionTurnResult> {
+    // Concurrency guard: don't start reflection while a cycle is running.
+    if (this._panelRef?.getRunStatus().running) {
+      return { skipped: true, reason: 'cycle_in_progress' };
+    }
+
+    // Policy plugin check: reflection is a no-op without an active reflection plugin.
+    const reflectionPrompt = await (
+      this.plugins as unknown as { getActiveReflectionPrompt?: () => Promise<string | null> }
+    ).getActiveReflectionPrompt?.();
+    if (!reflectionPrompt) {
+      return { skipped: true, reason: 'no_reflection_plugin' };
+    }
+
+    // Assemble bounded context.
+    const ctx = await this._assembleReflectionContext();
+
+    // Run the governed turn with source:'reflection' (kernel__write_skill is now injectable).
+    const turnResult = await this.runGovernedTurn({
+      source: 'reflection',
+      context: ctx,
+      system_prompt: reflectionPrompt,
+      cycle_id: cycleId,
+    });
+
+    // Audit the reflection turn (runGovernedTurn intentionally emits nothing for 'reflection').
+    const toolCallsExecuted = turnResult.tool_calls.length;
+    await this.audit.log({
+      cycle_id: turnResult.cycle_id,
+      event_type: 'reflection_turn',
+      llm_text: turnResult.text?.slice(0, 2000),
+      skills_written: turnResult.skills_written,
+      meta: {
+        ctx_len: ctx.length,
+        toolCallsExecuted,
+        tools_called: turnResult.tool_calls.map((t) => `${t.plugin_id}.${t.function}`),
+      },
+    });
+
+    return {
+      skipped: false,
+      cycle_id: turnResult.cycle_id,
+      skills_written: turnResult.skills_written.length,
+    };
   }
 
   /**
