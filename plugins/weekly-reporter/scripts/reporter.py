@@ -206,7 +206,14 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 
-def generate_and_send(args: dict[str, Any]) -> dict:
+def generate_and_send(args: dict[str, Any], _context: Any = None) -> dict:
+    """Generate and optionally send a report via Telegram.
+
+    When called by the sandbox runner, ``_context`` carries the per-call
+    credentials injected by the kernel (F1). In bare-metal dev (no runner),
+    the function falls back to os.environ so existing dev workflows are
+    unaffected.
+    """
     trades = args.get("trades", [])
     equity_curve = args.get("equity_curve", [1.0])
     period = args.get("period", "weekly")
@@ -217,9 +224,14 @@ def generate_and_send(args: dict[str, Any]) -> dict:
     message = format_telegram_message(report)
     report["telegram_message"] = message
 
-    # Envío solo si hay credenciales configuradas
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    # Credentials are injected by the kernel via context['credentials'] (F1).
+    # When _context is provided (sandbox runner path), read from it.
+    # Fallback to os.environ for bare-metal dev (SANDBOX_STRICT=false).
+    ctx_credentials: dict = {}
+    if _context is not None and hasattr(_context, "metadata"):
+        ctx_credentials = _context.metadata.get("credentials", {})
+    token = ctx_credentials.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = ctx_credentials.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID", "")
 
     if token and chat_id:
         sent = send_telegram(token, chat_id, message)

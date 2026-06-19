@@ -60,9 +60,18 @@ def check_plugin_files(plugin_ids: list[str]) -> CheckResult:
     )
 
 
-def check_credentials(required_vars: list[str]) -> CheckResult:
-    """Verifica que las variables de entorno requeridas están presentes."""
-    missing = [v for v in required_vars if not os.environ.get(v)]
+def check_credentials(required_vars: list[str], available: dict[str, str] | None = None) -> CheckResult:
+    """Verifica que las credenciales requeridas están disponibles.
+
+    Since F1, credentials are no longer in the sandbox environment. Callers must
+    pass ``available`` — a dict of credential keys injected by the kernel via
+    context['credentials']. Falls back to os.environ for bare-metal dev
+    (SANDBOX_STRICT=false / no _context).
+    """
+    if available is None:
+        # Bare-metal dev fallback: check os.environ directly.
+        available = {v: os.environ.get(v, "") for v in required_vars}
+    missing = [v for v in required_vars if not available.get(v)]
     if missing:
         return CheckResult(
             name="credentials",
@@ -106,14 +115,28 @@ def check_context_health(context: dict[str, Any]) -> CheckResult:
     )
 
 
-def run_diagnostics(args: dict[str, Any]) -> dict:
+def run_diagnostics(args: dict[str, Any], _context: Any = None) -> dict:
+    """Run all diagnostic checks.
+
+    Since F1, credentials are passed by the kernel via the sandbox request
+    context rather than the subprocess environment. When ``_context`` is
+    provided by the runner, we read credentials from it. Otherwise we fall
+    back to os.environ for bare-metal dev (SANDBOX_STRICT=false).
+    """
     plugin_ids: list[str] = args.get("active_plugin_ids", [])
     required_creds: list[str] = args.get("required_credentials", [])
     context: dict[str, Any] = args.get("context", {})
 
+    # Resolve available credentials: prefer kernel-injected (F1), fall back to env.
+    available_creds: dict[str, str] | None = None
+    if _context is not None and hasattr(_context, "metadata"):
+        ctx_creds = _context.metadata.get("credentials", None)
+        if ctx_creds is not None:
+            available_creds = ctx_creds
+
     checks = [
         check_plugin_files(plugin_ids),
-        check_credentials(required_creds),
+        check_credentials(required_creds, available=available_creds),
         check_context_health(context),
     ]
 
