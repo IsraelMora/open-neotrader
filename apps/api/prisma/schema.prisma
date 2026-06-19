@@ -43,6 +43,9 @@ model Plugin {
   smoke_test_result  String?  // JSON: SmokeResult {ok,result,checks}; null = not yet smoke-tested
   reputation_score   Float?   // composite 0-100 from gate-ready pretest portfolios; null = unrated (F3-s3)
   reputation_detail  String?  // JSON: {portfolios_count, avg_sharpe, avg_return_pct, worst_dd_pct, computed_at}; null = unrated
+  trust_score      Float?   // composite 0-100 (scan/smoke/reputation/votes, KV-weighted); null = no usable signal (F3-s4)
+  content_checksum String?  // sha256 of manifest.toml+plugin.py+hooks/*.py at install; recompute+WARN on update (F3-s4)
+  votes_net        Int      @default(0)  // reserved community net votes; inert (default 0 → neutral 50) until store→api sync (F3-s4)
   installed_at   DateTime @default(now())
   updated_at     DateTime @updatedAt
 
