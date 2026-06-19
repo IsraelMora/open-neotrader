@@ -903,6 +903,25 @@ export class AgentsService {
    *   VETO   — recent veto summary from audit decision meta  (~800 chars cap)
    *   PRETEST— compare() top-5 portfolios + winners         (~1200 chars cap)
    */
+  /** Parses a single audit decision entry's meta JSON to extract a veto summary line. */
+  private _parseVetoLine(metaJson: string): string | null {
+    try {
+      const meta = JSON.parse(metaJson) as Record<string, unknown>;
+      const vs = meta['veto_summary'] as Record<string, unknown> | undefined;
+      if (!vs) return null;
+      const proposed = String((vs['signals_proposed'] as number | undefined) ?? 0);
+      const approved = String((vs['signals_approved'] as number | undefined) ?? 0);
+      const vetoed = String((vs['signals_vetoed'] as number | undefined) ?? 0);
+      const reasons = Array.isArray(vs['veto_reasons'])
+        ? (vs['veto_reasons'] as string[]).slice(0, 3).join('; ')
+        : '';
+      const reasonsPart = reasons ? ' reasons:' + reasons : '';
+      return `proposed:${proposed} approved:${approved} vetoed:${vetoed}${reasonsPart}`;
+    } catch {
+      return null;
+    }
+  }
+
   private async _assembleReflectionContext(): Promise<string> {
     const BUDGET = 4000;
     const AUDIT_CAP = 1200;
@@ -913,9 +932,7 @@ export class AgentsService {
     // Section: AUDIT
     let auditSection = '(unavailable)';
     try {
-      const entries = await this.audit.query({
-        limit: 20,
-      });
+      const entries = await this.audit.query({ limit: 20 });
       const relevantTypes = new Set([
         'signal',
         'decision',
@@ -923,7 +940,9 @@ export class AgentsService {
         'skill_written',
         'reflection_turn',
       ]);
-      const lines = (entries as Array<{ event_type: string; symbol?: string | null; action?: string | null }>)
+      const lines = (
+        entries as Array<{ event_type: string; symbol?: string | null; action?: string | null }>
+      )
         .filter((e) => relevantTypes.has(e.event_type))
         .map((e) => `${e.event_type} ${e.symbol ?? ''} ${e.action ?? ''}`.trim());
       auditSection = lines.join('\n').slice(0, AUDIT_CAP);
@@ -940,45 +959,21 @@ export class AgentsService {
           .map((e) => String(e.equity))
           .join(',')
           .slice(0, EQUITY_CAP);
-      } else {
-        equitySection = '(unavailable)';
       }
     } catch {
       equitySection = '(unavailable)';
     }
 
-    // Section: VETO
+    // Section: VETO (extracted helper reduces cognitive complexity)
     let vetoSection = '(unavailable)';
     try {
       const decisions = await this.audit.query({ limit: 10 });
-      const vetoEntries = (
-        decisions as Array<{
-          event_type: string;
-          meta?: string | null;
-        }>
-      ).filter((e) => e.event_type === 'decision');
-
-      const vetoLines: string[] = [];
-      for (const entry of vetoEntries) {
-        if (!entry.meta) continue;
-        try {
-          const meta = JSON.parse(entry.meta) as Record<string, unknown>;
-          const vs = meta['veto_summary'] as Record<string, unknown> | undefined;
-          if (vs) {
-            const proposed = vs['signals_proposed'] ?? 0;
-            const approved = vs['signals_approved'] ?? 0;
-            const vetoed = vs['signals_vetoed'] ?? 0;
-            const reasons = Array.isArray(vs['veto_reasons'])
-              ? (vs['veto_reasons'] as string[]).slice(0, 3).join('; ')
-              : '';
-            vetoLines.push(
-              `proposed:${proposed} approved:${approved} vetoed:${vetoed}${reasons ? ` reasons:${reasons}` : ''}`,
-            );
-          }
-        } catch {
-          // skip unparseable meta
-        }
-      }
+      const vetoEntries = (decisions as Array<{ event_type: string; meta?: string | null }>).filter(
+        (e) => e.event_type === 'decision',
+      );
+      const vetoLines = vetoEntries
+        .map((e) => (e.meta ? this._parseVetoLine(e.meta) : null))
+        .filter((l): l is string => l !== null);
       vetoSection = (vetoLines.length > 0 ? vetoLines.join('\n') : '(none)').slice(0, VETO_CAP);
     } catch {
       vetoSection = '(unavailable)';
@@ -991,18 +986,14 @@ export class AgentsService {
         const cmp = await this.pretest.compare();
         const top5 = cmp.portfolios.slice(0, 5);
         const portfolioLines = top5
-          .map(
-            (p) =>
-              `${p.name}: return=${String(p.return_pct?.toFixed?.(2) ?? p.return_pct)}% gate=${String(p.gate_status)}`,
-          )
+          .map((p) => {
+            const ret =
+              typeof p.return_pct === 'number' ? p.return_pct.toFixed(2) : String(p.return_pct);
+            return `${p.name}: return=${ret}% gate=${String(p.gate_status)}`;
+          })
           .join('\n');
-        pretestSection =
-          `winner_return:${cmp.winner_by_return} winner_risk_adj:${cmp.winner_by_risk_adj}\n${portfolioLines}`.slice(
-            0,
-            PRETEST_CAP,
-          );
-      } else {
-        pretestSection = '(unavailable)';
+        const header = `winner_return:${cmp.winner_by_return} winner_risk_adj:${cmp.winner_by_risk_adj}`;
+        pretestSection = (header + '\n' + portfolioLines).slice(0, PRETEST_CAP);
       }
     } catch {
       pretestSection = '(unavailable)';

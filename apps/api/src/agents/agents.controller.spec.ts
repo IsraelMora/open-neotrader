@@ -3,6 +3,8 @@ import { ConflictException } from '@nestjs/common';
 import { AgentsController } from './agents.controller';
 import { PanelService } from '../panel/panel.service';
 import type { ReflectionTurnResult } from './agents.service';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 
 // ── Stubs ─────────────────────────────────────────────────────────────────────
 
@@ -13,9 +15,11 @@ function makePanelStub(opts: {
   return {
     reflectNow: opts.reflectThrows
       ? jest.fn().mockRejectedValue(opts.reflectThrows)
-      : jest.fn().mockResolvedValue(
-          opts.reflectResult ?? { skipped: false, cycle_id: 'ref-001', skills_written: 0 },
-        ),
+      : jest
+          .fn()
+          .mockResolvedValue(
+            opts.reflectResult ?? { skipped: false, cycle_id: 'ref-001', skills_written: 0 },
+          ),
   };
 }
 
@@ -29,9 +33,9 @@ async function buildModule(panelStub: Partial<PanelService>): Promise<TestingMod
       },
     ],
   })
-    .overrideGuard(require('../auth/guards/jwt-auth.guard').JwtAuthGuard)
+    .overrideGuard(JwtAuthGuard)
     .useValue({ canActivate: () => true })
-    .overrideGuard(require('../auth/guards/totp-required.guard').TotpRequiredGuard)
+    .overrideGuard(TotpRequiredGuard)
     .useValue({ canActivate: () => true })
     .compile();
 }

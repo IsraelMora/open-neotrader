@@ -2507,11 +2507,14 @@ function makeAssemblerService(opts: {
     winner_by_risk_adj: '',
   };
 
-  const pretest: Partial<PretestService> | undefined = opts.noPretestService
-    ? undefined
-    : opts.pretestThrows
-      ? { compare: jest.fn().mockRejectedValue(new Error('pretest unavailable')) }
-      : { compare: jest.fn().mockResolvedValue(pretestCompareResult) };
+  let pretest: Partial<PretestService> | undefined;
+  if (opts.noPretestService) {
+    pretest = undefined;
+  } else if (opts.pretestThrows) {
+    pretest = { compare: jest.fn().mockRejectedValue(new Error('pretest unavailable')) };
+  } else {
+    pretest = { compare: jest.fn().mockResolvedValue(pretestCompareResult) };
+  }
 
   return new (AgentsService as unknown as new (
     llm: unknown,
@@ -2657,7 +2660,7 @@ function makeReflectionService(opts: {
       backend: 'api',
       skills_read: [],
       skills_written: [],
-    } as LlmResponse),
+    }),
   };
 
   const snapshot: Partial<SnapshotService> = {
@@ -2715,7 +2718,7 @@ describe('F4-S2 Phase 2.3 — runReflectionTurn', () => {
     expect(result.reason).toBe('no_reflection_plugin');
     expect(runGovernedTurnSpy).not.toHaveBeenCalled();
 
-    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const calls = audit.log.mock.calls as Array<[Record<string, unknown>]>;
     const reflectionAudit = calls.find(([a]) => a['event_type'] === 'reflection_turn');
     expect(reflectionAudit).toBeUndefined();
   });
@@ -2736,7 +2739,13 @@ describe('F4-S2 Phase 2.3 — runReflectionTurn', () => {
       backend: 'api',
       skills_read: [],
       skills_written: ['x'],
-      llm_response: { text: '', tool_calls: [], backend: 'api', skills_read: [], skills_written: [] },
+      llm_response: {
+        text: '',
+        tool_calls: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+      },
       signalsEmitted: [],
     });
 
@@ -2744,11 +2753,12 @@ describe('F4-S2 Phase 2.3 — runReflectionTurn', () => {
 
     expect(result.skipped).toBe(false);
 
-    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const calls = audit.log.mock.calls as Array<[Record<string, unknown>]>;
     const reflectionAudit = calls.find(([a]) => a['event_type'] === 'reflection_turn');
     expect(reflectionAudit).toBeDefined();
     const meta = reflectionAudit![0]['meta'] as Record<string, unknown>;
-    const ctxLen = (meta['ctx_len'] as number | undefined) ?? (meta['contextLen'] as number | undefined);
+    const ctxLen =
+      (meta['ctx_len'] as number | undefined) ?? (meta['contextLen'] as number | undefined);
     expect(ctxLen).toBeLessThanOrEqual(4000);
   });
 
@@ -2766,7 +2776,13 @@ describe('F4-S2 Phase 2.3 — runReflectionTurn', () => {
       backend: 'api',
       skills_read: [],
       skills_written: [],
-      llm_response: { text: '', tool_calls: [], backend: 'api', skills_read: [], skills_written: [] },
+      llm_response: {
+        text: '',
+        tool_calls: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+      },
       signalsEmitted: [],
     });
 
@@ -2774,7 +2790,7 @@ describe('F4-S2 Phase 2.3 — runReflectionTurn', () => {
 
     expect(result.skipped).toBe(false);
 
-    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const calls = audit.log.mock.calls as Array<[Record<string, unknown>]>;
     const reflectionAudit = calls.find(([a]) => a['event_type'] === 'reflection_turn');
     expect(reflectionAudit).toBeDefined();
   });
