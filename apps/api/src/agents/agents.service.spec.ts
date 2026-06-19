@@ -5,6 +5,8 @@ import type { PluginsService } from '../plugins/plugins.service';
 import type { ContextMemoryService } from '../context-memory/context-memory.service';
 import type { AuditService } from '../audit/audit.service';
 import type { AlertsService } from '../alerts/alerts.service';
+import type { SnapshotService } from '../snapshot/snapshot.service';
+import type { PretestService } from '../pretest/pretest.service';
 
 // ── Stubs ─────────────────────────────────────────────────────────────────────
 
@@ -2446,5 +2448,353 @@ describe('F4-S2 Task 1.7 — GovernedTurnInput.source union accepts reflection (
 
     expect(captured).toHaveLength(1);
     expect(captured[0].tools).not.toContain('kernel__write_skill');
+  });
+});
+
+// ── F4-S2 Phase 2 — _assembleReflectionContext ────────────────────────────────
+
+/**
+ * Helper to call the private _assembleReflectionContext method.
+ */
+async function callAssembleReflectionContext(service: AgentsService): Promise<string> {
+  return (
+    service as unknown as {
+      _assembleReflectionContext: () => Promise<string>;
+    }
+  )._assembleReflectionContext();
+}
+
+/**
+ * Build a service configured for assembler tests.
+ * snapshot and pretest are optional — match real constructor signature.
+ */
+function makeAssemblerService(opts: {
+  auditEntries?: Array<{ event_type: string; symbol?: string | null; action?: string | null }>;
+  equityCurve?: Array<{ ts: string; equity: number }>;
+  auditThrows?: boolean;
+  snapshotThrows?: boolean;
+  pretestCompare?: Record<string, unknown>;
+  pretestThrows?: boolean;
+  noPretestService?: boolean;
+}): AgentsService {
+  const audit = {
+    log: jest.fn().mockResolvedValue(undefined),
+    query: opts.auditThrows
+      ? jest.fn().mockRejectedValue(new Error('audit unavailable'))
+      : jest.fn().mockResolvedValue(
+          (opts.auditEntries ?? []).map((e) => ({
+            event_type: e.event_type,
+            symbol: e.symbol ?? null,
+            action: e.action ?? null,
+          })),
+        ),
+  };
+
+  const snapshot: Partial<SnapshotService> | undefined = opts.snapshotThrows
+    ? { getEquityCurve: jest.fn().mockRejectedValue(new Error('snapshot unavailable')) }
+    : {
+        getEquityCurve: jest.fn().mockResolvedValue(
+          (opts.equityCurve ?? [{ ts: '2024-01-01', equity: 1000 }]).map((e) => ({
+            ts: e.ts,
+            equity: e.equity,
+          })),
+        ),
+      };
+
+  const pretestCompareResult = opts.pretestCompare ?? {
+    portfolios: [],
+    winner_by_return: '',
+    winner_by_risk_adj: '',
+  };
+
+  let pretest: Partial<PretestService> | undefined;
+  if (opts.noPretestService) {
+    pretest = undefined;
+  } else if (opts.pretestThrows) {
+    pretest = { compare: jest.fn().mockRejectedValue(new Error('pretest unavailable')) };
+  } else {
+    pretest = { compare: jest.fn().mockResolvedValue(pretestCompareResult) };
+  }
+
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+  ) => AgentsService)(
+    {},
+    {},
+    {
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+      getProviderTools: jest.fn().mockResolvedValue([]),
+      findActive: jest.fn().mockResolvedValue([]),
+    },
+    {},
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    snapshot,
+    undefined,
+    undefined,
+    pretest,
+  );
+}
+
+describe('F4-S2 Phase 2.1 — _assembleReflectionContext budget enforcement', () => {
+  it('2.1a — nominal: result length <= 4000 when all sources are small', async () => {
+    const service = makeAssemblerService({
+      auditEntries: [
+        { event_type: 'cycle_complete', symbol: 'AAPL', action: 'buy' },
+        { event_type: 'signal', symbol: 'TSLA', action: 'sell' },
+      ],
+      equityCurve: [
+        { ts: '2024-01-01', equity: 1000 },
+        { ts: '2024-01-02', equity: 1050 },
+      ],
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(typeof ctx).toBe('string');
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+  });
+
+  it('2.1b — oversized sources: total assembled <= 4000 chars regardless', async () => {
+    const bigAuditEntries = Array.from({ length: 100 }, () => ({
+      event_type: 'cycle_complete',
+      symbol: 'AAPL'.repeat(20),
+      action: 'buy'.repeat(100),
+    }));
+
+    const bigEquity = Array.from({ length: 100 }, (_, i) => ({
+      ts: `2024-01-${String(i + 1).padStart(2, '0')}`,
+      equity: 1000 + i * 10,
+    }));
+
+    const bigPretest = {
+      portfolios: Array.from({ length: 50 }, (_, i) => ({
+        id: `p${i}`,
+        name: `Portfolio ${String(i).repeat(20)}`,
+        return_pct: i * 0.1,
+        gate_status: 'READY',
+      })),
+      winner_by_return: 'Portfolio 0',
+      winner_by_risk_adj: 'Portfolio 1',
+    };
+
+    const service = makeAssemblerService({
+      auditEntries: bigAuditEntries,
+      equityCurve: bigEquity,
+      pretestCompare: bigPretest,
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+  });
+
+  it('2.1c — SnapshotService throws: EQUITY section degrades to (unavailable), no throw', async () => {
+    const service = makeAssemblerService({
+      snapshotThrows: true,
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(typeof ctx).toBe('string');
+    expect(ctx).toContain('(unavailable)');
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+  });
+
+  it('2.1d — PretestService absent (undefined): PRETEST section degrades gracefully, no throw', async () => {
+    const service = makeAssemblerService({
+      noPretestService: true,
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(typeof ctx).toBe('string');
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+  });
+});
+
+// ── F4-S2 Phase 2.3 — runReflectionTurn ──────────────────────────────────────
+
+/** Export type check: ReflectionTurnResult must be importable */
+type _ReflectionTurnResultCheck = import('./agents.service').ReflectionTurnResult;
+
+function makeReflectionService(opts: { reflectionPrompt: string | null; llmText?: string }): {
+  service: AgentsService;
+  audit: { log: jest.Mock; query: jest.Mock };
+  runGovernedTurnSpy: jest.SpyInstance;
+} {
+  const audit = {
+    log: jest.fn().mockResolvedValue(undefined),
+    query: jest.fn().mockResolvedValue([]),
+  };
+
+  const plugins = {
+    getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+    getActiveReflectionPrompt: jest.fn().mockResolvedValue(opts.reflectionPrompt),
+    getProviderTools: jest.fn().mockResolvedValue([]),
+    findActive: jest.fn().mockResolvedValue([]),
+  };
+
+  const llm: Partial<LlmService> = {
+    complete: jest.fn().mockResolvedValue({
+      text: opts.llmText ?? 'reflection response',
+      tool_calls: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+    }),
+  };
+
+  const snapshot: Partial<SnapshotService> = {
+    getEquityCurve: jest.fn().mockResolvedValue([{ ts: '2024-01-01', equity: 1000 }]),
+  };
+
+  const pretest: Partial<PretestService> = {
+    compare: jest.fn().mockResolvedValue({
+      portfolios: [],
+      winner_by_return: '',
+      winner_by_risk_adj: '',
+    }),
+  };
+
+  const service = new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+  ) => AgentsService)(
+    llm,
+    makeSandbox(),
+    plugins,
+    {},
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    snapshot,
+    undefined,
+    undefined,
+    pretest,
+  );
+
+  const runGovernedTurnSpy = jest.spyOn(service, 'runGovernedTurn');
+
+  return { service, audit, runGovernedTurnSpy };
+}
+
+describe('F4-S2 Phase 2.3 — runReflectionTurn', () => {
+  it('2.3a — no reflection plugin → {skipped:true, reason:"no_reflection_plugin"}, no governed turn, no audit', async () => {
+    const { service, audit, runGovernedTurnSpy } = makeReflectionService({
+      reflectionPrompt: null,
+    });
+
+    const result = await service.runReflectionTurn();
+
+    expect(result.skipped).toBe(true);
+    expect(result.reason).toBe('no_reflection_plugin');
+    expect(runGovernedTurnSpy).not.toHaveBeenCalled();
+
+    const calls = audit.log.mock.calls as Array<[Record<string, unknown>]>;
+    const reflectionAudit = calls.find(([a]) => a['event_type'] === 'reflection_turn');
+    expect(reflectionAudit).toBeUndefined();
+  });
+
+  it('2.3b — plugin active, LLM calls write_skill → reflection_turn audit emitted, returns {skipped:false}', async () => {
+    const { service, audit, runGovernedTurnSpy } = makeReflectionService({
+      reflectionPrompt: 'Reflect on your decisions.',
+    });
+
+    runGovernedTurnSpy.mockResolvedValue({
+      cycle_id: 'reflect-001',
+      text: 'I will update the skill.',
+      tool_calls: [
+        { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
+      ],
+      decisions: [],
+      sandbox_results: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: ['x'],
+      llm_response: {
+        text: '',
+        tool_calls: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+      },
+      signalsEmitted: [],
+    });
+
+    const result = await service.runReflectionTurn('cycle-abc');
+
+    expect(result.skipped).toBe(false);
+
+    const calls = audit.log.mock.calls as Array<[Record<string, unknown>]>;
+    const reflectionAudit = calls.find(([a]) => a['event_type'] === 'reflection_turn');
+    expect(reflectionAudit).toBeDefined();
+    const meta = reflectionAudit![0]['meta'] as Record<string, unknown>;
+    const ctxLen =
+      (meta['ctx_len'] as number | undefined) ?? (meta['contextLen'] as number | undefined);
+    expect(ctxLen).toBeLessThanOrEqual(4000);
+  });
+
+  it('2.3c — plugin active, LLM does NOT call tool → audit still emitted, toolCallsExecuted===0', async () => {
+    const { service, audit, runGovernedTurnSpy } = makeReflectionService({
+      reflectionPrompt: 'Reflect.',
+    });
+
+    runGovernedTurnSpy.mockResolvedValue({
+      cycle_id: 'reflect-002',
+      text: 'No tools needed.',
+      tool_calls: [],
+      decisions: [],
+      sandbox_results: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+      llm_response: {
+        text: '',
+        tool_calls: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+      },
+      signalsEmitted: [],
+    });
+
+    const result = await service.runReflectionTurn();
+
+    expect(result.skipped).toBe(false);
+
+    const calls = audit.log.mock.calls as Array<[Record<string, unknown>]>;
+    const reflectionAudit = calls.find(([a]) => a['event_type'] === 'reflection_turn');
+    expect(reflectionAudit).toBeDefined();
+  });
+
+  // Note: the cycle_in_progress guard was removed from runReflectionTurn (Fix #2).
+  // Concurrency is now handled exclusively by PanelService.reflectNow (which holds
+  // runState.running while reflection is in-flight). All callers route through reflectNow.
+  it('2.3d — plugin active → proceeds to governed turn regardless of external state (lock is in reflectNow)', async () => {
+    const { service, runGovernedTurnSpy } = makeReflectionService({
+      reflectionPrompt: 'Reflect.',
+    });
+
+    const result = await service.runReflectionTurn();
+
+    expect(result.skipped).toBe(false);
+    expect(runGovernedTurnSpy).toHaveBeenCalledTimes(1);
   });
 });

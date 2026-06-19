@@ -1,6 +1,6 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { AgentsService } from '../agents/agents.service';
+import { AgentsService, ReflectionTurnResult } from '../agents/agents.service';
 import { LlmService } from '../llm/llm.service';
 import { SandboxGateway } from '../sandbox/sandbox.gateway';
 import { PluginsService } from '../plugins/plugins.service';
@@ -360,5 +360,31 @@ export class PanelService {
       throw new BadRequestException(`clave de métrica inválida: ${JSON.stringify(key)}`);
     }
     return this.getCfgKey(key, null);
+  }
+
+  // ── F4-S2: Manual reflection trigger ──────────────────────────────────────
+
+  /**
+   * Triggers a reflection turn immediately, bypassing the cadence check.
+   * Guards against concurrent execution: throws 409 ConflictException if a cycle
+   * (or another reflection) is currently running.
+   *
+   * This endpoint is reachable via POST /agents/reflect (guarded by JwtAuthGuard
+   * and TotpRequiredGuard). The scheduler also calls this via _maybeReflect to
+   * avoid injecting AgentsService directly into CycleSchedulerService (which would
+   * risk a circular module dependency: scheduler→panel already exists; no new edge needed).
+   */
+  async reflectNow(): Promise<ReflectionTurnResult> {
+    if (this.runState.running) {
+      throw new ConflictException(
+        'A cycle is currently running — reflection cannot start concurrently',
+      );
+    }
+    this.runState.running = true;
+    try {
+      return await this.agents.runReflectionTurn();
+    } finally {
+      this.runState.running = false;
+    }
   }
 }
