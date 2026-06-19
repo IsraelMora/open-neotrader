@@ -1778,3 +1778,496 @@ describe('AgentsService._executeCycle — veto ordering: LLM sees only post-veto
     expect(llmContext).not.toContain('TSLA');
   });
 });
+
+// ── F4-S1 Phase 3: Kernel Tool Tests ─────────────────────────────────────────
+
+// Shared type alias for the kernel-related plugins subset.
+type KernelPluginsMock = jest.Mocked<
+  Pick<PluginsService, 'findActive' | 'getProviderTools' | 'writeSkillGuarded'>
+>;
+
+/** Shared factory: returns a minimal PluginsService mock with writeSkillGuarded for kernel tests. */
+function makeKernelPluginsMock(): KernelPluginsMock {
+  return {
+    findActive: jest.fn().mockResolvedValue([]),
+    getProviderTools: jest.fn().mockResolvedValue([]),
+    writeSkillGuarded: jest.fn().mockResolvedValue({ ok: true, old_len: 100, new_len: 130 }),
+  };
+}
+
+/**
+ * Helper to call _validateToolCalls with hoistedTools override so we can inject
+ * a kernel tool definition (simulating effectiveTools from runGovernedTurn).
+ */
+async function callValidateWithHoisted(
+  service: AgentsService,
+  cycleId: string,
+  calls: ToolCallRequest[],
+  hoistedTools: import('../plugins/plugins.service').ProviderTool[],
+  source?: string,
+): Promise<ToolCallRequest[]> {
+  return (
+    service as unknown as {
+      _validateToolCalls: (
+        c: string,
+        t: ToolCallRequest[],
+        hoistedTools: import('../plugins/plugins.service').ProviderTool[],
+        preloaded: undefined,
+        virtualOnly: undefined,
+        source?: string,
+      ) => Promise<ToolCallRequest[]>;
+    }
+  )._validateToolCalls(cycleId, calls, hoistedTools, undefined, undefined, source);
+}
+
+/** Helper to call _executeToolCalls (private) */
+async function callExecuteToolCalls(
+  service: AgentsService,
+  cycleId: string,
+  calls: ToolCallRequest[],
+): Promise<{
+  decisions: import('./agents.service').Decision[];
+  sandbox_results: import('./agents.service').SandboxResult[];
+}> {
+  return (
+    service as unknown as {
+      _executeToolCalls: (
+        c: string,
+        t: ToolCallRequest[],
+      ) => Promise<{
+        decisions: import('./agents.service').Decision[];
+        sandbox_results: import('./agents.service').SandboxResult[];
+      }>;
+    }
+  )._executeToolCalls(cycleId, calls);
+}
+
+describe('F4-S1 Phase 3.2/3.3 — _validateToolCalls kernel bypass', () => {
+  const CYCLE_ID = 'kernel-validate-001';
+
+  it('3.2 — kernel write_skill call is NOT dropped with plugin_not_found or function_not_declared (source:reflection)', async () => {
+    // No active plugins at all — but kernel tools must pass when source==='reflection'
+    const plugins = makePlugins([], []);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const kernelTool: import('../plugins/plugins.service').ProviderTool = {
+      plugin_id: 'kernel',
+      name: 'kernel__write_skill',
+      description: 'Reescribe un SKILL.md opt-in durante reflexión.',
+      input_schema: {
+        type: 'object',
+        properties: { skill: { type: 'string' }, new_body: { type: 'string' } },
+        required: ['skill', 'new_body'],
+      },
+    };
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
+    ];
+
+    // Pass source:'reflection' — the only context where kernel tools are permitted
+    const result = await callValidateWithHoisted(
+      service,
+      CYCLE_ID,
+      calls,
+      [kernelTool],
+      'reflection',
+    );
+
+    // Kernel tool MUST pass validation and be returned as a valid call
+    expect(result).toHaveLength(1);
+    expect(result[0].plugin_id).toBe('kernel');
+    expect(result[0].function).toBe('write_skill');
+    // No tool_call_dropped audit for kernel tools
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'tool_call_dropped', plugin_id: 'kernel' }),
+    );
+  });
+
+  it('3.3 — unknown kernel function is dropped with reason "unknown_kernel_tool"', async () => {
+    const plugins = makePlugins([], []);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [{ plugin_id: 'kernel', function: 'unknown_fn', args: {} }];
+
+    const result = await callValidateWithHoisted(service, CYCLE_ID, calls, []);
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'kernel',
+        meta: expect.objectContaining({ reason: 'unknown_kernel_tool' }) as unknown,
+      }),
+    );
+  });
+});
+
+describe('F4-S1 Phase 3.4/3.5 — _executeToolCalls kernel dispatch', () => {
+  const CYCLE_ID = 'kernel-exec-001';
+
+  function makePluginsWithWriteSkillGuarded(): KernelPluginsMock {
+    return makeKernelPluginsMock();
+  }
+
+  function makeAgentsServiceWithKernelPlugins(
+    plugins: KernelPluginsMock,
+    audit: ReturnType<typeof makeAudit>,
+    sandbox: ReturnType<typeof makeSandbox>,
+  ): AgentsService {
+    return new AgentsService(
+      {} as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      {} as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+  }
+
+  it('3.4 — kernel write_skill tool_call routes to writeSkillGuarded, sandbox.callPlugin is NEVER called', async () => {
+    const plugins = makePluginsWithWriteSkillGuarded();
+    const audit = makeAudit();
+    const sandbox = makeSandbox();
+    const service = makeAgentsServiceWithKernelPlugins(plugins, audit, sandbox);
+
+    const calls: ToolCallRequest[] = [
+      {
+        plugin_id: 'kernel',
+        function: 'write_skill',
+        args: { skill: 'my-skill', new_body: 'new body content' },
+      },
+    ];
+
+    await callExecuteToolCalls(service, CYCLE_ID, calls);
+
+    // Must route to writeSkillGuarded
+    expect(plugins.writeSkillGuarded).toHaveBeenCalledWith('my-skill', 'new body content');
+    // Must NEVER call sandbox.callPlugin for kernel tools
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+  });
+
+  it('3.5 — existing plugin tool_calls still flow to sandbox.callPlugin unchanged (regression)', async () => {
+    const plugins = makePluginsWithWriteSkillGuarded();
+    (plugins.findActive as jest.Mock).mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider' },
+    ]);
+    (plugins.getProviderTools as jest.Mock).mockResolvedValue([
+      {
+        plugin_id: 'alpaca-provider',
+        name: 'alpaca-provider__place_order',
+        description: '',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ]);
+    const audit = makeAudit();
+    const sandbox = makeSandbox();
+    const service = makeAgentsServiceWithKernelPlugins(plugins, audit, sandbox);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'alpaca-provider', function: 'place_order', args: { symbol: 'AAPL' } },
+    ];
+
+    await callExecuteToolCalls(service, CYCLE_ID, calls);
+
+    // Regular plugin calls MUST still go through sandbox
+    expect(sandbox.callPlugin).toHaveBeenCalledWith('alpaca-provider', 'place_order', {
+      symbol: 'AAPL',
+    });
+    // writeSkillGuarded must NOT be called for regular plugin calls
+    expect(plugins.writeSkillGuarded).not.toHaveBeenCalled();
+  });
+});
+
+// ── F4-S1 Phase 4.1 — Injection Gating Tests ─────────────────────────────────
+
+describe('F4-S1 Phase 4.1 — runGovernedTurn tool schema injection gating', () => {
+  function buildInjectionCapturingService(
+    source: 'chat' | 'cycle' | 'pretest',
+    capturedSchema: { tools: string }[],
+  ): AgentsService {
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+        const sp = opts.system_prompt ?? '';
+        // Extract the [TOOL SCHEMA] content for assertion
+        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+        capturedSchema.push({ tools: match ? match[1] : '' });
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+
+    // Give it a decision prompt so the schema IS injected
+    const plugins = makeFullPlugins('Use tools via JSON.', []);
+
+    return new AgentsService(
+      llm as unknown as LlmService,
+      makeSandbox() as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      makeMemory() as unknown as ContextMemoryService,
+      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+  }
+
+  it('4.1 source:cycle — kernel__write_skill NOT in injected [TOOL SCHEMA]', async () => {
+    const captured: { tools: string }[] = [];
+    const service = buildInjectionCapturingService('cycle', captured);
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'run cycle' });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).not.toContain('kernel__write_skill');
+  });
+
+  it('4.1 source:chat — kernel__write_skill NOT in injected [TOOL SCHEMA]', async () => {
+    const captured: { tools: string }[] = [];
+    const service = buildInjectionCapturingService('chat', captured);
+
+    await service.runGovernedTurn({ source: 'chat', context: 'ask something' });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).not.toContain('kernel__write_skill');
+  });
+
+  it('4.1 source:pretest — kernel__write_skill NOT in injected [TOOL SCHEMA]', async () => {
+    const captured: { tools: string }[] = [];
+    const service = buildInjectionCapturingService('pretest', captured);
+
+    await service.runGovernedTurn({ source: 'pretest', context: 'pretest run' });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).not.toContain('kernel__write_skill');
+  });
+
+  it('4.1 source:reflection (cast) — kernel__write_skill IS in injected [TOOL SCHEMA]', async () => {
+    const captured: { tools: string }[] = [];
+    // Cast to bypass union — 'reflection' is not in GovernedTurnInput.source union in s1 (by design).
+    // This test proves the gating condition is correctly wired for forward-compat.
+    const service = buildInjectionCapturingService('chat' /* placeholder, we'll cast */, captured);
+
+    await service.runGovernedTurn({
+      source: 'reflection' as unknown as 'chat',
+      context: 'reflection turn',
+    });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).toContain('kernel__write_skill');
+  });
+});
+
+// ── Fix: CRITICAL — kernel tool dispatch gating by source ─────────────────────
+//
+// Confirms that kernel__write_skill emitted by the LLM in a non-reflection turn
+// is DROPPED (audited 'kernel_source_not_allowed') and writeSkillGuarded is NEVER
+// called — i.e. s1 is truly inert, not just cosmetically gated at injection.
+
+describe('F4-S1 Fix — kernel tool DROPPED when source !== reflection (dispatch enforcement)', () => {
+  const CYCLE_ID = 'kernel-src-gate-001';
+
+  function makePluginsForSourceGate(): KernelPluginsMock {
+    return makeKernelPluginsMock();
+  }
+
+  function makeServiceForSourceGate(
+    plugins: KernelPluginsMock,
+    audit: ReturnType<typeof makeAudit>,
+  ): AgentsService {
+    return new AgentsService(
+      {} as unknown as LlmService,
+      makeSandbox() as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      {} as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+  }
+
+  it('src-gate.1 source:cycle — kernel__write_skill is DROPPED with kernel_source_not_allowed, writeSkillGuarded NOT called', async () => {
+    const plugins = makePluginsForSourceGate();
+    const audit = makeAudit();
+    const service = makeServiceForSourceGate(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
+    ];
+
+    // Call _validateToolCalls directly — cycle source means kernel call must be dropped
+    const result = await (
+      service as unknown as {
+        _validateToolCalls: (
+          c: string,
+          t: ToolCallRequest[],
+          hoisted: undefined,
+          preloaded: undefined,
+          virtualOnly: undefined,
+          source: string,
+        ) => Promise<ToolCallRequest[]>;
+      }
+    )._validateToolCalls(CYCLE_ID, calls, undefined, undefined, undefined, 'cycle');
+
+    // Kernel call must be DROPPED (not allowed outside reflection)
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cycle_id: CYCLE_ID,
+        event_type: 'tool_call_dropped',
+        plugin_id: 'kernel',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }),
+      }),
+    );
+    // CRITICAL: writeSkillGuarded must NEVER have been called
+    expect(plugins.writeSkillGuarded).not.toHaveBeenCalled();
+  });
+
+  it('src-gate.2 source:chat — kernel__write_skill DROPPED, writeSkillGuarded NOT called', async () => {
+    const plugins = makePluginsForSourceGate();
+    const audit = makeAudit();
+    const service = makeServiceForSourceGate(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
+    ];
+
+    const result = await (
+      service as unknown as {
+        _validateToolCalls: (
+          c: string,
+          t: ToolCallRequest[],
+          hoisted: undefined,
+          preloaded: undefined,
+          virtualOnly: undefined,
+          source: string,
+        ) => Promise<ToolCallRequest[]>;
+      }
+    )._validateToolCalls(CYCLE_ID, calls, undefined, undefined, undefined, 'chat');
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'kernel',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }),
+      }),
+    );
+    expect(plugins.writeSkillGuarded).not.toHaveBeenCalled();
+  });
+
+  it('src-gate.3 source:pretest — kernel__write_skill DROPPED, writeSkillGuarded NOT called', async () => {
+    const plugins = makePluginsForSourceGate();
+    const audit = makeAudit();
+    const service = makeServiceForSourceGate(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
+    ];
+
+    const result = await (
+      service as unknown as {
+        _validateToolCalls: (
+          c: string,
+          t: ToolCallRequest[],
+          hoisted: undefined,
+          preloaded: undefined,
+          virtualOnly: undefined,
+          source: string,
+        ) => Promise<ToolCallRequest[]>;
+      }
+    )._validateToolCalls(CYCLE_ID, calls, undefined, undefined, undefined, 'pretest');
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'kernel',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }),
+      }),
+    );
+    expect(plugins.writeSkillGuarded).not.toHaveBeenCalled();
+  });
+
+  it('src-gate.4 source:reflection — kernel__write_skill IS allowed, passes validation', async () => {
+    const plugins = makePluginsForSourceGate();
+    const audit = makeAudit();
+    const service = makeServiceForSourceGate(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
+    ];
+
+    const result = await (
+      service as unknown as {
+        _validateToolCalls: (
+          c: string,
+          t: ToolCallRequest[],
+          hoisted: undefined,
+          preloaded: undefined,
+          virtualOnly: undefined,
+          source: string,
+        ) => Promise<ToolCallRequest[]>;
+      }
+    )._validateToolCalls(CYCLE_ID, calls, undefined, undefined, undefined, 'reflection');
+
+    // Must be allowed when source === 'reflection'
+    expect(result).toHaveLength(1);
+    expect(result[0].plugin_id).toBe('kernel');
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }),
+      }),
+    );
+  });
+
+  it('src-gate.5 end-to-end: runGovernedTurn with source:cycle + LLM emitting kernel__write_skill — writeSkillGuarded NEVER called', async () => {
+    // The LLM returns a kernel__write_skill tool_call in a cycle turn.
+    const toolCallText =
+      '<tool_calls>[{"tool":"kernel__write_skill","args":{"skill":"my-skill","new_body":"injected body"}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('Emit tool calls as JSON.', []);
+    // Add writeSkillGuarded to the plugins stub
+    const pluginsWithKernel = {
+      ...plugins,
+      writeSkillGuarded: jest.fn().mockResolvedValue({ ok: true, old_len: 0, new_len: 100 }),
+    };
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      pluginsWithKernel as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    const result = await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'cycle run',
+    });
+
+    // Kernel call must be DROPPED — not in result.tool_calls
+    expect(result.tool_calls).toHaveLength(0);
+    // writeSkillGuarded must NEVER have been called
+    expect(pluginsWithKernel.writeSkillGuarded).not.toHaveBeenCalled();
+    // Must have audited tool_call_dropped with kernel_source_not_allowed
+    const logCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const droppedCall = logCalls.find(
+      ([arg]) =>
+        arg['event_type'] === 'tool_call_dropped' &&
+        (arg['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
+    );
+    expect(droppedCall).toBeDefined();
+  });
+});

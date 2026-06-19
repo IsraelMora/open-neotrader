@@ -21,10 +21,19 @@ import {
 } from './manifest';
 import { scanLocalManifests } from './local-sync';
 import type { Plugin } from '@prisma/client';
+import type { KvService } from '../common/kv.service';
+import type { AuditService } from '../audit/audit.service';
 
 export type { Plugin };
 export type PluginVerification = 'unverified' | 'pending' | 'verified' | 'rejected';
 export type { PluginType } from './manifest';
+
+export interface WriteSkillResult {
+  ok: boolean;
+  reason?: 'not_found' | 'not_writable' | 'diff_too_large' | 'write_failed';
+  old_len?: number;
+  new_len?: number;
+}
 
 export interface SkillMeta {
   id: string;
@@ -134,6 +143,8 @@ export class PluginsService implements OnApplicationBootstrap {
     readonly db: PrismaService,
     private readonly events: PluginEventsService,
     cfg: ConfigService,
+    private readonly kv?: KvService,
+    private readonly audit?: AuditService,
   ) {
     this.pluginsDir = cfg.get<string>('PLUGINS_DIR', path.resolve(process.cwd(), '../../plugins'));
   }
@@ -605,6 +616,153 @@ export class PluginsService implements OnApplicationBootstrap {
   }
 
   // ── write_skill (learning loop) ───────────────────────────────────────────
+
+  /**
+   * Guarded write path for the LLM learning loop. Enforces allowlist, diff-cap,
+   * KV snapshot (BEFORE write), and emits audit events. This is the only method
+   * the kernel tool or REST endpoints should call — never writeSkillContent directly.
+   */
+  async writeSkillGuarded(
+    skillName: string,
+    newBody: string,
+    opts?: { minLen?: number; maxRatio?: number },
+  ): Promise<WriteSkillResult> {
+    const minLen = opts?.minLen ?? 50;
+    const maxRatio = opts?.maxRatio ?? 0.5;
+
+    // 1. Resolve active skill plugin
+    const plugin = await this.db.plugin.findFirst({
+      where: { active: true, type: 'skill', name: skillName },
+    });
+    if (!plugin?.installed_path) {
+      return { ok: false, reason: 'not_found' };
+    }
+
+    // 2. Allowlist gate: require llm_writable === true
+    const manifest = this.getManifest(plugin.installed_path);
+    if (manifest?.plugin.llm_writable !== true) {
+      await this.audit?.log({
+        event_type: 'skill_write_denied',
+        plugin_id: plugin.id,
+        meta: { skill: skillName, reason: 'not_writable' },
+      });
+      return { ok: false, reason: 'not_writable' };
+    }
+
+    // 3. Read current body
+    const currentBody = await this.loadSkillContent(skillName);
+    const oldLen = currentBody?.length ?? 0;
+    const newLen = newBody.trim().length;
+
+    // 4. Diff-cap: absolute floor + relative delta cap.
+    // NOTE: The length-ratio cap does NOT catch same-length full rewrites (e.g. a body
+    // that is the same length but completely different content). This is a known limitation
+    // compensated by the snapshot+revert+audit trail: any bad write is recoverable via
+    // revertSkill, and every write is audited. Full-content diff (e.g. Levenshtein ratio)
+    // is a future hardening option if the threat model requires it.
+    const floorViolation = newLen < minLen;
+    const ratioViolation = oldLen > 0 && Math.abs(newLen - oldLen) / oldLen > maxRatio;
+    if (floorViolation || ratioViolation) {
+      await this.audit?.log({
+        event_type: 'skill_write_denied',
+        plugin_id: plugin.id,
+        meta: { skill: skillName, reason: 'diff_too_large', old_len: oldLen, new_len: newLen },
+      });
+      return { ok: false, reason: 'diff_too_large' };
+    }
+
+    // 5. Snapshot current body to KV BEFORE write (FIFO cap=5)
+    if (!this.kv) {
+      this.log.warn(
+        `writeSkillGuarded: KvService is undefined — snapshot and revert unavailable for '${skillName}'. Check KvService provider configuration.`,
+      );
+    }
+    const snapshotKey = `skill_snapshot:${skillName}`;
+    const raw = (await this.kv?.get(snapshotKey)) ?? null;
+    let arr: string[];
+    try {
+      arr = raw ? (JSON.parse(raw) as string[]) : [];
+    } catch {
+      arr = [];
+    }
+    arr.push(currentBody ?? '');
+    if (arr.length > 5) arr.shift();
+    await this.kv?.set(snapshotKey, JSON.stringify(arr));
+
+    // 6. Write new body
+    const written = await this.writeSkillContent(skillName, newBody);
+    if (!written) {
+      return { ok: false, reason: 'write_failed' };
+    }
+
+    // 7. Audit skill_written
+    await this.audit?.log({
+      event_type: 'skill_written',
+      plugin_id: plugin.id,
+      meta: { skill: skillName, old_len: oldLen, new_len: newLen },
+    });
+
+    return { ok: true, old_len: oldLen, new_len: newLen };
+  }
+
+  /**
+   * Restores the most recent KV snapshot for a skill. Bypasses diff-cap — revert
+   * always restores a body that the kernel previously persisted.
+   */
+  async revertSkill(
+    skillName: string,
+  ): Promise<{ ok: boolean; reason?: 'no_snapshot' | 'not_found' | 'not_writable' }> {
+    // Allowlist gate (fail-closed): only llm_writable:true skills may be reverted.
+    // Revert restores a body the kernel previously wrote; it still modifies a skill file,
+    // so the same opt-in check applies.
+    const pluginForCheck = await this.db.plugin.findFirst({
+      where: { active: true, type: 'skill', name: skillName },
+    });
+    if (pluginForCheck?.installed_path) {
+      const manifest = this.getManifest(pluginForCheck.installed_path);
+      if (manifest?.plugin.llm_writable !== true) {
+        await this.audit?.log({
+          event_type: 'skill_write_denied',
+          plugin_id: pluginForCheck.id,
+          meta: { skill: skillName, reason: 'not_writable', op: 'revert' },
+        });
+        return { ok: false, reason: 'not_writable' };
+      }
+    }
+
+    const snapshotKey = `skill_snapshot:${skillName}`;
+    const raw = (await this.kv?.get(snapshotKey)) ?? null;
+    let arr: string[];
+    try {
+      arr = raw ? (JSON.parse(raw) as string[]) : [];
+    } catch {
+      arr = [];
+    }
+
+    if (arr.length === 0) {
+      return { ok: false, reason: 'no_snapshot' };
+    }
+
+    const body = arr.pop()!;
+    await this.kv?.set(snapshotKey, JSON.stringify(arr));
+
+    const written = await this.writeSkillContent(skillName, body);
+    if (!written) {
+      return { ok: false, reason: 'not_found' };
+    }
+
+    // Resolve plugin_id for audit (best-effort, non-blocking)
+    const plugin = await this.db.plugin.findFirst({
+      where: { active: true, type: 'skill', name: skillName },
+    });
+    await this.audit?.log({
+      event_type: 'skill_reverted',
+      plugin_id: plugin?.id,
+      meta: { skill: skillName, restored_len: body.length },
+    });
+
+    return { ok: true };
+  }
 
   /** Actualiza el cuerpo del SKILL.md de un skill activo preservando el frontmatter (learning loop). */
   async writeSkillContent(skillName: string, newBody: string): Promise<boolean> {

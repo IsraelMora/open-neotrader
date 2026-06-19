@@ -100,6 +100,34 @@ export interface VetoSummary {
   discipline_plugins: string[];
 }
 
+// ── Kernel tool constants (Phase 3.6) ─────────────────────────────────────────
+
+/**
+ * Schema definition for the kernel__write_skill tool.
+ * Injected into the LLM tool schema ONLY when source === 'reflection'.
+ * In s1 the union does not include 'reflection', so this is never injected in production.
+ */
+const KERNEL_WRITE_SKILL_TOOL: import('../plugins/plugins.service').ProviderTool = {
+  plugin_id: 'kernel',
+  name: 'kernel__write_skill',
+  description: 'Reescribe el cuerpo de un SKILL.md opt-in (llm_writable) durante una reflexión.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      skill: { type: 'string' },
+      new_body: { type: 'string' },
+    },
+    required: ['skill', 'new_body'],
+  },
+};
+
+/**
+ * Registry of kernel-side tool functions. Any tool_call with plugin_id === 'kernel'
+ * is validated against this set instead of the plugin allowlist. Unknown kernel
+ * functions are dropped with reason 'unknown_kernel_tool'.
+ */
+const KERNEL_TOOL_REGISTRY: Set<string> = new Set(['write_skill']);
+
 /** Orquesta el ciclo completo del agente: memoria, hooks de plugins, capa de veto, LLM y ejecución de tool calls. */
 @Injectable()
 export class AgentsService {
@@ -157,11 +185,19 @@ export class AgentsService {
 
     // ── Hoist getProviderTools ONCE — shared between schema injection and validation ──
     const providerTools = await this.plugins.getProviderTools();
+
+    // ── Kernel tool injection gating (reflection-gated; inert in s1) ─────────────
+    // GovernedTurnInput.source union is 'chat'|'cycle'|'pretest' in s1 — 'reflection' is not
+    // reachable. The condition is written now so s2 (adding 'reflection' to the union +
+    // runReflectionTurn) requires zero changes here.
+    const kernelTools = (input.source as string) === 'reflection' ? [KERNEL_WRITE_SKILL_TOOL] : [];
+    const effectiveTools = [...providerTools, ...kernelTools];
+
     const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
 
     let builtSystemPrompt = input.system_prompt ?? '';
     if (decisionPrompt !== null) {
-      const toolSchemaJson = JSON.stringify(providerTools);
+      const toolSchemaJson = JSON.stringify(effectiveTools);
       if (toolSchemaJson.length > 8000) {
         this.log.warn(
           `token-budget guard: injected tool schema is ${toolSchemaJson.length} chars — consider reducing active tools`,
@@ -192,12 +228,15 @@ export class AgentsService {
     const skills_written = llmResponse.skills_written ?? [];
 
     // ── Validate and dispatch ─────────────────────────────────────────────────
+    // Pass effectiveTools (providerTools + kernelTools) so _validateToolCalls can find kernel tools.
+    // Pass source so the kernel tool source gate is enforced (only 'reflection' allows kernel tools).
     const validatedCalls = await this._validateToolCalls(
       cycle_id,
       llmResponse.tool_calls,
-      providerTools,
+      effectiveTools,
       input._activePlugins,
       input.virtual_only,
+      input.source,
     );
     const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
       cycle_id,
@@ -599,8 +638,21 @@ export class AgentsService {
     validToolNames: Set<string>,
     providerTools: import('../plugins/plugins.service').ProviderTool[],
     virtual_only: boolean,
+    allowKernelTools: boolean,
   ): string | null {
-    // FIRST: virtual_only guard — drop provider tool-calls before any other check.
+    // FIRST: kernel namespace — validate against kernel registry, then enforce source gate.
+    // This check must come BEFORE virtual_only and plugin-active checks.
+    if (call.plugin_id === 'kernel') {
+      if (!KERNEL_TOOL_REGISTRY.has(call.function)) return 'unknown_kernel_tool';
+      // Source gate: kernel tools are only executable in reflection turns.
+      // In s1, 'reflection' is not in GovernedTurnInput.source union — so kernel tools
+      // are NEVER reachable in production turns. allowKernelTools=false drops any
+      // LLM-emitted kernel call with a distinct, auditable reason.
+      if (!allowKernelTools) return 'kernel_source_not_allowed';
+      return null;
+    }
+
+    // SECOND: virtual_only guard — drop provider tool-calls before any other check.
     if (virtual_only) {
       const plugin = activePlugins.find((p) => p.id === call.plugin_id);
       if (plugin?.type === 'provider') return 'virtual_mode_provider_blocked';
@@ -631,8 +683,12 @@ export class AgentsService {
     hoistedTools?: import('../plugins/plugins.service').ProviderTool[],
     preloadedActivePlugins?: import('../plugins/plugins.service').HydratedPlugin[],
     virtual_only?: boolean,
+    source?: string,
   ): Promise<import('../llm/llm.service').ToolCallRequest[]> {
     if (calls.length === 0) return [];
+
+    // Kernel tools are only permitted in reflection turns.
+    const allowKernelTools = source === 'reflection';
 
     try {
       // Use pre-fetched plugins when available (cycle path) to avoid a second DB round-trip.
@@ -652,6 +708,7 @@ export class AgentsService {
           validToolNames,
           providerTools,
           virtual_only ?? false,
+          allowKernelTools,
         );
 
         if (reason) {
@@ -680,6 +737,37 @@ export class AgentsService {
     }
   }
 
+  /**
+   * Dispatches a kernel-namespace tool call (plugin_id === 'kernel').
+   * Routes to the appropriate PluginsService method without ever entering the sandbox.
+   */
+  private async _dispatchKernelTool(
+    _cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+  ): Promise<void> {
+    if (tc.function === 'write_skill') {
+      const skill = typeof tc.args['skill'] === 'string' ? tc.args['skill'] : '';
+      const newBody = typeof tc.args['new_body'] === 'string' ? tc.args['new_body'] : '';
+      const result = await this.plugins.writeSkillGuarded(skill, newBody);
+      decisions.push({
+        ...tc,
+        allowed: result.ok,
+        reason: result.ok ? undefined : result.reason,
+      });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: 'write_skill',
+        ok: result.ok,
+        result,
+      });
+    } else {
+      this.log.warn(`_dispatchKernelTool: unknown kernel function '${tc.function}' — dropped`);
+      decisions.push({ ...tc, allowed: false, reason: 'unknown_kernel_tool' });
+    }
+  }
+
   private async _executeToolCalls(
     cycle_id: string,
     toolCalls: import('../llm/llm.service').ToolCallRequest[],
@@ -694,6 +782,12 @@ export class AgentsService {
 
     for (const tc of toolCalls) {
       try {
+        // Pre-step: kernel tools bypass the sandbox entirely.
+        if (tc.plugin_id === 'kernel') {
+          await this._dispatchKernelTool(cycle_id, tc, decisions, sandbox_results);
+          continue;
+        }
+
         decisions.push({ ...tc, allowed: true });
         const res = await this.sandbox.callPlugin(tc.plugin_id, tc.function, tc.args);
         sandbox_results.push({ plugin_id: tc.plugin_id, function: tc.function, ...res });

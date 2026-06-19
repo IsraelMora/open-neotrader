@@ -177,6 +177,23 @@ describe('parseToolCalls', () => {
     expect(result[0].function).toBe('cancel_order');
   });
 
+  // ── kernel__ namespace split ─────────────────────────────────────────────────
+
+  it('parses kernel__write_skill → {plugin_id:"kernel", function:"write_skill"}', () => {
+    // Codifies the design assumption: the first-__ split correctly assigns plugin_id='kernel'
+    // and function='write_skill'. This test is the guarantee the kernel namespace relies on.
+    const text = '[{"tool":"kernel__write_skill","args":{"skill":"s","new_body":"b"}}]';
+
+    const result = parseToolCalls(text);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual({
+      plugin_id: 'kernel',
+      function: 'write_skill',
+      args: { skill: 's', new_body: 'b' },
+    });
+  });
+
   // ── Never throws ─────────────────────────────────────────────────────────────
 
   it('never throws on any input', () => {
