@@ -4,6 +4,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
   type OnApplicationBootstrap,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -23,6 +24,7 @@ import { scanLocalManifests } from './local-sync';
 import type { Plugin } from '@prisma/client';
 import type { KvService } from '../common/kv.service';
 import type { AuditService } from '../audit/audit.service';
+import type { SandboxGateway } from '../sandbox/sandbox.gateway';
 
 export type { Plugin };
 export type PluginVerification = 'unverified' | 'pending' | 'verified' | 'rejected';
@@ -145,6 +147,7 @@ export class PluginsService implements OnApplicationBootstrap {
     cfg: ConfigService,
     private readonly kv?: KvService,
     private readonly audit?: AuditService,
+    @Optional() private readonly sandbox?: SandboxGateway,
   ) {
     this.pluginsDir = cfg.get<string>('PLUGINS_DIR', path.resolve(process.cwd(), '../../plugins'));
   }
@@ -544,6 +547,40 @@ export class PluginsService implements OnApplicationBootstrap {
     return this.findById(id);
   }
 
+  // ── F3-s1: Scan + Trust Report ─────────────────────────────────────────────
+
+  /**
+   * Re-runs static AST analysis for an existing plugin and stores the result.
+   * Returns the updated plugin record.
+   */
+  async rescan(id: string): Promise<HydratedPlugin> {
+    await this.findById(id); // throws NotFoundException if not found
+    if (!this.sandbox) {
+      throw new Error('SandboxGateway not available for rescan');
+    }
+    const scanResponse = await this.sandbox.analyzePlugin(id);
+    const scanData =
+      scanResponse.ok && scanResponse.result
+        ? (scanResponse.result as Record<string, unknown>)
+        : { ok: false, error: scanResponse.error, findings: [] };
+    await this.db.plugin.update({
+      where: { id },
+      data: { scan_result: JSON.stringify(scanData) },
+    });
+    return this.findById(id);
+  }
+
+  /**
+   * Returns the current trust report for a plugin.
+   * For F3-s1, only scan_result is populated; null means not yet scanned.
+   */
+  async getTrustReport(id: string): Promise<{ scan_result: Record<string, unknown> | null }> {
+    const plugin = await this.findById(id);
+    const raw = plugin.scan_result ?? null;
+    const parsed = raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
+    return { scan_result: parsed };
+  }
+
   async setConfig(id: string, config: Record<string, unknown>): Promise<HydratedPlugin> {
     // Valida contra el schema si existe
     const schema = await this.getConfigSchema(id);
@@ -632,6 +669,9 @@ export class PluginsService implements OnApplicationBootstrap {
           : null,
       },
     });
+
+    // F3-s1: Static AST scan on install — WARN-only, NEVER blocks install
+    await this._scanOnInstall(id);
 
     this.events.emit('plugin.installed', { plugin_id: id, version: plugin.version });
     return hydrate(plugin);
@@ -831,6 +871,24 @@ export class PluginsService implements OnApplicationBootstrap {
   }
 
   // ── Private helpers ───────────────────────────────────────────────────────
+
+  /** F3-s1: Runs static AST scan after install. NEVER throws — scan_result stays null on error. */
+  private async _scanOnInstall(pluginId: string): Promise<void> {
+    if (!this.sandbox) return;
+    try {
+      const scanResponse = await this.sandbox.analyzePlugin(pluginId);
+      const scanData =
+        scanResponse.ok && scanResponse.result
+          ? (scanResponse.result as Record<string, unknown>)
+          : { ok: false, error: scanResponse.error, findings: [] };
+      await this.db.plugin.update({
+        where: { id: pluginId },
+        data: { scan_result: JSON.stringify(scanData) },
+      });
+    } catch (e) {
+      this.log.warn(`scan failed for ${pluginId}: ${(e as Error).message}`);
+    }
+  }
 
   private tryReadSkillMd(
     installedPath: string,
