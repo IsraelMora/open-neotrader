@@ -112,6 +112,35 @@ export interface GateResult {
   metrics: SignificanceMetrics;
 }
 
+/**
+ * Result of computePluginReputation.
+ * reputation_score is null when zero gate-READY portfolios contain the plugin (unrated).
+ */
+export interface ReputationResult {
+  ok: true;
+  reputation_score: number | null;
+  sample: {
+    portfolios_count: number;
+    avg_sharpe: number;
+    avg_return_pct: number;
+    worst_dd_pct: number;
+  } | null;
+}
+
+// ── Reputation formula constants (F3-s3) ─────────────────────────────────────
+/** Normalization ceiling for Sharpe ratio: avg_sharpe >= SHARPE_TARGET clamps nSharpe to 1. */
+const SHARPE_TARGET = 2.0;
+/** Normalization ceiling for return (%): avg_return_pct >= RETURN_TARGET clamps nReturn to 1. */
+const RETURN_TARGET = 50;
+/** Drawdown tolerance (%): worst_dd_pct >= DD_TOLERANCE clamps nRisk to 0 (worst penalty). */
+const DD_TOLERANCE = 50;
+/** Weight for Sharpe contribution (risk-adjusted consistency dominates). */
+const W_SHARPE = 0.5;
+/** Weight for return contribution. */
+const W_RETURN = 0.3;
+/** Weight for risk (drawdown) contribution. */
+const W_RISK = 0.2;
+
 /** Result of a PretestService.promote() call — four possible outcomes. */
 export interface PromoteResult {
   ok: boolean;
@@ -508,13 +537,124 @@ export class PretestService {
    * Evaluates significance gate for a portfolio by ID.
    * Reads thresholds from KvService (system-wide config), falling back to defaults.
    * Returns { ready, reasons, metrics }.
+   *
+   * F3-s3: When ready===true, fires a fire-and-forget recompute of reputation_score
+   * for each plugin in the portfolio. Recompute failures are WARN-logged and NEVER
+   * alter the gate result or delay the caller.
    */
   async gate(id: string): Promise<GateResult> {
     const portfolio = await this.findOne(id);
     const metrics = this.computeSignificance(portfolio.state);
     const thresholds = await this._readGateThresholds();
     const reasons = this._evaluateGate(metrics, thresholds);
-    return { ready: reasons.length === 0, reasons, metrics };
+    const ready = reasons.length === 0;
+
+    if (ready) {
+      // Fire-and-forget: reputation recompute must NEVER affect the gate result or delay caller
+      void this._recomputePluginReputations(portfolio.plugin_ids).catch((e: unknown) =>
+        this.log.warn(`reputation recompute failed: ${(e as Error).message}`),
+      );
+    }
+
+    return { ready, reasons, metrics };
+  }
+
+  /**
+   * Computes a composite reputation score (0–100) for a plugin based on gate-READY
+   * pretest portfolios that contain it.
+   *
+   * Attribution is portfolio-level: all plugins in a gate-ready portfolio share credit
+   * from that portfolio's performance metrics. Per-trade attribution is deferred (F3-s3
+   * non-goal). This approximation is documented here and in the spec.
+   *
+   * Returns null reputation_score when zero gate-READY portfolios contain the plugin.
+   * Never throws for an unknown pluginId (unknown id = 0 containing portfolios → null).
+   *
+   * Cost guard: evaluates gate readiness IN-MEMORY via computeSignificance + _evaluateGate
+   * with thresholds read ONCE. Never calls this.gate(id) per portfolio (would be O(N) DB+KV).
+   */
+  async computePluginReputation(pluginId: string): Promise<ReputationResult> {
+    // Step 1: Load all portfolios (hydrated, with state + plugin_ids)
+    const all = await this.findAll();
+
+    // Step 2: Filter to portfolios containing this plugin
+    const containing = all.filter((p) => p.plugin_ids.includes(pluginId));
+    if (containing.length === 0) {
+      return { ok: true, reputation_score: null, sample: null };
+    }
+
+    // Step 3: Read gate thresholds ONCE (cost guard — never call this.gate per portfolio)
+    const thresholds = await this._readGateThresholds();
+
+    // Step 4: Filter to gate-READY portfolios using in-memory evaluation
+    const ready = containing.filter((p) => {
+      const metrics = this.computeSignificance(p.state);
+      const reasons = this._evaluateGate(metrics, thresholds);
+      return reasons.length === 0;
+    });
+
+    if (ready.length === 0) {
+      return { ok: true, reputation_score: null, sample: null };
+    }
+
+    // Step 5: Aggregate metrics across gate-ready portfolios
+    let sumSharpe = 0;
+    let sumReturnPct = 0;
+    let worstDdPct = 0;
+
+    for (const p of ready) {
+      const metrics = this.computeSignificance(p.state);
+      sumSharpe += metrics.sharpe;
+      const returnPct = ((p.state.equity - p.initial_capital) / p.initial_capital) * 100;
+      sumReturnPct += returnPct;
+      if (p.state.max_drawdown_pct > worstDdPct) {
+        worstDdPct = p.state.max_drawdown_pct;
+      }
+    }
+
+    const n = ready.length;
+    const avg_sharpe = sumSharpe / n;
+    const avg_return_pct = sumReturnPct / n;
+    const worst_dd_pct = worstDdPct;
+
+    // Step 6: Apply composite formula
+    const clamp = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
+    const nSharpe = clamp(avg_sharpe / SHARPE_TARGET, 0, 1);
+    const nReturn = clamp(avg_return_pct / RETURN_TARGET, 0, 1);
+    const nRisk = clamp(1 - worst_dd_pct / DD_TOLERANCE, 0, 1);
+    const raw = W_SHARPE * nSharpe + W_RETURN * nReturn + W_RISK * nRisk;
+    const reputation_score = Math.round(clamp(raw, 0, 1) * 100 * 10) / 10; // round to 1 decimal
+
+    return {
+      ok: true,
+      reputation_score,
+      sample: { portfolios_count: n, avg_sharpe, avg_return_pct, worst_dd_pct },
+    };
+  }
+
+  /**
+   * Recomputes and persists reputation_score for each plugin in the given list.
+   * Per-plugin try/catch: one failure never prevents other plugins from being updated.
+   * Silently catches P2025 (record not found) and any other error — logs WARN only.
+   */
+  private async _recomputePluginReputations(pluginIds: string[]): Promise<void> {
+    for (const id of pluginIds) {
+      try {
+        const result = await this.computePluginReputation(id);
+        const reputation_detail = result.sample
+          ? JSON.stringify({ ...result.sample, computed_at: new Date().toISOString() })
+          : null;
+        await this.db.plugin.update({
+          where: { id },
+          data: {
+            reputation_score: result.reputation_score,
+            reputation_detail,
+          },
+        });
+      } catch (e: unknown) {
+        this.log.warn(`reputation persist failed for plugin ${id}: ${(e as Error).message}`);
+      }
+    }
   }
 
   /** Reads gate thresholds from KvService, falling back to defaults on missing/NaN.

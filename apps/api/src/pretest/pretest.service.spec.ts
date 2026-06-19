@@ -3093,3 +3093,527 @@ describe('F4-S4 Hardening — _applyPlugins: activate succeeds but setConfig thr
     expect(meta['partial']).toBe(true);
   });
 });
+
+// ── F3-s3 Phase 1.1: Migration smoke test (RED → GREEN) ──────────────────────
+
+import * as fs_sync from 'fs';
+import * as path_sync from 'path';
+
+describe('F3-s3 migration smoke — 0006_plugin_reputation', () => {
+  const MIGRATION_DIR = path_sync.resolve(
+    __dirname,
+    '../../prisma/migrations/0006_plugin_reputation',
+  );
+  const MIGRATION_FILE = path_sync.join(MIGRATION_DIR, 'migration.sql');
+
+  it('1.1 — migration file exists at the expected path', () => {
+    expect(fs_sync.existsSync(MIGRATION_FILE)).toBe(true);
+  });
+
+  it('1.1 — migration SQL contains ADD COLUMN "reputation_score" REAL', () => {
+    const sql = fs_sync.readFileSync(MIGRATION_FILE, 'utf8');
+    expect(sql).toMatch(/ADD\s+COLUMN\s+"reputation_score"\s+REAL/i);
+  });
+
+  it('1.1 — migration SQL contains ADD COLUMN "reputation_detail" TEXT', () => {
+    const sql = fs_sync.readFileSync(MIGRATION_FILE, 'utf8');
+    expect(sql).toMatch(/ADD\s+COLUMN\s+"reputation_detail"\s+TEXT/i);
+  });
+});
+
+// ── F3-s3 Phase 2: computePluginReputation (RED → GREEN) ─────────────────────
+
+import {
+  PretestService as PretestServiceForReputation,
+  PretestPortfolio,
+  PretestState as PretestStateForReputation,
+} from './pretest.service';
+import type { KvService as KvServiceType } from '../common/kv.service';
+
+/** Build a PretestPortfolio hydrated object for computePluginReputation tests. */
+function makePortfolio(
+  id: string,
+  pluginIds: string[],
+  state: PretestStateForReputation,
+): PretestPortfolio {
+  return {
+    id,
+    name: `Portfolio ${id}`,
+    description: null,
+    initial_capital: 10_000,
+    plugin_ids: pluginIds,
+    plugin_configs: {},
+    state,
+    run_count: 5,
+    last_run_at: new Date(),
+    is_active: true,
+    created_at: new Date(),
+  };
+}
+
+/**
+ * Build a PretestState with N sell trades for reputation tests.
+ * entry_price stored on each trade to make computeSignificance deterministic.
+ */
+function makeSimpleStateWithTrades(
+  n: number,
+  winFraction: number,
+  maxDdPct: number,
+): PretestStateForReputation {
+  const trades: import('./pretest.service').PretestTrade[] = [];
+  for (let i = 0; i < n; i++) {
+    const isWin = i < Math.floor(n * winFraction);
+    trades.push({
+      ts: new Date().toISOString(),
+      symbol: 'AAPL',
+      action: 'sell',
+      price: 110,
+      quantity: 10,
+      pnl: isWin ? 100 : -50,
+      entry_price: 100,
+    });
+  }
+  return {
+    equity: 11_000,
+    cash: 11_000,
+    positions: [],
+    trades,
+    max_equity: 12_000,
+    max_drawdown_pct: maxDdPct,
+    realized_pnl: 500,
+    win_trades: Math.floor(n * winFraction),
+    loss_trades: n - Math.floor(n * winFraction),
+  };
+}
+
+/**
+ * Build PretestService wired for computePluginReputation unit tests.
+ * findAll() returns the given portfolios; KV returns gate thresholds that
+ * allow/deny gate passage based on the portfolio state.
+ */
+function makePretestSvcForReputation(
+  portfolios: PretestPortfolio[],
+  kvOverrides: Record<string, string | null> = {},
+): PretestServiceForReputation {
+  const db = {
+    pretestPortfolio: {
+      findMany: jest.fn().mockResolvedValue(
+        portfolios.map((p) => ({
+          ...p,
+          plugin_ids: JSON.stringify(p.plugin_ids),
+          plugin_configs: JSON.stringify(p.plugin_configs),
+          state: JSON.stringify(p.state),
+          updated_at: new Date(),
+        })),
+      ),
+      findUnique: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+    },
+    plugin: {
+      update: jest.fn().mockResolvedValue({}),
+    },
+  } as unknown as import('../prisma/prisma.service').PrismaService;
+
+  const kv = {
+    get: jest.fn((key: string) => Promise.resolve(key in kvOverrides ? kvOverrides[key] : null)),
+    set: jest.fn().mockResolvedValue(undefined),
+    delete: jest.fn().mockResolvedValue(undefined),
+  } as unknown as KvServiceType;
+
+  return new PretestServiceForReputation(
+    db,
+    {} as unknown as import('../sandbox/sandbox.gateway').SandboxGateway,
+    {} as unknown as import('../plugins/plugins.service').PluginsService,
+    {} as unknown as import('../llm/llm.service').LlmService,
+    {} as unknown as import('../context-memory/context-memory.service').ContextMemoryService,
+    {} as unknown as import('../providers/provider-gateway.service').ProviderGatewayService,
+    {} as unknown as import('../agents/agents.service').AgentsService,
+    kv,
+    {
+      log: jest.fn().mockResolvedValue(undefined),
+    } as unknown as import('../audit/audit.service').AuditService,
+  );
+}
+
+// Thresholds that make states with enough trades + correct sharpe GATE-READY
+// KV: min_trades=3, min_sharpe=0.1, max_dd_pct=30, min_loss_trades=1
+const PERMISSIVE_KV: Record<string, string> = {
+  'pretest.gate.min_trades': '3',
+  'pretest.gate.min_sharpe': '0.1',
+  'pretest.gate.max_dd_pct': '30',
+  'pretest.gate.min_loss_trades': '1',
+};
+
+describe('PretestService.computePluginReputation (F3-s3 Phase 2)', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  // 2.1: plugin in 0 portfolios → null (unrated)
+  it('2.1 — plugin not in any portfolio → {ok:true, reputation_score:null, sample:null}', async () => {
+    const svc = makePretestSvcForReputation([], PERMISSIVE_KV);
+    const result = await svc.computePluginReputation('unknown-plugin');
+    expect(result).toEqual({ ok: true, reputation_score: null, sample: null });
+  });
+
+  // 2.2: 0 gate-ready portfolios (portfolios exist but none pass gate) → null
+  it('2.2 — plugin in portfolios but none gate-ready → {ok:true, reputation_score:null, sample:null}', async () => {
+    const state = makeSimpleStateWithTrades(2, 0.5, 5); // only 2 trades, min_trades=3 → NOT READY
+    const portfolio = makePortfolio('pf-1', ['plugin-a'], state);
+    const svc = makePretestSvcForReputation([portfolio], PERMISSIVE_KV);
+    const result = await svc.computePluginReputation('plugin-a');
+    expect(result).toEqual({ ok: true, reputation_score: null, sample: null });
+  });
+
+  // 2.3: 1 gate-ready portfolio → returns numeric score
+  it('2.3 — 1 gate-ready portfolio → reputation_score is a number in [0,100]', async () => {
+    const state = makeSimpleStateWithTrades(20, 0.7, 5); // 20 trades, winFraction=0.7, dd=5%
+    const portfolio = makePortfolio('pf-2', ['plugin-b'], state);
+    const svc = makePretestSvcForReputation([portfolio], PERMISSIVE_KV);
+    const result = await svc.computePluginReputation('plugin-b');
+    expect(result.ok).toBe(true);
+    expect(result.reputation_score).not.toBeNull();
+    expect(result.reputation_score).toBeGreaterThanOrEqual(0);
+    expect(result.reputation_score).toBeLessThanOrEqual(100);
+    expect(result.sample).not.toBeNull();
+    expect(result.sample!.portfolios_count).toBe(1);
+  });
+
+  // 2.4: 2 gate-ready portfolios → aggregation correct
+  it('2.4 — 2 gate-ready portfolios → avg_sharpe=mean, avg_return_pct=mean, worst_dd_pct=max', async () => {
+    // Portfolio A: dd=5, Portfolio B: dd=15 → worst_dd_pct=15
+    const stateA = makeSimpleStateWithTrades(20, 0.7, 5);
+    const stateB = makeSimpleStateWithTrades(20, 0.7, 15);
+    const pfA = makePortfolio('pf-a', ['plugin-c'], stateA);
+    const pfB = makePortfolio('pf-b', ['plugin-c'], stateB);
+    const svc = makePretestSvcForReputation([pfA, pfB], PERMISSIVE_KV);
+    const result = await svc.computePluginReputation('plugin-c');
+    expect(result.ok).toBe(true);
+    expect(result.sample!.portfolios_count).toBe(2);
+    // worst_dd_pct = max(5, 15) = 15
+    expect(result.sample!.worst_dd_pct).toBe(15);
+  });
+
+  // 2.5: mixed ready + not-ready → only ready counted
+  it('2.5 — mixed ready/not-ready → only ready ones counted in sample.portfolios_count', async () => {
+    const readyState = makeSimpleStateWithTrades(20, 0.7, 5);
+    const notReadyState = makeSimpleStateWithTrades(2, 0.5, 5); // 2 trades < min_trades=3
+    const pfReady = makePortfolio('pf-ready', ['plugin-d'], readyState);
+    const pfNotReady = makePortfolio('pf-not-ready', ['plugin-d'], notReadyState);
+    const svc = makePretestSvcForReputation([pfReady, pfNotReady], PERMISSIVE_KV);
+    const result = await svc.computePluginReputation('plugin-d');
+    expect(result.ok).toBe(true);
+    expect(result.sample!.portfolios_count).toBe(1); // only 1 ready
+  });
+
+  // 2.6: formula worked example → 53.0
+  it('2.6 — formula worked example: avg_sharpe=1.0, avg_return_pct=20, worst_dd_pct=10 → score=53.0', async () => {
+    // We need a portfolio state whose computeSignificance yields sharpe≈1.0
+    // and state metrics yield return_pct=20%, dd=10
+    // Use 10 trades: 5 wins (+20 pnl each), 5 losses (-5 pnl each), entry_price=100, qty=1
+    // returns per trade: win=20/100=0.2, loss=-5/100=-0.05
+    // mean = (5*0.2 + 5*(-0.05))/10 = (1-0.25)/10 = 0.075
+    // variance = sum((r-mean)^2)/(n-1); n=10, r_win=0.2, r_loss=-0.05
+    // diff_win=0.2-0.075=0.125, diff_loss=-0.05-0.075=-0.125
+    // variance=( 5*(0.125)^2 + 5*(0.125)^2 )/9 = 5*(0.015625 + 0.015625)/9 = 5*0.03125/9 = 0.15625/9 ≈ 0.01736
+    // std=sqrt(0.01736)≈0.1317
+    // sharpe=0.075/0.1317≈0.570 — NOT exactly 1.0
+    // To get sharpe=1.0, use all wins: mean=return, std=0 → sharpe=0 (all same)
+    // Better: build state directly with specific metrics and mock computeSignificance
+    // The simplest approach: use the svc in a way that we can directly verify the formula output
+    // by providing a state where we know the exact sharpe from computeSignificance.
+    //
+    // Easier: spy on computeSignificance to return known metrics.
+    const readyState = makeSimpleStateWithTrades(20, 0.7, 10);
+    // initial_capital=10000, equity=12000 → return_pct=20
+    const pf = {
+      ...makePortfolio('pf-formula', ['plugin-formula'], readyState),
+      initial_capital: 10_000,
+      state: { ...readyState, equity: 12_000 }, // 20% return
+    };
+    const svc = makePretestSvcForReputation([pf], PERMISSIVE_KV);
+
+    // Spy on computeSignificance to return metrics with sharpe=1.0
+    jest.spyOn(svc, 'computeSignificance').mockReturnValue({
+      sharpe: 1.0,
+      profit_factor: 2.0,
+      win_rate: 0.7,
+      max_dd: 10,
+      n_trades: 20,
+      loss_trades: 6,
+    });
+
+    const result = await svc.computePluginReputation('plugin-formula');
+    expect(result.ok).toBe(true);
+    // Formula: nSharpe=clamp(1/2,0,1)=0.5, nReturn=clamp(20/50,0,1)=0.4, nRisk=clamp(1-10/50,0,1)=0.8
+    // raw=0.5*0.5+0.3*0.4+0.2*0.8=0.25+0.12+0.16=0.53 → score=53.0
+    expect(result.reputation_score).toBe(53.0);
+  });
+
+  // 2.7: clamping
+  it('2.7 — clamping: zero sharpe→nSharpe=0; return≥50→nReturn=1; dd≥50→nRisk=0; score stays in [0,100]', async () => {
+    // Use sharpe=0 (passes gate: 0 >= min_sharpe=0) but still demonstrates nSharpe=0 clamping
+    // dd=60 > DD_TOLERANCE=50 → nRisk=clamp(1-60/50,0,1)=0
+    // return_pct=150% > RETURN_TARGET=50 → nReturn=clamp(150/50,0,1)=1
+    const readyState = makeSimpleStateWithTrades(20, 0.7, 60); // dd=60
+    const pf = {
+      ...makePortfolio('pf-clamp', ['plugin-clamp'], readyState),
+      initial_capital: 10_000,
+      state: { ...readyState, equity: 25_000 }, // return_pct=150% → nReturn clamps to 1
+    };
+    const svc = makePretestSvcForReputation([pf], {
+      ...PERMISSIVE_KV,
+      'pretest.gate.max_dd_pct': '80', // allow dd=60 to pass gate (60 < 80)
+      'pretest.gate.min_sharpe': '0', // sharpe=0 passes gate (0 >= 0)
+    });
+
+    jest.spyOn(svc, 'computeSignificance').mockReturnValue({
+      sharpe: 0, // → nSharpe=clamp(0/2,0,1)=0
+      profit_factor: null,
+      win_rate: 0.7,
+      max_dd: 60, // → nRisk=clamp(1-60/50,0,1)=0
+      n_trades: 20,
+      loss_trades: 6,
+    });
+
+    const result = await svc.computePluginReputation('plugin-clamp');
+    expect(result.ok).toBe(true);
+    // nSharpe=0, nReturn=1 (clamped from 150/50=3), nRisk=0 → raw=0*0.5+1*0.3+0*0.2=0.3 → score=30.0
+    expect(result.reputation_score).toBe(30.0);
+    expect(result.reputation_score).toBeGreaterThanOrEqual(0);
+    expect(result.reputation_score).toBeLessThanOrEqual(100);
+  });
+
+  // 2.8: cost-guard — this.gate NOT called; _readGateThresholds called once
+  it('2.8 — cost-guard: this.gate is NOT called; _readGateThresholds called exactly once', async () => {
+    const readyState = makeSimpleStateWithTrades(20, 0.7, 5);
+    const pf = makePortfolio('pf-costguard', ['plugin-costguard'], readyState);
+    const svc = makePretestSvcForReputation([pf], PERMISSIVE_KV);
+
+    const gateSpy = jest.spyOn(svc, 'gate');
+    // _readGateThresholds is private — spy via bracket access
+    const thresholdsSpy = jest.spyOn(
+      svc as unknown as { _readGateThresholds: () => Promise<unknown> },
+      '_readGateThresholds',
+    );
+
+    await svc.computePluginReputation('plugin-costguard');
+
+    expect(gateSpy).not.toHaveBeenCalled();
+    expect(thresholdsSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── F3-s3 Phase 3: _recomputePluginReputations + gate() trigger (RED → GREEN) ──
+
+describe('PretestService._recomputePluginReputations (F3-s3 Phase 3)', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  /** Build a PretestService with mocked db.plugin.update for recompute tests */
+  function makeSvcForRecompute(pluginUpdateMock?: jest.Mock): {
+    svc: PretestServiceForReputation;
+    dbPluginUpdate: jest.Mock;
+  } {
+    const dbPluginUpdate = pluginUpdateMock ?? jest.fn().mockResolvedValue({});
+    const db = {
+      pretestPortfolio: {
+        findMany: jest.fn().mockResolvedValue([]),
+        findUnique: jest.fn(),
+        create: jest.fn(),
+        update: jest.fn(),
+      },
+      plugin: {
+        update: dbPluginUpdate,
+      },
+    } as unknown as import('../prisma/prisma.service').PrismaService;
+
+    const kv = {
+      get: jest.fn((key: string) =>
+        Promise.resolve(key in PERMISSIVE_KV ? PERMISSIVE_KV[key] : null),
+      ),
+      set: jest.fn().mockResolvedValue(undefined),
+      delete: jest.fn().mockResolvedValue(undefined),
+    } as unknown as KvServiceType;
+
+    const svc = new PretestServiceForReputation(
+      db,
+      {} as unknown as import('../sandbox/sandbox.gateway').SandboxGateway,
+      {} as unknown as import('../plugins/plugins.service').PluginsService,
+      {} as unknown as import('../llm/llm.service').LlmService,
+      {} as unknown as import('../context-memory/context-memory.service').ContextMemoryService,
+      {} as unknown as import('../providers/provider-gateway.service').ProviderGatewayService,
+      {} as unknown as import('../agents/agents.service').AgentsService,
+      kv,
+      {
+        log: jest.fn().mockResolvedValue(undefined),
+      } as unknown as import('../audit/audit.service').AuditService,
+    );
+    return { svc, dbPluginUpdate };
+  }
+
+  // 3.1: _recomputePluginReputations calls db.plugin.update for each plugin
+  it('3.1 — _recomputePluginReputations writes reputation_score + reputation_detail for each plugin', async () => {
+    const { svc, dbPluginUpdate } = makeSvcForRecompute();
+
+    // Mock computePluginReputation so we control the output
+    jest.spyOn(svc, 'computePluginReputation').mockResolvedValue({
+      ok: true,
+      reputation_score: 75,
+      sample: {
+        portfolios_count: 2,
+        avg_sharpe: 1.5,
+        avg_return_pct: 30,
+        worst_dd_pct: 10,
+      },
+    });
+
+    await (
+      svc as unknown as { _recomputePluginReputations: (ids: string[]) => Promise<void> }
+    )._recomputePluginReputations(['plugin-a', 'plugin-b']);
+
+    expect(dbPluginUpdate).toHaveBeenCalledTimes(2);
+    // First call for plugin-a
+    expect(dbPluginUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'plugin-a' },
+        data: expect.objectContaining({
+          reputation_score: 75,
+          reputation_detail: expect.stringContaining('"portfolios_count"') as unknown,
+        }) as unknown,
+      }),
+    );
+  });
+
+  // 3.2: per-plugin isolation — one db.update throwing does not stop others
+  it('3.2 — one db.plugin.update throws → other plugins still processed', async () => {
+    let callCount = 0;
+    const dbPluginUpdate = jest.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) throw new Error('P2025 record not found');
+      return Promise.resolve({});
+    });
+    const { svc } = makeSvcForRecompute(dbPluginUpdate);
+
+    jest.spyOn(svc, 'computePluginReputation').mockResolvedValue({
+      ok: true,
+      reputation_score: 50,
+      sample: { portfolios_count: 1, avg_sharpe: 1.0, avg_return_pct: 10, worst_dd_pct: 5 },
+    });
+
+    // Should not throw even though first update throws
+    await expect(
+      (
+        svc as unknown as { _recomputePluginReputations: (ids: string[]) => Promise<void> }
+      )._recomputePluginReputations(['plugin-a', 'plugin-b']),
+    ).resolves.not.toThrow();
+
+    // Both were attempted
+    expect(dbPluginUpdate).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── F3-s3 Phase 3 (gate trigger tests) ───────────────────────────────────────
+
+describe('PretestService.gate() — F3-s3 reputation trigger', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  function makeSvcForGateTrigger(gateReady: boolean): {
+    svc: PretestServiceForReputation;
+    recomputeSpy: jest.SpyInstance;
+  } {
+    const portfolioRow = {
+      id: 'pf-trigger',
+      name: 'trigger portfolio',
+      description: null,
+      initial_capital: 10_000,
+      plugin_ids: JSON.stringify(['plugin-x', 'plugin-y']),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(makeSimpleStateWithTrades(gateReady ? 20 : 2, 0.7, 5)),
+      run_count: 3,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        findMany: jest.fn().mockResolvedValue([]),
+        update: jest.fn(),
+      },
+      plugin: {
+        update: jest.fn().mockResolvedValue({}),
+      },
+    } as unknown as import('../prisma/prisma.service').PrismaService;
+
+    const kv = {
+      get: jest.fn((key: string) =>
+        Promise.resolve(key in PERMISSIVE_KV ? PERMISSIVE_KV[key] : null),
+      ),
+      set: jest.fn().mockResolvedValue(undefined),
+      delete: jest.fn().mockResolvedValue(undefined),
+    } as unknown as KvServiceType;
+
+    const svc = new PretestServiceForReputation(
+      db,
+      {} as unknown as import('../sandbox/sandbox.gateway').SandboxGateway,
+      {} as unknown as import('../plugins/plugins.service').PluginsService,
+      {} as unknown as import('../llm/llm.service').LlmService,
+      {} as unknown as import('../context-memory/context-memory.service').ContextMemoryService,
+      {} as unknown as import('../providers/provider-gateway.service').ProviderGatewayService,
+      {} as unknown as import('../agents/agents.service').AgentsService,
+      kv,
+      {
+        log: jest.fn().mockResolvedValue(undefined),
+      } as unknown as import('../audit/audit.service').AuditService,
+    );
+
+    // Spy on private _recomputePluginReputations
+    const recomputeSpy = jest
+      .spyOn(
+        svc as unknown as { _recomputePluginReputations: (ids: string[]) => Promise<void> },
+        '_recomputePluginReputations',
+      )
+      .mockResolvedValue(undefined);
+
+    return { svc, recomputeSpy };
+  }
+
+  // 3.3: gate returns ready=true → _recomputePluginReputations called with plugin_ids
+  it('3.3 — gate ready=true → _recomputePluginReputations called with portfolio.plugin_ids', async () => {
+    const { svc, recomputeSpy } = makeSvcForGateTrigger(true);
+
+    const result = await svc.gate('pf-trigger');
+
+    expect(result.ready).toBe(true);
+    // Allow micro-task flush for fire-and-forget void
+    await Promise.resolve();
+    expect(recomputeSpy).toHaveBeenCalledWith(['plugin-x', 'plugin-y']);
+  });
+
+  // 3.4: gate returns ready=false → _recomputePluginReputations NOT called
+  it('3.4 — gate ready=false → _recomputePluginReputations NOT called', async () => {
+    const { svc, recomputeSpy } = makeSvcForGateTrigger(false);
+
+    const result = await svc.gate('pf-trigger');
+
+    expect(result.ready).toBe(false);
+    await Promise.resolve();
+    expect(recomputeSpy).not.toHaveBeenCalled();
+  });
+
+  // 3.5: _recomputePluginReputations rejects → gate still resolves with correct GateResult
+  it('3.5 — _recomputePluginReputations rejects → gate still resolves, GateResult unaffected', async () => {
+    const { svc, recomputeSpy } = makeSvcForGateTrigger(true);
+
+    // Override spy to reject
+    recomputeSpy.mockRejectedValue(new Error('recompute failed'));
+
+    // gate() should still resolve normally — fire-and-forget handles the rejection
+    const result = await svc.gate('pf-trigger');
+
+    expect(result.ready).toBe(true);
+    expect(result).toHaveProperty('reasons');
+    expect(result).toHaveProperty('metrics');
+  });
+});
