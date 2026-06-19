@@ -1487,6 +1487,164 @@ describe('AgentsService — notify_intents accumulation (Fix #3)', () => {
   });
 });
 
+// ── PR B Phase B1: _persistNotificationIntents + bridge injection (B1.3 / B1.4) ─
+
+/**
+ * B1.3 — _persistNotificationIntents dispatches each intent via bridge.send.
+ * B1.4 — after refactor, TelegramService has no @OnEvent or DEFAULT_CONFIG
+ *         (behavioral: only NotifierBridge dispatch fires, not a second event-driven path).
+ */
+
+// Minimal NotifierBridge stub
+interface BridgeStub {
+  send: jest.Mock;
+}
+
+function makeBridgeStub(): BridgeStub {
+  return { send: jest.fn().mockResolvedValue({ ok: true }) };
+}
+
+/**
+ * Build an AgentsService with a NotifierBridge injected.
+ * The constructor accepts NotifierBridge as the 8th positional argument (after ConfigService slot).
+ */
+function makeServiceWithBridge(
+  bridge: BridgeStub,
+  audit: ReturnType<typeof makeAudit>,
+): AgentsService {
+  // We need to cast because AgentsService constructor is updated in GREEN to accept NotifierBridge.
+  // The test is RED until that injection is wired.
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    bridge: unknown,
+  ) => AgentsService)(
+    {},
+    {},
+    {},
+    {},
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    bridge,
+  );
+}
+
+async function callPersistNotificationIntents(
+  service: AgentsService,
+  ctx: Record<string, unknown>,
+  cycleId: string,
+): Promise<void> {
+  return (
+    service as unknown as {
+      _persistNotificationIntents: (ctx: Record<string, unknown>, cycleId: string) => Promise<void>;
+    }
+  )._persistNotificationIntents(ctx, cycleId);
+}
+
+describe('AgentsService._persistNotificationIntents — bridge dispatch (B1.3)', () => {
+  it('B1.3a — one intent calls bridge.send exactly once with correct channel and text', async () => {
+    const bridge = makeBridgeStub();
+    const audit = makeAudit();
+    const service = makeServiceWithBridge(bridge, audit);
+
+    const ctx: Record<string, unknown> = {
+      _collected_notify_intents: [{ channel: 'telegram', text: 'report ready' }],
+    };
+
+    await callPersistNotificationIntents(service, ctx, 'cycle-b1-001');
+
+    expect(bridge.send).toHaveBeenCalledTimes(1);
+    expect(bridge.send).toHaveBeenCalledWith('telegram', 'report ready', expect.anything());
+  });
+
+  it('B1.3b — two intents call bridge.send twice', async () => {
+    const bridge = makeBridgeStub();
+    const audit = makeAudit();
+    const service = makeServiceWithBridge(bridge, audit);
+
+    const ctx: Record<string, unknown> = {
+      _collected_notify_intents: [
+        { channel: 'telegram', text: 'msg one' },
+        { channel: 'telegram', text: 'msg two' },
+      ],
+    };
+
+    await callPersistNotificationIntents(service, ctx, 'cycle-b1-002');
+
+    expect(bridge.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('B1.3c — empty _collected_notify_intents → zero bridge.send calls', async () => {
+    const bridge = makeBridgeStub();
+    const audit = makeAudit();
+    const service = makeServiceWithBridge(bridge, audit);
+
+    const ctx: Record<string, unknown> = {
+      _collected_notify_intents: [],
+    };
+
+    await callPersistNotificationIntents(service, ctx, 'cycle-b1-003');
+
+    expect(bridge.send).not.toHaveBeenCalled();
+  });
+
+  it('B1.3d — absent _collected_notify_intents → zero bridge.send calls', async () => {
+    const bridge = makeBridgeStub();
+    const audit = makeAudit();
+    const service = makeServiceWithBridge(bridge, audit);
+
+    const ctx: Record<string, unknown> = {};
+
+    await callPersistNotificationIntents(service, ctx, 'cycle-b1-004');
+
+    expect(bridge.send).not.toHaveBeenCalled();
+  });
+
+  it('B1.3e — audits notification_sent per successful send', async () => {
+    const bridge = makeBridgeStub();
+    const audit = makeAudit();
+    const service = makeServiceWithBridge(bridge, audit);
+
+    const ctx: Record<string, unknown> = {
+      _collected_notify_intents: [{ channel: 'telegram', text: 'hello' }],
+    };
+
+    await callPersistNotificationIntents(service, ctx, 'cycle-b1-005');
+
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const sentAudit = auditCalls.find(([arg]) => arg['event_type'] === 'notification_sent');
+    expect(sentAudit).toBeDefined();
+    expect(sentAudit![0]).toMatchObject({
+      event_type: 'notification_sent',
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      meta: expect.objectContaining({ channel: 'telegram' }),
+    });
+  });
+
+  it('B1.3f — never throws even when bridge.send rejects', async () => {
+    const bridge = makeBridgeStub();
+    bridge.send.mockRejectedValue(new Error('network error'));
+    const audit = makeAudit();
+    const service = makeServiceWithBridge(bridge, audit);
+
+    const ctx: Record<string, unknown> = {
+      _collected_notify_intents: [{ channel: 'telegram', text: 'crash test' }],
+    };
+
+    await expect(
+      callPersistNotificationIntents(service, ctx, 'cycle-b1-006'),
+    ).resolves.not.toThrow();
+  });
+});
+
 // ── Fix #4: veto ordering — LLM sees only post-veto signals ──────────────────
 
 describe('AgentsService._executeCycle — veto ordering: LLM sees only post-veto signals', () => {
