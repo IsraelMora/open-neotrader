@@ -41,6 +41,8 @@ model Plugin {
   installed_path String?
   scan_result        String?  // JSON: ScanResult from F3-s1 static AST analysis; null = not yet scanned
   smoke_test_result  String?  // JSON: SmokeResult {ok,result,checks}; null = not yet smoke-tested
+  reputation_score   Float?   // composite 0-100 from gate-ready pretest portfolios; null = unrated (F3-s3)
+  reputation_detail  String?  // JSON: {portfolios_count, avg_sharpe, avg_return_pct, worst_dd_pct, computed_at}; null = unrated
   installed_at   DateTime @default(now())
   updated_at     DateTime @updatedAt
 
