@@ -11,7 +11,7 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags, ApiOperation } from '@nestjs/swagger';
-import { LlmService, LlmRequest, type CustomLlmProvider } from './llm.service';
+import { LlmService, type CustomLlmProvider } from './llm.service';
 import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 
 /** Endpoints de gestión del LLM: completar contexto, configurar modelo/backend y administrar providers custom. */
@@ -22,11 +22,9 @@ import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 export class LlmController {
   constructor(private readonly llm: LlmService) {}
 
-  @Post('complete')
-  @ApiOperation({ summary: 'Enviar contexto al LLM y obtener análisis + tool calls' })
-  complete(@Body() req: LlmRequest) {
-    return this.llm.complete(req);
-  }
+  // El acceso al LLM para análisis/ejecución va por el ciclo gobernado
+  // (AgentsService.runGovernedTurn vía panel/WS). No exponemos un passthrough
+  // crudo a llm.complete: sería una superficie sin auditoría ni validación.
 
   @Get('config')
   @ApiOperation({ summary: 'Configuración activa del LLM: modelo, backend, capacidades' })
