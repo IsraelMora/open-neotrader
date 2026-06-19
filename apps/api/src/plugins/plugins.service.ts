@@ -10,6 +10,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
@@ -105,6 +106,149 @@ const j = <T>(v: string | null): T | null => {
   }
 };
 const s = (v: unknown): string | null => (v != null ? JSON.stringify(v) : null);
+
+// ── F3-s4: Trust Score constants ─────────────────────────────────────────────
+
+/** Penalty applied per warning-severity finding when normalizing scan_result. */
+export const PENALTY_PER_WARN = 10;
+/** Step applied per net vote when normalizing votes_net → [0,100]. */
+export const VOTE_STEP = 5;
+
+/** Default weights used when KV `trust.weights` is absent or invalid. */
+const DEFAULT_TRUST_WEIGHTS = { scan: 0.3, smoke: 0.2, reputation: 0.4, votes: 0.1 };
+/** Default badge threshold used when KV `trust.badge_threshold` is absent or invalid. */
+const DEFAULT_BADGE_THRESHOLD = 80;
+
+export interface TrustScoreInput {
+  scan_result: string | null;
+  smoke_test_result: string | null;
+  reputation_score: number | null;
+  votes_net: number;
+}
+
+export interface TrustWeights {
+  scan: number;
+  smoke: number;
+  reputation: number;
+  votes: number;
+}
+
+export interface TrustScoreResult {
+  trust_score: number | null;
+  badge: boolean;
+  breakdown: {
+    inputs: {
+      scan: number | null;
+      smoke: number | null;
+      reputation: number | null;
+      votes: number;
+    };
+    weights_used: Partial<TrustWeights>;
+    threshold: number;
+  };
+}
+
+/** Normalize scan_result JSON → [0,100] or null if absent/unparseable. */
+function normalizeScan(scanResult: string | null): number | null {
+  if (scanResult === null) return null;
+  try {
+    const parsed = JSON.parse(scanResult) as { findings?: { severity: string }[] };
+    const warnCount = (parsed.findings ?? []).filter((f) => f.severity === 'warning').length;
+    return Math.max(0, Math.min(100, 100 - PENALTY_PER_WARN * warnCount));
+  } catch {
+    return null;
+  }
+}
+
+/** Normalize smoke_test_result JSON → [0,100] or null if absent/unparseable. */
+function normalizeSmoke(smokeResult: string | null): number | null {
+  if (smokeResult === null) return null;
+  try {
+    const parsed = JSON.parse(smokeResult) as { result?: string };
+    if (parsed.result === 'passed') return 100;
+    if (parsed.result === 'inconclusive') return 50;
+    if (parsed.result === 'failed') return 0;
+    return null; // unrecognized → excluded
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * F3-s4: Compute a composite trust score from plugin signals.
+ *
+ * PURE function — no I/O, no DB, no side effects.
+ * Takes the plugin row data + parsed KV weights + badge threshold.
+ * Returns {trust_score, badge, breakdown}.
+ *
+ * Formula:
+ *   - Normalize each signal to [0,100] (null signals are EXCLUDED).
+ *   - votes_net is NEVER excluded (default 0 → neutral 50).
+ *   - Re-weight over present signals: denom = Σ weight_i for present i.
+ *   - denom <= 0 → trust_score = null.
+ *   - raw = Σ (weight_i * nInput_i) / denom.
+ *   - trust_score = round(clamp(raw, 0, 100), 1).
+ *   - badge = trust_score !== null && trust_score >= threshold.
+ */
+export function computeTrustScore(
+  plugin: TrustScoreInput,
+  weights: TrustWeights,
+  threshold: number,
+): TrustScoreResult {
+  // ── Step 1: normalize each signal ──────────────────────────────────────────
+  const nScan = normalizeScan(plugin.scan_result);
+  const nSmoke = normalizeSmoke(plugin.smoke_test_result);
+
+  const nReputation: number | null = plugin.reputation_score ?? null;
+
+  // votes is NEVER excluded
+  const nVotes = Math.max(0, Math.min(100, 50 + VOTE_STEP * plugin.votes_net));
+
+  // ── Step 2: re-weight over present inputs ──────────────────────────────────
+  const signalMap: Array<[keyof TrustWeights, number | null]> = [
+    ['scan', nScan],
+    ['smoke', nSmoke],
+    ['reputation', nReputation],
+    ['votes', nVotes],
+  ];
+
+  let denom = 0;
+  let raw = 0;
+  const weights_used: Partial<TrustWeights> = {};
+
+  for (const [key, value] of signalMap) {
+    if (value !== null && weights[key] > 0) {
+      denom += weights[key];
+      raw += weights[key] * value;
+      weights_used[key] = weights[key];
+    }
+  }
+  // votes always included in inputs but only contributes to denom if weight > 0
+  // (already handled above — votes is never null)
+
+  let trust_score: number | null = null;
+  if (denom > 0) {
+    const clamped = Math.max(0, Math.min(100, raw / denom));
+    trust_score = Math.round(clamped * 10) / 10;
+  }
+
+  const badge = trust_score !== null && trust_score >= threshold;
+
+  return {
+    trust_score,
+    badge,
+    breakdown: {
+      inputs: {
+        scan: nScan,
+        smoke: nSmoke,
+        reputation: nReputation,
+        votes: nVotes,
+      },
+      weights_used,
+      threshold,
+    },
+  };
+}
 
 // ── SKILL.md frontmatter parser ───────────────────────────────────────────────
 function parseSkillMd(content: string): { name: string; description: string; body: string } {
@@ -952,6 +1096,104 @@ export class PluginsService implements OnApplicationBootstrap {
     } catch (e) {
       this.log.warn(`scan failed for ${pluginId}: ${(e as Error).message}`);
     }
+  }
+
+  /**
+   * F3-s4: Reads trust-score config from KV.
+   * Fail-safe: any missing/malformed key → defaults. Never throws.
+   * Mirrors the _readGateThresholds pattern from pretest.service.ts.
+   */
+  async _readTrustConfig(): Promise<{ weights: TrustWeights; threshold: number }> {
+    const parseNum = (raw: string | null, fallback: number): number => {
+      if (raw === null) return fallback;
+      const n = Number(raw);
+      return isFinite(n) ? n : fallback;
+    };
+
+    const [rawWeights, rawThreshold] = await Promise.all([
+      this.kv?.get('trust.weights') ?? Promise.resolve(null),
+      this.kv?.get('trust.badge_threshold') ?? Promise.resolve(null),
+    ]);
+
+    // Parse weights: must be a non-null object with numeric values; negatives → 0; all-zero → defaults
+    let weights: TrustWeights = { ...DEFAULT_TRUST_WEIGHTS };
+    if (rawWeights !== null) {
+      try {
+        const parsed: unknown = JSON.parse(rawWeights);
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const obj = parsed as Record<string, unknown>;
+          const coerce = (key: keyof TrustWeights): number => {
+            const v = Number(obj[key]);
+            if (!isFinite(v)) return 0;
+            return v < 0 ? 0 : v;
+          };
+          const w: TrustWeights = {
+            scan: coerce('scan'),
+            smoke: coerce('smoke'),
+            reputation: coerce('reputation'),
+            votes: coerce('votes'),
+          };
+          const total = w.scan + w.smoke + w.reputation + w.votes;
+          weights = total > 0 ? w : { ...DEFAULT_TRUST_WEIGHTS };
+        }
+      } catch {
+        // parse fail → defaults already set
+      }
+    }
+
+    // Parse threshold: numeric, clamped to [0, 100]
+    const rawNum = parseNum(rawThreshold, DEFAULT_BADGE_THRESHOLD);
+    const threshold = Math.max(0, Math.min(100, rawNum));
+
+    return { weights, threshold };
+  }
+
+  /**
+   * F3-s4: Computes SHA-256 checksum over plugin content files in stable order.
+   * Files covered: manifest.toml, plugin.py, hooks/*.py (sorted lexicographically).
+   * Missing files are silently skipped (not an error).
+   * Returns null if installedPath is null/undefined or no covered files exist.
+   */
+  computeContentChecksum(installedPath: string | null | undefined): string | null {
+    if (!installedPath) return null;
+
+    const h = crypto.createHash('sha256');
+    let parts = 0;
+
+    const tryAppend = (rel: string): void => {
+      const full = path.join(installedPath, rel);
+      try {
+        if (!fs.existsSync(full)) return;
+        const bytes = fs.readFileSync(full, 'utf8');
+        h.update(rel + '\0' + bytes + '\0');
+        parts++;
+      } catch {
+        // skip unreadable file
+      }
+    };
+
+    // Fixed files first (manifest then plugin)
+    for (const rel of ['manifest.toml', 'plugin.py']) {
+      tryAppend(rel);
+    }
+
+    // hooks/*.py sorted lexicographically
+    const hooksDir = path.join(installedPath, 'hooks');
+    try {
+      if (fs.existsSync(hooksDir)) {
+        const hookFiles = fs
+          .readdirSync(hooksDir)
+          .filter((f) => f.endsWith('.py'))
+          .sort((a, b) => a.localeCompare(b));
+        for (const f of hookFiles) {
+          tryAppend(path.join('hooks', f));
+        }
+      }
+    } catch {
+      // hooks dir unreadable → skip
+    }
+
+    return parts > 0 ? h.digest('hex') : null;
   }
 
   private tryReadSkillMd(
