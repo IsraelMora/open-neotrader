@@ -380,6 +380,56 @@ export class PluginsService implements OnApplicationBootstrap {
     }
   }
 
+  /**
+   * Returns the reflection policy prompt from the single active plugin that declares a
+   * [reflection] manifest section. Behavior mirrors getActiveDecisionPrompt:
+   *   - 0 active reflection plugins → null (no log; reflection is a no-op)
+   *   - 1 active reflection plugin  → prompt string verbatim (prompt wins over prompt_file)
+   *   - >1 active reflection plugins → null + Logger.error("[CRITICAL] ...")
+   * Never throws.
+   */
+  async getActiveReflectionPrompt(): Promise<string | null> {
+    try {
+      const active = await this.findActive();
+      const reflectionPlugins = active.filter((p) => {
+        const manifest = this.getManifest(p.installed_path);
+        return (
+          manifest?.reflection && (manifest.reflection.prompt || manifest.reflection.prompt_file)
+        );
+      });
+
+      if (reflectionPlugins.length === 0) return null;
+
+      if (reflectionPlugins.length > 1) {
+        const ids = reflectionPlugins.map((p) => p.id).join(', ');
+        this.log.error(
+          `[CRITICAL] multiple reflection plugins active: ${ids}. No reflection prompt injected this turn.`,
+        );
+        return null;
+      }
+
+      // Exactly one.
+      const plugin = reflectionPlugins[0];
+      const manifest = this.getManifest(plugin.installed_path)!;
+      const reflection = manifest.reflection!;
+
+      if (reflection.prompt) return reflection.prompt;
+
+      if (reflection.prompt_file && plugin.installed_path) {
+        const safeName = path.basename(reflection.prompt_file);
+        try {
+          return fs.readFileSync(path.join(plugin.installed_path, safeName), 'utf8');
+        } catch {
+          return null;
+        }
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Devuelve los tools.json de un plugin específico. */
   async getPluginTools(id: string): Promise<ProviderTool[]> {
     const p = await this.findById(id);

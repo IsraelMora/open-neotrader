@@ -23,8 +23,10 @@ export interface GovernedTurnInput {
    * - 'chat' emits a chat_turn audit event (interactive turns).
    * - 'cycle' skips the audit (cycle owns its own cycle_start/cycle_complete events).
    * - 'pretest' emits a pretest_turn audit event (virtual portfolio evaluation).
+   * - 'reflection' enables kernel__write_skill injection and skips the turn-level audit
+   *   (runReflectionTurn owns the reflection_turn audit). Added in s2.
    */
-  source: 'chat' | 'cycle' | 'pretest';
+  source: 'chat' | 'cycle' | 'pretest' | 'reflection';
   /** User/cycle prompt (already enriched by the caller if needed). */
   context: string;
   /** Optional caller base system prompt; decision prompt + tool schema will be prepended by the kernel. */
@@ -272,6 +274,9 @@ export class AgentsService {
       });
     } else if (input.source === 'cycle') {
       // Cycle owns its own audit — nothing to emit here.
+    } else if (input.source === 'reflection') {
+      // Reflection turn audit is owned by runReflectionTurn (emits 'reflection_turn' event).
+      // runGovernedTurn intentionally emits nothing for reflection turns.
     } else {
       this.log.warn(
         `runGovernedTurn: unknown source discriminator '${String(input.source)}' — skipping audit`,
