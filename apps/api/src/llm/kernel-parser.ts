@@ -4,8 +4,14 @@ import type { ToolCallRequest } from './llm.service';
 
 /** Extracts raw JSON text from a fenced ```json block, if present. */
 function extractFenced(text: string): { raw: string } | null {
-  const match = /```json\s*\n([\s\S]*?)\n```/.exec(text);
-  return match ? { raw: match[1].trim() } : null;
+  // Non-backtracking extraction: find markers, then slice between them.
+  const open = text.indexOf('```json');
+  if (open === -1) return null;
+  const contentStart = text.indexOf('\n', open);
+  if (contentStart === -1) return null;
+  const close = text.indexOf('\n```', contentStart);
+  if (close === -1) return null;
+  return { raw: text.slice(contentStart + 1, close).trim() };
 }
 
 /** Extracts raw JSON text from a <tool_calls>...</tool_calls> block, if present. */
@@ -45,7 +51,7 @@ type RawEntry = Record<string, unknown>;
  * Returns null for entries that cannot be normalized.
  */
 function normalizeEntry(entry: RawEntry): ToolCallRequest | null {
-  if (typeof entry !== 'object' || entry === null) return null;
+  if (!entry || typeof entry !== 'object') return null;
 
   // Object-form: { plugin_id, function, args }
   if (typeof entry['plugin_id'] === 'string' && typeof entry['function'] === 'string') {
@@ -56,7 +62,7 @@ function normalizeEntry(entry: RawEntry): ToolCallRequest | null {
   // Tool-form: { tool: "pluginId__fn", args: {...} }
   if (typeof entry['tool'] === 'string') {
     if (typeof entry['args'] !== 'object' || entry['args'] === null) return null;
-    const tool = entry['tool'] as string;
+    const tool = entry['tool'];
     const idx = tool.indexOf('__');
     if (idx === -1) return null; // no __ separator — malformed
 
@@ -88,15 +94,11 @@ function normalizeEntry(entry: RawEntry): ToolCallRequest | null {
  * Calls auditFn(rawBlock) only when a block is detected but JSON is malformed.
  * Never throws.
  */
-export function parseToolCalls(
-  text: string,
-  auditFn?: (raw: string) => void,
-): ToolCallRequest[] {
+export function parseToolCalls(text: string, auditFn?: (raw: string) => void): ToolCallRequest[] {
   if (!text) return [];
 
   // Try each extraction strategy in priority order.
-  const detected =
-    extractFenced(text) ?? extractTagged(text) ?? extractBare(text);
+  const detected = extractFenced(text) ?? extractTagged(text) ?? extractBare(text);
 
   if (!detected) return [];
 

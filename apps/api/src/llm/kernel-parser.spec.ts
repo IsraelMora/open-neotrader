@@ -51,9 +51,15 @@ describe('parseToolCalls', () => {
   // ── All three formats produce identical result ───────────────────────────────
 
   it('produces identical ToolCallRequest[] for all three formats', () => {
-    const call = { plugin_id: 'alpaca-provider', function: 'place_order', args: { symbol: 'AAPL' } };
-    const fenced = '```json\n[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL"}}]\n```';
-    const tagged = '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL"}}]</tool_calls>';
+    const call = {
+      plugin_id: 'alpaca-provider',
+      function: 'place_order',
+      args: { symbol: 'AAPL' },
+    };
+    const fenced =
+      '```json\n[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL"}}]\n```';
+    const tagged =
+      '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL"}}]</tool_calls>';
     const bare = '[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL"}}]';
 
     expect(parseToolCalls(fenced)).toEqual([call]);
@@ -64,7 +70,8 @@ describe('parseToolCalls', () => {
   // ── Prose-wrapped bare array ─────────────────────────────────────────────────
 
   it('parses a bare array wrapped in surrounding prose', () => {
-    const text = 'Some analysis here. [{"tool":"alpaca-provider__place_order","args":{}}] And more text.';
+    const text =
+      'Some analysis here. [{"tool":"alpaca-provider__place_order","args":{}}] And more text.';
 
     const result = parseToolCalls(text);
 
@@ -161,7 +168,8 @@ describe('parseToolCalls', () => {
   });
 
   it('drops entries missing the args field (when using tool-form)', () => {
-    const text = '[{"tool":"alpaca-provider__place_order"},{"tool":"alpaca-provider__cancel_order","args":{}}]';
+    const text =
+      '[{"tool":"alpaca-provider__place_order"},{"tool":"alpaca-provider__cancel_order","args":{}}]';
 
     const result = parseToolCalls(text);
 
