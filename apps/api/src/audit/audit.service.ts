@@ -15,7 +15,10 @@ export type AuditEventType =
   | 'parse_miss'
   | 'chat_turn'
   | 'pretest_turn'
-  | 'notification_sent';
+  | 'notification_sent'
+  | 'skill_written'
+  | 'skill_reverted'
+  | 'skill_write_denied';
 
 export interface AuditPayload {
   cycle_id?: string;

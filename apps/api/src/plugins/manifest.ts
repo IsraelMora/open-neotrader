@@ -65,6 +65,8 @@ export interface PluginManifest {
     license?: string;
     repository?: string;
     min_platform_version?: string;
+    /** When true, the LLM is allowed to rewrite this skill's SKILL.md body via writeSkillGuarded. */
+    llm_writable?: boolean;
   };
   tools?: ToolSpec[];
   credentials?: Record<string, CredentialSpec>;
