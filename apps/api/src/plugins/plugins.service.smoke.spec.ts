@@ -253,6 +253,45 @@ describe('PluginsService.activate — smoke test integration (F3-s2)', () => {
   });
 });
 
+describe('PluginsService.activate — smoke_test_result persist failure (F3-s2)', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('f3s2-3.11 — db.update for smoke_test_result throws → activate STILL sets active=true, no exception propagates, warn is logged', async () => {
+    const plugin = makePlugin('persist-fail-plugin');
+    const db = makeDb(plugin);
+    const sandbox = {
+      smokeTestPlugin: jest.fn().mockResolvedValue({ ok: true, result: FAKE_SMOKE_PASSED }),
+      analyzePlugin: jest.fn(),
+    };
+
+    // Make the smoke_test_result update throw; the active=true update must still succeed
+    (db.plugin.update as jest.Mock).mockImplementation(
+      ({ data }: { data: Record<string, unknown> }) => {
+        if ('smoke_test_result' in data) {
+          return Promise.reject(new Error('DB connection lost'));
+        }
+        return Promise.resolve({ ...plugin, ...data });
+      },
+    );
+
+    const service = makeService(db, sandbox);
+    const warnSpy = jest.spyOn((service as unknown as { log: { warn: jest.Mock } }).log, 'warn');
+
+    // Must NOT throw
+    await expect(service.activate('persist-fail-plugin')).resolves.toBeDefined();
+
+    // active=true must still be set despite the persist failure
+    const updateCalls = (db.plugin.update as jest.Mock).mock.calls as Array<
+      [{ where: { id: string }; data: Record<string, unknown> }]
+    >;
+    const activeUpdateCall = updateCalls.find(([args]) => args.data['active'] === true);
+    expect(activeUpdateCall).toBeDefined();
+
+    // A warn must have been logged for the persist failure
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/smoke_test_result persist failed/));
+  });
+});
+
 describe('PluginsService.getTrustReport (F3-s2 AC-7)', () => {
   beforeEach(() => jest.clearAllMocks());
 

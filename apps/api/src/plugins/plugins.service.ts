@@ -886,21 +886,31 @@ export class PluginsService implements OnApplicationBootstrap {
   /**
    * F3-s2: Runs pre-activation smoke test and stores the result.
    * WARN-only — NEVER throws or blocks activation.
+   * Two distinct try/catch blocks so a DB persistence failure does not mask
+   * a real smoke failure and vice-versa.
    */
   private async _smokeTestOnActivate(pluginId: string): Promise<void> {
     if (!this.sandbox) return;
+
+    let data: Record<string, unknown> | undefined;
     try {
       const res = await this.sandbox.smokeTestPlugin(pluginId);
-      const data =
+      data =
         res.ok && res.result
           ? (res.result as Record<string, unknown>)
           : { ok: false, result: 'inconclusive', error: res.error, checks: [] };
+    } catch (e) {
+      this.log.warn(`smoke test failed for ${pluginId}: ${(e as Error).message}`); // activation still proceeds
+      return;
+    }
+
+    try {
       await this.db.plugin.update({
         where: { id: pluginId },
         data: { smoke_test_result: JSON.stringify(data) },
       });
     } catch (e) {
-      this.log.warn(`smoke test failed for ${pluginId}: ${(e as Error).message}`); // activation still proceeds
+      this.log.warn(`smoke_test_result persist failed for ${pluginId}: ${(e as Error).message}`); // activation still proceeds
     }
   }
 
