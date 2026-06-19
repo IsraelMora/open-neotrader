@@ -12,6 +12,7 @@ import type { PluginsService } from '../plugins/plugins.service';
 import type { LlmService } from '../llm/llm.service';
 import type { ContextMemoryService } from '../context-memory/context-memory.service';
 import type { AgentsService } from '../agents/agents.service';
+import type { KvService } from '../common/kv.service';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -83,13 +84,34 @@ function makeStubAgents(): AgentsService {
   } as unknown as AgentsService;
 }
 
-function makeService(gateway: ProviderGatewayService, agents?: AgentsService): PretestService {
+function makeStubKv(overrides: Record<string, string | null> = {}): KvService {
+  return {
+    get: jest.fn((key: string) => Promise.resolve(key in overrides ? overrides[key] : null)),
+    set: jest.fn().mockResolvedValue(undefined),
+    delete: jest.fn().mockResolvedValue(undefined),
+  } as unknown as KvService;
+}
+
+function makeService(
+  gateway: ProviderGatewayService,
+  agents?: AgentsService,
+  kv?: KvService,
+): PretestService {
   const db = {} as unknown as PrismaService;
   const sandbox = {} as unknown as SandboxGateway;
   const plugins = {} as unknown as PluginsService;
   const llm = {} as unknown as LlmService;
   const memory = {} as unknown as ContextMemoryService;
-  return new PretestService(db, sandbox, plugins, llm, memory, gateway, agents ?? makeStubAgents());
+  return new PretestService(
+    db,
+    sandbox,
+    plugins,
+    llm,
+    memory,
+    gateway,
+    agents ?? makeStubAgents(),
+    kv ?? makeStubKv(),
+  );
 }
 
 // ── Phase 1.1: RED tests — fills use getQuote.last ────────────────────────────
@@ -990,6 +1012,7 @@ describe('PretestService.runCycle — __pretest_policy__ exclusion (fix 3)', () 
       memory,
       gateway,
       mockAgents,
+      makeStubKv(),
     );
 
     await svc.runCycle('port-1');
@@ -1311,7 +1334,16 @@ describe('PretestService.runCycle — uses agents.runGovernedTurn (PR3)', () => 
     } as unknown as PrismaService;
 
     // Build service with both llm AND agents injected
-    const svc = new PretestService(db, sandbox, plugins, mockLlm, memory, gateway, mockAgents);
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      mockLlm,
+      memory,
+      gateway,
+      mockAgents,
+      makeStubKv(),
+    );
 
     await svc.runCycle(PORTFOLIO_ID);
 
@@ -1327,5 +1359,680 @@ describe('PretestService.runCycle — uses agents.runGovernedTurn (PR3)', () => 
     // llm.complete must NEVER be called from PretestService
     // eslint-disable-next-line @typescript-eslint/unbound-method
     expect(mockLlm.complete).not.toHaveBeenCalled();
+  });
+});
+
+// ── Phase 4.1: RED tests — significance gate (PR4) ───────────────────────────
+
+/**
+ * Helper: build a PretestState with closing trades carrying pnl.
+ * Closing trades = those with action 'sell' or 'close' that have a pnl field.
+ */
+function makeStateWithTrades(
+  trades: Array<{
+    action: 'buy' | 'sell' | 'close';
+    pnl?: number;
+    price?: number;
+    avg_price?: number;
+    qty?: number;
+    symbol?: string;
+  }>,
+  max_drawdown_pct = 0,
+): PretestState {
+  const tradeFull: PretestTrade[] = trades.map((t, i) => ({
+    ts: new Date(Date.now() + i * 1000).toISOString(),
+    symbol: t.symbol ?? 'AAPL',
+    action: t.action,
+    price: t.price ?? 100,
+    quantity: t.qty ?? 10,
+    ...(t.pnl !== undefined ? { pnl: t.pnl } : {}),
+  }));
+  const win_trades = trades.filter((t) => (t.pnl ?? 0) > 0).length;
+  const loss_trades = trades.filter((t) => (t.pnl ?? 0) < 0).length;
+  return makeState({ trades: tradeFull, max_drawdown_pct, win_trades, loss_trades });
+}
+
+const DEFAULT_GATEWAY = makeGateway(() => Promise.resolve(makeQuote('AAPL', 100)));
+
+describe('PretestService.computeSignificance (Phase 4.1.1)', () => {
+  it('4.1.1 — computes sharpe, profit_factor, win_rate, max_dd, n_trades from closing trades', () => {
+    // Two closing trades with defined pnl:
+    // trade A: pnl=200, price=100, qty=10 → r_A = 200/(100*10) = 0.2
+    // trade B: pnl=-50, price=100, qty=10 → r_B = -50/(100*10) = -0.05
+    // mean(r) = (0.2 + (-0.05)) / 2 = 0.075
+    // sample std (n-1=1): std = sqrt(((0.2-0.075)^2 + (-0.05-0.075)^2) / 1) = sqrt(0.015625+0.015625) = sqrt(0.03125) ≈ 0.17678
+    // sharpe = 0.075 / 0.17678 ≈ 0.4243
+    // profit_factor = 200 / 50 = 4
+    // win_rate = 1/2 = 0.5
+    // n_trades = 2 (only closing trades with pnl)
+    const state = makeStateWithTrades(
+      [
+        { action: 'sell', pnl: 200, price: 100, qty: 10 },
+        { action: 'sell', pnl: -50, price: 100, qty: 10 },
+      ],
+      12,
+    );
+
+    const svc = makeService(DEFAULT_GATEWAY);
+    const metrics = (
+      svc as unknown as {
+        computeSignificance: (s: PretestState) => {
+          sharpe: number;
+          profit_factor: number | null;
+          win_rate: number;
+          max_dd: number;
+          n_trades: number;
+        };
+      }
+    ).computeSignificance(state);
+
+    expect(metrics.n_trades).toBe(2);
+    expect(metrics.sharpe).toBeCloseTo(0.4243, 3);
+    expect(metrics.profit_factor).toBeCloseTo(4, 5);
+    expect(metrics.win_rate).toBeCloseTo(0.5, 5);
+    expect(metrics.max_dd).toBe(12);
+  });
+});
+
+describe('PretestService.computeSignificance (Phase 4.1.2)', () => {
+  it('4.1.2 — sharpe = 0 when n_trades < 2', () => {
+    // Only one closing trade — cannot compute meaningful sharpe
+    const state = makeStateWithTrades([{ action: 'sell', pnl: 100, price: 100, qty: 10 }]);
+    const svc = makeService(DEFAULT_GATEWAY);
+    const metrics = (
+      svc as unknown as {
+        computeSignificance: (s: PretestState) => { sharpe: number; n_trades: number };
+      }
+    ).computeSignificance(state);
+
+    expect(metrics.n_trades).toBe(1);
+    expect(metrics.sharpe).toBe(0);
+  });
+
+  it('4.1.2b — sharpe = 0 when all returns are equal (std = 0)', () => {
+    // Three identical returns → std = 0 → sharpe = 0
+    const state = makeStateWithTrades([
+      { action: 'sell', pnl: 100, price: 100, qty: 10 },
+      { action: 'sell', pnl: 100, price: 100, qty: 10 },
+      { action: 'sell', pnl: 100, price: 100, qty: 10 },
+    ]);
+    const svc = makeService(DEFAULT_GATEWAY);
+    const metrics = (
+      svc as unknown as {
+        computeSignificance: (s: PretestState) => { sharpe: number; n_trades: number };
+      }
+    ).computeSignificance(state);
+
+    expect(metrics.n_trades).toBe(3);
+    expect(metrics.sharpe).toBe(0);
+  });
+});
+
+describe('PretestService.computeSignificance (Phase 4.1.3)', () => {
+  it('4.1.3 — profit_factor = null when no losing trades exist', () => {
+    // All trades are winners → no denominator for profit_factor
+    const state = makeStateWithTrades([
+      { action: 'sell', pnl: 100, price: 100, qty: 10 },
+      { action: 'sell', pnl: 200, price: 100, qty: 10 },
+    ]);
+    const svc = makeService(DEFAULT_GATEWAY);
+    const metrics = (
+      svc as unknown as {
+        computeSignificance: (s: PretestState) => { profit_factor: number | null };
+      }
+    ).computeSignificance(state);
+
+    expect(metrics.profit_factor).toBeNull();
+  });
+});
+
+describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
+  function makePortfolioRow(tradeCount: number, max_drawdown_pct: number, sharpe: number) {
+    // Build trades with pnl that yields the desired sharpe
+    // To get a predictable sharpe: use symmetric wins/losses so we can control std
+    // We'll use trades with explicit pnl, price=100, qty=1 so r_i = pnl
+    // For simplicity, build 'tradeCount' trades all with the same pnl = 0.1 so sharpe=0
+    // then override via max_drawdown_pct for gate tests that only need to test one condition at a time
+    const trades: PretestTrade[] = Array.from({ length: tradeCount }, (_, i) => ({
+      ts: new Date(Date.now() + i * 1000).toISOString(),
+      symbol: 'TEST',
+      action: 'sell' as const,
+      price: 100,
+      quantity: 1,
+      pnl: sharpe > 0 ? 100 : -10, // mixed to get non-null profit_factor; adjust per test
+    }));
+    const win_trades = trades.filter((t) => (t.pnl ?? 0) > 0).length;
+    const loss_trades = trades.filter((t) => (t.pnl ?? 0) < 0).length;
+    const stateObj: PretestState = {
+      equity: 10000,
+      cash: 10000,
+      positions: [],
+      trades,
+      max_equity: 10000,
+      max_drawdown_pct,
+      realized_pnl: 0,
+      win_trades,
+      loss_trades,
+    };
+    return {
+      id: 'port-gate-test',
+      name: 'Gate Test Portfolio',
+      description: null,
+      initial_capital: 10000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(stateObj),
+      run_count: tradeCount,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+  }
+
+  it('4.1.4 — gate returns ready:false and reasons includes min_trades message when below threshold', async () => {
+    // 5 trades < default 20 → NOT READY
+    const row = makePortfolioRow(5, 5, 1.5);
+    const db = {
+      pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
+    } as unknown as PrismaService;
+    const kv = makeStubKv({}); // all defaults
+    const svc = new PretestService(
+      db,
+      {} as unknown as SandboxGateway,
+      {} as unknown as PluginsService,
+      {} as unknown as LlmService,
+      {} as unknown as ContextMemoryService,
+      DEFAULT_GATEWAY,
+      makeStubAgents(),
+      kv,
+    );
+
+    const result = await svc.gate('port-gate-test');
+
+    expect(result.ready).toBe(false);
+    expect(result.reasons.some((r: string) => r.includes('min_trades'))).toBe(true);
+    expect(result.metrics).toBeDefined();
+  });
+
+  it('4.1.5 — gate returns ready:false with sharpe reason when Sharpe below threshold', async () => {
+    // 25 trades, drawdown OK, but sharpe will be 0 (all same direction pnl → std=0 → sharpe=0)
+    // We need all same pnl so std=0 → sharpe=0; default min_sharpe=1.0
+    const trades: PretestTrade[] = Array.from({ length: 25 }, (_, i) => ({
+      ts: new Date(Date.now() + i * 1000).toISOString(),
+      symbol: 'TEST',
+      action: 'sell' as const,
+      price: 100,
+      quantity: 1,
+      pnl: 10, // all equal → std=0 → sharpe=0
+    }));
+    const stateObj: PretestState = {
+      equity: 10000,
+      cash: 10000,
+      positions: [],
+      trades,
+      max_equity: 10000,
+      max_drawdown_pct: 5,
+      realized_pnl: 250,
+      win_trades: 25,
+      loss_trades: 0,
+    };
+    const row = {
+      id: 'sharpe-test',
+      name: 'Sharpe Test',
+      description: null,
+      initial_capital: 10000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(stateObj),
+      run_count: 25,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const db = {
+      pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
+    } as unknown as PrismaService;
+    const kv = makeStubKv({});
+    const svc = new PretestService(
+      db,
+      {} as unknown as SandboxGateway,
+      {} as unknown as PluginsService,
+      {} as unknown as LlmService,
+      {} as unknown as ContextMemoryService,
+      DEFAULT_GATEWAY,
+      makeStubAgents(),
+      kv,
+    );
+
+    const result = await svc.gate('sharpe-test');
+
+    expect(result.ready).toBe(false);
+    expect(result.reasons.some((r: string) => r.includes('min_sharpe'))).toBe(true);
+  });
+
+  it('4.1.6 — gate returns ready:false with drawdown reason when max_dd exceeds threshold', async () => {
+    // 30 trades, Sharpe ≥ 1.0 via proper mix, but drawdown = 25% > default 20%
+    // To get sharpe >= 1.0: use two symmetric trades with one win and one loss where mean/std > 1
+    // Simpler: use alternating +2, -1 so mean > std
+    const trades: PretestTrade[] = Array.from({ length: 30 }, (_, i) => ({
+      ts: new Date(Date.now() + i * 1000).toISOString(),
+      symbol: 'TEST',
+      action: 'sell' as const,
+      price: 100,
+      quantity: 1,
+      pnl: i % 2 === 0 ? 20 : -2, // r = 0.20 or -0.02; mean=(0.2*15 + -0.02*15)/30=0.09; need to verify sharpe
+    }));
+    const stateObj: PretestState = {
+      equity: 10000,
+      cash: 10000,
+      positions: [],
+      trades,
+      max_equity: 10000,
+      max_drawdown_pct: 25, // exceeds default 20%
+      realized_pnl: 0,
+      win_trades: 15,
+      loss_trades: 15,
+    };
+    const row = {
+      id: 'dd-test',
+      name: 'DD Test',
+      description: null,
+      initial_capital: 10000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(stateObj),
+      run_count: 30,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const db = {
+      pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
+    } as unknown as PrismaService;
+    const kv = makeStubKv({});
+    const svc = new PretestService(
+      db,
+      {} as unknown as SandboxGateway,
+      {} as unknown as PluginsService,
+      {} as unknown as LlmService,
+      {} as unknown as ContextMemoryService,
+      DEFAULT_GATEWAY,
+      makeStubAgents(),
+      kv,
+    );
+
+    const result = await svc.gate('dd-test');
+
+    expect(result.ready).toBe(false);
+    expect(result.reasons.some((r: string) => r.includes('max_dd'))).toBe(true);
+  });
+
+  it('4.1.7 — gate returns ready:true and reasons=[] when all thresholds met', async () => {
+    // 30 trades, sharpe will be computed to be ≥ 1.0, drawdown = 15%
+    // trades: alternating pnl = +20, -2; price=100, qty=1
+    // r_i = pnl / (price*qty) = pnl/100
+    // wins: r=0.20 (15 trades), losses: r=-0.02 (15 trades)
+    // mean = (15*0.20 + 15*(-0.02)) / 30 = (3 - 0.3) / 30 = 0.09
+    // variance = [15*(0.20-0.09)^2 + 15*(-0.02-0.09)^2] / 29 = [15*0.0121 + 15*0.0121] / 29 = 0.3630/29 ≈ 0.01252
+    // std = sqrt(0.01252) ≈ 0.1119
+    // sharpe = 0.09 / 0.1119 ≈ 0.804 — hmm, not ≥ 1.0 with this ratio
+    // Use +30, -2 instead: mean=(15*0.30 + 15*(-0.02))/30=(4.5-0.3)/30=0.14
+    // variance=[15*(0.30-0.14)^2+15*(-0.02-0.14)^2]/29=[15*0.0256+15*0.0256]/29=0.768/29≈0.02648
+    // std=sqrt(0.02648)≈0.1627; sharpe=0.14/0.1627≈0.860 still < 1.0
+    // Use +50, -1 per 100: r=0.50 or r=-0.01; mean=(15*0.5+15*(-0.01))/30=(7.5-0.15)/30=0.245
+    // variance=[15*(0.5-0.245)^2+15*(-0.01-0.245)^2]/29=[15*0.065025+15*0.065025]/29=1.95075/29≈0.0673
+    // std=sqrt(0.0673)≈0.2594; sharpe=0.245/0.2594≈0.945 still < 1.0
+    // Use +100, -1: r=1.0 or r=-0.01; mean=(15*1.0+15*(-0.01))/30=(15-0.15)/30=0.495
+    // variance=[15*(1.0-0.495)^2+15*(-0.01-0.495)^2]/29=[15*0.255025+15*0.255025]/29=7.6508/29≈0.2638
+    // std=sqrt(0.2638)≈0.5136; sharpe=0.495/0.5136≈0.964 not yet ≥ 1.0
+    // Use +200, -1: r=2.0 or r=-0.01; mean=(15*2.0+15*(-0.01))/30=(30-0.15)/30=0.995
+    // variance=[15*(2.0-0.995)^2+15*(-0.01-0.995)^2]/29=[15*1.010025+15*1.010025]/29=30.3008/29≈1.0449
+    // std=sqrt(1.0449)≈1.0222; sharpe=0.995/1.0222≈0.9734 still < 1.0
+    // Use all wins (pnl=+10) but then profit_factor=null (no losses → pass gate) and need >= 1.0 sharpe
+    // With all equal returns: std=0 → sharpe=0. Bad.
+    // Best approach: use wins with varying pnl to get sharpe > 1.0
+    // e.g., n=30 trades: 20 wins pnl=+10, 10 wins pnl=+2; all are wins so profit_factor=null (PASS)
+    // r values: 0.1 (×20) and 0.02 (×10); mean=(20*0.1+10*0.02)/30=(2+0.2)/30=0.0733
+    // variance=[20*(0.1-0.0733)^2+10*(0.02-0.0733)^2]/29=[20*0.000713+10*0.002844]/29=[0.01426+0.02844]/29≈0.001472
+    // std=sqrt(0.001472)≈0.03836; sharpe=0.0733/0.03836≈1.910 ✓ > 1.0
+    const trades: PretestTrade[] = [
+      ...Array.from({ length: 20 }, (_, i) => ({
+        ts: new Date(Date.now() + i * 1000).toISOString(),
+        symbol: 'TEST',
+        action: 'sell' as const,
+        price: 100,
+        quantity: 1,
+        pnl: 10,
+      })),
+      ...Array.from({ length: 10 }, (_, i) => ({
+        ts: new Date(Date.now() + (20 + i) * 1000).toISOString(),
+        symbol: 'TEST',
+        action: 'sell' as const,
+        price: 100,
+        quantity: 1,
+        pnl: 2,
+      })),
+    ];
+    const stateObj: PretestState = {
+      equity: 10000,
+      cash: 10000,
+      positions: [],
+      trades,
+      max_equity: 10000,
+      max_drawdown_pct: 15, // ≤ 20% threshold
+      realized_pnl: 220,
+      win_trades: 30,
+      loss_trades: 0,
+    };
+    const row = {
+      id: 'ready-test',
+      name: 'Ready Portfolio',
+      description: null,
+      initial_capital: 10000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(stateObj),
+      run_count: 30,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const db = {
+      pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
+    } as unknown as PrismaService;
+    const kv = makeStubKv({});
+    const svc = new PretestService(
+      db,
+      {} as unknown as SandboxGateway,
+      {} as unknown as PluginsService,
+      {} as unknown as LlmService,
+      {} as unknown as ContextMemoryService,
+      DEFAULT_GATEWAY,
+      makeStubAgents(),
+      kv,
+    );
+
+    const result = await svc.gate('ready-test');
+
+    expect(result.ready).toBe(true);
+    expect(result.reasons).toEqual([]);
+    expect(result.metrics).toBeDefined();
+  });
+
+  it('4.1.8 — KvService override min_trades=5 makes 6-trade portfolio READY (good sharpe/dd)', async () => {
+    // 6 trades, override min_trades=5 via KvService; good sharpe and drawdown
+    const trades: PretestTrade[] = [
+      ...Array.from({ length: 4 }, (_, i) => ({
+        ts: new Date(Date.now() + i * 1000).toISOString(),
+        symbol: 'TEST',
+        action: 'sell' as const,
+        price: 100,
+        quantity: 1,
+        pnl: 10,
+      })),
+      ...Array.from({ length: 2 }, (_, i) => ({
+        ts: new Date(Date.now() + (4 + i) * 1000).toISOString(),
+        symbol: 'TEST',
+        action: 'sell' as const,
+        price: 100,
+        quantity: 1,
+        pnl: 2,
+      })),
+    ];
+    const stateObj: PretestState = {
+      equity: 10000,
+      cash: 10000,
+      positions: [],
+      trades,
+      max_equity: 10000,
+      max_drawdown_pct: 5,
+      realized_pnl: 44,
+      win_trades: 6,
+      loss_trades: 0,
+    };
+    const row = {
+      id: 'override-test',
+      name: 'Override Test',
+      description: null,
+      initial_capital: 10000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(stateObj),
+      run_count: 6,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const db = {
+      pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
+    } as unknown as PrismaService;
+    // Override min_trades to 5 via KvService
+    const kv = makeStubKv({ 'pretest.gate.min_trades': '5' });
+    const svc = new PretestService(
+      db,
+      {} as unknown as SandboxGateway,
+      {} as unknown as PluginsService,
+      {} as unknown as LlmService,
+      {} as unknown as ContextMemoryService,
+      DEFAULT_GATEWAY,
+      makeStubAgents(),
+      kv,
+    );
+
+    const result = await svc.gate('override-test');
+
+    // 6 trades >= 5 min_trades (KvService override), good sharpe and drawdown → READY
+    expect(result.ready).toBe(true);
+    expect(result.reasons).toEqual([]);
+  });
+});
+
+describe('PretestService.compare gate_status (Phase 4.1.9-4.1.10)', () => {
+  it('4.1.9 — compare() skips NOT_READY portfolio from winner selection despite higher return', async () => {
+    // Portfolio A: 25 trades, READY (sharpe>1.0, dd<20%) return +12%
+    // Portfolio B: 3 trades (below min_trades=20), NOT_READY, return +40%
+    // Winner should be Portfolio A, not B
+
+    const tradesA: PretestTrade[] = [
+      ...Array.from({ length: 20 }, (_, i) => ({
+        ts: new Date(Date.now() + i * 1000).toISOString(),
+        symbol: 'A',
+        action: 'sell' as const,
+        price: 100,
+        quantity: 1,
+        pnl: 10,
+      })),
+      ...Array.from({ length: 5 }, (_, i) => ({
+        ts: new Date(Date.now() + (20 + i) * 1000).toISOString(),
+        symbol: 'A',
+        action: 'sell' as const,
+        price: 100,
+        quantity: 1,
+        pnl: 2,
+      })),
+    ];
+    const stateA: PretestState = {
+      equity: 11200,
+      cash: 11200,
+      positions: [],
+      trades: tradesA,
+      max_equity: 11200,
+      max_drawdown_pct: 10,
+      realized_pnl: 1200,
+      win_trades: 25,
+      loss_trades: 0,
+    };
+
+    const tradesB: PretestTrade[] = Array.from({ length: 3 }, (_, i) => ({
+      ts: new Date(Date.now() + i * 1000).toISOString(),
+      symbol: 'B',
+      action: 'sell' as const,
+      price: 100,
+      quantity: 1,
+      pnl: 1000,
+    }));
+    const stateB: PretestState = {
+      equity: 14000,
+      cash: 14000,
+      positions: [],
+      trades: tradesB,
+      max_equity: 14000,
+      max_drawdown_pct: 3,
+      realized_pnl: 4000,
+      win_trades: 3,
+      loss_trades: 0,
+    };
+
+    const rowA = {
+      id: 'port-a',
+      name: 'Portfolio A',
+      description: null,
+      initial_capital: 10000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(stateA),
+      run_count: 25,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const rowB = {
+      id: 'port-b',
+      name: 'Portfolio B',
+      description: null,
+      initial_capital: 10000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(stateB),
+      run_count: 3,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
+    const db = {
+      pretestPortfolio: { findMany: jest.fn().mockResolvedValue([rowA, rowB]) },
+    } as unknown as PrismaService;
+    const kv = makeStubKv({}); // default thresholds: min_trades=20
+
+    const svc = new PretestService(
+      db,
+      {} as unknown as SandboxGateway,
+      {} as unknown as PluginsService,
+      {} as unknown as LlmService,
+      {} as unknown as ContextMemoryService,
+      DEFAULT_GATEWAY,
+      makeStubAgents(),
+      kv,
+    );
+
+    const result = await svc.compare();
+
+    // Portfolio B is NOT_READY (only 3 trades < 20 threshold), so A wins despite lower return
+    expect(result.winner_by_return).toBe('Portfolio A');
+    expect(result.winner_by_risk_adj).toBe('Portfolio A');
+  });
+
+  it('4.1.10 — compare() returns gate_status field on all portfolio entries', async () => {
+    const tradesA: PretestTrade[] = Array.from({ length: 25 }, (_, i) => ({
+      ts: new Date(Date.now() + i * 1000).toISOString(),
+      symbol: 'A',
+      action: 'sell' as const,
+      price: 100,
+      quantity: 1,
+      pnl: 10,
+    }));
+    const stateA: PretestState = {
+      equity: 10000,
+      cash: 10000,
+      positions: [],
+      trades: tradesA,
+      max_equity: 10000,
+      max_drawdown_pct: 5,
+      realized_pnl: 250,
+      win_trades: 25,
+      loss_trades: 0,
+    };
+    const tradesB: PretestTrade[] = Array.from({ length: 2 }, (_, i) => ({
+      ts: new Date(Date.now() + i * 1000).toISOString(),
+      symbol: 'B',
+      action: 'sell' as const,
+      price: 100,
+      quantity: 1,
+      pnl: 50,
+    }));
+    const stateB: PretestState = {
+      equity: 10000,
+      cash: 10000,
+      positions: [],
+      trades: tradesB,
+      max_equity: 10000,
+      max_drawdown_pct: 2,
+      realized_pnl: 100,
+      win_trades: 2,
+      loss_trades: 0,
+    };
+
+    const rowA = {
+      id: 'pa',
+      name: 'A',
+      description: null,
+      initial_capital: 10000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(stateA),
+      run_count: 25,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const rowB = {
+      id: 'pb',
+      name: 'B',
+      description: null,
+      initial_capital: 10000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(stateB),
+      run_count: 2,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
+    const db = {
+      pretestPortfolio: { findMany: jest.fn().mockResolvedValue([rowA, rowB]) },
+    } as unknown as PrismaService;
+    const kv = makeStubKv({});
+
+    const svc = new PretestService(
+      db,
+      {} as unknown as SandboxGateway,
+      {} as unknown as PluginsService,
+      {} as unknown as LlmService,
+      {} as unknown as ContextMemoryService,
+      DEFAULT_GATEWAY,
+      makeStubAgents(),
+      kv,
+    );
+
+    const result = await svc.compare();
+
+    // Every portfolio entry must have gate_status
+    expect(result.portfolios.every((p) => 'gate_status' in p)).toBe(true);
+    // A has 25 trades with all same pnl → sharpe=0 < 1.0 → NOT_READY
+    // B has 2 trades → also NOT_READY (n<20)
+    result.portfolios.forEach((p) => {
+      expect(['READY', 'NOT_READY']).toContain(p.gate_status);
+    });
   });
 });
