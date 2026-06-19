@@ -349,6 +349,32 @@ def cmd_emit_signal(req: dict) -> dict:
     }
 
 
+def cmd_analyze_plugin(req: dict) -> dict:
+    """
+    Run static AST analysis on a plugin directory.
+
+    Request: {"cmd": "analyze_plugin", "plugin_id": "<id>"}
+    Response: scan_result dict — {ok: True, findings: [...], summary: {...}}
+
+    IMPORTANT: NEVER calls _load_module or executes plugin code.
+    Uses analyzer.analyze_plugin() which is AST-only (pure file read + ast.parse).
+
+    Runs safely under SANDBOX_STRICT=true:
+      - Only reads files under PLUGINS_DIR (allowed root for the open() guard)
+      - Only imports stdlib `ast` (not in BLOCKED_MODULES)
+    """
+    import analyzer as _analyzer  # local import mirrors isolation/other helpers
+
+    plugin_id: str = req["plugin_id"]
+    plugin_dir = PLUGINS_DIR / plugin_id
+
+    if not plugin_dir.is_dir():
+        raise FileNotFoundError(f"Plugin not found: {plugin_id}")
+
+    manifest = _read_manifest(plugin_id)
+    return _analyzer.analyze_plugin(plugin_dir, manifest)
+
+
 def cmd_run_cycle(req: dict) -> dict:
     active_ids: set[str] = set(req.get("active_ids", []))
     context: dict = req.get("context", {})
@@ -447,6 +473,7 @@ COMMANDS = {
     "run_hook": cmd_run_hook,
     "emit_signal": cmd_emit_signal,
     "run_cycle": cmd_run_cycle,
+    "analyze_plugin": cmd_analyze_plugin,
 }
 
 
