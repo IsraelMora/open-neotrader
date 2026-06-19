@@ -16,6 +16,14 @@ PLUGIN_DIR = Path(__file__).parents[3] / "plugins" / "weekly-reporter"
 
 def _load_on_cycle():
     """Load the on_cycle function from plugins/weekly-reporter/hooks/on_cycle.py."""
+    # Undo sandbox isolation poisoning (test_isolation.py sets urllib.request → None
+    # in sys.modules; our hook imports it at module level, so we must clear it here)
+    for blocked_mod in list(sys.modules.keys()):
+        if sys.modules[blocked_mod] is None and (
+            blocked_mod.startswith("urllib") or blocked_mod in ("socket", "ssl", "http")
+        ):
+            del sys.modules[blocked_mod]
+
     hook_path = PLUGIN_DIR / "hooks" / "on_cycle.py"
     spec = importlib.util.spec_from_file_location("weekly_reporter_on_cycle", hook_path)
     assert spec is not None and spec.loader is not None, (

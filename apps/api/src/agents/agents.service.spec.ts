@@ -947,6 +947,10 @@ describe('AgentsService.runGovernedTurn — pretest source (PR3)', () => {
 
 // ── Phase A1: Extra-plugin invocation (PRE/POST stage ordering + cycle_abort) ─
 
+type ExtraSandboxStub = jest.Mocked<
+  Pick<SandboxGateway, 'runCycle' | 'callPlugin' | 'call' | 'runExtraCycleHook' | 'getPluginStage'>
+>;
+
 /**
  * Factory for a full agents service with a configurable sandbox.runExtraCycleHook
  * so we can assert call order relative to runGovernedTurn.
@@ -958,9 +962,7 @@ function makeExtraInvocationService(opts: {
   capturedOrder: string[];
 }): {
   service: AgentsService;
-  sandbox: jest.Mocked<
-    Pick<SandboxGateway, 'runCycle' | 'callPlugin' | 'call' | 'runExtraCycleHook'>
-  >;
+  sandbox: ExtraSandboxStub;
   audit: ReturnType<typeof makeAudit>;
   plugins: ReturnType<typeof makeFullPlugins>;
 } {
@@ -969,15 +971,17 @@ function makeExtraInvocationService(opts: {
   const plugins = makeFullPlugins(null, []);
   plugins.findActive.mockResolvedValue(allPlugins as never);
 
-  const sandbox: jest.Mocked<
-    Pick<SandboxGateway, 'runCycle' | 'callPlugin' | 'call' | 'runExtraCycleHook'>
-  > = {
+  const sandbox: ExtraSandboxStub = {
     runCycle: jest.fn().mockImplementation(() => {
       opts.capturedOrder.push('runCycle');
       return Promise.resolve({ ok: true, result: { pending_signals: [] } });
     }),
     callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
     call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+    getPluginStage: jest.fn().mockImplementation((pluginId: string) => {
+      const plugin = opts.extraPlugins.find((p) => p.id === pluginId);
+      return plugin?.schedulerStage ?? 'post';
+    }),
     runExtraCycleHook: jest.fn().mockImplementation((pluginId: string) => {
       const plugin = opts.extraPlugins.find((p) => p.id === pluginId);
       opts.capturedOrder.push(`extra:${pluginId}:${plugin?.schedulerStage ?? 'post'}`);
@@ -1102,12 +1106,11 @@ describe('AgentsService — _persistPluginAlerts runs on PRE abort output (A1.4)
       { id: 'doctor', type: 'extra', name: 'Doctor' },
     ] as never);
 
-    const sandbox: jest.Mocked<
-      Pick<SandboxGateway, 'runCycle' | 'callPlugin' | 'call' | 'runExtraCycleHook'>
-    > = {
+    const sandbox: ExtraSandboxStub = {
       runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
       callPlugin: jest.fn().mockResolvedValue({ ok: true }),
       call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+      getPluginStage: jest.fn().mockReturnValue('pre'),
       runExtraCycleHook: jest.fn().mockImplementation((pluginId: string) => {
         capturedOrder.push(`extra:${pluginId}`);
         return Promise.resolve({
