@@ -833,7 +833,7 @@ describe('PluginsService.revertSkill', () => {
 
 import type { PrismaService as PrismaServiceForPlugins } from '../prisma/prisma.service';
 
-/** Minimal Plugin row shape for reputation tests */
+/** Minimal Plugin row shape for reputation/trust tests */
 function makePluginRow(
   id: string,
   overrides: {
@@ -841,6 +841,9 @@ function makePluginRow(
     reputation_detail?: string | null;
     scan_result?: string | null;
     smoke_test_result?: string | null;
+    trust_score?: number | null;
+    content_checksum?: string | null;
+    votes_net?: number;
   } = {},
 ): import('@prisma/client').Plugin {
   return {
@@ -863,6 +866,9 @@ function makePluginRow(
     smoke_test_result: overrides.smoke_test_result ?? null,
     reputation_score: overrides.reputation_score ?? null,
     reputation_detail: overrides.reputation_detail ?? null,
+    trust_score: overrides.trust_score ?? null,
+    content_checksum: overrides.content_checksum ?? null,
+    votes_net: overrides.votes_net ?? 0,
     installed_at: new Date(),
     updated_at: new Date(),
   };
