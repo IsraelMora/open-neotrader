@@ -884,10 +884,12 @@ describe('PretestService.runCycle — __pretest_policy__ exclusion (fix 3)', () 
     const sandbox = { runCycle: runCycleMock } as unknown as SandboxGatewayType;
 
     const fakePretestPluginId = 'real-plugin-123';
-    const pluginsFindActive = jest.fn().mockResolvedValue([
-      { id: fakePretestPluginId, config: {} },
-    ]);
-    const pluginsService = { findActive: pluginsFindActive } as unknown as import('../plugins/plugins.service').PluginsService;
+    const pluginsFindActive = jest
+      .fn()
+      .mockResolvedValue([{ id: fakePretestPluginId, config: {} }]);
+    const pluginsService = {
+      findActive: pluginsFindActive,
+    } as unknown as import('../plugins/plugins.service').PluginsService;
 
     const portfolioRow = {
       id: 'port-1',
@@ -1184,4 +1186,3 @@ describe('PretestService._calcQuantity — commission-aware sizing (fix 5)', () 
     });
   });
 });
-

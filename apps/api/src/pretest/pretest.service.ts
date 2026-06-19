@@ -434,9 +434,11 @@ export class PretestService {
     policy: PretestPolicy = POLICY_DEFAULTS,
   ): number {
     if (action === 'buy') {
-      // Use policy.sizing_pct of available cash per order
+      // Use policy.sizing_pct of available cash per order.
+      // Divide by price*(1+commission_pct) so the full cost (notional + fee) fits in budget.
       const budget = state.cash * policy.sizing_pct;
-      return price > 0 ? Math.floor(budget / price) : 0;
+      const cost_per_share = price * (1 + policy.commission_pct);
+      return cost_per_share > 0 ? Math.floor(budget / cost_per_share) : 0;
     }
     const pos = state.positions.find((p) => p.symbol === symbol);
     return pos?.quantity ?? 0;
@@ -468,23 +470,27 @@ export class PretestService {
   }
 
   private _applyBuy(state: PretestState, trade: PretestTrade, commission_pct = 0): void {
-    const cost = trade.price * trade.quantity;
-    const total_cost = cost + cost * commission_pct;
+    const notional = trade.price * trade.quantity;
+    const buy_commission = notional * commission_pct;
+    const total_cost = notional + buy_commission;
     if (total_cost > state.cash) return; // insufficient funds — skip, do NOT record to state.trades
     state.cash -= total_cost;
     // Record only after confirming the trade executes
     state.trades.push(trade);
+    // Embed buy commission into cost basis: avg_price = (notional + buy_commission) / qty.
+    // This satisfies the cash/pnl conservation invariant and is industry-standard cost accounting.
+    const cost_basis_price = (notional + buy_commission) / trade.quantity;
     const existing = state.positions.find((p) => p.symbol === trade.symbol);
     if (existing) {
       const total_qty = existing.quantity + trade.quantity;
       existing.avg_price =
-        (existing.avg_price * existing.quantity + trade.price * trade.quantity) / total_qty;
+        (existing.avg_price * existing.quantity + cost_basis_price * trade.quantity) / total_qty;
       existing.quantity = total_qty;
     } else {
       state.positions.push({
         symbol: trade.symbol,
         quantity: trade.quantity,
-        avg_price: trade.price,
+        avg_price: cost_basis_price,
       });
     }
   }
