@@ -16,6 +16,7 @@ const KNOWN_EVENT_TYPES: AuditEventType[] = [
   'skill_written',
   'skill_reverted',
   'skill_write_denied',
+  'reflection_turn',
 ];
 
 describe('AuditEventType', () => {
@@ -39,6 +40,13 @@ describe('AuditEventType', () => {
 
   it('includes skill_write_denied as a valid event type', () => {
     const eventType: AuditEventType = 'skill_write_denied';
+    expect(KNOWN_EVENT_TYPES).toContain(eventType);
+  });
+
+  it('includes reflection_turn as a valid event type (s2 compile-guard)', () => {
+    // Compile-time gate: tsc will reject this if 'reflection_turn' is not in the union.
+    const eventType: AuditEventType = 'reflection_turn';
+    // Runtime gate: verify the literal value is in the known set.
     expect(KNOWN_EVENT_TYPES).toContain(eventType);
   });
 });
