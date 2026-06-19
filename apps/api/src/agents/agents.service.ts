@@ -8,6 +8,7 @@ import { AuditService } from '../audit/audit.service';
 import { AlertsService, CreateAlertDto } from '../alerts/alerts.service';
 
 import type { LlmResponse } from '../llm/llm.service';
+import { parseToolCalls } from '../llm/kernel-parser';
 
 /** Resultado completo de un ciclo del agente, incluyendo decisiones, ejecuciones en sandbox y resumen de vetos. */
 export interface AgentCycleResult {
@@ -144,6 +145,16 @@ export class AgentsService {
       system_prompt: systemPrompt,
     });
 
+    // Parse tool_calls from LLM text here (governed cycle), so WS/panel paths stay inert.
+    const auditFn = (raw: string): void => {
+      void this.audit.log({
+        cycle_id,
+        event_type: 'parse_miss',
+        meta: { raw_block: raw.slice(0, 500) },
+      });
+    };
+    llmResponse.tool_calls = parseToolCalls(llmResponse.text, auditFn);
+
     const skills_read = llmResponse.skills_read ?? [];
 
     await this.audit.log({
@@ -259,39 +270,45 @@ export class AgentsService {
   ): Promise<import('../llm/llm.service').ToolCallRequest[]> {
     if (calls.length === 0) return [];
 
-    // Build lookup structures once.
-    const activePlugins = await this.plugins.findActive();
-    const activeIds = new Set(activePlugins.map((p: HydratedPlugin) => p.id));
-    const providerTools = await this.plugins.getProviderTools();
-    const validToolNames = new Set(providerTools.map((t) => t.name)); // "pluginId__fn"
+    try {
+      // Build lookup structures once.
+      const activePlugins = await this.plugins.findActive();
+      const activeIds = new Set(activePlugins.map((p: HydratedPlugin) => p.id));
+      const providerTools = await this.plugins.getProviderTools();
+      const validToolNames = new Set(providerTools.map((t) => t.name)); // "pluginId__fn"
 
-    const valid: import('../llm/llm.service').ToolCallRequest[] = [];
+      const valid: import('../llm/llm.service').ToolCallRequest[] = [];
 
-    for (const call of calls) {
-      let reason: string | null = null;
+      for (const call of calls) {
+        let reason: string | null = null;
 
-      if (!activeIds.has(call.plugin_id)) {
-        // Unknown plugin (never registered/installed) vs inactive (registered but disabled).
-        // Both cases where the plugin is not found in active set.
-        const isKnownPlugin = providerTools.some((t) => t.plugin_id === call.plugin_id);
-        reason = isKnownPlugin ? 'plugin_inactive' : 'plugin_not_found';
-      } else if (!validToolNames.has(`${call.plugin_id}__${call.function}`)) {
-        reason = 'function_not_declared';
+        if (!activeIds.has(call.plugin_id)) {
+          // Unknown plugin (never registered/installed) vs inactive (registered but disabled).
+          // Both cases where the plugin is not found in active set.
+          const isKnownPlugin = providerTools.some((t) => t.plugin_id === call.plugin_id);
+          reason = isKnownPlugin ? 'plugin_inactive' : 'plugin_not_found';
+        } else if (!validToolNames.has(`${call.plugin_id}__${call.function}`)) {
+          reason = 'function_not_declared';
+        }
+
+        if (reason) {
+          await this.audit.log({
+            cycle_id,
+            event_type: 'tool_call_dropped',
+            plugin_id: call.plugin_id,
+            meta: { function: call.function, reason, args: call.args },
+          });
+        } else {
+          valid.push(call);
+        }
       }
 
-      if (reason) {
-        await this.audit.log({
-          cycle_id,
-          event_type: 'tool_call_dropped',
-          plugin_id: call.plugin_id,
-          meta: { function: call.function, reason, args: call.args },
-        });
-      } else {
-        valid.push(call);
-      }
+      return valid;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log.warn(`_validateToolCalls error — dropping all calls: ${msg}`);
+      return [];
     }
-
-    return valid;
   }
 
   private async _executeToolCalls(

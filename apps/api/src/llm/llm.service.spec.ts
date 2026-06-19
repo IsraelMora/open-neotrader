@@ -27,13 +27,13 @@ function makePlugins(): PluginsService {
 function mockFetch(responseText: string): void {
   globalThis.fetch = jest.fn().mockResolvedValue({
     ok: true,
-    json: async () => ({ content: [{ text: responseText }] }),
+    json: () => Promise.resolve({ content: [{ text: responseText }] }),
   });
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-describe('LlmService.complete() — parseToolCalls wire', () => {
+describe('LlmService.complete() — inert contract (no parseToolCalls)', () => {
   let service: LlmService;
   let plugins: PluginsService;
 
@@ -46,31 +46,24 @@ describe('LlmService.complete() — parseToolCalls wire', () => {
     jest.restoreAllMocks();
   });
 
-  it('populates tool_calls when response contains a <tool_calls> block', async () => {
+  it('returns tool_calls: [] even when response contains a <tool_calls> block', async () => {
     const toolCallText =
       '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","qty":3}}]</tool_calls>';
     mockFetch(toolCallText);
 
     const result = await service.complete({ context: 'test' });
 
-    expect(result.tool_calls).toHaveLength(1);
-    expect(result.tool_calls[0]).toEqual({
-      plugin_id: 'alpaca-provider',
-      function: 'place_order',
-      args: { symbol: 'AAPL', qty: 3 },
-    });
+    // complete() does NOT parse — parsing happens in AgentsService._executeCycle().
+    expect(result.tool_calls).toEqual([]);
   });
 
-  it('populates tool_calls when response contains a fenced ```json block', async () => {
-    const toolCallText =
-      '```json\n[{"tool":"paper-trading__open_position","args":{"qty":1}}]\n```';
+  it('returns tool_calls: [] even when response contains a fenced ```json block', async () => {
+    const toolCallText = '```json\n[{"tool":"paper-trading__open_position","args":{"qty":1}}]\n```';
     mockFetch(toolCallText);
 
     const result = await service.complete({ context: 'test' });
 
-    expect(result.tool_calls).toHaveLength(1);
-    expect(result.tool_calls[0].plugin_id).toBe('paper-trading');
-    expect(result.tool_calls[0].function).toBe('open_position');
+    expect(result.tool_calls).toEqual([]);
   });
 
   it('returns empty tool_calls when response contains plain prose (no block)', async () => {

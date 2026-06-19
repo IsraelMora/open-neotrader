@@ -4,7 +4,6 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { PluginsService } from '../plugins/plugins.service';
 import { buildSubscriptionArgs } from './subscription-args';
-import { parseToolCalls } from './kernel-parser';
 
 /** Petición al LLM: contexto del ciclo y prompt de sistema opcional. */
 export interface LlmRequest {
@@ -134,9 +133,6 @@ export class LlmService {
     } else {
       res = await this.completeViaApi(req);
     }
-
-    // Parse tool_calls from the response text exactly once, backend-agnostically.
-    res.tool_calls = parseToolCalls(res.text);
 
     return res;
   }
