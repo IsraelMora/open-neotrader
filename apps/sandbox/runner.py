@@ -349,6 +349,205 @@ def cmd_emit_signal(req: dict) -> dict:
     }
 
 
+def _classify(exc: BaseException) -> tuple[str, str]:
+    """
+    Classify a plugin exception as 'inconclusive' or 'failed'.
+
+    Order:
+    1. TYPE-first: ImportError / SyntaxError / AttributeError / TypeError / NameError
+       → always 'failed' (structural defect, regardless of message).
+    2. Message-heuristic: KeyError / LookupError / ValueError whose message
+       contains credential/data substrings → 'inconclusive'.
+    3. Generic KeyError (no matched message) → 'inconclusive'
+       (credential key absence is the most common KeyError in plugins).
+    4. Default → 'failed'.
+
+    Returns (status, detail) where status is 'inconclusive' | 'failed'.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+
+    # --- TYPE-first gate (structural defects) --------------------------------
+    if isinstance(exc, (ImportError, SyntaxError, AttributeError, TypeError, NameError)):
+        return "failed", detail
+
+    # --- Message-heuristic for credential/data-dependent exceptions ----------
+    _INCONCLUSIVE_SUBSTRINGS = (
+        "credential",
+        "api key",
+        "api_key",
+        "token",
+        "secret",
+        "unauthorized",
+        "401",
+        "empty",
+        "no data",
+        "not found",
+        "missing",
+    )
+    msg_lower = str(exc).lower()
+    if isinstance(exc, (KeyError, LookupError, ValueError)):
+        if any(s in msg_lower for s in _INCONCLUSIVE_SUBSTRINGS):
+            return "inconclusive", detail
+        # Generic KeyError with no matched message → inconclusive
+        # (absent credential key is the dominant cause in plugins)
+        if isinstance(exc, KeyError):
+            return "inconclusive", detail
+        # Other LookupError / ValueError without matching substrings → failed
+        return "failed", detail
+
+    # --- Generic message heuristic for any exception type -------------------
+    if any(s in msg_lower for s in _INCONCLUSIVE_SUBSTRINGS):
+        return "inconclusive", detail
+
+    # --- Default: structural failure ----------------------------------------
+    return "failed", detail
+
+
+def cmd_smoke_test(req: dict) -> dict:
+    """
+    Execute a pre-activation smoke test for a plugin.
+
+    Request: {"cmd": "smoke_test", "plugin_id": "<id>"}
+    Response: {"ok": True, "result": "passed"|"inconclusive"|"failed",
+               "checks": [{"name": str, "status": str, "detail": str}]}
+
+    Runs three check categories:
+    1. manifest-parse: _read_manifest must succeed.
+    2. on_activate: if hook file exists, load + call fn(ctx) with empty typed ctx.
+    3. skills: for each key in manifest.skills.keys, resolve + call fn(signal, _context).
+
+    Aggregate: failed > inconclusive > passed.
+    Only FileNotFoundError propagates (missing plugin dir); all plugin code
+    exceptions are caught and classified.
+
+    EXECUTES plugin code intentionally — safe under SANDBOX_STRICT isolation.
+    """
+    plugin_id: str = req["plugin_id"]
+    plugin_dir = PLUGINS_DIR / plugin_id
+
+    if not plugin_dir.is_dir():
+        raise FileNotFoundError(f"Plugin not found: {plugin_id}")
+
+    checks: list[dict] = []
+
+    # --- 1. Manifest check ---------------------------------------------------
+    try:
+        m = _read_manifest(plugin_id)
+        if not m:
+            checks.append({
+                "name": "manifest",
+                "status": "failed",
+                "detail": "manifest.toml missing or empty",
+            })
+            m = {}
+        else:
+            checks.append({"name": "manifest", "status": "passed", "detail": "manifest.toml parseable"})
+    except Exception as exc:
+        checks.append({"name": "manifest", "status": "failed", "detail": str(exc)})
+        m = {}
+
+    # --- Shared minimal context for plugin calls ----------------------------
+    config_defaults: dict = {}
+    if m:
+        for field, spec_data in m.get("config", {}).items():
+            config_defaults[field] = (
+                spec_data.get("default") if isinstance(spec_data, dict) else spec_data
+            )
+    ctx = _SdkContext(
+        config=config_defaults,
+        credentials={},
+        universe=[],
+        portfolio={},
+    )
+
+    # --- 2. on_activate check -----------------------------------------------
+    hooks_cfg: dict = m.get("hooks", {}) if m else {}
+    hook_file_rel: str = hooks_cfg.get("on_activate", "hooks/on_activate.py")
+    hook_path = plugin_dir / hook_file_rel
+
+    if not hook_path.exists():
+        checks.append({
+            "name": "on_activate",
+            "status": "passed",
+            "detail": "no on_activate hook (absence is fine)",
+        })
+    else:
+        try:
+            import importlib.util as _ilu
+            hook_spec = _ilu.spec_from_file_location(
+                f"_nt_smoke_{plugin_id}_on_activate", hook_path
+            )
+            if hook_spec is None or hook_spec.loader is None:
+                raise ImportError(f"Cannot load hook spec: {hook_path}")
+            hook_mod = _ilu.module_from_spec(hook_spec)
+            plugin_str = str(plugin_dir)
+            if plugin_str not in sys.path:
+                sys.path.insert(0, plugin_str)
+            hook_spec.loader.exec_module(hook_mod)  # type: ignore[attr-defined]
+            fn = getattr(hook_mod, "on_activate", None)
+            if fn is None:
+                checks.append({
+                    "name": "on_activate",
+                    "status": "failed",
+                    "detail": "on_activate function not found in hook file",
+                })
+            else:
+                fn(ctx)
+                checks.append({"name": "on_activate", "status": "passed", "detail": "on_activate ran without error"})
+        except Exception as exc:
+            status, detail = _classify(exc)
+            checks.append({"name": "on_activate", "status": status, "detail": detail})
+
+    # --- 3. Skills checks ---------------------------------------------------
+    declared_keys: list[str] = m.get("skills", {}).get("keys", []) if m else []
+
+    # Load module once (avoid double side-effects)
+    mod = None
+    if declared_keys:
+        try:
+            mod = _load_module(plugin_id)
+        except Exception as exc:
+            # Module load failure → all skill checks fail
+            status, detail = _classify(exc)
+            for key in declared_keys:
+                checks.append({"name": key, "status": status, "detail": f"module load error: {detail}"})
+            declared_keys = []  # skip per-skill loop below
+
+    for key in declared_keys:
+        try:
+            fn_name = resolve_permitted_function(set(declared_keys), plugin_id, key)
+        except PermissionError as exc:
+            checks.append({"name": key, "status": "failed", "detail": str(exc)})
+            continue
+
+        fn = getattr(mod, fn_name, None) if mod is not None else None
+        if fn is None:
+            checks.append({
+                "name": key,
+                "status": "failed",
+                "detail": f"declared skill fn '{fn_name}' not defined in plugin.py",
+            })
+            continue
+
+        try:
+            fn(signal={}, _context=ctx)
+            checks.append({"name": key, "status": "passed", "detail": "skill fn called without error"})
+        except Exception as exc:
+            status, detail = _classify(exc)
+            checks.append({"name": key, "status": status, "detail": detail})
+
+    # --- Aggregate worst-of --------------------------------------------------
+    statuses = {c["status"] for c in checks}
+    if "failed" in statuses:
+        overall = "failed"
+    elif "inconclusive" in statuses:
+        overall = "inconclusive"
+    else:
+        overall = "passed"
+
+    return {"ok": True, "result": overall, "checks": checks}
+
+
 def cmd_analyze_plugin(req: dict) -> dict:
     """
     Run static AST analysis on a plugin directory.
@@ -474,6 +673,7 @@ COMMANDS = {
     "emit_signal": cmd_emit_signal,
     "run_cycle": cmd_run_cycle,
     "analyze_plugin": cmd_analyze_plugin,
+    "smoke_test": cmd_smoke_test,
 }
 
 
