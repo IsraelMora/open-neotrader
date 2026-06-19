@@ -11,7 +11,8 @@ export type AuditEventType =
   | 'plugin_deactivate'
   | 'credential_set'
   | 'tool_call_dropped'
-  | 'parse_miss';
+  | 'parse_miss'
+  | 'chat_turn';
 
 export interface AuditPayload {
   cycle_id?: string;
