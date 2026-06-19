@@ -312,9 +312,12 @@ def cmd_run_hook(req: dict) -> dict:
     if fn is None:
         raise AttributeError(f"Función '{hook_name}' no encontrada en {hook_path}")
 
-    # Enriquecer el contexto con config del manifest
+    # Enriquecer el contexto con config del manifest.
+    # [config] entries may be raw primitives (e.g. fail_on_missing_credentials = false)
+    # or ConfigFieldSpec dicts ({default: ..., type: ...}). Handle both shapes.
     config_defaults = {
-        field: spec_data.get("default") for field, spec_data in m.get("config", {}).items()
+        field: (spec_data.get("default") if isinstance(spec_data, dict) else spec_data)
+        for field, spec_data in m.get("config", {}).items()
     }
     effective_config = {**config_defaults, **context.get("config", {})}
     ctx = {**context, "config": effective_config}
