@@ -360,8 +360,12 @@ function makeReflectionService(
     },
   } as unknown as import('../prisma/prisma.service').PrismaService;
 
-  const events = { emit: jest.fn() } as unknown as import('./plugin-events.service').PluginEventsService;
-  const cfg = { get: jest.fn().mockReturnValue('/var/plugins') } as unknown as import('@nestjs/config').ConfigService;
+  const events = {
+    emit: jest.fn(),
+  } as unknown as import('./plugin-events.service').PluginEventsService;
+  const cfg = {
+    get: jest.fn().mockReturnValue('/var/plugins'),
+  } as unknown as import('@nestjs/config').ConfigService;
 
   const service = new PluginsService(db, events, cfg);
 
@@ -373,7 +377,10 @@ function makeReflectionService(
   return service;
 }
 
-function makeReflectionManifest(id: string, reflectionSection?: PluginManifest['reflection']): PluginManifest {
+function makeReflectionManifest(
+  id: string,
+  reflectionSection?: PluginManifest['reflection'],
+): PluginManifest {
   return {
     plugin: { id, name: id, version: '1.0.0', type: 'extra' },
     reflection: reflectionSection,
@@ -495,7 +502,7 @@ describe('PluginsService.getActiveReflectionPrompt', () => {
     expect(result).toBe(prompt);
     const calls = readFileSyncSpy.mock.calls as unknown[][];
     const relevantCalls = calls.filter(
-      (args) => typeof args[0] === 'string' && (args[0] as string).includes('REFLECT'),
+      (args) => typeof args[0] === 'string' && args[0].includes('REFLECT'),
     );
     expect(relevantCalls).toHaveLength(0);
   });

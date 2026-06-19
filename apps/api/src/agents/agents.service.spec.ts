@@ -2054,7 +2054,7 @@ describe('F4-S1 Phase 4.1 — runGovernedTurn tool schema injection gating', () 
     const service = buildInjectionCapturingService('chat' /* placeholder, we'll cast */, captured);
 
     await service.runGovernedTurn({
-      source: 'reflection' as unknown as 'chat',
+      source: 'reflection',
       context: 'reflection turn',
     });
 

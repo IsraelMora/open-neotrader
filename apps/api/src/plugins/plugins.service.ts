@@ -393,7 +393,9 @@ export class PluginsService implements OnApplicationBootstrap {
       const active = await this.findActive();
       const reflectionPlugins = active.filter((p) => {
         const manifest = this.getManifest(p.installed_path);
-        return manifest?.reflection && (manifest.reflection.prompt || manifest.reflection.prompt_file);
+        return (
+          manifest?.reflection && (manifest.reflection.prompt || manifest.reflection.prompt_file)
+        );
       });
 
       if (reflectionPlugins.length === 0) return null;
