@@ -119,6 +119,16 @@ class TestImportGuardStrict:
         assert "ctypes" not in iso.BLOCKED_MODULES
         assert "cffi" not in iso.BLOCKED_MODULES
 
+    def test_third_party_http_libs_blocked(self):
+        """
+        Third-party HTTP/network egress libs must be blocked too, not just stdlib.
+        urllib3 (the lib `requests` is built on) and pycurl are direct network
+        egress vectors a plugin could import even though stdlib urllib is blocked.
+        """
+        iso = _fresh_isolation()
+        assert "urllib3" in iso.BLOCKED_MODULES
+        assert "pycurl" in iso.BLOCKED_MODULES
+
     def test_socket_via_importlib_blocked_under_strict(self):
         """
         importlib.import_module('socket') must also be blocked, not just
