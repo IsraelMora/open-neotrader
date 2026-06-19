@@ -26,6 +26,7 @@ import { ContextMemoryService } from '../context-memory/context-memory.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
 import { AgentsService } from '../agents/agents.service';
 import { KvService } from '../common/kv.service';
+import { AuditService } from '../audit/audit.service';
 
 /**
  * Per-portfolio fill policy. Stored under plugin_configs['__pretest_policy__'].
@@ -111,6 +112,24 @@ export interface GateResult {
   metrics: SignificanceMetrics;
 }
 
+/** Result of a PretestService.promote() call — four possible outcomes. */
+export interface PromoteResult {
+  ok: boolean;
+  /** Set when ok is false — explains the rejection. */
+  reason?: 'gate_not_ready' | 'needs_confirmation' | 'gate_error';
+  /** Reasons from the significance gate when reason === 'gate_not_ready'. */
+  gate_reasons?: string[];
+  /** Pending plugin set when reason === 'needs_confirmation'. */
+  pending?: {
+    plugin_ids: string[];
+    plugin_configs: Record<string, Record<string, unknown>>;
+  };
+  /** Per-plugin apply results when ok === true. */
+  applied?: Array<{ plugin_id: string; activated: boolean; config_set: boolean }>;
+  /** Per-plugin failures collected during best-effort apply loop. */
+  failed?: Array<{ plugin_id: string; step: 'activate' | 'setConfig'; error: string }>;
+}
+
 export interface PretestCompare {
   portfolios: Array<{
     id: string;
@@ -154,6 +173,7 @@ export class PretestService {
     @Inject(forwardRef(() => AgentsService))
     private readonly agents: AgentsService,
     private readonly kv: KvService,
+    private readonly audit: AuditService,
   ) {}
 
   // ── CRUD ─────────────────────────────────────────────────────────────────────
@@ -569,6 +589,130 @@ export class PretestService {
       );
     }
     return reasons;
+  }
+
+  // ── Gated promotion ──────────────────────────────────────────────────────────
+
+  /**
+   * Promotes a gate-ready pretest portfolio to live by activating its plugin set
+   * and applying per-plugin config overrides via PluginsService.
+   *
+   * Three-outcome state machine (strict order):
+   *  1. gate_not_ready  — gate.ready===false; NEVER activates/sets config; audits promotion_gate_blocked.
+   *  2. needs_confirmation — gate ready but human confirm required (default) and not provided.
+   *  3. applied — gate ready AND (confirm provided OR operator disabled confirm); best-effort apply.
+   *
+   * Fail-safe parse for require_human_confirm: only the literal string 'false' disables it.
+   * Any other value (null, missing, 'true', 'yes', ...) keeps it enabled.
+   */
+  async promote(id: string, opts?: { confirm?: boolean }): Promise<PromoteResult> {
+    // Step 1: findOne — NotFoundException propagates (404 at REST, caught at kernel dispatch).
+    const pf = await this.findOne(id);
+
+    // Step 2: GATE HARD CHECK — cannot be bypassed.
+    // gate() throw (unexpected error) → fail-closed with gate_error; does NOT activate/setConfig.
+    let g: GateResult;
+    try {
+      g = await this.gate(id);
+    } catch (gateErr: unknown) {
+      const errMsg = gateErr instanceof Error ? gateErr.message : String(gateErr);
+      await this.audit.log({
+        event_type: 'promotion_gate_blocked',
+        meta: { pretest_id: id, error: errMsg },
+      });
+      return { ok: false, reason: 'gate_error' };
+    }
+    if (!g.ready) {
+      await this.audit.log({
+        event_type: 'promotion_gate_blocked',
+        meta: { pretest_id: id, reasons: g.reasons },
+      });
+      return { ok: false, reason: 'gate_not_ready', gate_reasons: g.reasons };
+    }
+
+    // Step 3: HUMAN-CONFIRM — fail-safe parse: only literal 'false' disables.
+    const rawConfirm = await this.kv.get('promotion.require_human_confirm');
+    const requireConfirm = rawConfirm !== 'false';
+
+    if (requireConfirm && !opts?.confirm) {
+      return {
+        ok: false,
+        reason: 'needs_confirmation',
+        pending: {
+          plugin_ids: pf.plugin_ids,
+          plugin_configs: pf.plugin_configs,
+        },
+      };
+    }
+
+    // Step 4: APPLY — best-effort per-plugin loop; never abort on single failure.
+    const confirmedBy: 'human' | 'operator_disabled' = opts?.confirm
+      ? 'human'
+      : 'operator_disabled';
+    const { applied, failed } = await this._applyPlugins(pf.plugin_ids, pf.plugin_configs);
+
+    const partial = failed.length > 0;
+    const failedIds = failed.map((f) => f.plugin_id);
+
+    // Step 5: Single audit event for the full apply.
+    await this.audit.log({
+      event_type: 'pretest_promoted',
+      meta: {
+        pretest_id: id,
+        confirmed_by: confirmedBy,
+        applied,
+        failed,
+        partial,
+        failed_ids: failedIds,
+        gate_metrics: g.metrics,
+      },
+    });
+
+    return { ok: true, applied, failed };
+  }
+
+  /**
+   * Best-effort per-plugin activation and config application.
+   * Never aborts on individual plugin failure; collects applied[] / failed[].
+   */
+  private async _applyPlugins(
+    pluginIds: string[],
+    pluginConfigs: Record<string, Record<string, unknown>>,
+  ): Promise<{
+    applied: Array<{ plugin_id: string; activated: boolean; config_set: boolean }>;
+    failed: Array<{ plugin_id: string; step: 'activate' | 'setConfig'; error: string }>;
+  }> {
+    const applied: Array<{ plugin_id: string; activated: boolean; config_set: boolean }> = [];
+    const failed: Array<{ plugin_id: string; step: 'activate' | 'setConfig'; error: string }> = [];
+
+    for (const pluginId of pluginIds) {
+      let activated = false;
+      let config_set = false;
+
+      try {
+        await this.plugins.activate(pluginId);
+        activated = true;
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err.message : String(err);
+        failed.push({ plugin_id: pluginId, step: 'activate', error });
+        applied.push({ plugin_id: pluginId, activated: false, config_set: false });
+        continue;
+      }
+
+      if (Object.prototype.hasOwnProperty.call(pluginConfigs, pluginId)) {
+        try {
+          await this.plugins.setConfig(pluginId, pluginConfigs[pluginId]);
+          config_set = true;
+        } catch (err: unknown) {
+          const error = err instanceof Error ? err.message : String(err);
+          failed.push({ plugin_id: pluginId, step: 'setConfig', error });
+        }
+      }
+
+      applied.push({ plugin_id: pluginId, activated, config_set });
+    }
+
+    return { applied, failed };
   }
 
   // ── Simulación de fills ───────────────────────────────────────────────────────

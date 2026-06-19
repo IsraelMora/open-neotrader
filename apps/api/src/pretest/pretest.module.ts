@@ -9,6 +9,7 @@ import { ContextMemoryModule } from '../context-memory/context-memory.module';
 import { ProvidersModule } from '../providers/providers.module';
 import { AgentsModule } from '../agents/agents.module';
 import { KvService } from '../common/kv.service';
+import { AuditModule } from '../audit/audit.module';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { KvService } from '../common/kv.service';
     // forwardRef breaks the circular dependency:
     // PretestModule → forwardRef(AgentsModule) ↔ AgentsModule → forwardRef(PretestModule)
     forwardRef(() => AgentsModule),
+    AuditModule,
   ],
   providers: [PretestService, KvService],
   controllers: [PretestController],
