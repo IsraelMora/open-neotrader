@@ -1111,6 +1111,30 @@ export class AgentsService {
     }
   }
 
+  /**
+   * Renders the PRETEST COMPARE section string from a compare result.
+   * Returns '(no pretest portfolios)' when the result has zero portfolios,
+   * avoiding a confusing empty `winner_return: winner_risk_adj:` line.
+   */
+  private _renderPretestCompare(
+    cmp: import('../pretest/pretest.service').PretestCompare,
+    cap: number,
+  ): string {
+    if (cmp.portfolios.length === 0) {
+      return '(no pretest portfolios)';
+    }
+    const top5 = cmp.portfolios.slice(0, 5);
+    const portfolioLines = top5
+      .map((p) => {
+        const ret =
+          typeof p.return_pct === 'number' ? p.return_pct.toFixed(2) : String(p.return_pct);
+        return `${p.name}: return=${ret}% gate=${String(p.gate_status)}`;
+      })
+      .join('\n');
+    const header = `winner_return:${cmp.winner_by_return} winner_risk_adj:${cmp.winner_by_risk_adj}`;
+    return (header + '\n' + portfolioLines).slice(0, cap);
+  }
+
   private async _assembleReflectionContext(): Promise<string> {
     const BUDGET = 4000;
     const AUDIT_CAP = 1200;
@@ -1186,16 +1210,7 @@ export class AgentsService {
     try {
       if (this.pretest) {
         const cmp = await this.pretest.compare();
-        const top5 = cmp.portfolios.slice(0, 5);
-        const portfolioLines = top5
-          .map((p) => {
-            const ret =
-              typeof p.return_pct === 'number' ? p.return_pct.toFixed(2) : String(p.return_pct);
-            return `${p.name}: return=${ret}% gate=${String(p.gate_status)}`;
-          })
-          .join('\n');
-        const header = `winner_return:${cmp.winner_by_return} winner_risk_adj:${cmp.winner_by_risk_adj}`;
-        pretestSection = (header + '\n' + portfolioLines).slice(0, PRETEST_CAP);
+        pretestSection = this._renderPretestCompare(cmp, PRETEST_CAP);
       }
     } catch {
       pretestSection = '(unavailable)';
