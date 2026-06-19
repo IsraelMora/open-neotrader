@@ -18,7 +18,8 @@ export type AuditEventType =
   | 'notification_sent'
   | 'skill_written'
   | 'skill_reverted'
-  | 'skill_write_denied';
+  | 'skill_write_denied'
+  | 'kernel_source_not_allowed';
 
 export interface AuditPayload {
   cycle_id?: string;

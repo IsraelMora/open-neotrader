@@ -229,12 +229,14 @@ export class AgentsService {
 
     // ── Validate and dispatch ─────────────────────────────────────────────────
     // Pass effectiveTools (providerTools + kernelTools) so _validateToolCalls can find kernel tools.
+    // Pass source so the kernel tool source gate is enforced (only 'reflection' allows kernel tools).
     const validatedCalls = await this._validateToolCalls(
       cycle_id,
       llmResponse.tool_calls,
       effectiveTools,
       input._activePlugins,
       input.virtual_only,
+      input.source,
     );
     const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
       cycle_id,
@@ -636,11 +638,18 @@ export class AgentsService {
     validToolNames: Set<string>,
     providerTools: import('../plugins/plugins.service').ProviderTool[],
     virtual_only: boolean,
+    allowKernelTools: boolean,
   ): string | null {
-    // FIRST: kernel namespace — bypass plugin allowlist, validate against kernel registry.
+    // FIRST: kernel namespace — validate against kernel registry, then enforce source gate.
     // This check must come BEFORE virtual_only and plugin-active checks.
     if (call.plugin_id === 'kernel') {
-      return KERNEL_TOOL_REGISTRY.has(call.function) ? null : 'unknown_kernel_tool';
+      if (!KERNEL_TOOL_REGISTRY.has(call.function)) return 'unknown_kernel_tool';
+      // Source gate: kernel tools are only executable in reflection turns.
+      // In s1, 'reflection' is not in GovernedTurnInput.source union — so kernel tools
+      // are NEVER reachable in production turns. allowKernelTools=false drops any
+      // LLM-emitted kernel call with a distinct, auditable reason.
+      if (!allowKernelTools) return 'kernel_source_not_allowed';
+      return null;
     }
 
     // SECOND: virtual_only guard — drop provider tool-calls before any other check.
@@ -674,8 +683,12 @@ export class AgentsService {
     hoistedTools?: import('../plugins/plugins.service').ProviderTool[],
     preloadedActivePlugins?: import('../plugins/plugins.service').HydratedPlugin[],
     virtual_only?: boolean,
+    source?: string,
   ): Promise<import('../llm/llm.service').ToolCallRequest[]> {
     if (calls.length === 0) return [];
+
+    // Kernel tools are only permitted in reflection turns.
+    const allowKernelTools = source === 'reflection';
 
     try {
       // Use pre-fetched plugins when available (cycle path) to avoid a second DB round-trip.
@@ -695,6 +708,7 @@ export class AgentsService {
           validToolNames,
           providerTools,
           virtual_only ?? false,
+          allowKernelTools,
         );
 
         if (reason) {
