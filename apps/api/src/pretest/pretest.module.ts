@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { PretestService } from './pretest.service';
 import { PretestController } from './pretest.controller';
 import { PrismaModule } from '../prisma/prisma.module';
@@ -16,7 +16,9 @@ import { KvService } from '../common/kv.service';
     PluginsModule,
     ContextMemoryModule,
     ProvidersModule,
-    AgentsModule,
+    // forwardRef breaks the circular dependency:
+    // PretestModule → forwardRef(AgentsModule) ↔ AgentsModule → forwardRef(PretestModule)
+    forwardRef(() => AgentsModule),
   ],
   providers: [PretestService, KvService],
   controllers: [PretestController],

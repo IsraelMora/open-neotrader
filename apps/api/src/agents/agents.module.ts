@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { AgentsService } from './agents.service';
 import { LlmModule } from '../llm/llm.module';
 import { SandboxModule } from '../sandbox/sandbox.module';
@@ -8,6 +8,7 @@ import { AuditModule } from '../audit/audit.module';
 import { AlertsModule } from '../alerts/alerts.module';
 import { SnapshotModule } from '../snapshot/snapshot.module';
 import { NotifierModule } from '../notifier/notifier.module';
+import { PretestModule } from '../pretest/pretest.module';
 
 @Module({
   imports: [
@@ -19,10 +20,11 @@ import { NotifierModule } from '../notifier/notifier.module';
     AlertsModule,
     SnapshotModule,
     NotifierModule,
-    // PretestModule is NOT imported here to avoid a circular module dependency
-    // (PretestModule → AgentsModule → PretestModule). AgentsService.pretest is injected
-    // optionally (?); the assembler degrades gracefully when PretestService is absent.
-    // Wire PretestService into AgentsService via AppModule custom provider if needed.
+    // forwardRef breaks the circular dependency:
+    // AgentsModule → forwardRef(PretestModule) ↔ PretestModule → forwardRef(AgentsModule)
+    // PretestService injects AgentsService (to run governed turns for pretest cycles).
+    // AgentsService injects PretestService (to create/compare pretest portfolios in reflection).
+    forwardRef(() => PretestModule),
   ],
   providers: [AgentsService],
   exports: [AgentsService],

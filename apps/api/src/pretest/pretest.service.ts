@@ -17,7 +17,7 @@
  * not cost-basis. getQuote failures are handled gracefully: skip fill or fallback to
  * last-known current_price / avg_price for MTM.
  */
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, Inject, forwardRef } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { SandboxGateway } from '../sandbox/sandbox.gateway';
 import { PluginsService, HydratedPlugin } from '../plugins/plugins.service';
@@ -151,6 +151,7 @@ export class PretestService {
     private readonly llm: LlmService,
     private readonly memory: ContextMemoryService,
     private readonly gateway: ProviderGatewayService,
+    @Inject(forwardRef(() => AgentsService))
     private readonly agents: AgentsService,
     private readonly kv: KvService,
   ) {}
