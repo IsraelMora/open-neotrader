@@ -44,7 +44,7 @@ function makeService(
   } as unknown as PluginEventsService;
 
   const cfg = {
-    get: jest.fn().mockReturnValue('/tmp/plugins'),
+    get: jest.fn().mockReturnValue('/var/plugins'),
   } as unknown as ConfigService;
 
   const service = new PluginsService(db, events, cfg);
@@ -71,10 +71,9 @@ describe('PluginsService.getActiveDecisionPrompt', () => {
   beforeEach(() => jest.restoreAllMocks());
 
   it('returns null when no active plugin declares a [decision] section', async () => {
-    const service = makeService(
-      [{ id: 'some-plugin', installed_path: '/plugins/some-plugin' }],
-      { '/plugins/some-plugin': makeManifest('some-plugin') /* no decision */ },
-    );
+    const service = makeService([{ id: 'some-plugin', installed_path: '/plugins/some-plugin' }], {
+      '/plugins/some-plugin': makeManifest('some-plugin') /* no decision */,
+    });
     const logSpy = jest.spyOn(service['log'], 'error');
 
     const result = await service.getActiveDecisionPrompt();
@@ -85,10 +84,9 @@ describe('PluginsService.getActiveDecisionPrompt', () => {
 
   it('returns the decision.prompt verbatim when exactly one plugin has [decision]', async () => {
     const prompt = 'Emit tool_calls as JSON inside <tool_calls></tool_calls> tags.';
-    const service = makeService(
-      [{ id: 'my-decision', installed_path: '/plugins/my-decision' }],
-      { '/plugins/my-decision': makeManifest('my-decision', { prompt }) },
-    );
+    const service = makeService([{ id: 'my-decision', installed_path: '/plugins/my-decision' }], {
+      '/plugins/my-decision': makeManifest('my-decision', { prompt }),
+    });
 
     const result = await service.getActiveDecisionPrompt();
 
@@ -117,7 +115,9 @@ describe('PluginsService.getActiveDecisionPrompt', () => {
       'utf8',
     );
     readFileSyncSpy.mockReset();
-    (fs.readFileSync as jest.Mock).mockImplementation(jest.requireActual<typeof import('fs')>('fs').readFileSync);
+    (fs.readFileSync as jest.Mock).mockImplementation(
+      jest.requireActual<typeof import('fs')>('fs').readFileSync,
+    );
   });
 
   it('basenames the prompt_file path to prevent traversal', async () => {
@@ -141,22 +141,21 @@ describe('PluginsService.getActiveDecisionPrompt', () => {
       'utf8',
     );
     readFileSyncSpy.mockReset();
-    (fs.readFileSync as jest.Mock).mockImplementation(jest.requireActual<typeof import('fs')>('fs').readFileSync);
+    (fs.readFileSync as jest.Mock).mockImplementation(
+      jest.requireActual<typeof import('fs')>('fs').readFileSync,
+    );
   });
 
   it('prefers prompt over prompt_file when both are present', async () => {
     const prompt = 'Inline prompt wins.';
     const readFileSyncSpy = fs.readFileSync as jest.Mock;
 
-    const service = makeService(
-      [{ id: 'both-set', installed_path: '/plugins/both-set' }],
-      {
-        '/plugins/both-set': makeManifest('both-set', {
-          prompt,
-          prompt_file: 'DECISION.md',
-        }),
-      },
-    );
+    const service = makeService([{ id: 'both-set', installed_path: '/plugins/both-set' }], {
+      '/plugins/both-set': makeManifest('both-set', {
+        prompt,
+        prompt_file: 'DECISION.md',
+      }),
+    });
 
     const result = await service.getActiveDecisionPrompt();
 
@@ -164,7 +163,7 @@ describe('PluginsService.getActiveDecisionPrompt', () => {
     // readFileSync must NOT be called since prompt wins over prompt_file.
     const calls = readFileSyncSpy.mock.calls as unknown[][];
     const relevantCalls = calls.filter(
-      (args) => typeof args[0] === 'string' && (args[0] as string).includes('DECISION'),
+      (args) => typeof args[0] === 'string' && args[0].includes('DECISION'),
     );
     expect(relevantCalls).toHaveLength(0);
   });
@@ -174,17 +173,16 @@ describe('PluginsService.getActiveDecisionPrompt', () => {
       throw new Error('ENOENT');
     });
 
-    const service = makeService(
-      [{ id: 'bad-file', installed_path: '/plugins/bad-file' }],
-      {
-        '/plugins/bad-file': makeManifest('bad-file', { prompt_file: 'MISSING.md' }),
-      },
-    );
+    const service = makeService([{ id: 'bad-file', installed_path: '/plugins/bad-file' }], {
+      '/plugins/bad-file': makeManifest('bad-file', { prompt_file: 'MISSING.md' }),
+    });
 
     const result = await service.getActiveDecisionPrompt();
     expect(result).toBeNull();
     // Restore mock for subsequent tests.
-    (fs.readFileSync as jest.Mock).mockImplementation(jest.requireActual<typeof import('fs')>('fs').readFileSync);
+    (fs.readFileSync as jest.Mock).mockImplementation(
+      jest.requireActual<typeof import('fs')>('fs').readFileSync,
+    );
   });
 
   it('returns null and logs CRITICAL (as error) when >1 active plugins declare [decision]', async () => {

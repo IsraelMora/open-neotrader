@@ -71,6 +71,59 @@ function makeLlm(responseText: string): Partial<LlmService> {
   };
 }
 
+// Shared sandbox / memory factories used across multiple describe blocks.
+function makeSandbox(): jest.Mocked<Pick<SandboxGateway, 'runCycle' | 'callPlugin'>> {
+  return {
+    runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+    callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+  };
+}
+
+function makeMemory(): jest.Mocked<
+  Pick<ContextMemoryService, 'toContextString' | 'appendObservation' | 'trackSignal'>
+> {
+  return {
+    toContextString: jest.fn().mockResolvedValue(''),
+    appendObservation: jest.fn().mockResolvedValue(undefined),
+    trackSignal: jest.fn().mockResolvedValue(undefined),
+  };
+}
+
+// Shared full-plugins factory that includes getActiveDecisionPrompt.
+function makeFullPlugins(
+  decisionPrompt: string | null = null,
+  tools: { plugin_id: string; name: string; description: string; input_schema: object }[] = [],
+): jest.Mocked<
+  Pick<
+    PluginsService,
+    'findActive' | 'getProviderTools' | 'getSkillsMetadata' | 'getActiveDecisionPrompt'
+  >
+> {
+  return {
+    findActive: jest.fn().mockResolvedValue([]),
+    getProviderTools: jest.fn().mockResolvedValue(tools),
+    getSkillsMetadata: jest.fn().mockResolvedValue([]),
+    getActiveDecisionPrompt: jest.fn().mockResolvedValue(decisionPrompt),
+  };
+}
+
+function makeFullAgentsService(
+  llm: Partial<LlmService>,
+  audit: ReturnType<typeof makeAudit>,
+  plugins: ReturnType<typeof makeFullPlugins>,
+  sandbox: ReturnType<typeof makeSandbox>,
+  memory: ReturnType<typeof makeMemory>,
+): AgentsService {
+  return new AgentsService(
+    llm as unknown as LlmService,
+    sandbox as unknown as SandboxGateway,
+    plugins as unknown as PluginsService,
+    memory as unknown as ContextMemoryService,
+    audit as unknown as AuditService,
+    { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+  );
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('AgentsService._validateToolCalls', () => {
@@ -226,53 +279,6 @@ describe('AgentsService._executeCycle — parse wiring', () => {
     )._executeCycle(cycleId, context, undefined);
   }
 
-  function makeFullPlugins(
-    decisionPrompt: string | null = null,
-  ): jest.Mocked<
-    Pick<PluginsService, 'findActive' | 'getProviderTools' | 'getSkillsMetadata' | 'getActiveDecisionPrompt'>
-  > {
-    return {
-      findActive: jest.fn().mockResolvedValue([]),
-      getProviderTools: jest.fn().mockResolvedValue([]),
-      getSkillsMetadata: jest.fn().mockResolvedValue([]),
-      getActiveDecisionPrompt: jest.fn().mockResolvedValue(decisionPrompt),
-    };
-  }
-
-  function makeSandbox(): jest.Mocked<Pick<SandboxGateway, 'runCycle' | 'callPlugin'>> {
-    return {
-      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
-      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
-    };
-  }
-
-  function makeMemory(): jest.Mocked<
-    Pick<ContextMemoryService, 'toContextString' | 'appendObservation' | 'trackSignal'>
-  > {
-    return {
-      toContextString: jest.fn().mockResolvedValue(''),
-      appendObservation: jest.fn().mockResolvedValue(undefined),
-      trackSignal: jest.fn().mockResolvedValue(undefined),
-    };
-  }
-
-  function makeFullAgentsService(
-    llm: Partial<LlmService>,
-    audit: ReturnType<typeof makeAudit>,
-    plugins: ReturnType<typeof makeFullPlugins>,
-    sandbox: ReturnType<typeof makeSandbox>,
-    memory: ReturnType<typeof makeMemory>,
-  ): AgentsService {
-    return new AgentsService(
-      llm as unknown as LlmService,
-      sandbox as unknown as SandboxGateway,
-      plugins as unknown as PluginsService,
-      memory as unknown as ContextMemoryService,
-      audit as unknown as AuditService,
-      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
-    );
-  }
-
   it('parses tool_calls from llmResponse.text via parseToolCalls in the cycle', async () => {
     const responseText =
       '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","qty":1}}]</tool_calls>';
@@ -342,40 +348,6 @@ describe('AgentsService._executeCycle — decision prompt injection (Phase 6.3)'
         ) => ReturnType<AgentsService['runCycle']>;
       }
     )._executeCycle(cycleId, context, systemPrompt);
-  }
-
-  function makeSandbox(): jest.Mocked<Pick<SandboxGateway, 'runCycle' | 'callPlugin'>> {
-    return {
-      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
-      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
-    };
-  }
-
-  function makeMemory(): jest.Mocked<
-    Pick<ContextMemoryService, 'toContextString' | 'appendObservation' | 'trackSignal'>
-  > {
-    return {
-      toContextString: jest.fn().mockResolvedValue(''),
-      appendObservation: jest.fn().mockResolvedValue(undefined),
-      trackSignal: jest.fn().mockResolvedValue(undefined),
-    };
-  }
-
-  function makeFullPlugins(
-    decisionPrompt: string | null = null,
-    tools: { plugin_id: string; name: string; description: string; input_schema: object }[] = [],
-  ): jest.Mocked<
-    Pick<
-      PluginsService,
-      'findActive' | 'getProviderTools' | 'getSkillsMetadata' | 'getActiveDecisionPrompt'
-    >
-  > {
-    return {
-      findActive: jest.fn().mockResolvedValue([]),
-      getProviderTools: jest.fn().mockResolvedValue(tools),
-      getSkillsMetadata: jest.fn().mockResolvedValue([]),
-      getActiveDecisionPrompt: jest.fn().mockResolvedValue(decisionPrompt),
-    };
   }
 
   function buildService(
