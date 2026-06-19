@@ -7,6 +7,7 @@ import { ContextMemoryModule } from '../context-memory/context-memory.module';
 import { AuditModule } from '../audit/audit.module';
 import { AlertsModule } from '../alerts/alerts.module';
 import { SnapshotModule } from '../snapshot/snapshot.module';
+import { NotifierModule } from '../notifier/notifier.module';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { SnapshotModule } from '../snapshot/snapshot.module';
     AuditModule,
     AlertsModule,
     SnapshotModule,
+    NotifierModule,
   ],
   providers: [AgentsService],
   exports: [AgentsService],

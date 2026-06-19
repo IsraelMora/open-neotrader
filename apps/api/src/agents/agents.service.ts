@@ -7,6 +7,7 @@ import { ContextMemoryService } from '../context-memory/context-memory.service';
 import { AuditService } from '../audit/audit.service';
 import { AlertsService, CreateAlertDto } from '../alerts/alerts.service';
 import { SnapshotService } from '../snapshot/snapshot.service';
+import { NotifierBridge } from '../notifier/notifier-bridge';
 import { ConfigService } from '@nestjs/config';
 
 import type { LlmResponse } from '../llm/llm.service';
@@ -113,6 +114,7 @@ export class AgentsService {
     private readonly alerts: AlertsService,
     private readonly snapshot?: SnapshotService,
     _cfg?: ConfigService,
+    private readonly notifierBridge?: NotifierBridge,
   ) {}
 
   /**
@@ -305,6 +307,8 @@ export class AgentsService {
     const initialCtx: Record<string, unknown> = { ...vetoCtx, active_plugin_ids: activeIds };
     const preResult = await this._runPreExtras(preExtras, initialCtx, cycle_id);
     if (preResult.aborted) {
+      // Dispatch any notify_intents collected before abort (safe: intents are already in abortResult ctx)
+      await this._persistNotificationIntents(initialCtx, cycle_id);
       return {
         ...preResult.abortResult,
         context_injected: !!memContext,
@@ -342,8 +346,10 @@ export class AgentsService {
     } = turnResult;
 
     // ── 3c. POST-stage extra plugins (after LLM turn) ─────────────────────────
-    // Result carries _collected_notify_intents; PR B will consume it from this return value.
-    await this._runPostExtras(postExtras, runningCtx, cycle_id);
+    const postFinalCtx = await this._runPostExtras(postExtras, runningCtx, cycle_id);
+
+    // ── 3d. Dispatch accumulated notify_intents (PR B) ───────────────────────
+    await this._persistNotificationIntents(postFinalCtx, cycle_id);
 
     // ── Persistir en memoria inter-ciclos ─────────────────────────────────────
 
@@ -716,6 +722,49 @@ export class AgentsService {
     }
 
     return { decisions, sandbox_results, signalsEmitted };
+  }
+
+  /**
+   * Dispatches all accumulated notify_intents via NotifierBridge.
+   *
+   * Reads ctx['_collected_notify_intents'] (array of {channel, text, parse_mode?})
+   * and calls bridge.send once per intent. Emits a 'notification_sent' audit event
+   * per dispatch. Never throws — any bridge error is caught and audited.
+   *
+   * Mirrors _persistPluginAlerts pattern: collect-then-act, no inline side effects.
+   */
+  private async _persistNotificationIntents(
+    ctx: Record<string, unknown>,
+    cycle_id: string,
+  ): Promise<void> {
+    if (!this.notifierBridge) return;
+    const raw = ctx['_collected_notify_intents'];
+    if (!Array.isArray(raw) || raw.length === 0) return;
+
+    for (const item of raw) {
+      const intent = item as Record<string, unknown>;
+      const channel = (intent['channel'] as string | undefined) ?? 'telegram';
+      const text = (intent['text'] as string | undefined) ?? '';
+      const parseMode = intent['parse_mode'] as 'Markdown' | 'HTML' | undefined;
+
+      let ok = false;
+      try {
+        const result = await this.notifierBridge.send(channel, text, { parse_mode: parseMode });
+        ok = result.ok;
+      } catch (err: unknown) {
+        this.log.warn(`_persistNotificationIntents: bridge.send threw — ${String(err)}`);
+      }
+
+      try {
+        await this.audit.log({
+          cycle_id,
+          event_type: 'notification_sent',
+          meta: { channel, ok },
+        });
+      } catch (err: unknown) {
+        this.log.warn(`_persistNotificationIntents: audit.log threw — ${String(err)}`);
+      }
+    }
   }
 
   /**
