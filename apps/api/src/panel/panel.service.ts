@@ -205,8 +205,8 @@ export class PanelService {
   /** Envía una pregunta al LLM con historial opcional y devuelve la respuesta. */
   async chat(question: string, history?: unknown[]) {
     const context = history ? `${JSON.stringify(history)}\n\n${question}` : question;
-    const res = await this.llm.complete({ context });
-    return { response: res.text, tool_calls: res.tool_calls, backend: res.backend };
+    const r = await this.agents.runGovernedTurn({ source: 'chat', context });
+    return { response: r.text, tool_calls: r.tool_calls, backend: r.backend };
   }
 
   // ── Doctor ────────────────────────────────────────────────────────────────
