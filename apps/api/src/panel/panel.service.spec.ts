@@ -12,9 +12,11 @@ function makeAgentsStub(opts: {
   return {
     runReflectionTurn: opts.reflectNowThrows
       ? jest.fn().mockRejectedValue(new Error('reflection failed'))
-      : jest.fn().mockResolvedValue(
-          opts.reflectNowResult ?? { skipped: false, cycle_id: 'ref-001', skills_written: 0 },
-        ),
+      : jest
+          .fn()
+          .mockResolvedValue(
+            opts.reflectNowResult ?? { skipped: false, cycle_id: 'ref-001', skills_written: 0 },
+          ),
   };
 }
 
@@ -75,5 +77,76 @@ describe('F4-S2 Phase 3.3 — PanelService.reflectNow', () => {
     expect(agentsStub.runReflectionTurn).toHaveBeenCalledTimes(1);
     expect(result.skipped).toBe(false);
     expect(result.cycle_id).toBe('ref-123');
+  });
+});
+
+describe('F4-S2 Fix #1 — reflectNow holds the running lock during reflection', () => {
+  it('3.3c — runState.running is true while runReflectionTurn is in-flight', async () => {
+    let runningDuringReflection: boolean | undefined;
+
+    // Stub that captures runState.running mid-execution
+    const agentsStub: jest.Mocked<Pick<AgentsService, 'runReflectionTurn'>> = {
+      runReflectionTurn: jest.fn().mockImplementation(
+        () =>
+          new Promise<ReflectionTurnResult>((resolve) => {
+            // runState.running must be true at this point (lock held)
+            runningDuringReflection = (service as unknown as { runState: { running: boolean } })
+              .runState.running;
+            resolve({ skipped: false, cycle_id: 'ref-lock', skills_written: 0 });
+          }),
+      ),
+    };
+
+    const service = makePanelService({ cycleRunning: false, agentsStub });
+
+    await service.reflectNow();
+
+    expect(runningDuringReflection).toBe(true);
+  });
+
+  it('3.3d — runState.running is cleared after reflectNow completes (success)', async () => {
+    const agentsStub = makeAgentsStub({});
+    const service = makePanelService({ cycleRunning: false, agentsStub });
+
+    await service.reflectNow();
+
+    const state = (service as unknown as { runState: { running: boolean } }).runState;
+    expect(state.running).toBe(false);
+  });
+
+  it('3.3e — runState.running is cleared even when runReflectionTurn throws (finally)', async () => {
+    const agentsStub = makeAgentsStub({ reflectNowThrows: true });
+    const service = makePanelService({ cycleRunning: false, agentsStub });
+
+    await expect(service.reflectNow()).rejects.toThrow('reflection failed');
+
+    const state = (service as unknown as { runState: { running: boolean } }).runState;
+    expect(state.running).toBe(false);
+  });
+
+  it('3.3f — second reflectNow call while first is in-flight → throws ConflictException', async () => {
+    let resolveFirst!: (v: ReflectionTurnResult) => void;
+
+    const agentsStub: jest.Mocked<Pick<AgentsService, 'runReflectionTurn'>> = {
+      runReflectionTurn: jest.fn().mockImplementation(
+        () =>
+          new Promise<ReflectionTurnResult>((resolve) => {
+            resolveFirst = resolve;
+          }),
+      ),
+    };
+    const service = makePanelService({ cycleRunning: false, agentsStub });
+
+    // Start first call — lock is acquired synchronously before the await inside reflectNow
+    const firstCallPromise = service.reflectNow();
+
+    // The event loop hasn't been given a chance to settle yet, but because the
+    // lock is set synchronously (before the await in the fixed implementation),
+    // the second call must see running===true immediately.
+    await expect(service.reflectNow()).rejects.toThrow(ConflictException);
+
+    // Clean up
+    resolveFirst({ skipped: false, cycle_id: 'x', skills_written: 0 });
+    await firstCallPromise;
   });
 });

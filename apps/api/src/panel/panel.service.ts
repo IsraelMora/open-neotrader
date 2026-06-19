@@ -376,8 +376,15 @@ export class PanelService {
    */
   async reflectNow(): Promise<ReflectionTurnResult> {
     if (this.runState.running) {
-      throw new ConflictException('A cycle is currently running — reflection cannot start concurrently');
+      throw new ConflictException(
+        'A cycle is currently running — reflection cannot start concurrently',
+      );
     }
-    return this.agents.runReflectionTurn();
+    this.runState.running = true;
+    try {
+      return await this.agents.runReflectionTurn();
+    } finally {
+      this.runState.running = false;
+    }
   }
 }
