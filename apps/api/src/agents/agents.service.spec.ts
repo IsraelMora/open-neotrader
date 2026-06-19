@@ -2274,6 +2274,79 @@ describe('F4-S1 Fix — kernel tool DROPPED when source !== reflection (dispatch
   });
 });
 
+// ── F4-S3 Fix — end-to-end source-gate for kernel__create_pretest_variant and kernel__run_pretest_compare ──
+//
+// Mirrors src-gate.5: drive through runGovernedTurn and confirm sandbox.callPlugin is
+// NEVER called for these kernel tools, and that the right drop reason is emitted.
+
+describe('F4-S3 Fix — kernel pretest tools DROPPED end-to-end when source !== reflection', () => {
+  it('src-gate.6 end-to-end: source:cycle + LLM emitting kernel__create_pretest_variant — sandbox.callPlugin NEVER called, kernel_source_not_allowed audited', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"kernel__create_pretest_variant","args":{"name":"v1","plugin_ids":["p1"]}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('Emit tool calls.', []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    const result = await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    // Tool call must be DROPPED — not surfaced in result
+    expect(result.tool_calls).toHaveLength(0);
+    // sandbox.callPlugin must NEVER be called for this kernel tool
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+    // Must have audited tool_call_dropped with kernel_source_not_allowed
+    const logCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const droppedCall = logCalls.find(
+      ([arg]) =>
+        arg['event_type'] === 'tool_call_dropped' &&
+        (arg['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
+    );
+    expect(droppedCall).toBeDefined();
+  });
+
+  it('src-gate.7 end-to-end: source:cycle + LLM emitting kernel__run_pretest_compare — sandbox.callPlugin NEVER called, kernel_source_not_allowed audited', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"kernel__run_pretest_compare","args":{}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('Emit tool calls.', []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    const result = await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    // Tool call must be DROPPED — not surfaced in result
+    expect(result.tool_calls).toHaveLength(0);
+    // sandbox.callPlugin must NEVER be called for this kernel tool
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+    // Must have audited tool_call_dropped with kernel_source_not_allowed
+    const logCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const droppedCall = logCalls.find(
+      ([arg]) =>
+        arg['event_type'] === 'tool_call_dropped' &&
+        (arg['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
+    );
+    expect(droppedCall).toBeDefined();
+  });
+});
+
 // ── F4-S2 Task 1.7/1.8 — source:'reflection' union activation ────────────────
 //
 // These tests verify that adding 'reflection' to GovernedTurnInput.source union
@@ -2620,6 +2693,28 @@ describe('F4-S2 Phase 2.1 — _assembleReflectionContext budget enforcement', ()
     expect(typeof ctx).toBe('string');
     expect(ctx.length).toBeLessThanOrEqual(4000);
   });
+
+  it('2.1e — empty portfolios (compare returns []): PRETEST section must NOT emit confusing "winner_return: winner_risk_adj:" line', async () => {
+    // When pretest.compare() returns zero portfolios, the winner_return/winner_risk_adj
+    // fields are empty strings, so emitting `winner_return: winner_risk_adj:` is misleading.
+    // The guard `if (cmp.portfolios.length > 0)` must suppress that header entirely.
+    const service = makeAssemblerService({
+      pretestCompare: {
+        portfolios: [],
+        winner_by_return: '',
+        winner_by_risk_adj: '',
+      },
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(typeof ctx).toBe('string');
+    // The confusing winner line must NOT appear
+    expect(ctx).not.toContain('winner_return:');
+    expect(ctx).not.toContain('winner_risk_adj:');
+    // Budget still respected
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+  });
 });
 
 // ── F4-S2 Phase 2.3 — runReflectionTurn ──────────────────────────────────────
@@ -2878,6 +2973,128 @@ describe('F4-S3 Task 1.1 — DI boot: forwardRef decorator metadata verified on 
 
     expect((service as unknown as Record<string, unknown>)['pretest']).toBe(pretestStub);
   });
+});
+
+// ── Task 1.1c — REAL NestJS module compile boot test ─────────────────────────
+//
+// This is the authoritative proof that forwardRef resolves at RUNTIME inside NestJS DI.
+// Metadata inspection (1.1a) catches missing decorators; this test catches missing
+// module wiring (forwardRef in AgentsModule/PretestModule imports).
+//
+// Strategy: Test.createTestingModule imports the REAL AgentsModule + PretestModule.
+// All external infrastructure providers (Prisma, Sandbox, LLM, etc.) are overridden
+// with no-op mocks so .compile() succeeds without real I/O.
+// A circular-dependency error from NestJS would cause .compile() to throw — the test
+// asserts it does NOT throw, and that both AgentsService and PretestService resolve.
+
+describe('F4-S3 Task 1.1c — REAL NestJS module compile: forwardRef circular DI resolves without error', () => {
+  it('1.1c — AgentsModule + PretestModule compile() succeeds: both services resolve, pretest is defined on AgentsService', async () => {
+    // Inline imports: only needed in this test, avoids polluting the module-level scope
+    // with @nestjs/testing (which is a dev dependency, fine in spec files).
+    const { Test } = await import('@nestjs/testing');
+    const { AgentsModule } = await import('./agents.module');
+    const { PretestModule } = await import('../pretest/pretest.module');
+
+    // Infrastructure providers that would fail without real I/O
+    const { PrismaService } = await import('../prisma/prisma.service');
+    const { SandboxGateway } = await import('../sandbox/sandbox.gateway');
+    const { LlmService } = await import('../llm/llm.service');
+    const { PluginsService } = await import('../plugins/plugins.service');
+    const { PluginEventsService } = await import('../plugins/plugin-events.service');
+    const { LifecycleService } = await import('../plugins/lifecycle.service');
+    const { PluginWatcherService } = await import('../plugins/plugin-watcher.service');
+    const { ContextMemoryService } = await import('../context-memory/context-memory.service');
+    const { AuditService } = await import('../audit/audit.service');
+    const { AlertsService } = await import('../alerts/alerts.service');
+    const { SnapshotService } = await import('../snapshot/snapshot.service');
+    const { NotifierBridge } = await import('../notifier/notifier-bridge');
+    const { TelegramService } = await import('../notifier/telegram.service');
+    const { ProviderGatewayService } = await import('../providers/provider-gateway.service');
+    const { OhlcvCacheService } = await import('../providers/ohlcv-cache.service');
+    const { KvService } = await import('../common/kv.service');
+    const { MigrationRunnerService } = await import('../prisma/migration-runner.service');
+    const { AgentsService: AgentsSvc } = await import('./agents.service');
+    const { PretestService } = await import('../pretest/pretest.service');
+    const { ConfigModule } = await import('@nestjs/config');
+    const { TotpRequiredGuard } = await import('../auth/guards/totp-required.guard');
+
+    const moduleRef = await Test.createTestingModule({
+      // ConfigModule.forRoot({ isGlobal: true }) makes ConfigService available in all
+      // nested module scopes — mirrors how AppModule registers it in production.
+      imports: [ConfigModule.forRoot({ isGlobal: true }), AgentsModule, PretestModule],
+    })
+      .overrideProvider(PrismaService)
+      .useValue({ $connect: jest.fn(), $disconnect: jest.fn() })
+      .overrideProvider(MigrationRunnerService)
+      .useValue({})
+      .overrideProvider(SandboxGateway)
+      .useValue({
+        runCycle: jest.fn(),
+        callPlugin: jest.fn(),
+        call: jest.fn(),
+        runExtraCycleHook: jest.fn(),
+        getPluginStage: jest.fn(),
+      })
+      .overrideProvider(LlmService)
+      .useValue({ complete: jest.fn() })
+      .overrideProvider(PluginsService)
+      .useValue({
+        findActive: jest.fn(),
+        getProviderTools: jest.fn(),
+        getSkillsMetadata: jest.fn(),
+        getActiveDecisionPrompt: jest.fn(),
+        getActiveReflectionPrompt: jest.fn(),
+        writeSkillGuarded: jest.fn(),
+      })
+      .overrideProvider(PluginEventsService)
+      .useValue({})
+      .overrideProvider(LifecycleService)
+      .useValue({})
+      .overrideProvider(PluginWatcherService)
+      .useValue({})
+      .overrideProvider(ContextMemoryService)
+      .useValue({
+        toContextString: jest.fn(),
+        appendObservation: jest.fn(),
+        trackSignal: jest.fn(),
+      })
+      .overrideProvider(AuditService)
+      .useValue({ log: jest.fn(), query: jest.fn() })
+      .overrideProvider(AlertsService)
+      .useValue({ createBulk: jest.fn() })
+      .overrideProvider(SnapshotService)
+      .useValue({ getEquityCurve: jest.fn() })
+      .overrideProvider(NotifierBridge)
+      .useValue({ send: jest.fn() })
+      .overrideProvider(TelegramService)
+      .useValue({ sendMessage: jest.fn() })
+      .overrideProvider(ProviderGatewayService)
+      .useValue({ getQuote: jest.fn() })
+      .overrideProvider(OhlcvCacheService)
+      .useValue({ get: jest.fn(), set: jest.fn() })
+      .overrideProvider(KvService)
+      .useValue({ get: jest.fn(), set: jest.fn(), del: jest.fn() })
+      .overrideProvider(TotpRequiredGuard)
+      .useValue({ canActivate: jest.fn().mockReturnValue(true) })
+      .compile();
+
+    // If compile() throws with "Nest cannot create ... circular dependency", the test fails.
+    // The fact that we reach here proves NestJS resolved the forwardRef graph without error.
+
+    const agentsService = moduleRef.get(AgentsSvc);
+    const pretestService = moduleRef.get(PretestService);
+
+    expect(agentsService).toBeDefined();
+    expect(pretestService).toBeDefined();
+
+    // The critical assertion: AgentsService has its pretest property wired (not undefined)
+    // This proves forwardRef(() => PretestService) in AgentsModule resolved at DI time.
+    const pretest = (agentsService as unknown as Record<string, unknown>)['pretest'];
+    expect(pretest).toBeDefined();
+    expect(pretest).toBe(pretestService);
+
+    await moduleRef.close();
+  }, 15000); // generous timeout for module compilation
 });
 
 // ── Task 1.3: Tool schema tests (source-gated) ────────────────────────────────
