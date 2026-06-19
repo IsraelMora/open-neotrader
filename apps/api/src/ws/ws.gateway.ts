@@ -13,7 +13,7 @@ import { Logger, OnModuleInit } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Server, WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
-import { LlmService } from '../llm/llm.service';
+import { AgentsService } from '../agents/agents.service';
 import { PluginEventsService, type NeuroTraderEvents } from '../plugins/plugin-events.service';
 
 interface AuthClient extends WebSocket {
@@ -51,7 +51,7 @@ export class WsGateway
 
   constructor(
     private readonly jwt: JwtService,
-    private readonly llm: LlmService,
+    private readonly agents: AgentsService,
     private readonly events: PluginEventsService,
   ) {}
 
@@ -163,18 +163,19 @@ export class WsGateway
     this.send(client, 'agent:thinking', { ts: new Date().toISOString() });
 
     try {
-      const result = await this.llm.complete({
+      const r = await this.agents.runGovernedTurn({
+        source: 'chat',
         context: payload.context ?? '',
         system_prompt: payload.message,
       });
 
       this.send(client, 'agent:response', {
         ts: new Date().toISOString(),
-        text: result.text,
-        tool_calls: result.tool_calls,
-        backend: result.backend,
-        skills_read: result.skills_read,
-        skills_written: result.skills_written,
+        text: r.text,
+        tool_calls: r.tool_calls,
+        backend: r.backend,
+        skills_read: r.skills_read,
+        skills_written: r.skills_written,
       });
     } catch (err) {
       this.send(client, 'agent:error', {
