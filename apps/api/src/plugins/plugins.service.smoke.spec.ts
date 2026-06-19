@@ -88,6 +88,8 @@ function makePlugin(id: string, overrides: Record<string, unknown> = {}) {
     installed_path: `/plugins/${id}` as string | null,
     scan_result: JSON.stringify(FAKE_SCAN_RESULT) as string | null,
     smoke_test_result: null as string | null,
+    reputation_score: null as number | null,
+    reputation_detail: null as string | null,
     installed_at: new Date(),
     updated_at: new Date(),
     ...overrides,

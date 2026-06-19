@@ -72,6 +72,9 @@ function makeInstalledPlugin(id: string) {
     config: null,
     installed_path: `/plugins/${id}`,
     scan_result: null,
+    smoke_test_result: null,
+    reputation_score: null,
+    reputation_detail: null,
     installed_at: new Date(),
     updated_at: new Date(),
   };
