@@ -2627,11 +2627,7 @@ describe('F4-S2 Phase 2.1 — _assembleReflectionContext budget enforcement', ()
 /** Export type check: ReflectionTurnResult must be importable */
 type _ReflectionTurnResultCheck = import('./agents.service').ReflectionTurnResult;
 
-function makeReflectionService(opts: {
-  reflectionPrompt: string | null;
-  llmText?: string;
-  panelRunning?: boolean;
-}): {
+function makeReflectionService(opts: { reflectionPrompt: string | null; llmText?: string }): {
   service: AgentsService;
   audit: { log: jest.Mock; query: jest.Mock };
   runGovernedTurnSpy: jest.SpyInstance;
@@ -2646,11 +2642,6 @@ function makeReflectionService(opts: {
     getActiveReflectionPrompt: jest.fn().mockResolvedValue(opts.reflectionPrompt),
     getProviderTools: jest.fn().mockResolvedValue([]),
     findActive: jest.fn().mockResolvedValue([]),
-  };
-
-  const panelRunning = opts.panelRunning ?? false;
-  const panel = {
-    getRunStatus: jest.fn().mockReturnValue({ running: panelRunning, last: null }),
   };
 
   const llm: Partial<LlmService> = {
@@ -2686,7 +2677,6 @@ function makeReflectionService(opts: {
     cfg: unknown,
     notifier: unknown,
     pretest: unknown,
-    panel: unknown,
   ) => AgentsService)(
     llm,
     makeSandbox(),
@@ -2698,7 +2688,6 @@ function makeReflectionService(opts: {
     undefined,
     undefined,
     pretest,
-    panel,
   );
 
   const runGovernedTurnSpy = jest.spyOn(service, 'runGovernedTurn');
@@ -2795,16 +2784,17 @@ describe('F4-S2 Phase 2.3 — runReflectionTurn', () => {
     expect(reflectionAudit).toBeDefined();
   });
 
-  it('2.3d — cycle running (panel.getRunStatus().running===true) → {skipped:true, reason:"cycle_in_progress"}, no governed turn', async () => {
+  // Note: the cycle_in_progress guard was removed from runReflectionTurn (Fix #2).
+  // Concurrency is now handled exclusively by PanelService.reflectNow (which holds
+  // runState.running while reflection is in-flight). All callers route through reflectNow.
+  it('2.3d — plugin active → proceeds to governed turn regardless of external state (lock is in reflectNow)', async () => {
     const { service, runGovernedTurnSpy } = makeReflectionService({
       reflectionPrompt: 'Reflect.',
-      panelRunning: true,
     });
 
     const result = await service.runReflectionTurn();
 
-    expect(result.skipped).toBe(true);
-    expect(result.reason).toBe('cycle_in_progress');
-    expect(runGovernedTurnSpy).not.toHaveBeenCalled();
+    expect(result.skipped).toBe(false);
+    expect(runGovernedTurnSpy).toHaveBeenCalledTimes(1);
   });
 });

@@ -161,9 +161,6 @@ export class AgentsService {
     // PretestService injected optionally so existing unit-tests that don't provide
     // it continue compiling; _assembleReflectionContext degrades gracefully.
     private readonly pretest?: PretestService,
-    // Panel reference for the cycle-running guard (injected by AgentsModule via forwardRef
-    // or provided directly in tests). Kept optional to avoid circular dep issues.
-    private readonly _panelRef?: { getRunStatus: () => { running: boolean } },
   ) {}
 
   /**
@@ -929,25 +926,39 @@ export class AgentsService {
     const VETO_CAP = 800;
     const PRETEST_CAP = 1200;
 
+    // Single audit query (limit 20) shared by AUDIT and VETO sections — avoids two DB calls.
+    type AuditEntry = {
+      event_type: string;
+      symbol?: string | null;
+      action?: string | null;
+      meta?: string | null;
+    };
+    let auditEntries: AuditEntry[] = [];
+    let auditQueryFailed = false;
+    try {
+      auditEntries = await this.audit.query({ limit: 20 });
+    } catch {
+      auditQueryFailed = true;
+    }
+
     // Section: AUDIT
     let auditSection = '(unavailable)';
-    try {
-      const entries = await this.audit.query({ limit: 20 });
-      const relevantTypes = new Set([
-        'signal',
-        'decision',
-        'cycle_complete',
-        'skill_written',
-        'reflection_turn',
-      ]);
-      const lines = (
-        entries as Array<{ event_type: string; symbol?: string | null; action?: string | null }>
-      )
-        .filter((e) => relevantTypes.has(e.event_type))
-        .map((e) => `${e.event_type} ${e.symbol ?? ''} ${e.action ?? ''}`.trim());
-      auditSection = lines.join('\n').slice(0, AUDIT_CAP);
-    } catch {
-      auditSection = '(unavailable)';
+    if (!auditQueryFailed) {
+      try {
+        const relevantTypes = new Set([
+          'signal',
+          'decision',
+          'cycle_complete',
+          'skill_written',
+          'reflection_turn',
+        ]);
+        const lines = auditEntries
+          .filter((e) => relevantTypes.has(e.event_type))
+          .map((e) => `${e.event_type} ${e.symbol ?? ''} ${e.action ?? ''}`.trim());
+        auditSection = lines.join('\n').slice(0, AUDIT_CAP);
+      } catch {
+        auditSection = '(unavailable)';
+      }
     }
 
     // Section: EQUITY
@@ -964,19 +975,18 @@ export class AgentsService {
       equitySection = '(unavailable)';
     }
 
-    // Section: VETO (extracted helper reduces cognitive complexity)
+    // Section: VETO — derived from the same auditEntries fetched above (no second query).
     let vetoSection = '(unavailable)';
-    try {
-      const decisions = await this.audit.query({ limit: 10 });
-      const vetoEntries = (decisions as Array<{ event_type: string; meta?: string | null }>).filter(
-        (e) => e.event_type === 'decision',
-      );
-      const vetoLines = vetoEntries
-        .map((e) => (e.meta ? this._parseVetoLine(e.meta) : null))
-        .filter((l): l is string => l !== null);
-      vetoSection = (vetoLines.length > 0 ? vetoLines.join('\n') : '(none)').slice(0, VETO_CAP);
-    } catch {
-      vetoSection = '(unavailable)';
+    if (!auditQueryFailed) {
+      try {
+        const vetoEntries = auditEntries.filter((e) => e.event_type === 'decision');
+        const vetoLines = vetoEntries
+          .map((e) => (e.meta ? this._parseVetoLine(e.meta) : null))
+          .filter((l): l is string => l !== null);
+        vetoSection = (vetoLines.length > 0 ? vetoLines.join('\n') : '(none)').slice(0, VETO_CAP);
+      } catch {
+        vetoSection = '(unavailable)';
+      }
     }
 
     // Section: PRETEST
@@ -1020,15 +1030,9 @@ export class AgentsService {
    * 6. Return ReflectionTurnResult.
    */
   async runReflectionTurn(cycleId?: string): Promise<ReflectionTurnResult> {
-    // Concurrency guard: don't start reflection while a cycle is running.
-    if (this._panelRef?.getRunStatus().running) {
-      return { skipped: true, reason: 'cycle_in_progress' };
-    }
-
     // Policy plugin check: reflection is a no-op without an active reflection plugin.
-    const reflectionPrompt = await (
-      this.plugins as unknown as { getActiveReflectionPrompt?: () => Promise<string | null> }
-    ).getActiveReflectionPrompt?.();
+    // Concurrency guard is held by PanelService.reflectNow (all callers go through it).
+    const reflectionPrompt = await this.plugins.getActiveReflectionPrompt();
     if (!reflectionPrompt) {
       return { skipped: true, reason: 'no_reflection_plugin' };
     }
