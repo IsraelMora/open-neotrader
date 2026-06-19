@@ -158,10 +158,11 @@ export class AgentsService {
       },
     });
 
-    // ── 5. Ejecutar tool calls aprobadas ──────────────────────────────────────
+    // ── 5. Validar tool calls contra manifests activos, luego ejecutar ───────
+    const validatedCalls = await this._validateToolCalls(cycle_id, llmResponse.tool_calls);
     const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
       cycle_id,
-      llmResponse.tool_calls,
+      validatedCalls,
     );
 
     // ── 6. Persistir en memoria inter-ciclos ──────────────────────────────────
@@ -244,6 +245,53 @@ export class AgentsService {
     }
 
     return { vetoCtx, vetoSummary };
+  }
+
+  /**
+   * Validates parsed tool_calls against active plugin manifests.
+   * Drops calls whose plugin is not active or whose function is not declared in tools.json.
+   * Each dropped call is audited with event_type 'tool_call_dropped' and a specific reason.
+   * Returns only valid calls. Never throws.
+   */
+  private async _validateToolCalls(
+    cycle_id: string,
+    calls: import('../llm/llm.service').ToolCallRequest[],
+  ): Promise<import('../llm/llm.service').ToolCallRequest[]> {
+    if (calls.length === 0) return [];
+
+    // Build lookup structures once.
+    const activePlugins = await this.plugins.findActive();
+    const activeIds = new Set(activePlugins.map((p: HydratedPlugin) => p.id));
+    const providerTools = await this.plugins.getProviderTools();
+    const validToolNames = new Set(providerTools.map((t) => t.name)); // "pluginId__fn"
+
+    const valid: import('../llm/llm.service').ToolCallRequest[] = [];
+
+    for (const call of calls) {
+      let reason: string | null = null;
+
+      if (!activeIds.has(call.plugin_id)) {
+        // Unknown plugin (never registered/installed) vs inactive (registered but disabled).
+        // Both cases where the plugin is not found in active set.
+        const isKnownPlugin = providerTools.some((t) => t.plugin_id === call.plugin_id);
+        reason = isKnownPlugin ? 'plugin_inactive' : 'plugin_not_found';
+      } else if (!validToolNames.has(`${call.plugin_id}__${call.function}`)) {
+        reason = 'function_not_declared';
+      }
+
+      if (reason) {
+        await this.audit.log({
+          cycle_id,
+          event_type: 'tool_call_dropped',
+          plugin_id: call.plugin_id,
+          meta: { function: call.function, reason, args: call.args },
+        });
+      } else {
+        valid.push(call);
+      }
+    }
+
+    return valid;
   }
 
   private async _executeToolCalls(
