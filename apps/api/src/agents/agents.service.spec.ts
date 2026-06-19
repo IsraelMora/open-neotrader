@@ -538,8 +538,7 @@ describe('AgentsService.runGovernedTurn — valid tool call dispatched (source: 
 
 describe('AgentsService.runGovernedTurn — hallucinated/inactive tool dropped (source: chat)', () => {
   it('drops call to inactive plugin; audits tool_call_dropped; does not dispatch', async () => {
-    const toolCallText =
-      '<tool_calls>[{"tool":"ghost-plugin__ghost_fn","args":{}}]</tool_calls>';
+    const toolCallText = '<tool_calls>[{"tool":"ghost-plugin__ghost_fn","args":{}}]</tool_calls>';
     const llm = makeLlm(toolCallText);
     const audit = makeAudit();
     // ghost-plugin is NOT active and has no declared tools.

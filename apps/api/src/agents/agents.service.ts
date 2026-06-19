@@ -165,7 +165,11 @@ export class AgentsService {
     const skills_written = llmResponse.skills_written ?? [];
 
     // ── Validate and dispatch ─────────────────────────────────────────────────
-    const validatedCalls = await this._validateToolCalls(cycle_id, llmResponse.tool_calls, providerTools);
+    const validatedCalls = await this._validateToolCalls(
+      cycle_id,
+      llmResponse.tool_calls,
+      providerTools,
+    );
     const { decisions, sandbox_results } = await this._executeToolCalls(cycle_id, validatedCalls);
 
     // ── Audit the turn (only for chat source) ────────────────────────────────
@@ -189,7 +193,7 @@ export class AgentsService {
       tool_calls: validatedCalls,
       decisions,
       sandbox_results,
-      backend: (llmResponse.backend ?? 'api') as 'api' | 'subscription',
+      backend: llmResponse.backend ?? 'api',
       skills_read,
       skills_written,
       llm_response: llmResponse,
@@ -238,25 +242,9 @@ export class AgentsService {
       pendingSignals,
     );
 
-    // ── 4. Decision prompt + tool schema injection (read-not-interpret) ──────
-    // Hoist getProviderTools() ONCE — shared between schema injection and validation.
-    const providerTools = await this.plugins.getProviderTools();
-    const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
-
-    let builtSystemPrompt = systemPrompt ?? '';
-    if (decisionPrompt !== null) {
-      const toolSchemaJson = JSON.stringify(providerTools);
-      if (toolSchemaJson.length > 8000) {
-        this.log.warn(
-          `token-budget guard: injected tool schema is ${toolSchemaJson.length} chars — consider reducing active tools`,
-        );
-      }
-      const parts: string[] = [`[DECISION]\n${decisionPrompt}`, `[TOOL SCHEMA]\n${toolSchemaJson}`];
-      if (builtSystemPrompt) parts.push(builtSystemPrompt);
-      builtSystemPrompt = parts.join('\n\n');
-    }
-
-    // ── 5. LLM: proponer acciones con señales aprobadas en contexto ───────────
+    // ── 4+5+6. Governed LLM turn (decision prompt + schema injection, llm.complete,
+    //            parseToolCalls, _validateToolCalls, _executeToolCalls) ─────────
+    // Build signal summary from approved signals after veto, prepend to context.
     const approvedSignals: unknown[] = Array.isArray(vetoCtx['pending_signals'])
       ? (vetoCtx['pending_signals'] as unknown[])
       : [];
@@ -266,48 +254,41 @@ export class AgentsService {
         ? `\n\n[SEÑALES APROBADAS POR LAS DISCIPLINAS]\n${JSON.stringify(approvedSignals, null, 2)}\n`
         : '\n\n[NO HAY SEÑALES APROBADAS EN ESTE CICLO]\n';
 
-    const llmResponse = await this.llm.complete({
+    const turnResult = await this.runGovernedTurn({
+      source: 'cycle',
       context: enrichedContext + signalSummary,
-      system_prompt: builtSystemPrompt || undefined,
+      system_prompt: systemPrompt,
+      cycle_id,
     });
 
-    // Parse tool_calls from LLM text here (governed cycle), so WS/panel paths stay inert.
-    const auditFn = (raw: string): void => {
-      void this.audit.log({
-        cycle_id,
-        event_type: 'parse_miss',
-        meta: { raw_block: raw.slice(0, 500) },
-      });
-    };
-    llmResponse.tool_calls = parseToolCalls(llmResponse.text, auditFn);
+    const { decisions, sandbox_results, llm_response: llmResponse, skills_read } = turnResult;
 
-    const skills_read = llmResponse.skills_read ?? [];
-
+    // Emit a llm_response stage audit (equivalent to what _executeCycle emitted before).
     await this.audit.log({
       cycle_id,
       event_type: 'cycle_complete',
       llm_text: llmResponse.text?.slice(0, 2000),
       skills_read,
-      signals_count: llmResponse.tool_calls.length,
+      signals_count: turnResult.tool_calls.length,
       meta: {
         stage: 'llm_response',
-        tools_called: llmResponse.tool_calls.map((t) => `${t.plugin_id}.${t.function}`),
+        tools_called: turnResult.tool_calls.map((t) => `${t.plugin_id}.${t.function}`),
       },
     });
 
-    // ── 6. Validar tool calls contra manifests activos, luego ejecutar ───────
-    // Pass hoisted providerTools to avoid a second getProviderTools() call.
-    const validatedCalls = await this._validateToolCalls(
-      cycle_id,
-      llmResponse.tool_calls,
-      providerTools,
-    );
-    const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
-      cycle_id,
-      validatedCalls,
-    );
+    // ── Persistir en memoria inter-ciclos ─────────────────────────────────────
+    // Reconstruct signalsEmitted from dispatched decisions (decisions with allowed=true
+    // that have symbol+action in their args).
+    const signalsEmitted = decisions
+      .filter((d) => d.allowed)
+      .flatMap((d) => {
+        const args = d.args;
+        if (typeof args['symbol'] === 'string' && typeof args['action'] === 'string') {
+          return [{ symbol: args['symbol'], action: args['action'] }];
+        }
+        return [];
+      });
 
-    // ── 6. Persistir en memoria inter-ciclos ──────────────────────────────────
     await this.memory.appendObservation({
       cycle_id,
       text: llmResponse.text?.slice(0, 500) ?? '',
