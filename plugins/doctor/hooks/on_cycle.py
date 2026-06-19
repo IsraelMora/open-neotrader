@@ -21,7 +21,7 @@ class _HookContext:
         self.metadata = metadata
 
 
-def run(ctx: dict) -> dict:
+def on_cycle(ctx: dict) -> dict:
     config = ctx.get("plugin_config", {})
     active_ids = ctx.get("active_plugin_ids", [])
     required_creds: list[str] = []
@@ -64,5 +64,5 @@ def run(ctx: dict) -> dict:
 if __name__ == "__main__":
     raw = sys.stdin.read()
     ctx = json.loads(raw)
-    out = run(ctx)
+    out = on_cycle(ctx)
     print(json.dumps(out))

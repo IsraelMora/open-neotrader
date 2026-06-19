@@ -38,6 +38,11 @@ export interface HooksSpec {
   on_signal?: string;
 }
 
+/** Declares the execution stage for an extra plugin within the cycle. Default is 'post'. */
+export interface SchedulerSpec {
+  stage?: 'pre' | 'post';
+}
+
 export interface PermissionsSpec {
   network?: boolean;
   write_config?: boolean;
@@ -65,6 +70,7 @@ export interface PluginManifest {
   credentials?: Record<string, CredentialSpec>;
   config?: Record<string, ConfigFieldSpec>;
   hooks?: HooksSpec;
+  scheduler?: SchedulerSpec;
   permissions?: PermissionsSpec;
   stack?: StackSpec;
   /** Optional decision capability: supplies the decision prompt for LLM system prompt injection. */

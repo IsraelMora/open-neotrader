@@ -35,7 +35,7 @@ def _is_monthly_report_day(config: dict) -> bool:
     return today == target
 
 
-def run(ctx: dict) -> dict:
+def on_cycle(ctx: dict) -> dict:
     config = ctx.get("plugin_config", {})
     should_run = _is_weekly_report_day(config) or _is_monthly_report_day(config)
 
@@ -69,5 +69,5 @@ def run(ctx: dict) -> dict:
 if __name__ == "__main__":
     raw = sys.stdin.read()
     ctx = json.loads(raw)
-    out = run(ctx)
+    out = on_cycle(ctx)
     print(json.dumps(out))

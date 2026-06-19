@@ -6,6 +6,8 @@ import { PluginsService, HydratedPlugin } from '../plugins/plugins.service';
 import { ContextMemoryService } from '../context-memory/context-memory.service';
 import { AuditService } from '../audit/audit.service';
 import { AlertsService, CreateAlertDto } from '../alerts/alerts.service';
+import { SnapshotService } from '../snapshot/snapshot.service';
+import { ConfigService } from '@nestjs/config';
 
 import type { LlmResponse } from '../llm/llm.service';
 import { parseToolCalls } from '../llm/kernel-parser';
@@ -66,6 +68,8 @@ export interface AgentCycleResult {
   llm_response: LlmResponse;
   context_injected: boolean;
   veto_summary: VetoSummary;
+  /** True when a PRE-stage extra plugin aborted the cycle before the LLM turn. */
+  aborted?: boolean;
 }
 
 /** Decisión de tool call del LLM: qué función invocar y si fue aprobada (o vetada con razón). */
@@ -107,6 +111,8 @@ export class AgentsService {
     private readonly memory: ContextMemoryService,
     private readonly audit: AuditService,
     private readonly alerts: AlertsService,
+    private readonly snapshot?: SnapshotService,
+    _cfg?: ConfigService,
   ) {}
 
   /**
@@ -287,11 +293,31 @@ export class AgentsService {
       pendingSignals,
     );
 
+    // ── 3b. PRE-stage extra plugins (before LLM turn) ─────────────────────────
+    const extraPlugins = activePlugins.filter((p: HydratedPlugin) => p.type === 'extra');
+    const preExtras = extraPlugins.filter(
+      (p: HydratedPlugin) => this.sandbox.getPluginStage(p.id) === 'pre',
+    );
+    const postExtras = extraPlugins.filter(
+      (p: HydratedPlugin) => this.sandbox.getPluginStage(p.id) !== 'pre',
+    );
+
+    const initialCtx: Record<string, unknown> = { ...vetoCtx, active_plugin_ids: activeIds };
+    const preResult = await this._runPreExtras(preExtras, initialCtx, cycle_id);
+    if (preResult.aborted) {
+      return {
+        ...preResult.abortResult,
+        context_injected: !!memContext,
+        veto_summary: vetoSummary,
+      };
+    }
+    const runningCtx = preResult.ctx;
+
     // ── 4+5+6. Governed LLM turn (decision prompt + schema injection, llm.complete,
     //            parseToolCalls, _validateToolCalls, _executeToolCalls) ─────────
     // Build signal summary from approved signals after veto, prepend to context.
-    const approvedSignals: unknown[] = Array.isArray(vetoCtx['pending_signals'])
-      ? (vetoCtx['pending_signals'] as unknown[])
+    const approvedSignals: unknown[] = Array.isArray(runningCtx['pending_signals'])
+      ? (runningCtx['pending_signals'] as unknown[])
       : [];
 
     const signalSummary =
@@ -315,6 +341,10 @@ export class AgentsService {
       signalsEmitted,
     } = turnResult;
 
+    // ── 3c. POST-stage extra plugins (after LLM turn) ─────────────────────────
+    // Result carries _collected_notify_intents; PR B will consume it from this return value.
+    await this._runPostExtras(postExtras, runningCtx, cycle_id);
+
     // ── Persistir en memoria inter-ciclos ─────────────────────────────────────
 
     await this.memory.appendObservation({
@@ -337,6 +367,154 @@ export class AgentsService {
       context_injected: !!memContext,
       veto_summary: vetoSummary,
     };
+  }
+
+  /**
+   * Merges extra hook output additively into the running cycle context.
+   *
+   * PROTECTED_KEYS: never overwritten — extras must not influence the veto-approved
+   * trade-decision state or inject credentials/decisions into subsequent extras.
+   *   - pending_signals  : veto-approved signals; extras must not tamper
+   *   - credentials      : kernel-injected secrets; must not bleed across extras
+   *   - tool_calls       : LLM-decided calls; extras must not inject fake calls
+   *   - decisions        : validated decisions; extras must not override
+   *   - veto_reasons     : discipline layer output; extras must not alter
+   *
+   * SKIP_KEYS: handled specially outside this merge.
+   *   - notify_intents   : accumulated into _collected_notify_intents, not shallow-merged
+   *   - cycle_abort      : handled before merge is called
+   *   - cycle_abort_reason
+   */
+  private _mergeExtraCtx(
+    base: Record<string, unknown>,
+    extra: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const PROTECTED_KEYS = new Set([
+      'pending_signals',
+      'credentials',
+      'tool_calls',
+      'decisions',
+      'veto_reasons',
+    ]);
+    const SKIP_KEYS = new Set(['notify_intents', 'cycle_abort', 'cycle_abort_reason']);
+    const merged: Record<string, unknown> = { ...base };
+    for (const [k, v] of Object.entries(extra)) {
+      if (PROTECTED_KEYS.has(k)) continue;
+      if (SKIP_KEYS.has(k)) continue;
+      if (k === 'log' && Array.isArray(base['log']) && Array.isArray(v)) {
+        merged['log'] = [...(base['log'] as unknown[]), ...(v as unknown[])];
+      } else {
+        merged[k] = v;
+      }
+    }
+    return merged;
+  }
+
+  /**
+   * Runs all PRE-stage extra plugins sequentially.
+   * Returns the merged context and an abort indicator.
+   * If any PRE extra returns cycle_abort=true, emits the audit event and returns aborted:true.
+   */
+  private async _runPreExtras(
+    preExtras: HydratedPlugin[],
+    initialCtx: Record<string, unknown>,
+    cycle_id: string,
+  ): Promise<
+    | { aborted: false; ctx: Record<string, unknown> }
+    | {
+        aborted: true;
+        abortResult: Omit<AgentCycleResult, 'context_injected' | 'veto_summary'>;
+      }
+  > {
+    let ctx: Record<string, unknown> = initialCtx;
+    for (const extra of preExtras) {
+      const res = await this.sandbox.runExtraCycleHook(extra.id, ctx);
+      const extraCtx = res.ok && res.result ? (res.result as Record<string, unknown>) : {};
+      await this._persistPluginAlerts(extraCtx, cycle_id);
+      ctx = this._mergeExtraCtx(ctx, extraCtx);
+      this._logNotifyIntents(extra.id, extraCtx, ctx);
+      if (extraCtx['cycle_abort'] === true) {
+        await this.audit.log({
+          cycle_id,
+          event_type: 'cycle_aborted',
+          plugin_id: extra.id,
+          meta: { plugin_id: extra.id, reason: extraCtx['cycle_abort_reason'] ?? 'cycle_abort' },
+        });
+        return {
+          aborted: true,
+          abortResult: {
+            cycle_id,
+            llm_text: '',
+            decisions: [],
+            sandbox_results: [],
+            llm_response: {
+              text: '',
+              tool_calls: [],
+              backend: 'api',
+              skills_read: [],
+              skills_written: [],
+            },
+            aborted: true,
+          },
+        };
+      }
+    }
+    return { aborted: false, ctx };
+  }
+
+  /**
+   * Runs all POST-stage extra plugins sequentially.
+   * Enriches context with equity_curve from SnapshotService (degrades gracefully if absent).
+   * cycle_abort from POST extras is ignored (warn only).
+   * Returns the final merged context (includes _collected_notify_intents for PR B consumption).
+   */
+  private async _runPostExtras(
+    postExtras: HydratedPlugin[],
+    baseCtx: Record<string, unknown>,
+    cycle_id: string,
+  ): Promise<Record<string, unknown>> {
+    let postCtx: Record<string, unknown> = { ...baseCtx };
+    try {
+      if (this.snapshot) {
+        const equityCurveRaw = await this.snapshot.getEquityCurve(50);
+        postCtx['equity_curve'] = equityCurveRaw.map((e) => e.equity);
+      }
+    } catch (err: unknown) {
+      this.log.warn(`POST enrichment: getEquityCurve failed — ${String(err)}`);
+    }
+    for (const extra of postExtras) {
+      const res = await this.sandbox.runExtraCycleHook(extra.id, postCtx);
+      const extraCtx = res.ok && res.result ? (res.result as Record<string, unknown>) : {};
+      if (extraCtx['cycle_abort'] === true) {
+        this.log.warn(
+          `POST-stage extra '${extra.id}' returned cycle_abort=true — ignored (only PRE-stage can abort)`,
+        );
+      }
+      await this._persistPluginAlerts(extraCtx, cycle_id);
+      postCtx = this._mergeExtraCtx(postCtx, extraCtx);
+      this._logNotifyIntents(extra.id, extraCtx, postCtx);
+    }
+    return postCtx;
+  }
+
+  /**
+   * Logs received notify_intents and accumulates them into runningCtx._collected_notify_intents
+   * so PR B has a single consumption point.
+   */
+  private _logNotifyIntents(
+    pluginId: string,
+    extraCtx: Record<string, unknown>,
+    runningCtx: Record<string, unknown>,
+  ): void {
+    const intents = extraCtx['notify_intents'];
+    if (Array.isArray(intents) && intents.length > 0) {
+      this.log.debug(
+        `[extra:${pluginId}] ${String(intents.length)} notify_intent(s) received — dispatch pending PR B`,
+      );
+      const existing = runningCtx['_collected_notify_intents'];
+      const existingArr = Array.isArray(existing) ? (existing as unknown[]) : [];
+      runningCtx['_collected_notify_intents'] = [...existingArr, ...(intents as unknown[])];
+    }
   }
 
   private async _runVetoLayer(

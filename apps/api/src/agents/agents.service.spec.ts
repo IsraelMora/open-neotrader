@@ -945,6 +945,548 @@ describe('AgentsService.runGovernedTurn — pretest source (PR3)', () => {
   });
 });
 
+// ── Phase A1: Extra-plugin invocation (PRE/POST stage ordering + cycle_abort) ─
+
+type ExtraSandboxStub = jest.Mocked<
+  Pick<SandboxGateway, 'runCycle' | 'callPlugin' | 'call' | 'runExtraCycleHook' | 'getPluginStage'>
+>;
+
+/**
+ * Factory for a full agents service with a configurable sandbox.runExtraCycleHook
+ * so we can assert call order relative to runGovernedTurn.
+ */
+function makeExtraInvocationService(opts: {
+  extraPlugins: { id: string; type: string; name: string; schedulerStage: 'pre' | 'post' }[];
+  preHookResult?: Record<string, unknown>;
+  postHookResult?: Record<string, unknown>;
+  capturedOrder: string[];
+}): {
+  service: AgentsService;
+  sandbox: ExtraSandboxStub;
+  audit: ReturnType<typeof makeAudit>;
+  plugins: ReturnType<typeof makeFullPlugins>;
+} {
+  const audit = makeAudit();
+  const allPlugins = opts.extraPlugins.map((p) => ({ id: p.id, type: p.type, name: p.name }));
+  const plugins = makeFullPlugins(null, []);
+  plugins.findActive.mockResolvedValue(allPlugins as never);
+
+  const sandbox: ExtraSandboxStub = {
+    runCycle: jest.fn().mockImplementation(() => {
+      opts.capturedOrder.push('runCycle');
+      return Promise.resolve({ ok: true, result: { pending_signals: [] } });
+    }),
+    callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+    getPluginStage: jest.fn().mockImplementation((pluginId: string) => {
+      const plugin = opts.extraPlugins.find((p) => p.id === pluginId);
+      return plugin?.schedulerStage ?? 'post';
+    }),
+    runExtraCycleHook: jest.fn().mockImplementation((pluginId: string) => {
+      const plugin = opts.extraPlugins.find((p) => p.id === pluginId);
+      opts.capturedOrder.push(`extra:${pluginId}:${plugin?.schedulerStage ?? 'post'}`);
+      if (plugin?.schedulerStage === 'pre') {
+        return Promise.resolve({ ok: true, result: opts.preHookResult ?? {} });
+      }
+      return Promise.resolve({ ok: true, result: opts.postHookResult ?? {} });
+    }),
+  };
+
+  const llm: Partial<LlmService> = {
+    complete: jest.fn().mockImplementation(() => {
+      opts.capturedOrder.push('llm');
+      return Promise.resolve({
+        text: '',
+        tool_calls: [],
+        backend: 'api' as const,
+        skills_read: [],
+        skills_written: [],
+      } as LlmResponse);
+    }),
+  };
+
+  const memory = makeMemory();
+  const service = new AgentsService(
+    llm as unknown as LlmService,
+    sandbox as unknown as SandboxGateway,
+    plugins as unknown as PluginsService,
+    memory as unknown as ContextMemoryService,
+    audit as unknown as AuditService,
+    { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+  );
+
+  return { service, sandbox, audit, plugins };
+}
+
+describe('AgentsService — extra-plugin PRE/POST stage ordering (A1.1)', () => {
+  it('A1.1 — PRE extra runs before LLM turn; POST extra runs after LLM turn', async () => {
+    const capturedOrder: string[] = [];
+
+    const { service } = makeExtraInvocationService({
+      extraPlugins: [
+        { id: 'doctor', type: 'extra', name: 'Doctor', schedulerStage: 'pre' },
+        { id: 'weekly-reporter', type: 'extra', name: 'Weekly Reporter', schedulerStage: 'post' },
+      ],
+      capturedOrder,
+    });
+
+    await callExecuteCyclePrivate(service, 'stage-order-001', 'test context');
+
+    const extraDoctorIdx = capturedOrder.indexOf('extra:doctor:pre');
+    const llmIdx = capturedOrder.indexOf('llm');
+    const extraReporterIdx = capturedOrder.indexOf('extra:weekly-reporter:post');
+
+    expect(extraDoctorIdx).toBeGreaterThanOrEqual(0);
+    expect(llmIdx).toBeGreaterThanOrEqual(0);
+    expect(extraReporterIdx).toBeGreaterThanOrEqual(0);
+    // PRE must precede LLM; POST must follow LLM
+    expect(extraDoctorIdx).toBeLessThan(llmIdx);
+    expect(llmIdx).toBeLessThan(extraReporterIdx);
+  });
+});
+
+describe('AgentsService — PRE cycle_abort skips LLM + audits cycle_aborted (A1.2)', () => {
+  it('A1.2 — PRE extra returns cycle_abort=true → runGovernedTurn NOT called, audit cycle_aborted emitted', async () => {
+    const capturedOrder: string[] = [];
+
+    const { service, audit } = makeExtraInvocationService({
+      extraPlugins: [{ id: 'doctor', type: 'extra', name: 'Doctor', schedulerStage: 'pre' }],
+      preHookResult: { cycle_abort: true, cycle_abort_reason: 'Missing credentials' },
+      capturedOrder,
+    });
+
+    await callExecuteCyclePrivate(service, 'abort-pre-001', 'test context');
+
+    // LLM must NOT have been called
+    expect(capturedOrder).not.toContain('llm');
+
+    // audit cycle_aborted must have been emitted
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const abortAudit = auditCalls.find(([arg]) => arg['event_type'] === 'cycle_aborted');
+    expect(abortAudit).toBeDefined();
+    expect(abortAudit![0]).toMatchObject({
+      event_type: 'cycle_aborted',
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      meta: expect.objectContaining({ plugin_id: 'doctor' }),
+    });
+  });
+});
+
+describe('AgentsService — POST cycle_abort ignored (A1.3)', () => {
+  it('A1.3 — POST extra returns cycle_abort=true → LLM still runs, no abort audit', async () => {
+    const capturedOrder: string[] = [];
+
+    const { service, audit } = makeExtraInvocationService({
+      extraPlugins: [
+        { id: 'weekly-reporter', type: 'extra', name: 'Weekly Reporter', schedulerStage: 'post' },
+      ],
+      postHookResult: { cycle_abort: true },
+      capturedOrder,
+    });
+
+    await callExecuteCyclePrivate(service, 'post-abort-001', 'test context');
+
+    // LLM must still have run
+    expect(capturedOrder).toContain('llm');
+
+    // Must NOT have audited cycle_aborted
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const abortAudit = auditCalls.find(([arg]) => arg['event_type'] === 'cycle_aborted');
+    expect(abortAudit).toBeUndefined();
+  });
+});
+
+describe('AgentsService — _persistPluginAlerts runs on PRE abort output (A1.4)', () => {
+  it('A1.4 — PRE abort with emit_alerts → alerts persisted even on abort', async () => {
+    const capturedOrder: string[] = [];
+    const audit = makeAudit();
+    const alertsMock = { createBulk: jest.fn().mockResolvedValue([]) };
+    const plugins = makeFullPlugins(null, []);
+    plugins.findActive.mockResolvedValue([
+      { id: 'doctor', type: 'extra', name: 'Doctor' },
+    ] as never);
+
+    const sandbox: ExtraSandboxStub = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true }),
+      call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+      getPluginStage: jest.fn().mockReturnValue('pre'),
+      runExtraCycleHook: jest.fn().mockImplementation((pluginId: string) => {
+        capturedOrder.push(`extra:${pluginId}`);
+        return Promise.resolve({
+          ok: true,
+          result: {
+            cycle_abort: true,
+            cycle_abort_reason: 'creds missing',
+            emit_alerts: [
+              { type: 'SYSTEM', severity: 'HIGH', message: 'Missing creds', symbol: null },
+            ],
+          },
+        });
+      }),
+    };
+
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation(() => {
+        capturedOrder.push('llm');
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api' as const,
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+
+    const memory = makeMemory();
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      alertsMock as unknown as AlertsService,
+    );
+
+    await callExecuteCyclePrivate(service, 'alerts-abort-001', 'test');
+
+    // LLM must NOT have run
+    expect(capturedOrder).not.toContain('llm');
+    // alerts.createBulk must have been called (emit_alerts persisted on abort)
+    expect(alertsMock.createBulk).toHaveBeenCalled();
+  });
+});
+
+// ── Fix #2: _mergeExtraCtx credential + tool_call + decisions leak hardening ──
+
+/**
+ * Exercises _mergeExtraCtx directly via any-cast.
+ * We test the protected keys: pending_signals (existing), credentials, tool_calls,
+ * decisions, veto_reasons (new additions per fix #2).
+ */
+function callMergeExtraCtx(
+  service: AgentsService,
+  base: Record<string, unknown>,
+  extra: Record<string, unknown>,
+): Record<string, unknown> {
+  return (
+    service as unknown as {
+      _mergeExtraCtx: (
+        b: Record<string, unknown>,
+        e: Record<string, unknown>,
+      ) => Record<string, unknown>;
+    }
+  )._mergeExtraCtx(base, extra);
+}
+
+describe('AgentsService._mergeExtraCtx — credential + decision-key protection (Fix #2)', () => {
+  function makeMinimalService(): AgentsService {
+    return new AgentsService(
+      {} as unknown as LlmService,
+      {} as unknown as SandboxGateway,
+      {} as unknown as PluginsService,
+      {} as unknown as ContextMemoryService,
+      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+  }
+
+  it('Fix#2.1 — credentials from extra NOT merged into base context', () => {
+    const service = makeMinimalService();
+    const base = { cycle_id: 'c1', pending_signals: [{ symbol: 'AAPL', action: 'buy' }] };
+    const extra = {
+      credentials: { ALPACA_API_KEY: 'LEAKED' },
+      some_data: 'allowed',
+    };
+
+    const merged = callMergeExtraCtx(service, base, extra);
+
+    // credentials must NOT leak through
+    expect(merged['credentials']).toBeUndefined();
+    // non-protected keys ARE merged
+    expect(merged['some_data']).toBe('allowed');
+  });
+
+  it('Fix#2.2 — tool_calls from extra NOT merged into base context', () => {
+    const service = makeMinimalService();
+    const base = { cycle_id: 'c1' };
+    const extra = { tool_calls: [{ plugin_id: 'evil', function: 'do_bad', args: {} }] };
+
+    const merged = callMergeExtraCtx(service, base, extra);
+
+    expect(merged['tool_calls']).toBeUndefined();
+  });
+
+  it('Fix#2.3 — decisions from extra NOT merged into base context', () => {
+    const service = makeMinimalService();
+    const base = { cycle_id: 'c1' };
+    const extra = { decisions: [{ plugin_id: 'x', function: 'y', args: {}, allowed: true }] };
+
+    const merged = callMergeExtraCtx(service, base, extra);
+
+    expect(merged['decisions']).toBeUndefined();
+  });
+
+  it('Fix#2.4 — veto_reasons from extra NOT merged into base context', () => {
+    const service = makeMinimalService();
+    const base = { cycle_id: 'c1', veto_reasons: ['original reason'] };
+    const extra = { veto_reasons: ['injected reason'] };
+
+    const merged = callMergeExtraCtx(service, base, extra);
+
+    // Must preserve the base veto_reasons, not be overwritten by extra
+    expect(merged['veto_reasons']).toEqual(['original reason']);
+  });
+
+  it('Fix#2.5 — pending_signals still protected (existing invariant)', () => {
+    const service = makeMinimalService();
+    const approvedSignals = [{ symbol: 'AAPL', action: 'buy' }];
+    const base = { pending_signals: approvedSignals };
+    const extra = { pending_signals: [{ symbol: 'INJECTED', action: 'sell' }] };
+
+    const merged = callMergeExtraCtx(service, base, extra);
+
+    expect(merged['pending_signals']).toBe(approvedSignals);
+  });
+
+  it('Fix#2.6 — a PRE extra returning credentials + tool_calls via _runPreExtras: keys not in runningCtx', async () => {
+    // Integration: drive _runPreExtras with a PRE extra that returns protected keys;
+    // verify runningCtx does not contain them after merge.
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    plugins.findActive.mockResolvedValue([
+      { id: 'doctor', type: 'extra', name: 'Doctor' },
+    ] as never);
+
+    const sandbox: ExtraSandboxStub = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true }),
+      call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+      getPluginStage: jest.fn().mockReturnValue('pre'),
+      runExtraCycleHook: jest.fn().mockResolvedValue({
+        ok: true,
+        result: {
+          // These should be blocked by _mergeExtraCtx
+          pending_signals: [{ symbol: 'INJECTED', action: 'sell' }],
+          credentials: { ALPACA_API_KEY: 'LEAKED' },
+          tool_calls: [{ plugin_id: 'evil', function: 'bad', args: {} }],
+          decisions: [{ plugin_id: 'x', function: 'y', args: {}, allowed: true }],
+          // This is allowed
+          doctor_report: { status: 'ok' },
+        },
+      }),
+    };
+
+    const llm = makeLlm('');
+    const memory = makeMemory();
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    // Access _runPreExtras via any-cast
+    const initialCtx: Record<string, unknown> = {
+      pending_signals: [{ symbol: 'AAPL', action: 'buy' }],
+      cycle_id: 'prot-001',
+    };
+    const result = await (
+      service as unknown as {
+        _runPreExtras: (
+          extras: import('../plugins/plugins.service').HydratedPlugin[],
+          ctx: Record<string, unknown>,
+          cycleId: string,
+        ) => Promise<
+          { aborted: false; ctx: Record<string, unknown> } | { aborted: true; abortResult: unknown }
+        >;
+      }
+    )._runPreExtras(
+      [
+        { id: 'doctor', type: 'extra', name: 'Doctor' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+      initialCtx,
+      'prot-001',
+    );
+
+    expect(result.aborted).toBe(false);
+    if (!result.aborted) {
+      const ctx = result.ctx;
+      // pending_signals must be the original approved set, not injected
+      expect(ctx['pending_signals']).toEqual([{ symbol: 'AAPL', action: 'buy' }]);
+      // credentials must not leak
+      expect(ctx['credentials']).toBeUndefined();
+      // tool_calls must not leak
+      expect(ctx['tool_calls']).toBeUndefined();
+      // decisions must not leak
+      expect(ctx['decisions']).toBeUndefined();
+      // allowed data passes through
+      expect(ctx['doctor_report']).toEqual({ status: 'ok' });
+    }
+  });
+});
+
+// ── Fix #3: notify_intents accumulation into _collected_notify_intents ────────
+
+describe('AgentsService — notify_intents accumulation (Fix #3)', () => {
+  it('Fix#3.1 — two extras each emitting notify_intents: both collected in _collected_notify_intents', async () => {
+    // Two POST extras, each emitting one notify_intent.
+    // After both run, runningCtx._collected_notify_intents must have both.
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    plugins.findActive.mockResolvedValue([
+      { id: 'weekly-reporter', type: 'extra', name: 'Weekly Reporter' },
+      { id: 'telegram-notifier', type: 'extra', name: 'Telegram' },
+    ] as never);
+
+    const sandbox: ExtraSandboxStub = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true }),
+      call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+      runExtraCycleHook: jest
+        .fn()
+        .mockImplementationOnce(() =>
+          Promise.resolve({
+            ok: true,
+            result: {
+              notify_intents: [{ channel: 'telegram', message: 'Weekly report ready' }],
+            },
+          }),
+        )
+        .mockImplementationOnce(() =>
+          Promise.resolve({
+            ok: true,
+            result: {
+              notify_intents: [{ channel: 'telegram', message: 'Alert: drawdown' }],
+            },
+          }),
+        ),
+    };
+
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockResolvedValue({
+        text: '',
+        tool_calls: [],
+        backend: 'api' as const,
+        skills_read: [],
+        skills_written: [],
+      }),
+    };
+
+    const memory = makeMemory();
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    // Drive _runPostExtras directly
+    const baseCtx: Record<string, unknown> = { cycle_id: 'notify-001', pending_signals: [] };
+    const postFinalCtx = await (
+      service as unknown as {
+        _runPostExtras: (
+          postExtras: import('../plugins/plugins.service').HydratedPlugin[],
+          baseCtx: Record<string, unknown>,
+          cycleId: string,
+        ) => Promise<Record<string, unknown>>;
+      }
+    )._runPostExtras(
+      [
+        { id: 'weekly-reporter', type: 'extra', name: 'Weekly Reporter' },
+        { id: 'telegram-notifier', type: 'extra', name: 'Telegram' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+      baseCtx,
+      'notify-001',
+    );
+
+    // _collected_notify_intents must have both intents in the returned final context
+    const collected = postFinalCtx['_collected_notify_intents'] as unknown[] | undefined;
+    expect(collected).toBeDefined();
+    expect(Array.isArray(collected)).toBe(true);
+    expect(collected).toHaveLength(2);
+    expect(collected![0]).toMatchObject({ message: 'Weekly report ready' });
+    expect(collected![1]).toMatchObject({ message: 'Alert: drawdown' });
+  });
+
+  it('Fix#3.2 — PRE extra emitting notify_intents: also accumulated in ctx', async () => {
+    // PRE extra emitting notify_intent: must be accumulated in runningCtx
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    plugins.findActive.mockResolvedValue([
+      { id: 'doctor', type: 'extra', name: 'Doctor' },
+    ] as never);
+
+    const sandbox: ExtraSandboxStub = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true }),
+      call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+      getPluginStage: jest.fn().mockReturnValue('pre'),
+      runExtraCycleHook: jest.fn().mockResolvedValue({
+        ok: true,
+        result: {
+          notify_intents: [{ channel: 'log', message: 'Doctor check complete' }],
+          doctor_report: { status: 'ok' },
+        },
+      }),
+    };
+
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockResolvedValue({
+        text: '',
+        tool_calls: [],
+        backend: 'api' as const,
+        skills_read: [],
+        skills_written: [],
+      }),
+    };
+
+    const memory = makeMemory();
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    const initialCtx: Record<string, unknown> = { cycle_id: 'notify-pre-001', pending_signals: [] };
+    const result = await (
+      service as unknown as {
+        _runPreExtras: (
+          extras: import('../plugins/plugins.service').HydratedPlugin[],
+          ctx: Record<string, unknown>,
+          cycleId: string,
+        ) => Promise<
+          { aborted: false; ctx: Record<string, unknown> } | { aborted: true; abortResult: unknown }
+        >;
+      }
+    )._runPreExtras(
+      [
+        { id: 'doctor', type: 'extra', name: 'Doctor' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+      initialCtx,
+      'notify-pre-001',
+    );
+
+    expect(result.aborted).toBe(false);
+    if (!result.aborted) {
+      const ctx = result.ctx;
+      const collected = ctx['_collected_notify_intents'] as unknown[] | undefined;
+      expect(collected).toBeDefined();
+      expect(collected).toHaveLength(1);
+      expect(collected![0]).toMatchObject({ message: 'Doctor check complete' });
+    }
+  });
+});
+
 // ── Fix #4: veto ordering — LLM sees only post-veto signals ──────────────────
 
 describe('AgentsService._executeCycle — veto ordering: LLM sees only post-veto signals', () => {

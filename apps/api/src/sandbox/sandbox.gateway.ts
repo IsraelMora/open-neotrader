@@ -233,6 +233,37 @@ export class SandboxGateway {
     return this.call({ cmd: 'run_hook', plugin_id: pluginId, hook: 'on_cycle', context });
   }
 
+  /**
+   * Executes the on_cycle hook for an extra-type plugin, injecting credentials
+   * (resolved from the plugin's manifest [credentials] section) into the context
+   * before dispatch. Mirrors the credential-injection pattern used by callPlugin.
+   */
+  runExtraCycleHook(
+    pluginId: string,
+    context: Record<string, unknown> = {},
+  ): Promise<SandboxResponse> {
+    const pluginDir = path.join(this.pluginsDir, pluginId);
+    const manifest = readManifest(pluginDir);
+    const credentials = manifest ? resolveCredentials(manifest, process.env) : {};
+    const enrichedContext = { ...context, credentials };
+    return this.call({
+      cmd: 'run_hook',
+      plugin_id: pluginId,
+      hook: 'on_cycle',
+      context: enrichedContext,
+    });
+  }
+
+  /**
+   * Returns the manifest-declared [scheduler].stage for an extra plugin.
+   * Defaults to 'post' when absent (spec: no declaration → POST stage).
+   */
+  getPluginStage(pluginId: string): 'pre' | 'post' {
+    const pluginDir = path.join(this.pluginsDir, pluginId);
+    const manifest = readManifest(pluginDir);
+    return manifest?.scheduler?.stage ?? 'post';
+  }
+
   /** Diagnóstico: lista plugins que runner.py reconoce */
   listPlugins(activeIds: string[]): Promise<SandboxResponse> {
     return this.call({ cmd: 'list_plugins', active_ids: activeIds });

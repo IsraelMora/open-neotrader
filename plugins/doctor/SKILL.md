@@ -12,7 +12,7 @@ Plugin de tipo `extra` que actúa como **watchdog al inicio de cada ciclo**. Ver
 
 ## Integración
 
-El hook `hooks/cycle.py` se ejecuta **al inicio de cada ciclo** y escribe `doctor_report` en el contexto. El LLM puede leer este reporte para tomar decisiones informadas (ej: no enviar señales de compra si las credenciales del broker faltan).
+El hook `hooks/on_cycle.py` se ejecuta **al inicio de cada ciclo** y escribe `doctor_report` en el contexto. El LLM puede leer este reporte para tomar decisiones informadas (ej: no enviar señales de compra si las credenciales del broker faltan).
 
 Si `fail_on_missing_credentials = true` y las credenciales faltan, escribe `cycle_abort = true` en el contexto para señalizar que el ciclo debe cancelarse.
 
