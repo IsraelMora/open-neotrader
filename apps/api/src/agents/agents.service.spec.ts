@@ -79,6 +79,15 @@ function makeSandbox(): jest.Mocked<Pick<SandboxGateway, 'runCycle' | 'callPlugi
   };
 }
 
+/** Full sandbox stub including `call` (needed for veto layer tests). */
+function makeFullSandbox(): jest.Mocked<Pick<SandboxGateway, 'runCycle' | 'callPlugin' | 'call'>> {
+  return {
+    runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+    callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+  };
+}
+
 function makeMemory(): jest.Mocked<
   Pick<ContextMemoryService, 'toContextString' | 'appendObservation' | 'trackSignal'>
 > {
@@ -462,5 +471,327 @@ describe('AgentsService._executeCycle — decision prompt injection (Phase 6.3)'
     await callExecuteCycle(service, CYCLE_ID, 'ctx');
 
     expect(logWarnSpy).toHaveBeenCalledWith(expect.stringContaining('token-budget'));
+  });
+});
+
+// ── AgentsService.runGovernedTurn ─────────────────────────────────────────────
+
+describe('AgentsService.runGovernedTurn — no-decision-plugin (source: chat)', () => {
+  it('returns text, empty tool_calls, backend; emits chat_turn audit; does not dispatch', async () => {
+    const llm = makeLlm('Hello from the model');
+    const audit = makeAudit();
+    // No decision plugin active, no tools.
+    const plugins = makeFullPlugins(null, []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const result = await service.runGovernedTurn({
+      source: 'chat',
+      context: 'What is the market doing?',
+    });
+
+    expect(result.text).toBe('Hello from the model');
+    expect(result.tool_calls).toEqual([]);
+    expect(result.backend).toBeDefined();
+
+    // audit.log must have been called with chat_turn.
+    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const chatTurnCall = calls.find(([arg]) => arg['event_type'] === 'chat_turn');
+    expect(chatTurnCall).toBeDefined();
+
+    // sandbox.callPlugin must NOT have been called.
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentsService.runGovernedTurn — valid tool call dispatched (source: chat)', () => {
+  it('dispatches a valid tool call and includes it in result; audits chat_turn', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","qty":1}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const tools = [
+      {
+        plugin_id: 'alpaca-provider',
+        name: 'alpaca-provider__place_order',
+        description: 'Place an order',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ];
+    const plugins = makeFullPlugins('Emit tool calls as JSON.', tools);
+    // Plugin must appear active.
+    plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const result = await service.runGovernedTurn({
+      source: 'chat',
+      context: 'Buy AAPL',
+    });
+
+    // The validated call must have been dispatched.
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+
+    // Result must include the dispatched tool_call.
+    expect(result.tool_calls).toHaveLength(1);
+    expect(result.tool_calls[0].plugin_id).toBe('alpaca-provider');
+
+    // chat_turn audit must be present.
+    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const chatTurnCall = calls.find(([arg]) => arg['event_type'] === 'chat_turn');
+    expect(chatTurnCall).toBeDefined();
+  });
+});
+
+describe('AgentsService.runGovernedTurn — hallucinated/inactive tool dropped (source: chat)', () => {
+  it('drops call to inactive plugin; audits tool_call_dropped; does not dispatch', async () => {
+    const toolCallText = '<tool_calls>[{"tool":"ghost-plugin__ghost_fn","args":{}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    // ghost-plugin is NOT active and has no declared tools.
+    const plugins = makeFullPlugins('Emit tool calls as JSON.', [
+      {
+        plugin_id: 'alpaca-provider',
+        name: 'alpaca-provider__place_order',
+        description: 'Place an order',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ]);
+    // No active plugins — ghost-plugin won't pass validation.
+    plugins.findActive.mockResolvedValue([]);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const result = await service.runGovernedTurn({
+      source: 'chat',
+      context: 'Do something invalid',
+    });
+
+    // The dropped call must NOT have been dispatched.
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+
+    // Result tool_calls must be empty (dropped before dispatch).
+    expect(result.tool_calls).toEqual([]);
+
+    // tool_call_dropped audit must be present.
+    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const droppedCall = calls.find(([arg]) => arg['event_type'] === 'tool_call_dropped');
+    expect(droppedCall).toBeDefined();
+    expect(droppedCall![0]).toMatchObject({
+      event_type: 'tool_call_dropped',
+      plugin_id: 'ghost-plugin',
+    });
+  });
+});
+
+// ── Fix #1: cycle_complete emitted exactly once per runCycle ──────────────────
+
+describe('AgentsService.runCycle — cycle_complete emitted exactly once', () => {
+  it('audits cycle_complete exactly once per runCycle call (no duplicate from _executeCycle)', async () => {
+    const llm = makeLlm('ok');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    const sandbox = makeFullSandbox();
+    const memory = makeMemory();
+
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    await service.runCycle('some context');
+
+    const allCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const cycleCompleteEmissions = allCalls.filter(
+      ([arg]) => arg['event_type'] === 'cycle_complete',
+    );
+
+    // CRITICAL: must be exactly 1, not 2.
+    expect(cycleCompleteEmissions).toHaveLength(1);
+    // The single emission must come from runCycle (has signals_count + llm_text, no meta.stage).
+    expect(cycleCompleteEmissions[0][0]).toMatchObject({
+      event_type: 'cycle_complete',
+    });
+    expect(
+      (cycleCompleteEmissions[0][0]['meta'] as Record<string, unknown> | undefined)?.['stage'],
+    ).toBeUndefined();
+  });
+});
+
+// ── Fix #2: runGovernedTurn exposes authoritative signalsEmitted ──────────────
+
+describe('AgentsService.runGovernedTurn — signalsEmitted in result', () => {
+  it('returns signalsEmitted matching the tool calls executed (symbol+action pairs)', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","qty":1,"action":"buy"}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const tools = [
+      {
+        plugin_id: 'alpaca-provider',
+        name: 'alpaca-provider__place_order',
+        description: 'Place an order',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ];
+    const plugins = makeFullPlugins('Emit tool calls.', tools);
+    plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const result = await service.runGovernedTurn({ source: 'chat', context: 'Buy AAPL' });
+
+    // signalsEmitted must be present and contain the AAPL buy signal.
+    expect(result.signalsEmitted).toBeDefined();
+    expect(result.signalsEmitted).toHaveLength(1);
+    expect(result.signalsEmitted[0]).toEqual({ symbol: 'AAPL', action: 'buy' });
+  });
+
+  it('returns empty signalsEmitted when no tool calls have symbol+action', async () => {
+    const llm = makeLlm('plain text response, no tools');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const result = await service.runGovernedTurn({
+      source: 'chat',
+      context: 'What is the market?',
+    });
+
+    expect(result.signalsEmitted).toBeDefined();
+    expect(result.signalsEmitted).toHaveLength(0);
+  });
+});
+
+// ── Shared helper for _executeCycle tests below ───────────────────────────────
+
+function callExecuteCyclePrivate(
+  service: AgentsService,
+  cycleId: string,
+  context: string,
+): ReturnType<AgentsService['runCycle']> {
+  return (
+    service as unknown as {
+      _executeCycle: (c: string, ctx: string, sp?: string) => ReturnType<AgentsService['runCycle']>;
+    }
+  )._executeCycle(cycleId, context, undefined);
+}
+
+// ── Fix #3: findActive called only once per cycle ─────────────────────────────
+
+describe('AgentsService._executeCycle — findActive called exactly once per cycle', () => {
+  it('calls plugins.findActive exactly once regardless of whether there are tool calls', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"TSLA","action":"sell"}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const tools = [
+      {
+        plugin_id: 'alpaca-provider',
+        name: 'alpaca-provider__place_order',
+        description: 'Place an order',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ];
+    const plugins = makeFullPlugins('Emit tool calls.', tools);
+    plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
+    const sandbox = makeFullSandbox();
+    const memory = makeMemory();
+
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    await callExecuteCyclePrivate(service, 'cycle-once-001', 'ctx');
+
+    // findActive must be called exactly once — pre-fetched list reused by _validateToolCalls.
+    expect(plugins.findActive).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Fix #4: veto ordering — LLM sees only post-veto signals ──────────────────
+
+describe('AgentsService._executeCycle — veto ordering: LLM sees only post-veto signals', () => {
+  it('passes only post-veto approved signals to LLM (vetoed signals are not in LLM context)', async () => {
+    // Arrange: two pending signals; discipline plugin removes one.
+    const pendingSignals = [
+      { symbol: 'AAPL', action: 'buy' }, // will be approved
+      { symbol: 'TSLA', action: 'sell' }, // will be vetoed
+    ];
+    const approvedSignals = [{ symbol: 'AAPL', action: 'buy' }];
+
+    const capturedContexts: string[] = [];
+    const llm: Partial<LlmService> = {
+      complete: jest
+        .fn()
+        .mockImplementation((opts: { context: string; system_prompt?: string }) => {
+          capturedContexts.push(opts.context);
+          return Promise.resolve({
+            text: '',
+            tool_calls: [],
+            backend: 'api' as const,
+            skills_read: [],
+            skills_written: [],
+          });
+        }),
+    };
+
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    // Sandbox: runCycle returns the two pending signals; discipline `call` removes TSLA.
+    const sandbox = makeFullSandbox();
+    sandbox.runCycle.mockResolvedValue({
+      ok: true,
+      result: { pending_signals: pendingSignals },
+    });
+    // discipline plugin removes TSLA, leaving only AAPL.
+    sandbox.call.mockResolvedValue({
+      ok: true,
+      result: { pending_signals: approvedSignals, veto_reasons: ['TSLA blocked by risk'] },
+    });
+
+    // Make one discipline plugin active.
+    plugins.findActive.mockResolvedValue([
+      { id: 'risk-discipline', type: 'discipline', name: 'Risk Discipline' },
+    ] as never);
+
+    const memory = makeMemory();
+
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    await callExecuteCyclePrivate(service, 'veto-order-001', 'market check');
+
+    // The LLM must have been called exactly once.
+    expect(capturedContexts).toHaveLength(1);
+    const llmContext = capturedContexts[0];
+
+    // Post-veto signal (AAPL) must be visible to LLM.
+    expect(llmContext).toContain('AAPL');
+
+    // Vetoed signal (TSLA) must NOT appear in the approved-signals block sent to LLM.
+    // The LLM context is built from approvedSignals after veto; TSLA must not be there.
+    expect(llmContext).not.toContain('TSLA');
   });
 });

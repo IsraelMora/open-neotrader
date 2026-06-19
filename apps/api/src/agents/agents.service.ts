@@ -10,6 +10,42 @@ import { AlertsService, CreateAlertDto } from '../alerts/alerts.service';
 import type { LlmResponse } from '../llm/llm.service';
 import { parseToolCalls } from '../llm/kernel-parser';
 
+/**
+ * Input for a single governed LLM turn. Used by runGovernedTurn for both
+ * interactive chat (source='chat') and scheduled cycle delegation (source='cycle').
+ */
+export interface GovernedTurnInput {
+  /** Discriminator: 'chat' emits a chat_turn audit event; 'cycle' skips it (cycle owns its own audit). */
+  source: 'chat' | 'cycle';
+  /** User/cycle prompt (already enriched by the caller if needed). */
+  context: string;
+  /** Optional caller base system prompt; decision prompt + tool schema will be prepended by the kernel. */
+  system_prompt?: string;
+  /** Reuse the caller's cycle_id; if absent, a new UUID is generated. */
+  cycle_id?: string;
+  /**
+   * Pre-fetched active plugins from _executeCycle. When provided, _validateToolCalls
+   * skips its own findActive() call (single DB round-trip per cycle).
+   * Only used when source === 'cycle'.
+   */
+  _activePlugins?: import('../plugins/plugins.service').HydratedPlugin[];
+}
+
+/** Result of a single governed LLM turn (validate + dispatch + audit). */
+export interface GovernedTurnResult {
+  cycle_id: string;
+  text: string;
+  tool_calls: import('../llm/llm.service').ToolCallRequest[];
+  decisions: Decision[];
+  sandbox_results: SandboxResult[];
+  backend: 'api' | 'subscription';
+  skills_read: string[];
+  skills_written: string[];
+  llm_response: LlmResponse;
+  /** Authoritative signals emitted by _executeToolCalls (symbol+action pairs). */
+  signalsEmitted: { symbol: string; action: string }[];
+}
+
 /** Resultado completo de un ciclo del agente, incluyendo decisiones, ejecuciones en sandbox y resumen de vetos. */
 export interface AgentCycleResult {
   cycle_id: string;
@@ -88,6 +124,101 @@ export class AgentsService {
     }
   }
 
+  /**
+   * Executes a single governed LLM turn: build system prompt (decision prompt + tool schema
+   * from a single hoisted getProviderTools call) → llm.complete → parseToolCalls (with
+   * parse_miss audit) → _validateToolCalls → _executeToolCalls → audit the turn.
+   *
+   * When source === 'chat', emits a 'chat_turn' audit entry so interactive turns are
+   * distinguishable from scheduled cycles. When source === 'cycle', skips the chat_turn
+   * audit (the caller owns cycle_start/cycle_complete).
+   */
+  async runGovernedTurn(input: GovernedTurnInput): Promise<GovernedTurnResult> {
+    const cycle_id = input.cycle_id ?? randomUUID();
+
+    // ── Hoist getProviderTools ONCE — shared between schema injection and validation ──
+    const providerTools = await this.plugins.getProviderTools();
+    const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
+
+    let builtSystemPrompt = input.system_prompt ?? '';
+    if (decisionPrompt !== null) {
+      const toolSchemaJson = JSON.stringify(providerTools);
+      if (toolSchemaJson.length > 8000) {
+        this.log.warn(
+          `token-budget guard: injected tool schema is ${toolSchemaJson.length} chars — consider reducing active tools`,
+        );
+      }
+      const parts: string[] = [`[DECISION]\n${decisionPrompt}`, `[TOOL SCHEMA]\n${toolSchemaJson}`];
+      if (builtSystemPrompt) parts.push(builtSystemPrompt);
+      builtSystemPrompt = parts.join('\n\n');
+    }
+
+    // ── LLM call ─────────────────────────────────────────────────────────────
+    const llmResponse = await this.llm.complete({
+      context: input.context,
+      system_prompt: builtSystemPrompt || undefined,
+    });
+
+    // ── Parse tool_calls with parse_miss audit ────────────────────────────────
+    const auditFn = (raw: string): void => {
+      void this.audit.log({
+        cycle_id,
+        event_type: 'parse_miss',
+        meta: { raw_block: raw.slice(0, 500) },
+      });
+    };
+    llmResponse.tool_calls = parseToolCalls(llmResponse.text, auditFn);
+
+    const skills_read = llmResponse.skills_read ?? [];
+    const skills_written = llmResponse.skills_written ?? [];
+
+    // ── Validate and dispatch ─────────────────────────────────────────────────
+    const validatedCalls = await this._validateToolCalls(
+      cycle_id,
+      llmResponse.tool_calls,
+      providerTools,
+      input._activePlugins,
+    );
+    const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
+      cycle_id,
+      validatedCalls,
+    );
+
+    // ── Audit the turn ────────────────────────────────────────────────────────
+    if (input.source === 'chat') {
+      await this.audit.log({
+        cycle_id,
+        event_type: 'chat_turn',
+        llm_text: llmResponse.text?.slice(0, 2000),
+        skills_read,
+        skills_written,
+        signals_count: validatedCalls.length,
+        meta: {
+          tools_called: validatedCalls.map((t) => `${t.plugin_id}.${t.function}`),
+        },
+      });
+    } else if (input.source === 'cycle') {
+      // Cycle owns its own audit — nothing to emit here.
+    } else {
+      this.log.warn(
+        `runGovernedTurn: unknown source discriminator '${String(input.source)}' — skipping audit`,
+      );
+    }
+
+    return {
+      cycle_id,
+      text: llmResponse.text,
+      tool_calls: validatedCalls,
+      decisions,
+      sandbox_results,
+      backend: llmResponse.backend ?? 'api',
+      skills_read,
+      skills_written,
+      llm_response: llmResponse,
+      signalsEmitted,
+    };
+  }
+
   private async _executeCycle(
     cycle_id: string,
     context: string,
@@ -130,25 +261,9 @@ export class AgentsService {
       pendingSignals,
     );
 
-    // ── 4. Decision prompt + tool schema injection (read-not-interpret) ──────
-    // Hoist getProviderTools() ONCE — shared between schema injection and validation.
-    const providerTools = await this.plugins.getProviderTools();
-    const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
-
-    let builtSystemPrompt = systemPrompt ?? '';
-    if (decisionPrompt !== null) {
-      const toolSchemaJson = JSON.stringify(providerTools);
-      if (toolSchemaJson.length > 8000) {
-        this.log.warn(
-          `token-budget guard: injected tool schema is ${toolSchemaJson.length} chars — consider reducing active tools`,
-        );
-      }
-      const parts: string[] = [`[DECISION]\n${decisionPrompt}`, `[TOOL SCHEMA]\n${toolSchemaJson}`];
-      if (builtSystemPrompt) parts.push(builtSystemPrompt);
-      builtSystemPrompt = parts.join('\n\n');
-    }
-
-    // ── 5. LLM: proponer acciones con señales aprobadas en contexto ───────────
+    // ── 4+5+6. Governed LLM turn (decision prompt + schema injection, llm.complete,
+    //            parseToolCalls, _validateToolCalls, _executeToolCalls) ─────────
+    // Build signal summary from approved signals after veto, prepend to context.
     const approvedSignals: unknown[] = Array.isArray(vetoCtx['pending_signals'])
       ? (vetoCtx['pending_signals'] as unknown[])
       : [];
@@ -158,48 +273,24 @@ export class AgentsService {
         ? `\n\n[SEÑALES APROBADAS POR LAS DISCIPLINAS]\n${JSON.stringify(approvedSignals, null, 2)}\n`
         : '\n\n[NO HAY SEÑALES APROBADAS EN ESTE CICLO]\n';
 
-    const llmResponse = await this.llm.complete({
+    const turnResult = await this.runGovernedTurn({
+      source: 'cycle',
       context: enrichedContext + signalSummary,
-      system_prompt: builtSystemPrompt || undefined,
+      system_prompt: systemPrompt,
+      cycle_id,
+      _activePlugins: activePlugins,
     });
 
-    // Parse tool_calls from LLM text here (governed cycle), so WS/panel paths stay inert.
-    const auditFn = (raw: string): void => {
-      void this.audit.log({
-        cycle_id,
-        event_type: 'parse_miss',
-        meta: { raw_block: raw.slice(0, 500) },
-      });
-    };
-    llmResponse.tool_calls = parseToolCalls(llmResponse.text, auditFn);
-
-    const skills_read = llmResponse.skills_read ?? [];
-
-    await this.audit.log({
-      cycle_id,
-      event_type: 'cycle_complete',
-      llm_text: llmResponse.text?.slice(0, 2000),
+    const {
+      decisions,
+      sandbox_results,
+      llm_response: llmResponse,
       skills_read,
-      signals_count: llmResponse.tool_calls.length,
-      meta: {
-        stage: 'llm_response',
-        tools_called: llmResponse.tool_calls.map((t) => `${t.plugin_id}.${t.function}`),
-      },
-    });
+      signalsEmitted,
+    } = turnResult;
 
-    // ── 6. Validar tool calls contra manifests activos, luego ejecutar ───────
-    // Pass hoisted providerTools to avoid a second getProviderTools() call.
-    const validatedCalls = await this._validateToolCalls(
-      cycle_id,
-      llmResponse.tool_calls,
-      providerTools,
-    );
-    const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
-      cycle_id,
-      validatedCalls,
-    );
+    // ── Persistir en memoria inter-ciclos ─────────────────────────────────────
 
-    // ── 6. Persistir en memoria inter-ciclos ──────────────────────────────────
     await this.memory.appendObservation({
       cycle_id,
       text: llmResponse.text?.slice(0, 500) ?? '',
@@ -286,17 +377,20 @@ export class AgentsService {
    * Drops calls whose plugin is not active or whose function is not declared in tools.json.
    * Each dropped call is audited with event_type 'tool_call_dropped' and a specific reason.
    * Returns only valid calls. Never throws.
+   *
+   * @param preloadedActivePlugins - When provided (cycle path), skips the findActive() DB call.
    */
   private async _validateToolCalls(
     cycle_id: string,
     calls: import('../llm/llm.service').ToolCallRequest[],
     hoistedTools?: import('../plugins/plugins.service').ProviderTool[],
+    preloadedActivePlugins?: import('../plugins/plugins.service').HydratedPlugin[],
   ): Promise<import('../llm/llm.service').ToolCallRequest[]> {
     if (calls.length === 0) return [];
 
     try {
-      // Build lookup structures once.
-      const activePlugins = await this.plugins.findActive();
+      // Use pre-fetched plugins when available (cycle path) to avoid a second DB round-trip.
+      const activePlugins = preloadedActivePlugins ?? (await this.plugins.findActive());
       const activeIds = new Set(activePlugins.map((p: HydratedPlugin) => p.id));
       // Use hoisted tools when provided (from _executeCycle) to avoid a second DB round-trip.
       const providerTools = hoistedTools ?? (await this.plugins.getProviderTools());
