@@ -267,6 +267,11 @@ export type HydratedPlugin = Omit<Plugin, 'skills' | 'stack_plugins' | 'symbols'
   stack_plugins: string[] | null;
   symbols: string[] | null;
   config: Record<string, unknown> | null;
+  // F3-s4: trust_score and badge are computed fields; trust_score overwrites the Prisma column
+  // to reflect the lazily-computed value. badge is always derived (never persisted separately).
+  // badge is optional because it is only present in findAll() and getTrustReport() outputs.
+  trust_score: number | null;
+  badge?: boolean;
 };
 
 function hydrate(p: Plugin): HydratedPlugin {
@@ -360,7 +365,25 @@ export class PluginsService implements OnApplicationBootstrap {
   // ── Queries ───────────────────────────────────────────────────────────────
 
   async findAll(): Promise<HydratedPlugin[]> {
-    return (await this.db.plugin.findMany({ orderBy: { name: 'asc' } })).map(hydrate);
+    const rows = await this.db.plugin.findMany({ orderBy: { name: 'asc' } });
+
+    // F3-s4: ONE _readTrustConfig() call for the whole list (never per-plugin)
+    const { weights, threshold } = await this._readTrustConfig();
+
+    return rows.map((p) => {
+      const hydrated = hydrate(p);
+      const { trust_score, badge } = computeTrustScore(
+        {
+          scan_result: p.scan_result,
+          smoke_test_result: p.smoke_test_result,
+          reputation_score: p.reputation_score,
+          votes_net: p.votes_net,
+        },
+        weights,
+        threshold,
+      );
+      return { ...hydrated, trust_score, badge };
+    });
   }
 
   async findById(id: string): Promise<HydratedPlugin> {
@@ -721,21 +744,54 @@ export class PluginsService implements OnApplicationBootstrap {
    * Returns the current trust report for a plugin.
    * F3-s1: scan_result (static AST analysis); F3-s2: smoke_test_result (pre-activation dry-run).
    * F3-s3: reputation_score (composite from gate-ready pretest portfolios; null = unrated).
+   * F3-s4: trust_score, badge, content_checksum, breakdown (lazy-computed from persisted signals).
    * null means the corresponding analysis has not been run yet.
+   * Opportunistically persists the computed trust_score if it differs from the stored value.
+   * The read result is ALWAYS returned regardless of whether the persist succeeds.
    */
   async getTrustReport(id: string): Promise<{
     scan_result: Record<string, unknown> | null;
     smoke_test_result: Record<string, unknown> | null;
     reputation_score: number | null;
+    trust_score: number | null;
+    badge: boolean;
+    content_checksum: string | null;
+    breakdown: TrustScoreResult['breakdown'];
   }> {
     const plugin = await this.findById(id);
     const scanRaw = plugin.scan_result ?? null;
     // smoke_test_result is a new F3-s2 column on the Plugin model (String?, nullable JSON)
     const smokeRaw = plugin.smoke_test_result ?? null;
+
+    // F3-s4: Compute trust_score lazily from persisted signals
+    const { weights, threshold } = await this._readTrustConfig();
+    const trustInput: TrustScoreInput = {
+      scan_result: scanRaw,
+      smoke_test_result: smokeRaw,
+      reputation_score: plugin.reputation_score ?? null,
+      votes_net: plugin.votes_net,
+    };
+    const { trust_score, badge, breakdown } = computeTrustScore(trustInput, weights, threshold);
+
+    // F3-s4: Opportunistically persist if stored trust_score differs from computed (fire-and-forget)
+    if (plugin.trust_score !== trust_score) {
+      void Promise.resolve(this.db.plugin.update({ where: { id }, data: { trust_score } })).catch(
+        (e: unknown) => {
+          this.log.warn(
+            `trust_score opportunistic persist failed for ${id}: ${(e as Error).message}`,
+          );
+        },
+      );
+    }
+
     return {
       scan_result: scanRaw ? (JSON.parse(scanRaw) as Record<string, unknown>) : null,
       smoke_test_result: smokeRaw ? (JSON.parse(smokeRaw) as Record<string, unknown>) : null,
       reputation_score: plugin.reputation_score ?? null,
+      trust_score,
+      badge,
+      content_checksum: plugin.content_checksum ?? null,
+      breakdown,
     };
   }
 
@@ -850,6 +906,17 @@ export class PluginsService implements OnApplicationBootstrap {
     // F3-s1: Static AST scan on install — WARN-only, NEVER blocks install
     await this._scanOnInstall(id);
 
+    // F3-s4: Compute + persist content checksum — NEVER blocks install
+    try {
+      const checksum = this.computeContentChecksum(installedPath);
+      await this.db.plugin.update({
+        where: { id },
+        data: { content_checksum: checksum },
+      });
+    } catch (e) {
+      this.log.warn(`content_checksum compute failed for ${id}: ${(e as Error).message}`);
+    }
+
     this.events.emit('plugin.installed', { plugin_id: id, version: plugin.version });
     return hydrate(plugin);
   }
@@ -879,6 +946,27 @@ export class PluginsService implements OnApplicationBootstrap {
         data: { name: manifest.plugin.name, version: manifest.plugin.version },
       });
     }
+
+    // F3-s4: Recompute content checksum + emit audit on change — NEVER blocks update
+    try {
+      const prevChecksum = p.content_checksum ?? null;
+      const nextChecksum = this.computeContentChecksum(p.installed_path);
+      if (prevChecksum && nextChecksum && prevChecksum !== nextChecksum) {
+        await this.audit?.log({
+          event_type: 'plugin_content_changed',
+          plugin_id: id,
+          meta: { old: prevChecksum, new: nextChecksum },
+        });
+        this.log.warn(`Plugin '${id}' content changed: checksum ${prevChecksum} → ${nextChecksum}`);
+      }
+      await this.db.plugin.update({
+        where: { id },
+        data: { content_checksum: nextChecksum },
+      });
+    } catch (e) {
+      this.log.warn(`content_checksum recompute failed for ${id}: ${(e as Error).message}`);
+    }
+
     return { ok: !stderr.includes('error'), output: stdout || stderr };
   }
 
