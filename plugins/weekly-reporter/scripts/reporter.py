@@ -1,7 +1,7 @@
 """
 Weekly/Monthly Reporter
 ========================
-Genera resúmenes de rendimiento y los envía vía Telegram.
+Genera resúmenes de rendimiento.
 
 Métricas calculadas:
   - P&L total y por símbolo
@@ -14,15 +14,16 @@ Basado en las mismas fórmulas que el backtester:
   - Sharpe = (E[r] - rf) / σ(r) × √252 (rf=0 para simplificar)
   - MaxDD = max(peak - trough) / peak
   - Profit Factor = Σ(ganancias) / Σ(pérdidas)
+
+Network delivery is handled by the kernel's NotifierBridge via notify_intents
+emitted by hooks/on_cycle.py — this module is network-free.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import os
 import sys
-import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
@@ -189,30 +190,14 @@ def format_telegram_message(report: dict) -> str:
     return "\n".join(lines)
 
 
-# ── Envío Telegram ────────────────────────────────────────────────────────────
-
-
-def send_telegram(token: str, chat_id: str, text: str) -> bool:
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "HTML"}).encode()
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
-
-
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 
-def generate_and_send(args: dict[str, Any], _context: Any = None) -> dict:
-    """Generate and optionally send a report via Telegram.
+def generate_report_with_message(args: dict[str, Any]) -> dict:
+    """Generate a report and attach the formatted Telegram message.
 
-    When called by the sandbox runner, ``_context`` carries the per-call
-    credentials injected by the kernel (F1). In bare-metal dev (no runner),
-    the function falls back to os.environ so existing dev workflows are
-    unaffected.
+    Network delivery is the responsibility of the kernel's NotifierBridge,
+    triggered via notify_intents emitted by hooks/on_cycle.py.
     """
     trades = args.get("trades", [])
     equity_curve = args.get("equity_curve", [1.0])
@@ -220,38 +205,20 @@ def generate_and_send(args: dict[str, Any], _context: Any = None) -> dict:
     config = args.get("config", {})
 
     report = generate_report(trades, equity_curve, period, config)
-
-    message = format_telegram_message(report)
-    report["telegram_message"] = message
-
-    # Credentials are injected by the kernel via context['credentials'] (F1).
-    # When _context is provided (sandbox runner path), read from it.
-    # Fallback to os.environ for bare-metal dev (SANDBOX_STRICT=false).
-    ctx_credentials: dict = {}
-    if _context is not None and hasattr(_context, "metadata"):
-        ctx_credentials = _context.metadata.get("credentials", {})
-    token = ctx_credentials.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = ctx_credentials.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID", "")
-
-    if token and chat_id:
-        sent = send_telegram(token, chat_id, message)
-        report["telegram_sent"] = sent
-    else:
-        report["telegram_sent"] = False
-        report["telegram_note"] = (
-            "Credenciales TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID no configuradas"
-        )
-
+    report["telegram_message"] = format_telegram_message(report)
     return report
 
 
 if __name__ == "__main__":
     data = json.loads(sys.stdin.read())
-    fn = data.get("function", "generate_and_send")
+    fn = data.get("function", "generate_report_with_message")
     args = data.get("args", {})
 
-    if fn == "generate_and_send":
-        out = generate_and_send(args)
+    if fn in ("generate_report_with_message", "generate_and_send"):
+        # "generate_and_send" kept as alias for backward compatibility with
+        # any existing runner call-sites; network delivery is now a no-op
+        # (handled externally via notify_intents).
+        out = generate_report_with_message(args)
     elif fn == "generate_report":
         out = generate_report(
             args.get("trades", []),
@@ -260,6 +227,6 @@ if __name__ == "__main__":
             args.get("config", {}),
         )
     else:
-        out = {"error": f"Función desconocida: {fn}"}
+        out = {"error": f"Unknown function: {fn}"}
 
     print(json.dumps(out))

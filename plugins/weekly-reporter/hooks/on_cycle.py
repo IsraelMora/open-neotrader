@@ -1,24 +1,20 @@
 """
 Hook on_cycle del Weekly Reporter.
-Verifica si es día de reporte (semanal o mensual) y genera el resumen.
+Verifica si es dia de reporte (semanal o mensual) y genera el resumen.
+Emite notify_intents para que el kernel's NotifierBridge despache el mensaje
+a Telegram — este hook no realiza llamadas de red directamente.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
+import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-from reporter import generate_and_send  # type: ignore[import]
+from reporter import generate_report, format_telegram_message  # type: ignore[import]
 
-
-class _HookContext:
-    """Minimal context object compatible with _SdkContext expected by inner scripts."""
-
-    def __init__(self, metadata: dict) -> None:
-        self.metadata = metadata
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
@@ -37,33 +33,41 @@ def _is_monthly_report_day(config: dict) -> bool:
 
 def on_cycle(ctx: dict) -> dict:
     config = ctx.get("plugin_config", {})
+
+    equity_curve = ctx.get("equity_curve")
+    closed_trades = ctx.get("closed_trades")
+
+    # Graceful degradation: missing context data → return without intent
+    if equity_curve is None or closed_trades is None:
+        return {"ok": False, "reason": "missing context: equity_curve or closed_trades not available"}
+
     should_run = _is_weekly_report_day(config) or _is_monthly_report_day(config)
 
     if not should_run:
-        return ctx
+        # Not a report day — still return without intent but without error
+        return {}
 
     period = "monthly" if _is_monthly_report_day(config) else "weekly"
 
-    trades = ctx.get("closed_trades", [])
-    equity_curve = ctx.get("equity_curve", [1.0])
+    report = generate_report(closed_trades, equity_curve, period, config)
+    message = format_telegram_message(report)
 
-    result = generate_and_send(
-        {
-            "trades": trades,
-            "equity_curve": equity_curve,
-            "period": period,
-            "config": config,
-        },
-        _context=_HookContext(metadata=ctx),
-    )
+    result: dict = {
+        "weekly_report": report,
+        "log": [
+            f"[weekly-reporter] Reporte {period} generado — emitiendo notify_intent para Telegram"
+        ],
+    }
 
-    ctx["weekly_report"] = result
-    ctx.setdefault("log", []).append(
-        f"[weekly-reporter] Reporte {period} generado: "
-        + ("enviado vía Telegram" if result.get("telegram_sent") else "sin Telegram configurado")
-    )
+    if report.get("ok") and message:
+        intents = ctx.get("notify_intents", [])
+        intents.append({"channel": "telegram", "text": message})
+        result["notify_intents"] = intents
+    else:
+        result["ok"] = False
+        result["reason"] = report.get("reason", "report generation failed")
 
-    return ctx
+    return result
 
 
 if __name__ == "__main__":
