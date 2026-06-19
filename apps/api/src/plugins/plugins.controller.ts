@@ -9,11 +9,13 @@ import {
   HttpCode,
   HttpStatus,
   HttpException,
+  UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags, ApiOperation } from '@nestjs/swagger';
 import { PluginsService } from './plugins.service';
 import type { HydratedPlugin, PluginVerification, WriteSkillResult } from './plugins.service';
 import { InstallPluginDto } from './dto/install-plugin.dto';
+import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 
 /** Endpoints CRUD de plugins: instalación, activación, config, tools, skills y verificación. */
 @ApiTags('plugins')
@@ -146,6 +148,7 @@ export class PluginsController {
     return this.svc.getManifest(p.installed_path);
   }
 
+  @UseGuards(TotpRequiredGuard)
   @Post(':id/skill')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
@@ -163,6 +166,7 @@ export class PluginsController {
     return result;
   }
 
+  @UseGuards(TotpRequiredGuard)
   @Post(':id/revert-skill')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Revert SKILL.md to most recent KV snapshot' })
