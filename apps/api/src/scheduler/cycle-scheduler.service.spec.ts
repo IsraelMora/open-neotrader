@@ -26,15 +26,15 @@ function makePanel(opts: {
     runCycle: jest.fn().mockReturnValue({ accepted: true, message: 'ok' }),
     reflectNow: opts.reflectNowThrows
       ? jest.fn().mockRejectedValue(new Error('reflection error'))
-      : jest.fn().mockResolvedValue(
-          opts.reflectNowResult ?? { skipped: false, cycle_id: 'reflect-001', skills_written: 0 },
-        ),
+      : jest
+          .fn()
+          .mockResolvedValue(
+            opts.reflectNowResult ?? { skipped: false, cycle_id: 'reflect-001', skills_written: 0 },
+          ),
   };
 }
 
-function makePlugins(): jest.Mocked<
-  Pick<PluginsService, 'findActive' | 'getManifest'>
-> {
+function makePlugins(): jest.Mocked<Pick<PluginsService, 'findActive' | 'getManifest'>> {
   return {
     findActive: jest.fn().mockResolvedValue([]),
     getManifest: jest.fn().mockReturnValue({}),
@@ -44,9 +44,7 @@ function makePlugins(): jest.Mocked<
 /**
  * Build a CycleSchedulerService and call _maybeReflect directly.
  */
-async function callMaybeReflect(
-  service: CycleSchedulerService,
-): Promise<void> {
+async function callMaybeReflect(service: CycleSchedulerService): Promise<void> {
   return (
     service as unknown as {
       _maybeReflect: () => Promise<void>;
@@ -80,10 +78,7 @@ describe('F4-S2 Phase 3.1 — CycleSchedulerService._maybeReflect cadence', () =
 
     expect(panel.reflectNow).not.toHaveBeenCalled();
     // counter must NOT be incremented when disabled
-    expect(kv.set).not.toHaveBeenCalledWith(
-      'reflection.cycle_counter',
-      expect.any(String),
-    );
+    expect(kv.set).not.toHaveBeenCalledWith('reflection.cycle_counter', expect.any(String));
   });
 
   it('3.1b — every_n_cycles=3, counter at 2 → counter becomes 3, reflectNow called, counter reset to 0', async () => {
@@ -143,6 +138,39 @@ describe('F4-S2 Phase 3.1 — CycleSchedulerService._maybeReflect cadence', () =
     await callMaybeReflect(service);
 
     // counter 9 → 10 → fires (10 >= 10)
+    expect(panel.reflectNow).toHaveBeenCalledTimes(1);
+    expect(kv.set).toHaveBeenCalledWith('reflection.cycle_counter', '0');
+  });
+});
+
+describe('F4-S2 Fix #3 — _maybeReflect counter reset only on reflectNow success', () => {
+  it('3.1f — reflectNow throws → counter NOT reset to 0 (still at threshold value)', async () => {
+    const kv = makeKv({
+      reflection: JSON.stringify({ every_n_cycles: 3 }),
+      'reflection.cycle_counter': '2',
+    });
+    const panel = makePanel({ reflectNowThrows: true });
+    const service = makeSchedulerService(kv, panel);
+
+    // Should not throw (error is caught + logged)
+    await callMaybeReflect(service);
+
+    // reflectNow was called
+    expect(panel.reflectNow).toHaveBeenCalledTimes(1);
+    // Counter must NOT have been reset to '0'
+    expect(kv.set).not.toHaveBeenCalledWith('reflection.cycle_counter', '0');
+  });
+
+  it('3.1g — reflectNow succeeds → counter IS reset to 0', async () => {
+    const kv = makeKv({
+      reflection: JSON.stringify({ every_n_cycles: 3 }),
+      'reflection.cycle_counter': '2',
+    });
+    const panel = makePanel({});
+    const service = makeSchedulerService(kv, panel);
+
+    await callMaybeReflect(service);
+
     expect(panel.reflectNow).toHaveBeenCalledTimes(1);
     expect(kv.set).toHaveBeenCalledWith('reflection.cycle_counter', '0');
   });

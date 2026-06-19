@@ -363,12 +363,13 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
     const counter = (parseInt(rawCounter ?? '0', 10) || 0) + 1;
 
     if (counter >= everyNCycles) {
-      // Threshold reached: reset counter and trigger reflection.
-      await this.store.set('reflection.cycle_counter', '0');
+      // Threshold reached: trigger reflection, reset counter only on success.
       try {
         await this.panel.reflectNow();
+        await this.store.set('reflection.cycle_counter', '0');
       } catch (err: unknown) {
         // Log but don't propagate — reflection failure must not disrupt the cycle scheduler.
+        // Counter is NOT reset: next cycle will retry immediately (counter still at threshold).
         this.log.warn(`_maybeReflect: panel.reflectNow() error — ${String(err)}`);
       }
     } else {
