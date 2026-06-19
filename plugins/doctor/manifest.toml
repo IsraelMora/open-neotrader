@@ -10,6 +10,7 @@ tags        = ["diagnostics", "health", "monitoring", "safety"]
 [scheduler]
 mode        = "polling"
 timeframe   = "1h"
+stage       = "pre"
 
 [config]
 fail_on_missing_credentials = false

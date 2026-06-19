@@ -10,6 +10,7 @@ tags        = ["reporting", "telegram", "pnl", "performance", "monitoring"]
 [scheduler]
 mode        = "polling"
 timeframe   = "1d"
+stage       = "post"
 
 [config]
 weekly_report_day   = "monday"      # día de la semana para reporte semanal (monday-sunday)

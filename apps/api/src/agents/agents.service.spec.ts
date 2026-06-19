@@ -945,6 +945,216 @@ describe('AgentsService.runGovernedTurn — pretest source (PR3)', () => {
   });
 });
 
+// ── Phase A1: Extra-plugin invocation (PRE/POST stage ordering + cycle_abort) ─
+
+/**
+ * Factory for a full agents service with a configurable sandbox.runExtraCycleHook
+ * so we can assert call order relative to runGovernedTurn.
+ */
+function makeExtraInvocationService(opts: {
+  extraPlugins: { id: string; type: string; name: string; schedulerStage: 'pre' | 'post' }[];
+  preHookResult?: Record<string, unknown>;
+  postHookResult?: Record<string, unknown>;
+  capturedOrder: string[];
+}): {
+  service: AgentsService;
+  sandbox: jest.Mocked<
+    Pick<SandboxGateway, 'runCycle' | 'callPlugin' | 'call' | 'runExtraCycleHook'>
+  >;
+  audit: ReturnType<typeof makeAudit>;
+  plugins: ReturnType<typeof makeFullPlugins>;
+} {
+  const audit = makeAudit();
+  const allPlugins = opts.extraPlugins.map((p) => ({ id: p.id, type: p.type, name: p.name }));
+  const plugins = makeFullPlugins(null, []);
+  plugins.findActive.mockResolvedValue(allPlugins as never);
+
+  const sandbox: jest.Mocked<
+    Pick<SandboxGateway, 'runCycle' | 'callPlugin' | 'call' | 'runExtraCycleHook'>
+  > = {
+    runCycle: jest.fn().mockImplementation(() => {
+      opts.capturedOrder.push('runCycle');
+      return Promise.resolve({ ok: true, result: { pending_signals: [] } });
+    }),
+    callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+    runExtraCycleHook: jest.fn().mockImplementation((pluginId: string) => {
+      const plugin = opts.extraPlugins.find((p) => p.id === pluginId);
+      opts.capturedOrder.push(`extra:${pluginId}:${plugin?.schedulerStage ?? 'post'}`);
+      if (plugin?.schedulerStage === 'pre') {
+        return Promise.resolve({ ok: true, result: opts.preHookResult ?? {} });
+      }
+      return Promise.resolve({ ok: true, result: opts.postHookResult ?? {} });
+    }),
+  };
+
+  const llm: Partial<LlmService> = {
+    complete: jest.fn().mockImplementation(() => {
+      opts.capturedOrder.push('llm');
+      return Promise.resolve({
+        text: '',
+        tool_calls: [],
+        backend: 'api' as const,
+        skills_read: [],
+        skills_written: [],
+      } as LlmResponse);
+    }),
+  };
+
+  const memory = makeMemory();
+  const service = new AgentsService(
+    llm as unknown as LlmService,
+    sandbox as unknown as SandboxGateway,
+    plugins as unknown as PluginsService,
+    memory as unknown as ContextMemoryService,
+    audit as unknown as AuditService,
+    { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+  );
+
+  return { service, sandbox, audit, plugins };
+}
+
+describe('AgentsService — extra-plugin PRE/POST stage ordering (A1.1)', () => {
+  it('A1.1 — PRE extra runs before LLM turn; POST extra runs after LLM turn', async () => {
+    const capturedOrder: string[] = [];
+
+    const { service } = makeExtraInvocationService({
+      extraPlugins: [
+        { id: 'doctor', type: 'extra', name: 'Doctor', schedulerStage: 'pre' },
+        { id: 'weekly-reporter', type: 'extra', name: 'Weekly Reporter', schedulerStage: 'post' },
+      ],
+      capturedOrder,
+    });
+
+    await callExecuteCyclePrivate(service, 'stage-order-001', 'test context');
+
+    const extraDoctorIdx = capturedOrder.indexOf('extra:doctor:pre');
+    const llmIdx = capturedOrder.indexOf('llm');
+    const extraReporterIdx = capturedOrder.indexOf('extra:weekly-reporter:post');
+
+    expect(extraDoctorIdx).toBeGreaterThanOrEqual(0);
+    expect(llmIdx).toBeGreaterThanOrEqual(0);
+    expect(extraReporterIdx).toBeGreaterThanOrEqual(0);
+    // PRE must precede LLM; POST must follow LLM
+    expect(extraDoctorIdx).toBeLessThan(llmIdx);
+    expect(llmIdx).toBeLessThan(extraReporterIdx);
+  });
+});
+
+describe('AgentsService — PRE cycle_abort skips LLM + audits cycle_aborted (A1.2)', () => {
+  it('A1.2 — PRE extra returns cycle_abort=true → runGovernedTurn NOT called, audit cycle_aborted emitted', async () => {
+    const capturedOrder: string[] = [];
+
+    const { service, audit } = makeExtraInvocationService({
+      extraPlugins: [{ id: 'doctor', type: 'extra', name: 'Doctor', schedulerStage: 'pre' }],
+      preHookResult: { cycle_abort: true, cycle_abort_reason: 'Missing credentials' },
+      capturedOrder,
+    });
+
+    await callExecuteCyclePrivate(service, 'abort-pre-001', 'test context');
+
+    // LLM must NOT have been called
+    expect(capturedOrder).not.toContain('llm');
+
+    // audit cycle_aborted must have been emitted
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const abortAudit = auditCalls.find(([arg]) => arg['event_type'] === 'cycle_aborted');
+    expect(abortAudit).toBeDefined();
+    expect(abortAudit![0]).toMatchObject({
+      event_type: 'cycle_aborted',
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      meta: expect.objectContaining({ plugin_id: 'doctor' }),
+    });
+  });
+});
+
+describe('AgentsService — POST cycle_abort ignored (A1.3)', () => {
+  it('A1.3 — POST extra returns cycle_abort=true → LLM still runs, no abort audit', async () => {
+    const capturedOrder: string[] = [];
+
+    const { service, audit } = makeExtraInvocationService({
+      extraPlugins: [
+        { id: 'weekly-reporter', type: 'extra', name: 'Weekly Reporter', schedulerStage: 'post' },
+      ],
+      postHookResult: { cycle_abort: true },
+      capturedOrder,
+    });
+
+    await callExecuteCyclePrivate(service, 'post-abort-001', 'test context');
+
+    // LLM must still have run
+    expect(capturedOrder).toContain('llm');
+
+    // Must NOT have audited cycle_aborted
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const abortAudit = auditCalls.find(([arg]) => arg['event_type'] === 'cycle_aborted');
+    expect(abortAudit).toBeUndefined();
+  });
+});
+
+describe('AgentsService — _persistPluginAlerts runs on PRE abort output (A1.4)', () => {
+  it('A1.4 — PRE abort with emit_alerts → alerts persisted even on abort', async () => {
+    const capturedOrder: string[] = [];
+    const audit = makeAudit();
+    const alertsMock = { createBulk: jest.fn().mockResolvedValue([]) };
+    const plugins = makeFullPlugins(null, []);
+    plugins.findActive.mockResolvedValue([
+      { id: 'doctor', type: 'extra', name: 'Doctor' },
+    ] as never);
+
+    const sandbox: jest.Mocked<
+      Pick<SandboxGateway, 'runCycle' | 'callPlugin' | 'call' | 'runExtraCycleHook'>
+    > = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true }),
+      call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+      runExtraCycleHook: jest.fn().mockImplementation((pluginId: string) => {
+        capturedOrder.push(`extra:${pluginId}`);
+        return Promise.resolve({
+          ok: true,
+          result: {
+            cycle_abort: true,
+            cycle_abort_reason: 'creds missing',
+            emit_alerts: [
+              { type: 'SYSTEM', severity: 'HIGH', message: 'Missing creds', symbol: null },
+            ],
+          },
+        });
+      }),
+    };
+
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation(() => {
+        capturedOrder.push('llm');
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api' as const,
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+
+    const memory = makeMemory();
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      alertsMock as unknown as AlertsService,
+    );
+
+    await callExecuteCyclePrivate(service, 'alerts-abort-001', 'test');
+
+    // LLM must NOT have run
+    expect(capturedOrder).not.toContain('llm');
+    // alerts.createBulk must have been called (emit_alerts persisted on abort)
+    expect(alertsMock.createBulk).toHaveBeenCalled();
+  });
+});
+
 // ── Fix #4: veto ordering — LLM sees only post-veto signals ──────────────────
 
 describe('AgentsService._executeCycle — veto ordering: LLM sees only post-veto signals', () => {
