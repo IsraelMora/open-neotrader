@@ -828,3 +828,142 @@ describe('PluginsService.revertSkill', () => {
     expect(writeSkillContentMock).not.toHaveBeenCalled();
   });
 });
+
+// ── F3-s3 Phase 4: PluginsService.getReputation + trust-report (RED → GREEN) ──
+
+import type { PrismaService as PrismaServiceForPlugins } from '../prisma/prisma.service';
+
+/** Minimal Plugin row shape for reputation tests */
+function makePluginRow(
+  id: string,
+  overrides: {
+    reputation_score?: number | null;
+    reputation_detail?: string | null;
+    scan_result?: string | null;
+    smoke_test_result?: string | null;
+  } = {},
+): import('@prisma/client').Plugin {
+  return {
+    id,
+    name: `Plugin ${id}`,
+    description: null,
+    version: '1.0.0',
+    type: 'skill',
+    active: false,
+    verification: 'unverified',
+    author: null,
+    source_url: null,
+    git_url: null,
+    stack_plugins: null,
+    skills: null,
+    symbols: null,
+    config: null,
+    installed_path: null,
+    scan_result: overrides.scan_result ?? null,
+    smoke_test_result: overrides.smoke_test_result ?? null,
+    reputation_score: overrides.reputation_score ?? null,
+    reputation_detail: overrides.reputation_detail ?? null,
+    installed_at: new Date(),
+    updated_at: new Date(),
+  };
+}
+
+/** Build PluginsService wired for reputation / trust-report tests */
+function makePluginsSvcForReputation(
+  pluginRow: import('@prisma/client').Plugin | null,
+): PluginsService {
+  const db = {
+    plugin: {
+      findUnique: jest.fn().mockResolvedValue(pluginRow),
+      findMany: jest.fn().mockResolvedValue(pluginRow ? [pluginRow] : []),
+      findFirst: jest.fn().mockResolvedValue(pluginRow),
+      create: jest.fn(),
+      update: jest.fn(),
+      delete: jest.fn(),
+    },
+  } as unknown as PrismaServiceForPlugins;
+
+  const events = {
+    emit: jest.fn(),
+  } as unknown as import('./plugin-events.service').PluginEventsService;
+  const cfg = {
+    get: jest.fn().mockReturnValue('/var/plugins'),
+  } as unknown as import('@nestjs/config').ConfigService;
+
+  const svc = new PluginsService(db, events, cfg);
+  svc.getManifest = jest.fn().mockReturnValue(null);
+  return svc;
+}
+
+describe('PluginsService.getReputation (F3-s3 Phase 4)', () => {
+  beforeEach(() => jest.restoreAllMocks());
+
+  // 4.1: plugin with reputation_score + reputation_detail → parsed object
+  it('4.1 — plugin with reputation_score=53 and JSON detail → returns {reputation_score:53, reputation_detail:obj}', async () => {
+    const detail = {
+      portfolios_count: 2,
+      avg_sharpe: 1.5,
+      avg_return_pct: 30,
+      worst_dd_pct: 10,
+      computed_at: '2026-01-01T00:00:00.000Z',
+    };
+    const row = makePluginRow('plugin-rated', {
+      reputation_score: 53,
+      reputation_detail: JSON.stringify(detail),
+    });
+    const svc = makePluginsSvcForReputation(row);
+
+    const result = await svc.getReputation('plugin-rated');
+
+    expect(result.reputation_score).toBe(53);
+    expect(result.reputation_detail).toEqual(detail);
+  });
+
+  // 4.2: plugin with null reputation → returns {null, null}
+  it('4.2 — plugin with null reputation_score and null detail → returns {reputation_score:null, reputation_detail:null}', async () => {
+    const row = makePluginRow('plugin-unrated', {
+      reputation_score: null,
+      reputation_detail: null,
+    });
+    const svc = makePluginsSvcForReputation(row);
+
+    const result = await svc.getReputation('plugin-unrated');
+
+    expect(result).toEqual({ reputation_score: null, reputation_detail: null });
+  });
+
+  // 4.3: plugin not found → NotFoundException
+  it('4.3 — plugin not found → throws NotFoundException', async () => {
+    const svc = makePluginsSvcForReputation(null);
+    await expect(svc.getReputation('unknown-id')).rejects.toThrow('no encontrado');
+  });
+});
+
+describe('PluginsService.getTrustReport — F3-s3 reputation_score extension', () => {
+  beforeEach(() => jest.restoreAllMocks());
+
+  // 4.4: getTrustReport includes reputation_score from column
+  it('4.4 — getTrustReport includes reputation_score field from persisted column', async () => {
+    const row = makePluginRow('plugin-trust', {
+      scan_result: JSON.stringify({ ok: true, findings: [] }),
+      smoke_test_result: JSON.stringify({ ok: true, result: 'passed', checks: [] }),
+      reputation_score: 72,
+    });
+    const svc = makePluginsSvcForReputation(row);
+
+    const report = await svc.getTrustReport('plugin-trust');
+
+    expect(report).toHaveProperty('reputation_score', 72);
+    expect(report).toHaveProperty('scan_result');
+    expect(report).toHaveProperty('smoke_test_result');
+  });
+
+  it('4.4b — getTrustReport returns reputation_score:null when column is null', async () => {
+    const row = makePluginRow('plugin-unrated-trust', { reputation_score: null });
+    const svc = makePluginsSvcForReputation(row);
+
+    const report = await svc.getTrustReport('plugin-unrated-trust');
+
+    expect(report.reputation_score).toBeNull();
+  });
+});

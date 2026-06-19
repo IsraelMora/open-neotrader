@@ -576,11 +576,13 @@ export class PluginsService implements OnApplicationBootstrap {
   /**
    * Returns the current trust report for a plugin.
    * F3-s1: scan_result (static AST analysis); F3-s2: smoke_test_result (pre-activation dry-run).
+   * F3-s3: reputation_score (composite from gate-ready pretest portfolios; null = unrated).
    * null means the corresponding analysis has not been run yet.
    */
   async getTrustReport(id: string): Promise<{
     scan_result: Record<string, unknown> | null;
     smoke_test_result: Record<string, unknown> | null;
+    reputation_score: number | null;
   }> {
     const plugin = await this.findById(id);
     const scanRaw = plugin.scan_result ?? null;
@@ -589,6 +591,26 @@ export class PluginsService implements OnApplicationBootstrap {
     return {
       scan_result: scanRaw ? (JSON.parse(scanRaw) as Record<string, unknown>) : null,
       smoke_test_result: smokeRaw ? (JSON.parse(smokeRaw) as Record<string, unknown>) : null,
+      reputation_score: plugin.reputation_score ?? null,
+    };
+  }
+
+  /**
+   * Returns the persisted reputation score and detail for a plugin.
+   * F3-s3: reads the column written by PretestService._recomputePluginReputations.
+   * Returns stale (last-persisted) data — score refreshes on next gate passage.
+   * Throws NotFoundException when the plugin does not exist.
+   */
+  async getReputation(id: string): Promise<{
+    reputation_score: number | null;
+    reputation_detail: Record<string, unknown> | null;
+  }> {
+    const p = await this.findById(id); // throws 404 if missing
+    return {
+      reputation_score: p.reputation_score ?? null,
+      reputation_detail: p.reputation_detail
+        ? (JSON.parse(p.reputation_detail) as Record<string, unknown>)
+        : null,
     };
   }
 
