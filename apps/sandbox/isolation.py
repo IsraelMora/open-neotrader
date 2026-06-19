@@ -61,6 +61,8 @@ BLOCKED_MODULES: frozenset[str] = frozenset(
         "smtplib",
         "telnetlib",
         "requests",
+        "urllib3",
+        "pycurl",
         "httpx",
         "aiohttp",
         "websocket",
