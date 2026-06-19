@@ -143,10 +143,7 @@ export class AgentsService {
           `token-budget guard: injected tool schema is ${toolSchemaJson.length} chars — consider reducing active tools`,
         );
       }
-      const parts: string[] = [
-        `[DECISION]\n${decisionPrompt}`,
-        `[TOOL SCHEMA]\n${toolSchemaJson}`,
-      ];
+      const parts: string[] = [`[DECISION]\n${decisionPrompt}`, `[TOOL SCHEMA]\n${toolSchemaJson}`];
       if (builtSystemPrompt) parts.push(builtSystemPrompt);
       builtSystemPrompt = parts.join('\n\n');
     }
@@ -192,7 +189,11 @@ export class AgentsService {
 
     // ── 6. Validar tool calls contra manifests activos, luego ejecutar ───────
     // Pass hoisted providerTools to avoid a second getProviderTools() call.
-    const validatedCalls = await this._validateToolCalls(cycle_id, llmResponse.tool_calls, providerTools);
+    const validatedCalls = await this._validateToolCalls(
+      cycle_id,
+      llmResponse.tool_calls,
+      providerTools,
+    );
     const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
       cycle_id,
       validatedCalls,
