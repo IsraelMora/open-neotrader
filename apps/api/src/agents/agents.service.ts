@@ -481,6 +481,12 @@ export class AgentsService {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log.warn(`_validateToolCalls error — dropping all calls: ${msg}`);
+      await this.audit.log({
+        cycle_id,
+        event_type: 'cycle_fail',
+        error: msg,
+        meta: { stage: '_validateToolCalls' },
+      });
       return [];
     }
   }

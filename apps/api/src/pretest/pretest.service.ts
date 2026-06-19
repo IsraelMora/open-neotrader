@@ -124,7 +124,7 @@ export class PretestService {
     private readonly llm: LlmService,
     private readonly memory: ContextMemoryService,
     private readonly gateway: ProviderGatewayService,
-    private readonly agents?: AgentsService,
+    private readonly agents: AgentsService,
   ) {}
 
   // ── CRUD ─────────────────────────────────────────────────────────────────────
@@ -276,7 +276,7 @@ export class PretestService {
 
     // Route the LLM call through the governed turn kernel (audit, tool validation, virtual guard).
     // virtual_only:true ensures no provider (broker) tool-calls reach the sandbox.
-    const turnResult = await this.agents!.runGovernedTurn({
+    const turnResult = await this.agents.runGovernedTurn({
       source: 'pretest',
       context,
       virtual_only: true,

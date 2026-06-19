@@ -265,6 +265,34 @@ describe('AgentsService._validateToolCalls', () => {
 
     await expect(callValidate(service, CYCLE_ID, calls)).resolves.toEqual([]);
   });
+
+  it('emits cycle_fail audit with stage:_validateToolCalls when getProviderTools throws', async () => {
+    const plugins = makePlugins(['alpaca-provider'], []);
+    (plugins.getProviderTools as jest.Mock).mockRejectedValue(new Error('Prisma connection lost'));
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'alpaca-provider', function: 'place_order', args: {} },
+    ];
+
+    const result = await callValidate(service, CYCLE_ID, calls);
+
+    // Still returns [] (fail-safe)
+    expect(result).toEqual([]);
+
+    // Must emit a cycle_fail audit with stage metadata
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cycle_id: CYCLE_ID,
+        event_type: 'cycle_fail',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        error: expect.stringContaining('Prisma connection lost'),
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ stage: '_validateToolCalls' }),
+      }),
+    );
+  });
 });
 
 // ── AgentsService._executeCycle — parseToolCalls wiring ──────────────────────
@@ -867,6 +895,53 @@ describe('AgentsService.runGovernedTurn — pretest source (PR3)', () => {
     const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
     const pretestTurnCall = calls.find(([arg]) => arg['event_type'] === 'pretest_turn');
     expect(pretestTurnCall).toBeUndefined();
+  });
+
+  it('3.1.7 — end-to-end virtual_only block: provider tool_call in LLM response is dropped, callPlugin not called, audit emitted', async () => {
+    // LLM returns a tool_call targeting a PROVIDER-type plugin
+    const toolCallText =
+      '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","action":"buy","qty":1}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+
+    const providerTool = {
+      plugin_id: 'alpaca-provider',
+      name: 'alpaca-provider__place_order',
+      description: 'Place an order',
+      input_schema: { type: 'object', properties: {} },
+    };
+    const plugins = makeFullPlugins('Emit tool calls as JSON.', [providerTool]);
+    // alpaca-provider is active and is of type 'provider'
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const result = await service.runGovernedTurn({
+      source: 'pretest',
+      context: 'Evaluate pretest signals',
+      virtual_only: true,
+    });
+
+    // Provider call must NOT have been dispatched to the sandbox
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+
+    // Result tool_calls must be empty (provider dropped before dispatch)
+    expect(result.tool_calls).toEqual([]);
+
+    // Must emit tool_call_dropped with reason virtual_mode_provider_blocked
+    const logCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const droppedCall = logCalls.find(([arg]) => arg['event_type'] === 'tool_call_dropped');
+    expect(droppedCall).toBeDefined();
+    expect(droppedCall![0]).toMatchObject({
+      event_type: 'tool_call_dropped',
+      plugin_id: 'alpaca-provider',
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      meta: expect.objectContaining({ reason: 'virtual_mode_provider_blocked' }),
+    });
   });
 });
 

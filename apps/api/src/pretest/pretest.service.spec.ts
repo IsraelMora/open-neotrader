@@ -60,13 +60,36 @@ function makeRejectingGateway(
   } as unknown as jest.Mocked<Pick<ProviderGatewayService, 'getQuote'>> & ProviderGatewayService;
 }
 
+function makeStubAgents(): AgentsService {
+  return {
+    runGovernedTurn: jest.fn().mockResolvedValue({
+      cycle_id: 'stub',
+      text: '',
+      tool_calls: [],
+      decisions: [],
+      sandbox_results: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+      llm_response: {
+        text: '',
+        tool_calls: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+      },
+      signalsEmitted: [],
+    }),
+  } as unknown as AgentsService;
+}
+
 function makeService(gateway: ProviderGatewayService, agents?: AgentsService): PretestService {
   const db = {} as unknown as PrismaService;
   const sandbox = {} as unknown as SandboxGateway;
   const plugins = {} as unknown as PluginsService;
   const llm = {} as unknown as LlmService;
   const memory = {} as unknown as ContextMemoryService;
-  return new PretestService(db, sandbox, plugins, llm, memory, gateway, agents);
+  return new PretestService(db, sandbox, plugins, llm, memory, gateway, agents ?? makeStubAgents());
 }
 
 // ── Phase 1.1: RED tests — fills use getQuote.last ────────────────────────────
