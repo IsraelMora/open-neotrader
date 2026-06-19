@@ -17,6 +17,9 @@ const KNOWN_EVENT_TYPES: AuditEventType[] = [
   'skill_reverted',
   'skill_write_denied',
   'reflection_turn',
+  'pretest_variant_created',
+  'pretest_compared',
+  'pretest_cap_reached',
 ];
 
 describe('AuditEventType', () => {
@@ -47,6 +50,24 @@ describe('AuditEventType', () => {
     // Compile-time gate: tsc will reject this if 'reflection_turn' is not in the union.
     const eventType: AuditEventType = 'reflection_turn';
     // Runtime gate: verify the literal value is in the known set.
+    expect(KNOWN_EVENT_TYPES).toContain(eventType);
+  });
+
+  // ── F4-S3 Task 1.2 — s3 audit event types compile-guard ─────────────────────
+
+  it('s3 — includes pretest_variant_created as a valid event type (compile-guard)', () => {
+    // Compile-time gate: tsc rejects if 'pretest_variant_created' is not in the union.
+    const eventType: AuditEventType = 'pretest_variant_created';
+    expect(KNOWN_EVENT_TYPES).toContain(eventType);
+  });
+
+  it('s3 — includes pretest_compared as a valid event type (compile-guard)', () => {
+    const eventType: AuditEventType = 'pretest_compared';
+    expect(KNOWN_EVENT_TYPES).toContain(eventType);
+  });
+
+  it('s3 — includes pretest_cap_reached as a valid event type (compile-guard)', () => {
+    const eventType: AuditEventType = 'pretest_cap_reached';
     expect(KNOWN_EVENT_TYPES).toContain(eventType);
   });
 });

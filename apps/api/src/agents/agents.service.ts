@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional, Inject, forwardRef } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { LlmService } from '../llm/llm.service';
 import { SandboxGateway } from '../sandbox/sandbox.gateway';
@@ -9,7 +9,7 @@ import { AlertsService, CreateAlertDto } from '../alerts/alerts.service';
 import { SnapshotService } from '../snapshot/snapshot.service';
 import { NotifierBridge } from '../notifier/notifier-bridge';
 import { ConfigService } from '@nestjs/config';
-import type { PretestService } from '../pretest/pretest.service';
+import { PretestService } from '../pretest/pretest.service';
 
 import type { LlmResponse } from '../llm/llm.service';
 import { parseToolCalls } from '../llm/kernel-parser';
@@ -137,11 +137,55 @@ const KERNEL_WRITE_SKILL_TOOL: import('../plugins/plugins.service').ProviderTool
 };
 
 /**
+ * Schema definition for the kernel__create_pretest_variant tool.
+ * Injected into the LLM tool schema ONLY when source === 'reflection'.
+ */
+const KERNEL_CREATE_PRETEST_VARIANT_TOOL: import('../plugins/plugins.service').ProviderTool = {
+  plugin_id: 'kernel',
+  name: 'kernel__create_pretest_variant',
+  description:
+    'Creates a strategy variant in pretest (virtual portfolio) during a reflection turn.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      name: { type: 'string' },
+      plugin_ids: { type: 'array', items: { type: 'string' } },
+      plugin_configs: { type: 'object' },
+      rationale: { type: 'string' },
+    },
+    required: ['name', 'plugin_ids'],
+  },
+};
+
+/**
+ * Schema definition for the kernel__run_pretest_compare tool.
+ * Injected into the LLM tool schema ONLY when source === 'reflection'.
+ * No arguments: compare() reads the current stored portfolio states.
+ */
+const KERNEL_RUN_PRETEST_COMPARE_TOOL: import('../plugins/plugins.service').ProviderTool = {
+  plugin_id: 'kernel',
+  name: 'kernel__run_pretest_compare',
+  description: 'Compares all pretest portfolios (gate-aware) and returns winners.',
+  input_schema: { type: 'object', properties: {}, required: [] },
+};
+
+/**
+ * Maximum number of active pretest portfolios allowed. Enforced at dispatch time by
+ * counting all portfolios via PretestService.findAll() before calling create().
+ * Bounds parallel simulation cost and prevents LLM-driven portfolio explosion.
+ */
+const MAX_PRETEST_VARIANTS = 20;
+
+/**
  * Registry of kernel-side tool functions. Any tool_call with plugin_id === 'kernel'
  * is validated against this set instead of the plugin allowlist. Unknown kernel
  * functions are dropped with reason 'unknown_kernel_tool'.
  */
-const KERNEL_TOOL_REGISTRY: Set<string> = new Set(['write_skill']);
+const KERNEL_TOOL_REGISTRY: Set<string> = new Set([
+  'write_skill',
+  'create_pretest_variant',
+  'run_pretest_compare',
+]);
 
 /** Orquesta el ciclo completo del agente: memoria, hooks de plugins, capa de veto, LLM y ejecución de tool calls. */
 @Injectable()
@@ -160,6 +204,10 @@ export class AgentsService {
     private readonly notifierBridge?: NotifierBridge,
     // PretestService injected optionally so existing unit-tests that don't provide
     // it continue compiling; _assembleReflectionContext degrades gracefully.
+    // @Optional() preserves backward compat for tests that omit pretest.
+    // @Inject(forwardRef(...)) breaks the AgentsModule ↔ PretestModule circular dep.
+    @Optional()
+    @Inject(forwardRef(() => PretestService))
     private readonly pretest?: PretestService,
   ) {}
 
@@ -208,7 +256,14 @@ export class AgentsService {
     // GovernedTurnInput.source union is 'chat'|'cycle'|'pretest' in s1 — 'reflection' is not
     // reachable. The condition is written now so s2 (adding 'reflection' to the union +
     // runReflectionTurn) requires zero changes here.
-    const kernelTools = (input.source as string) === 'reflection' ? [KERNEL_WRITE_SKILL_TOOL] : [];
+    const kernelTools =
+      (input.source as string) === 'reflection'
+        ? [
+            KERNEL_WRITE_SKILL_TOOL,
+            KERNEL_CREATE_PRETEST_VARIANT_TOOL,
+            KERNEL_RUN_PRETEST_COMPARE_TOOL,
+          ]
+        : [];
     const effectiveTools = [...providerTools, ...kernelTools];
 
     const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
@@ -760,33 +815,170 @@ export class AgentsService {
 
   /**
    * Dispatches a kernel-namespace tool call (plugin_id === 'kernel').
-   * Routes to the appropriate PluginsService method without ever entering the sandbox.
+   * Routes to the appropriate PluginsService/PretestService method without entering the sandbox.
    */
   private async _dispatchKernelTool(
-    _cycle_id: string,
+    cycle_id: string,
     tc: import('../llm/llm.service').ToolCallRequest,
     decisions: Decision[],
     sandbox_results: SandboxResult[],
   ): Promise<void> {
     if (tc.function === 'write_skill') {
-      const skill = typeof tc.args['skill'] === 'string' ? tc.args['skill'] : '';
-      const newBody = typeof tc.args['new_body'] === 'string' ? tc.args['new_body'] : '';
-      const result = await this.plugins.writeSkillGuarded(skill, newBody);
-      decisions.push({
-        ...tc,
-        allowed: result.ok,
-        reason: result.ok ? undefined : result.reason,
-      });
-      sandbox_results.push({
-        plugin_id: 'kernel',
-        function: 'write_skill',
-        ok: result.ok,
-        result,
-      });
+      await this._kernelWriteSkill(cycle_id, tc, decisions, sandbox_results);
+    } else if (tc.function === 'create_pretest_variant') {
+      await this._kernelCreatePretestVariant(cycle_id, tc, decisions, sandbox_results);
+    } else if (tc.function === 'run_pretest_compare') {
+      await this._kernelRunPretestCompare(cycle_id, tc, decisions, sandbox_results);
     } else {
       this.log.warn(`_dispatchKernelTool: unknown kernel function '${tc.function}' — dropped`);
       decisions.push({ ...tc, allowed: false, reason: 'unknown_kernel_tool' });
     }
+  }
+
+  /** Handles kernel__write_skill dispatch. */
+  private async _kernelWriteSkill(
+    _cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+  ): Promise<void> {
+    const skill = typeof tc.args['skill'] === 'string' ? tc.args['skill'] : '';
+    const newBody = typeof tc.args['new_body'] === 'string' ? tc.args['new_body'] : '';
+    const result = await this.plugins.writeSkillGuarded(skill, newBody);
+    decisions.push({
+      ...tc,
+      allowed: result.ok,
+      reason: result.ok ? undefined : result.reason,
+    });
+    sandbox_results.push({
+      plugin_id: 'kernel',
+      function: 'write_skill',
+      ok: result.ok,
+      result,
+    });
+  }
+
+  /** Handles kernel__create_pretest_variant dispatch. */
+  private async _kernelCreatePretestVariant(
+    cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+  ): Promise<void> {
+    if (!this.pretest) {
+      decisions.push({ ...tc, allowed: false, reason: 'pretest_unavailable' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'pretest_unavailable',
+      });
+      return;
+    }
+
+    // Coerce args
+    const name = typeof tc.args['name'] === 'string' ? tc.args['name'] : '';
+    const rawIds = tc.args['plugin_ids'];
+    const plugin_ids = Array.isArray(rawIds)
+      ? (rawIds as unknown[]).filter((x): x is string => typeof x === 'string')
+      : [];
+    const rawConfigs = tc.args['plugin_configs'];
+    const plugin_configs =
+      rawConfigs !== null && typeof rawConfigs === 'object' && !Array.isArray(rawConfigs)
+        ? (rawConfigs as Record<string, Record<string, unknown>>)
+        : undefined;
+
+    // Validate minimally: name non-empty AND plugin_ids has at least one entry
+    if (!name || plugin_ids.length === 0) {
+      decisions.push({ ...tc, allowed: false, reason: 'invalid_variant_args' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'invalid_variant_args',
+      });
+      return;
+    }
+
+    // Cap check
+    const existing = await this.pretest.findAll();
+    if (existing.length >= MAX_PRETEST_VARIANTS) {
+      await this.audit.log({
+        cycle_id,
+        event_type: 'pretest_cap_reached',
+        meta: { count: existing.length, cap: MAX_PRETEST_VARIANTS },
+      });
+      decisions.push({ ...tc, allowed: false, reason: 'pretest_cap_reached' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'pretest_cap_reached',
+      });
+      return;
+    }
+
+    // Create
+    const pf = await this.pretest.create({ name, plugin_ids, plugin_configs });
+    await this.audit.log({
+      cycle_id,
+      event_type: 'pretest_variant_created',
+      meta: { pretest_id: pf.id, name, plugin_ids },
+    });
+    decisions.push({ ...tc, allowed: true });
+    sandbox_results.push({
+      plugin_id: 'kernel',
+      function: tc.function,
+      ok: true,
+      result: { id: pf.id, name: pf.name },
+    });
+  }
+
+  /** Handles kernel__run_pretest_compare dispatch. Compare-only (ADR-3): never calls runAllActive. */
+  private async _kernelRunPretestCompare(
+    cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+  ): Promise<void> {
+    if (!this.pretest) {
+      decisions.push({ ...tc, allowed: false, reason: 'pretest_unavailable' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'pretest_unavailable',
+      });
+      return;
+    }
+
+    // Compare-only: reads current stored portfolio states.
+    // ADR-3: no runAllActive() — avoids N recursive LLM pretest turns mid-reflection.
+    const cmp = await this.pretest.compare();
+    await this.audit.log({
+      cycle_id,
+      event_type: 'pretest_compared',
+      meta: {
+        winner_by_return: cmp.winner_by_return,
+        winner_by_risk_adj: cmp.winner_by_risk_adj,
+        n: cmp.portfolios.length,
+      },
+    });
+    decisions.push({ ...tc, allowed: true });
+    sandbox_results.push({
+      plugin_id: 'kernel',
+      function: tc.function,
+      ok: true,
+      result: {
+        winner_by_return: cmp.winner_by_return,
+        winner_by_risk_adj: cmp.winner_by_risk_adj,
+        portfolios: cmp.portfolios.map((p) => ({
+          name: p.name,
+          return_pct: p.return_pct,
+          gate_status: p.gate_status,
+        })),
+      },
+    });
   }
 
   private async _executeToolCalls(
@@ -919,6 +1111,30 @@ export class AgentsService {
     }
   }
 
+  /**
+   * Renders the PRETEST COMPARE section string from a compare result.
+   * Returns '(no pretest portfolios)' when the result has zero portfolios,
+   * avoiding a confusing empty `winner_return: winner_risk_adj:` line.
+   */
+  private _renderPretestCompare(
+    cmp: import('../pretest/pretest.service').PretestCompare,
+    cap: number,
+  ): string {
+    if (cmp.portfolios.length === 0) {
+      return '(no pretest portfolios)';
+    }
+    const top5 = cmp.portfolios.slice(0, 5);
+    const portfolioLines = top5
+      .map((p) => {
+        const ret =
+          typeof p.return_pct === 'number' ? p.return_pct.toFixed(2) : String(p.return_pct);
+        return `${p.name}: return=${ret}% gate=${String(p.gate_status)}`;
+      })
+      .join('\n');
+    const header = `winner_return:${cmp.winner_by_return} winner_risk_adj:${cmp.winner_by_risk_adj}`;
+    return (header + '\n' + portfolioLines).slice(0, cap);
+  }
+
   private async _assembleReflectionContext(): Promise<string> {
     const BUDGET = 4000;
     const AUDIT_CAP = 1200;
@@ -994,16 +1210,7 @@ export class AgentsService {
     try {
       if (this.pretest) {
         const cmp = await this.pretest.compare();
-        const top5 = cmp.portfolios.slice(0, 5);
-        const portfolioLines = top5
-          .map((p) => {
-            const ret =
-              typeof p.return_pct === 'number' ? p.return_pct.toFixed(2) : String(p.return_pct);
-            return `${p.name}: return=${ret}% gate=${String(p.gate_status)}`;
-          })
-          .join('\n');
-        const header = `winner_return:${cmp.winner_by_return} winner_risk_adj:${cmp.winner_by_risk_adj}`;
-        pretestSection = (header + '\n' + portfolioLines).slice(0, PRETEST_CAP);
+        pretestSection = this._renderPretestCompare(cmp, PRETEST_CAP);
       }
     } catch {
       pretestSection = '(unavailable)';

@@ -2274,6 +2274,79 @@ describe('F4-S1 Fix — kernel tool DROPPED when source !== reflection (dispatch
   });
 });
 
+// ── F4-S3 Fix — end-to-end source-gate for kernel__create_pretest_variant and kernel__run_pretest_compare ──
+//
+// Mirrors src-gate.5: drive through runGovernedTurn and confirm sandbox.callPlugin is
+// NEVER called for these kernel tools, and that the right drop reason is emitted.
+
+describe('F4-S3 Fix — kernel pretest tools DROPPED end-to-end when source !== reflection', () => {
+  it('src-gate.6 end-to-end: source:cycle + LLM emitting kernel__create_pretest_variant — sandbox.callPlugin NEVER called, kernel_source_not_allowed audited', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"kernel__create_pretest_variant","args":{"name":"v1","plugin_ids":["p1"]}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('Emit tool calls.', []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    const result = await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    // Tool call must be DROPPED — not surfaced in result
+    expect(result.tool_calls).toHaveLength(0);
+    // sandbox.callPlugin must NEVER be called for this kernel tool
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+    // Must have audited tool_call_dropped with kernel_source_not_allowed
+    const logCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const droppedCall = logCalls.find(
+      ([arg]) =>
+        arg['event_type'] === 'tool_call_dropped' &&
+        (arg['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
+    );
+    expect(droppedCall).toBeDefined();
+  });
+
+  it('src-gate.7 end-to-end: source:cycle + LLM emitting kernel__run_pretest_compare — sandbox.callPlugin NEVER called, kernel_source_not_allowed audited', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"kernel__run_pretest_compare","args":{}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('Emit tool calls.', []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    const result = await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    // Tool call must be DROPPED — not surfaced in result
+    expect(result.tool_calls).toHaveLength(0);
+    // sandbox.callPlugin must NEVER be called for this kernel tool
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+    // Must have audited tool_call_dropped with kernel_source_not_allowed
+    const logCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const droppedCall = logCalls.find(
+      ([arg]) =>
+        arg['event_type'] === 'tool_call_dropped' &&
+        (arg['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
+    );
+    expect(droppedCall).toBeDefined();
+  });
+});
+
 // ── F4-S2 Task 1.7/1.8 — source:'reflection' union activation ────────────────
 //
 // These tests verify that adding 'reflection' to GovernedTurnInput.source union
@@ -2620,6 +2693,28 @@ describe('F4-S2 Phase 2.1 — _assembleReflectionContext budget enforcement', ()
     expect(typeof ctx).toBe('string');
     expect(ctx.length).toBeLessThanOrEqual(4000);
   });
+
+  it('2.1e — empty portfolios (compare returns []): PRETEST section must NOT emit confusing "winner_return: winner_risk_adj:" line', async () => {
+    // When pretest.compare() returns zero portfolios, the winner_return/winner_risk_adj
+    // fields are empty strings, so emitting `winner_return: winner_risk_adj:` is misleading.
+    // The guard `if (cmp.portfolios.length > 0)` must suppress that header entirely.
+    const service = makeAssemblerService({
+      pretestCompare: {
+        portfolios: [],
+        winner_by_return: '',
+        winner_by_risk_adj: '',
+      },
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(typeof ctx).toBe('string');
+    // The confusing winner line must NOT appear
+    expect(ctx).not.toContain('winner_return:');
+    expect(ctx).not.toContain('winner_risk_adj:');
+    // Budget still respected
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+  });
 });
 
 // ── F4-S2 Phase 2.3 — runReflectionTurn ──────────────────────────────────────
@@ -2796,5 +2891,809 @@ describe('F4-S2 Phase 2.3 — runReflectionTurn', () => {
 
     expect(result.skipped).toBe(false);
     expect(runGovernedTurnSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── F4-S3: Exploration Arena ──────────────────────────────────────────────────
+
+// ── Task 1.1: DI boot test (RED until forwardRef wiring is done) ─────────────
+//
+// Strategy: verify the forwardRef decorators are actually applied by inspecting
+// Reflect metadata on AgentsService and PretestService constructors.
+// NestJS @Inject(forwardRef(() => X)) stores a ForwardReference token in
+// PARAMTYPES_METADATA. We verify the injected token at the right parameter index.
+//
+// This is the most direct test for tasks 2.2–2.5: without the @Inject(forwardRef(…))
+// decorators, the metadata for those param slots will be undefined or a plain class ref.
+
+describe('F4-S3 Task 1.1 — DI boot: forwardRef decorator metadata verified on both constructors', () => {
+  it('1.1a — AgentsService constructor last param has @Inject(forwardRef(()=>PretestService)) applied', () => {
+    // @Inject(forwardRef(() => PretestService)) must be applied on the pretest? param of AgentsService.
+    // NestJS stores this in Reflect metadata key 'self:paramtypes' for @Inject decorators.
+    // The 'SELF_DECLARED_DEPS_METADATA' key stores [{index, param}] for each @Inject decorator.
+    const SELF_DECLARED_DEPS_METADATA = 'self:paramtypes';
+    const injectedDeps = Reflect.getMetadata(SELF_DECLARED_DEPS_METADATA, AgentsService) as
+      | Array<{ index: number; param: unknown }>
+      | undefined;
+
+    // There must be at least one @Inject decorator on AgentsService constructor
+    // (the one for PretestService via forwardRef)
+    expect(injectedDeps).toBeDefined();
+    expect(Array.isArray(injectedDeps)).toBe(true);
+
+    // Find the dep that is a forwardRef to PretestService (it's the last constructor param)
+    // forwardRef tokens have a .forwardRef property that is a function returning the class.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const { PretestService: PS } = jest.requireActual('../pretest/pretest.service');
+
+    const pretestDep = injectedDeps!.find((d) => {
+      const param = d.param as Record<string, unknown> | null | undefined;
+      if (!param || typeof param !== 'object') return false;
+      if (typeof param['forwardRef'] !== 'function') return false;
+      return (param['forwardRef'] as () => unknown)() === PS;
+    });
+
+    expect(pretestDep).toBeDefined();
+  });
+
+  it('1.1b — AgentsService with PretestService stub injected: pretest property is defined (forwardRef wires correctly)', () => {
+    // This is the canonical integration assertion: if forwardRef is wired, passing a pretest stub
+    // to the constructor results in this.pretest being defined.
+    // We construct it manually (positional, matching the real constructor).
+    const pretestStub = {
+      findAll: jest.fn().mockResolvedValue([]),
+      create: jest.fn(),
+      compare: jest.fn(),
+      runAllActive: jest.fn(),
+    };
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+    ) => AgentsService)(
+      {},
+      {},
+      { findActive: jest.fn(), getProviderTools: jest.fn(), getActiveDecisionPrompt: jest.fn() },
+      {},
+      { log: jest.fn() },
+      { createBulk: jest.fn() },
+      undefined,
+      undefined,
+      undefined,
+      pretestStub,
+    );
+
+    expect((service as unknown as Record<string, unknown>)['pretest']).toBe(pretestStub);
+  });
+});
+
+// ── Task 1.1c — REAL NestJS module compile boot test ─────────────────────────
+//
+// This is the authoritative proof that forwardRef resolves at RUNTIME inside NestJS DI.
+// Metadata inspection (1.1a) catches missing decorators; this test catches missing
+// module wiring (forwardRef in AgentsModule/PretestModule imports).
+//
+// Strategy: Test.createTestingModule imports the REAL AgentsModule + PretestModule.
+// All external infrastructure providers (Prisma, Sandbox, LLM, etc.) are overridden
+// with no-op mocks so .compile() succeeds without real I/O.
+// A circular-dependency error from NestJS would cause .compile() to throw — the test
+// asserts it does NOT throw, and that both AgentsService and PretestService resolve.
+
+describe('F4-S3 Task 1.1c — REAL NestJS module compile: forwardRef circular DI resolves without error', () => {
+  it('1.1c — AgentsModule + PretestModule compile() succeeds: both services resolve, pretest is defined on AgentsService', async () => {
+    // Inline imports: only needed in this test, avoids polluting the module-level scope
+    // with @nestjs/testing (which is a dev dependency, fine in spec files).
+    const { Test } = await import('@nestjs/testing');
+    const { AgentsModule } = await import('./agents.module');
+    const { PretestModule } = await import('../pretest/pretest.module');
+
+    // Infrastructure providers that would fail without real I/O
+    const { PrismaService } = await import('../prisma/prisma.service');
+    const { SandboxGateway } = await import('../sandbox/sandbox.gateway');
+    const { LlmService } = await import('../llm/llm.service');
+    const { PluginsService } = await import('../plugins/plugins.service');
+    const { PluginEventsService } = await import('../plugins/plugin-events.service');
+    const { LifecycleService } = await import('../plugins/lifecycle.service');
+    const { PluginWatcherService } = await import('../plugins/plugin-watcher.service');
+    const { ContextMemoryService } = await import('../context-memory/context-memory.service');
+    const { AuditService } = await import('../audit/audit.service');
+    const { AlertsService } = await import('../alerts/alerts.service');
+    const { SnapshotService } = await import('../snapshot/snapshot.service');
+    const { NotifierBridge } = await import('../notifier/notifier-bridge');
+    const { TelegramService } = await import('../notifier/telegram.service');
+    const { ProviderGatewayService } = await import('../providers/provider-gateway.service');
+    const { OhlcvCacheService } = await import('../providers/ohlcv-cache.service');
+    const { KvService } = await import('../common/kv.service');
+    const { MigrationRunnerService } = await import('../prisma/migration-runner.service');
+    const { AgentsService: AgentsSvc } = await import('./agents.service');
+    const { PretestService } = await import('../pretest/pretest.service');
+    const { ConfigModule } = await import('@nestjs/config');
+    const { TotpRequiredGuard } = await import('../auth/guards/totp-required.guard');
+
+    const moduleRef = await Test.createTestingModule({
+      // ConfigModule.forRoot({ isGlobal: true }) makes ConfigService available in all
+      // nested module scopes — mirrors how AppModule registers it in production.
+      imports: [ConfigModule.forRoot({ isGlobal: true }), AgentsModule, PretestModule],
+    })
+      .overrideProvider(PrismaService)
+      .useValue({ $connect: jest.fn(), $disconnect: jest.fn() })
+      .overrideProvider(MigrationRunnerService)
+      .useValue({})
+      .overrideProvider(SandboxGateway)
+      .useValue({
+        runCycle: jest.fn(),
+        callPlugin: jest.fn(),
+        call: jest.fn(),
+        runExtraCycleHook: jest.fn(),
+        getPluginStage: jest.fn(),
+      })
+      .overrideProvider(LlmService)
+      .useValue({ complete: jest.fn() })
+      .overrideProvider(PluginsService)
+      .useValue({
+        findActive: jest.fn(),
+        getProviderTools: jest.fn(),
+        getSkillsMetadata: jest.fn(),
+        getActiveDecisionPrompt: jest.fn(),
+        getActiveReflectionPrompt: jest.fn(),
+        writeSkillGuarded: jest.fn(),
+      })
+      .overrideProvider(PluginEventsService)
+      .useValue({})
+      .overrideProvider(LifecycleService)
+      .useValue({})
+      .overrideProvider(PluginWatcherService)
+      .useValue({})
+      .overrideProvider(ContextMemoryService)
+      .useValue({
+        toContextString: jest.fn(),
+        appendObservation: jest.fn(),
+        trackSignal: jest.fn(),
+      })
+      .overrideProvider(AuditService)
+      .useValue({ log: jest.fn(), query: jest.fn() })
+      .overrideProvider(AlertsService)
+      .useValue({ createBulk: jest.fn() })
+      .overrideProvider(SnapshotService)
+      .useValue({ getEquityCurve: jest.fn() })
+      .overrideProvider(NotifierBridge)
+      .useValue({ send: jest.fn() })
+      .overrideProvider(TelegramService)
+      .useValue({ sendMessage: jest.fn() })
+      .overrideProvider(ProviderGatewayService)
+      .useValue({ getQuote: jest.fn() })
+      .overrideProvider(OhlcvCacheService)
+      .useValue({ get: jest.fn(), set: jest.fn() })
+      .overrideProvider(KvService)
+      .useValue({ get: jest.fn(), set: jest.fn(), del: jest.fn() })
+      .overrideProvider(TotpRequiredGuard)
+      .useValue({ canActivate: jest.fn().mockReturnValue(true) })
+      .compile();
+
+    // If compile() throws with "Nest cannot create ... circular dependency", the test fails.
+    // The fact that we reach here proves NestJS resolved the forwardRef graph without error.
+
+    const agentsService = moduleRef.get(AgentsSvc);
+    const pretestService = moduleRef.get(PretestService);
+
+    expect(agentsService).toBeDefined();
+    expect(pretestService).toBeDefined();
+
+    // The critical assertion: AgentsService has its pretest property wired (not undefined)
+    // This proves forwardRef(() => PretestService) in AgentsModule resolved at DI time.
+    const pretest = (agentsService as unknown as Record<string, unknown>)['pretest'];
+    expect(pretest).toBeDefined();
+    expect(pretest).toBe(pretestService);
+
+    await moduleRef.close();
+  }, 15000); // generous timeout for module compilation
+});
+
+// ── Task 1.3: Tool schema tests (source-gated) ────────────────────────────────
+
+describe('F4-S3 Task 1.3 — kernel pretest tools present in reflection effectiveTools only', () => {
+  // Builds a service that captures the injected [TOOL SCHEMA] for s3 source-gating tests.
+  // Note: this helper mirrors the s1/s2 injection-capturing service but is scoped here
+  // so s3 tests remain self-contained. The distinct describe name disambiguates it from
+  // the s1 Phase 4.1 helper.
+  function buildS3SchemaCapturingService(capturedSchema: { tools: string }[]): AgentsService {
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+        const sp = opts.system_prompt ?? '';
+        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+        capturedSchema.push({ tools: match ? match[1] : '' });
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+    // Provide a decision prompt so the schema IS injected into the system prompt
+    const plugins = makeFullPlugins('Use tools via JSON — s3 test.', []);
+    const memory = makeMemory();
+    return new AgentsService(
+      llm as unknown as LlmService,
+      makeSandbox() as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+  }
+
+  it('1.3a — source:reflection → effectiveTools includes kernel__create_pretest_variant AND kernel__run_pretest_compare', async () => {
+    const captured: { tools: string }[] = [];
+    const service = buildS3SchemaCapturingService(captured);
+    await service.runGovernedTurn({ source: 'reflection', context: 'reflect' });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).toContain('kernel__create_pretest_variant');
+    expect(captured[0].tools).toContain('kernel__run_pretest_compare');
+  });
+
+  it('1.3b — source:cycle → neither kernel pretest tool is present in effectiveTools', async () => {
+    const captured: { tools: string }[] = [];
+    const service = buildS3SchemaCapturingService(captured);
+    await service.runGovernedTurn({ source: 'cycle', context: 'run cycle' });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).not.toContain('kernel__create_pretest_variant');
+    expect(captured[0].tools).not.toContain('kernel__run_pretest_compare');
+  });
+
+  it('1.3c — source:chat → neither kernel pretest tool is present in effectiveTools', async () => {
+    const captured: { tools: string }[] = [];
+    const service = buildS3SchemaCapturingService(captured);
+    await service.runGovernedTurn({ source: 'chat', context: 'ask something' });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).not.toContain('kernel__create_pretest_variant');
+    expect(captured[0].tools).not.toContain('kernel__run_pretest_compare');
+  });
+
+  it('1.3d — source:pretest → neither kernel pretest tool is present in effectiveTools', async () => {
+    const captured: { tools: string }[] = [];
+    const service = buildS3SchemaCapturingService(captured);
+    await service.runGovernedTurn({ source: 'pretest', context: 'pretest run' });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).not.toContain('kernel__create_pretest_variant');
+    expect(captured[0].tools).not.toContain('kernel__run_pretest_compare');
+  });
+});
+
+// ── Task 1.4: parseToolCalls split tests ─────────────────────────────────────
+
+describe('F4-S3 Task 1.4 — parseToolCalls first-__ split for new kernel tool names', () => {
+  it('1.4a — kernel__create_pretest_variant parses to {plugin_id:"kernel", function:"create_pretest_variant"}', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"kernel__create_pretest_variant","args":{"name":"test","plugin_ids":["p1"]}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('emit tools.', []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    // Drive through runGovernedTurn to trigger parseToolCalls; inspect decisions for plugin_id/function
+    // We check via _validateToolCalls dropping it (non-reflection) with unknown_kernel_tool OR
+    // kernel_source_not_allowed; either way plugin_id must be 'kernel' and function 'create_pretest_variant'.
+    const logCalls: Array<[Record<string, unknown>]> = [];
+    (audit.log as jest.Mock).mockImplementation((arg: Record<string, unknown>) => {
+      logCalls.push([arg]);
+      return Promise.resolve(undefined);
+    });
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    const droppedCall = logCalls.find(
+      ([arg]) => arg['event_type'] === 'tool_call_dropped' && arg['plugin_id'] === 'kernel',
+    );
+    expect(droppedCall).toBeDefined();
+    // The function must be 'create_pretest_variant' (from the drop meta)
+    const meta = droppedCall![0]['meta'] as Record<string, unknown>;
+    expect(meta['function']).toBe('create_pretest_variant');
+  });
+
+  it('1.4b — kernel__run_pretest_compare parses to {plugin_id:"kernel", function:"run_pretest_compare"}', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"kernel__run_pretest_compare","args":{}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('emit tools.', []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const logCalls: Array<[Record<string, unknown>]> = [];
+    (audit.log as jest.Mock).mockImplementation((arg: Record<string, unknown>) => {
+      logCalls.push([arg]);
+      return Promise.resolve(undefined);
+    });
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    const droppedCall = logCalls.find(
+      ([arg]) => arg['event_type'] === 'tool_call_dropped' && arg['plugin_id'] === 'kernel',
+    );
+    expect(droppedCall).toBeDefined();
+    const meta = droppedCall![0]['meta'] as Record<string, unknown>;
+    expect(meta['function']).toBe('run_pretest_compare');
+  });
+});
+
+// ── Task 1.5/1.6: Dispatch tests for the new kernel tools ────────────────────
+
+/**
+ * Factory for AgentsService with a PretestService mock wired as the optional pretest? param.
+ * Uses the 10-arg positional constructor (same pattern as makeAssemblerService / makeReflectionService).
+ */
+function makePretestMock(opts: {
+  findAllLength?: number;
+  createResult?: Partial<import('../pretest/pretest.service').PretestPortfolio>;
+  compareResult?: Partial<import('../pretest/pretest.service').PretestCompare>;
+  runAllActiveMock?: jest.Mock;
+}) {
+  return {
+    findAll: jest.fn().mockResolvedValue(
+      Array.from({ length: opts.findAllLength ?? 0 }, (_, i) => ({
+        id: `p${i}`,
+        name: `P${i}`,
+        is_active: true,
+      })),
+    ),
+    create: jest.fn().mockResolvedValue({
+      id: 'new-pf-id',
+      name: 'test variant',
+      ...(opts.createResult ?? {}),
+    }),
+    compare: jest.fn().mockResolvedValue(
+      opts.compareResult ?? {
+        portfolios: [
+          { id: 'p1', name: 'Alpha', return_pct: 5.5, gate_status: 'READY' },
+          { id: 'p2', name: 'Beta', return_pct: 3.2, gate_status: 'NOT_READY' },
+        ],
+        winner_by_return: 'Alpha',
+        winner_by_risk_adj: 'Alpha',
+      },
+    ),
+    runAllActive: opts.runAllActiveMock ?? jest.fn().mockResolvedValue([]),
+  };
+}
+
+function makeServiceWithPretest(
+  auditMock: ReturnType<typeof makeAudit>,
+  pretestMock: ReturnType<typeof makePretestMock>,
+  sandboxMock?: ReturnType<typeof makeSandbox>,
+): AgentsService {
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+  ) => AgentsService)(
+    {},
+    sandboxMock ?? makeSandbox(),
+    {
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+      getProviderTools: jest.fn().mockResolvedValue([]),
+      findActive: jest.fn().mockResolvedValue([]),
+      writeSkillGuarded: jest.fn(),
+    },
+    {},
+    auditMock,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    pretestMock,
+  );
+}
+
+/** Helper to call _dispatchKernelTool directly */
+async function callDispatchKernelTool(
+  service: AgentsService,
+  cycleId: string,
+  tc: import('../llm/llm.service').ToolCallRequest,
+  decisions: import('./agents.service').Decision[],
+  sandboxResults: import('./agents.service').SandboxResult[],
+): Promise<void> {
+  return (
+    service as unknown as {
+      _dispatchKernelTool: (
+        cycleId: string,
+        tc: import('../llm/llm.service').ToolCallRequest,
+        decisions: import('./agents.service').Decision[],
+        sandboxResults: import('./agents.service').SandboxResult[],
+      ) => Promise<void>;
+    }
+  )._dispatchKernelTool(cycleId, tc, decisions, sandboxResults);
+}
+
+describe('F4-S3 Task 1.5 — _dispatchKernelTool: create_pretest_variant', () => {
+  const CYCLE_ID = 's3-create-001';
+
+  it('1.5a — happy path: pretest.create called, audit pretest_variant_created, decision allowed:true, sandbox NOT called', async () => {
+    const audit = makeAudit();
+    const pretest = makePretestMock({ findAllLength: 3 });
+    const sandbox = makeSandbox();
+    const service = makeServiceWithPretest(audit, pretest, sandbox);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'create_pretest_variant',
+      args: { name: 'variant-a', plugin_ids: ['p1', 'p2'], rationale: 'test' },
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await callDispatchKernelTool(service, CYCLE_ID, tc, decisions, sandboxResults);
+
+    // pretest.create must have been called
+    expect(pretest.create).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'variant-a', plugin_ids: ['p1', 'p2'] }),
+    );
+    // audit pretest_variant_created must have been emitted
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_variant_created' }),
+    );
+    // decision allowed:true
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].allowed).toBe(true);
+    // sandbox.callPlugin must NOT have been called
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+  });
+
+  it('1.5b — cap reached (findAll >= 20): no create, audit pretest_cap_reached, decision allowed:false reason:pretest_cap_reached', async () => {
+    const audit = makeAudit();
+    const pretest = makePretestMock({ findAllLength: 20 });
+    const sandbox = makeSandbox();
+    const service = makeServiceWithPretest(audit, pretest, sandbox);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'create_pretest_variant',
+      args: { name: 'over-cap', plugin_ids: ['p1'] },
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await callDispatchKernelTool(service, CYCLE_ID, tc, decisions, sandboxResults);
+
+    // pretest.create must NOT have been called
+    expect(pretest.create).not.toHaveBeenCalled();
+    // audit pretest_cap_reached must have been emitted
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_cap_reached' }),
+    );
+    // decision allowed:false reason:pretest_cap_reached
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].allowed).toBe(false);
+    expect(decisions[0].reason).toBe('pretest_cap_reached');
+    // sandbox NOT called
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+  });
+
+  it('1.5c — invalid args (empty name): dropped invalid_variant_args, no create, no findAll', async () => {
+    const audit = makeAudit();
+    const pretest = makePretestMock({ findAllLength: 0 });
+    const sandbox = makeSandbox();
+    const service = makeServiceWithPretest(audit, pretest, sandbox);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'create_pretest_variant',
+      args: { name: '', plugin_ids: ['p1'] },
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await callDispatchKernelTool(service, CYCLE_ID, tc, decisions, sandboxResults);
+
+    expect(pretest.create).not.toHaveBeenCalled();
+    expect(pretest.findAll).not.toHaveBeenCalled();
+    expect(decisions[0].allowed).toBe(false);
+    expect(decisions[0].reason).toBe('invalid_variant_args');
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+  });
+
+  it('1.5c2 — invalid args (empty plugin_ids): dropped invalid_variant_args, no create, no findAll', async () => {
+    const audit = makeAudit();
+    const pretest = makePretestMock({ findAllLength: 0 });
+    const sandbox = makeSandbox();
+    const service = makeServiceWithPretest(audit, pretest, sandbox);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'create_pretest_variant',
+      args: { name: 'valid-name', plugin_ids: [] },
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await callDispatchKernelTool(service, CYCLE_ID, tc, decisions, sandboxResults);
+
+    expect(pretest.create).not.toHaveBeenCalled();
+    expect(pretest.findAll).not.toHaveBeenCalled();
+    expect(decisions[0].allowed).toBe(false);
+    expect(decisions[0].reason).toBe('invalid_variant_args');
+  });
+
+  it('1.5d — pretest unavailable (undefined): allowed:false reason:pretest_unavailable, no throw', async () => {
+    // Build service WITHOUT pretest (undefined)
+    const audit = makeAudit();
+    const sandbox = makeSandbox();
+    const serviceNoPretest = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+    ) => AgentsService)(
+      {},
+      sandbox,
+      {
+        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+        getProviderTools: jest.fn().mockResolvedValue([]),
+        findActive: jest.fn().mockResolvedValue([]),
+        writeSkillGuarded: jest.fn(),
+      },
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined, // pretest is undefined
+    );
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'create_pretest_variant',
+      args: { name: 'test', plugin_ids: ['p1'] },
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    // Must not throw
+    await expect(
+      callDispatchKernelTool(serviceNoPretest, CYCLE_ID, tc, decisions, sandboxResults),
+    ).resolves.not.toThrow();
+
+    expect(decisions[0].allowed).toBe(false);
+    expect(decisions[0].reason).toBe('pretest_unavailable');
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+  });
+});
+
+describe('F4-S3 Task 1.6 — _dispatchKernelTool: run_pretest_compare', () => {
+  const CYCLE_ID = 's3-compare-001';
+
+  it('1.6a — happy path: pretest.compare called, runAllActive NOT called, sandbox NOT called, audit pretest_compared, result in sandbox_results', async () => {
+    const audit = makeAudit();
+    const runAllActiveMock = jest.fn().mockResolvedValue([]);
+    const pretest = makePretestMock({ runAllActiveMock });
+    const sandbox = makeSandbox();
+    const service = makeServiceWithPretest(audit, pretest, sandbox);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'run_pretest_compare',
+      args: {},
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await callDispatchKernelTool(service, CYCLE_ID, tc, decisions, sandboxResults);
+
+    // pretest.compare must have been called
+    expect(pretest.compare).toHaveBeenCalledTimes(1);
+    // runAllActive must NOT have been called (compare-only per ADR-3)
+    expect(runAllActiveMock).not.toHaveBeenCalled();
+    // sandbox.callPlugin must NOT have been called
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+    // audit pretest_compared must have been emitted
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_compared' }),
+    );
+    // decision allowed:true
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].allowed).toBe(true);
+    // result must be in sandbox_results with winner + portfolios
+    expect(sandboxResults).toHaveLength(1);
+    const r = sandboxResults[0];
+    expect(r.ok).toBe(true);
+    const result = r.result as Record<string, unknown>;
+    expect(result['winner_by_return']).toBe('Alpha');
+    expect(result['winner_by_risk_adj']).toBe('Alpha');
+    expect(Array.isArray(result['portfolios'])).toBe(true);
+    const portfolios = result['portfolios'] as Array<Record<string, unknown>>;
+    expect(portfolios[0]).toMatchObject({ name: 'Alpha', return_pct: 5.5, gate_status: 'READY' });
+  });
+
+  it('1.6b — pretest unavailable (undefined): allowed:false reason:pretest_unavailable, no throw', async () => {
+    const audit = makeAudit();
+    const sandbox = makeSandbox();
+    const serviceNoPretest = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+    ) => AgentsService)(
+      {},
+      sandbox,
+      {
+        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+        getProviderTools: jest.fn().mockResolvedValue([]),
+        findActive: jest.fn().mockResolvedValue([]),
+        writeSkillGuarded: jest.fn(),
+      },
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'run_pretest_compare',
+      args: {},
+    };
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await expect(
+      callDispatchKernelTool(serviceNoPretest, CYCLE_ID, tc, decisions, sandboxResults),
+    ).resolves.not.toThrow();
+
+    expect(decisions[0].allowed).toBe(false);
+    expect(decisions[0].reason).toBe('pretest_unavailable');
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+  });
+});
+
+// ── Task 1.7: Source-gate regression tests ────────────────────────────────────
+
+describe('F4-S3 Task 1.7 — source-gate regression: new kernel tools dropped in non-reflection turns', () => {
+  const CYCLE_ID = 's3-gate-001';
+
+  it('1.7a — create_pretest_variant in cycle turn: dropped kernel_source_not_allowed', async () => {
+    const plugins = makePlugins([], []);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      {
+        plugin_id: 'kernel',
+        function: 'create_pretest_variant',
+        args: { name: 'x', plugin_ids: ['p1'] },
+      },
+    ];
+
+    const result = await callValidateWithHoisted(service, CYCLE_ID, calls, [], 'cycle');
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'kernel',
+        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }) as unknown,
+      }),
+    );
+  });
+
+  it('1.7b — run_pretest_compare in chat turn: dropped kernel_source_not_allowed', async () => {
+    const plugins = makePlugins([], []);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'run_pretest_compare', args: {} },
+    ];
+
+    const result = await callValidateWithHoisted(service, CYCLE_ID, calls, [], 'chat');
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'kernel',
+        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }) as unknown,
+      }),
+    );
+  });
+
+  it('1.7c — create_pretest_variant in pretest turn: dropped kernel_source_not_allowed', async () => {
+    const plugins = makePlugins([], []);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'create_pretest_variant', args: {} },
+    ];
+
+    const result = await callValidateWithHoisted(service, CYCLE_ID, calls, [], 'pretest');
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'kernel',
+        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }) as unknown,
+      }),
+    );
+  });
+
+  it('1.7d — unknown kernel function still dropped unknown_kernel_tool (registry regression)', async () => {
+    const plugins = makePlugins([], []);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'bogus_kernel_fn', args: {} },
+    ];
+
+    // Even in reflection turn — unknown function is dropped
+    const result = await callValidateWithHoisted(service, CYCLE_ID, calls, [], 'reflection');
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'kernel',
+        meta: expect.objectContaining({ reason: 'unknown_kernel_tool' }) as unknown,
+      }),
+    );
+  });
+
+  it('1.7e — all 3 kernel tools allowed in reflection turn (registry has 3 entries)', async () => {
+    const plugins = makePlugins([], []);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
+      {
+        plugin_id: 'kernel',
+        function: 'create_pretest_variant',
+        args: { name: 'v', plugin_ids: ['p1'] },
+      },
+      { plugin_id: 'kernel', function: 'run_pretest_compare', args: {} },
+    ];
+
+    const result = await callValidateWithHoisted(service, CYCLE_ID, calls, [], 'reflection');
+
+    // All 3 must pass validation in reflection turn
+    expect(result).toHaveLength(3);
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'tool_call_dropped', plugin_id: 'kernel' }),
+    );
   });
 });
