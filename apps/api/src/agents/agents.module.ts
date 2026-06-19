@@ -19,8 +19,14 @@ import { NotifierModule } from '../notifier/notifier.module';
     AlertsModule,
     SnapshotModule,
     NotifierModule,
+    // PretestModule is NOT imported here to avoid a circular module dependency
+    // (PretestModule → AgentsModule → PretestModule). AgentsService.pretest is injected
+    // optionally (?); the assembler degrades gracefully when PretestService is absent.
+    // Wire PretestService into AgentsService via AppModule custom provider if needed.
   ],
   providers: [AgentsService],
   exports: [AgentsService],
 })
 export class AgentsModule {}
+// Note: AgentsController lives in PanelModule (not here) because it depends on PanelService.
+// Hosting it here would create AgentsModule → PanelModule → AgentsModule circular dep.
