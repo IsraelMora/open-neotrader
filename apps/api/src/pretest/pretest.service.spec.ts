@@ -865,3 +865,323 @@ describe('PretestService._applyTrades — ghost-trade guard (fix 2)', () => {
     });
   });
 });
+
+// ── Fix 3 (PR2 jd): reserved-key exclusion invariant ─────────────────────────
+//
+// '__pretest_policy__' is a reserved key in plugin_configs, NOT a plugin id.
+// It must never appear in the plugin_ids array passed to sandbox.runCycle.
+// This test constructs a portfolio where plugin_configs contains
+// '__pretest_policy__', verifies that plugin_ids is built from pretestPlugins
+// (which are filtered from allPlugins by actual ids), and confirms that
+// '__pretest_policy__' never ends up in the ids sent to runCycle.
+
+import type { SandboxGateway as SandboxGatewayType } from '../sandbox/sandbox.gateway';
+
+describe('PretestService.runCycle — __pretest_policy__ exclusion (fix 3)', () => {
+  it('does not pass __pretest_policy__ as a plugin_id to sandbox.runCycle', async () => {
+    // Build a minimal service wiring with mocked db, sandbox, plugins, llm, memory
+    const runCycleMock = jest.fn().mockResolvedValue({ result: { pending_signals: [] } });
+    const sandbox = { runCycle: runCycleMock } as unknown as SandboxGatewayType;
+
+    const fakePretestPluginId = 'real-plugin-123';
+    const pluginsFindActive = jest.fn().mockResolvedValue([
+      { id: fakePretestPluginId, config: {} },
+    ]);
+    const pluginsService = { findActive: pluginsFindActive } as unknown as import('../plugins/plugins.service').PluginsService;
+
+    const portfolioRow = {
+      id: 'port-1',
+      name: 'Test Portfolio',
+      description: null,
+      initial_capital: 10_000,
+      plugin_ids: JSON.stringify([fakePretestPluginId]),
+      // plugin_configs has both the real plugin override AND the reserved policy key
+      plugin_configs: JSON.stringify({
+        [fakePretestPluginId]: {},
+        __pretest_policy__: { commission_pct: 0.001 },
+      }),
+      state: JSON.stringify({
+        equity: 10_000,
+        cash: 10_000,
+        positions: [],
+        trades: [],
+        max_equity: 10_000,
+        max_drawdown_pct: 0,
+        realized_pnl: 0,
+        win_trades: 0,
+        loss_trades: 0,
+      }),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        update: jest.fn().mockResolvedValue(portfolioRow),
+      },
+    } as unknown as import('../prisma/prisma.service').PrismaService;
+
+    const llm = {
+      complete: jest.fn().mockResolvedValue({ text: '', tool_calls: [] }),
+    } as unknown as import('../llm/llm.service').LlmService;
+
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as import('../context-memory/context-memory.service').ContextMemoryService;
+
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+
+    const svc = new (await import('./pretest.service')).PretestService(
+      db,
+      sandbox,
+      pluginsService,
+      llm,
+      memory,
+      gateway,
+    );
+
+    await svc.runCycle('port-1');
+
+    // sandbox.runCycle must have been called
+    expect(runCycleMock).toHaveBeenCalledTimes(1);
+    const [pluginIds] = runCycleMock.mock.calls[0] as [string[], unknown];
+
+    // '__pretest_policy__' must NOT be in the ids passed to sandbox
+    expect(pluginIds).not.toContain('__pretest_policy__');
+    // The real plugin id IS present
+    expect(pluginIds).toContain(fakePretestPluginId);
+  });
+});
+
+// ── Fix 4 (PR2 jd): commission cost-basis in avg_price — cash/pnl conservation ──
+//
+// BUG: _applyBuy deducts buy commission from cash but does NOT embed it in
+// avg_price. _applySell's realized_pnl = (sell - avg_price)*qty - sell_commission
+// only subtracts sell commission → PnL is overstated by the buy commission.
+// This breaks the invariant: initial_cash + realized_pnl == final_cash (after
+// a flat round-trip with no open positions).
+//
+// FIX: embed buy commission in cost basis:
+//   avg_price = (price * qty + buy_commission) / qty
+// Then realized_pnl = (sell_price - avg_price_with_commission)*qty - sell_commission
+// satisfies the conservation invariant exactly.
+
+describe('PretestService — commission cost-basis and cash/pnl conservation (fix 4)', () => {
+  describe('fix4.1 — round-trip conservation: initial_cash + realized_pnl ≈ final_cash', () => {
+    it('holds the conservation invariant buy 10@100 → sell 10@120 with commission_pct=0.001', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+
+      const INITIAL_CASH = 10_000;
+      const BUY_PRICE = 100;
+      const SELL_PRICE = 120;
+      const QTY = 10;
+      const COMMISSION = 0.001; // 0.1%
+
+      const state = makeState({ cash: INITIAL_CASH });
+
+      // Buy 10 @ 100
+      const buyTrade: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'AAPL',
+        action: 'buy',
+        price: BUY_PRICE,
+        quantity: QTY,
+      };
+      (
+        svc as unknown as {
+          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+        }
+      )._applyBuy(state, buyTrade, COMMISSION);
+
+      // Sell 10 @ 120
+      const sellTrade: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'AAPL',
+        action: 'sell',
+        price: SELL_PRICE,
+        quantity: QTY,
+      };
+      (
+        svc as unknown as {
+          _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+        }
+      )._applySell(state, sellTrade, COMMISSION);
+
+      // Conservation invariant: after flat round-trip (no open positions)
+      // final_cash must equal initial_cash + realized_pnl
+      expect(state.positions).toHaveLength(0); // flat, no open position
+      expect(state.cash).toBeCloseTo(INITIAL_CASH + state.realized_pnl, 8);
+    });
+
+    it('conservation holds with zero commission (no regression on defaults)', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+
+      const INITIAL_CASH = 10_000;
+      const state = makeState({ cash: INITIAL_CASH });
+
+      const buyTrade: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'AAPL',
+        action: 'buy',
+        price: 100,
+        quantity: 10,
+      };
+      (
+        svc as unknown as {
+          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+        }
+      )._applyBuy(state, buyTrade, 0);
+
+      const sellTrade: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'AAPL',
+        action: 'sell',
+        price: 120,
+        quantity: 10,
+      };
+      (
+        svc as unknown as {
+          _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+        }
+      )._applySell(state, sellTrade, 0);
+
+      expect(state.positions).toHaveLength(0);
+      expect(state.cash).toBeCloseTo(INITIAL_CASH + state.realized_pnl, 8);
+    });
+  });
+
+  describe('fix4.2 — avg_price embeds buy commission (cost-basis accounting)', () => {
+    it('avg_price = (price * qty + buy_commission) / qty after a buy with commission', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+
+      const BUY_PRICE = 100;
+      const QTY = 10;
+      const COMMISSION = 0.001; // buy_commission = 100*10*0.001 = 1.0
+      // expected avg_price = (100*10 + 1.0) / 10 = 100.1
+      const EXPECTED_AVG = (BUY_PRICE * QTY + BUY_PRICE * QTY * COMMISSION) / QTY;
+
+      const state = makeState({ cash: 10_000 });
+      const trade: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'AAPL',
+        action: 'buy',
+        price: BUY_PRICE,
+        quantity: QTY,
+      };
+
+      (
+        svc as unknown as {
+          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+        }
+      )._applyBuy(state, trade, COMMISSION);
+
+      expect(state.positions).toHaveLength(1);
+      expect(state.positions[0].avg_price).toBeCloseTo(EXPECTED_AVG, 8);
+    });
+
+    it('with zero commission, avg_price equals fill price exactly (no regression)', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+
+      const BUY_PRICE = 100;
+      const QTY = 5;
+      const state = makeState({ cash: 10_000 });
+      const trade: PretestTrade = {
+        ts: new Date().toISOString(),
+        symbol: 'AAPL',
+        action: 'buy',
+        price: BUY_PRICE,
+        quantity: QTY,
+      };
+
+      (
+        svc as unknown as {
+          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+        }
+      )._applyBuy(state, trade, 0);
+
+      expect(state.positions[0].avg_price).toBe(BUY_PRICE); // byte-identical default
+    });
+  });
+});
+
+// ── Fix 5 (PR2 jd): _calcQuantity accounts for commission in budget ───────────
+//
+// BUG: qty = floor(budget / price). With commission, total_cost = price*qty*(1+commission_pct)
+// can exceed budget → trade computed but then rejected at _applyBuy (cost > cash after sizing).
+// FIX: qty = floor(budget / (price * (1 + commission_pct))) so sizing pre-accounts for fee.
+
+describe('PretestService._calcQuantity — commission-aware sizing (fix 5)', () => {
+  describe('fix5.1 — computed qty total_cost (incl commission) stays within budget', () => {
+    it('with commission_pct=0.001, total cost including fee does not exceed budget', async () => {
+      const PRICE = 100;
+      const CASH = 10_000;
+      const COMMISSION = 0.001;
+      // budget = 10000 * 0.05 = 500; without fix: qty=5, total_cost=500*(1.001)=500.5 > 500
+      // with fix: qty = floor(500 / (100 * 1.001)) = floor(500/100.1) = floor(4.995) = 4
+      //           total_cost = 4 * 100 * 1.001 = 400.4 ≤ 500 ✓
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', PRICE)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: { __pretest_policy__: { commission_pct: COMMISSION } },
+      } as unknown as import('./pretest.service').PretestPortfolio;
+      const state = makeState({ cash: CASH });
+      const policy = (
+        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
+      )._readPolicy(portfolio);
+
+      const trades = await (
+        svc as unknown as {
+          _simulateFills: (
+            tc: unknown[],
+            s: PretestState,
+            policy: PretestPolicy,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._simulateFills([makeToolCall('AAPL', 'buy')], state, policy);
+
+      expect(trades).toHaveLength(1);
+      const qty = trades[0].quantity;
+      const budget = state.cash * policy.sizing_pct;
+      const total_cost = PRICE * qty * (1 + COMMISSION);
+      // The key invariant: total cost including commission must not exceed budget
+      expect(total_cost).toBeLessThanOrEqual(budget + Number.EPSILON);
+    });
+
+    it('with zero commission, sizing is unchanged (no regression on defaults)', async () => {
+      const PRICE = 100;
+      const CASH = 10_000;
+      // qty = floor(10000*0.05 / 100) = floor(5) = 5
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', PRICE)));
+      const svc = makeService(gateway);
+      const portfolio = {
+        plugin_configs: {},
+      } as unknown as import('./pretest.service').PretestPortfolio;
+      const state = makeState({ cash: CASH });
+      const policy = (
+        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
+      )._readPolicy(portfolio);
+
+      const trades = await (
+        svc as unknown as {
+          _simulateFills: (
+            tc: unknown[],
+            s: PretestState,
+            policy: PretestPolicy,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._simulateFills([makeToolCall('AAPL', 'buy')], state, policy);
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].quantity).toBe(5); // floor(500/100) = 5, unchanged
+    });
+  });
+});
+
