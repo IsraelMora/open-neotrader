@@ -273,4 +273,9 @@ export class SandboxGateway {
   analyzePlugin(pluginId: string): Promise<SandboxResponse> {
     return this.call({ cmd: 'analyze_plugin', plugin_id: pluginId });
   }
+
+  /** F3-s2: Executes pre-activation smoke test on a plugin via runner cmd=smoke_test */
+  smokeTestPlugin(pluginId: string): Promise<SandboxResponse> {
+    return this.call({ cmd: 'smoke_test', plugin_id: pluginId });
+  }
 }

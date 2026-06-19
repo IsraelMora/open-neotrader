@@ -501,6 +501,9 @@ export class PluginsService implements OnApplicationBootstrap {
       );
     }
 
+    // F3-s2: pre-activation smoke test — WARN-only, NEVER blocks activation
+    await this._smokeTestOnActivate(id);
+
     await this.db.plugin.update({ where: { id }, data: { active: true } });
     this.events.emit('plugin.activated', { plugin_id: id, type: p.type });
     return this.findById(id);
@@ -572,13 +575,21 @@ export class PluginsService implements OnApplicationBootstrap {
 
   /**
    * Returns the current trust report for a plugin.
-   * For F3-s1, only scan_result is populated; null means not yet scanned.
+   * F3-s1: scan_result (static AST analysis); F3-s2: smoke_test_result (pre-activation dry-run).
+   * null means the corresponding analysis has not been run yet.
    */
-  async getTrustReport(id: string): Promise<{ scan_result: Record<string, unknown> | null }> {
+  async getTrustReport(id: string): Promise<{
+    scan_result: Record<string, unknown> | null;
+    smoke_test_result: Record<string, unknown> | null;
+  }> {
     const plugin = await this.findById(id);
-    const raw = plugin.scan_result ?? null;
-    const parsed = raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
-    return { scan_result: parsed };
+    const scanRaw = plugin.scan_result ?? null;
+    // smoke_test_result is a new F3-s2 column on the Plugin model (String?, nullable JSON)
+    const smokeRaw = plugin.smoke_test_result ?? null;
+    return {
+      scan_result: scanRaw ? (JSON.parse(scanRaw) as Record<string, unknown>) : null,
+      smoke_test_result: smokeRaw ? (JSON.parse(smokeRaw) as Record<string, unknown>) : null,
+    };
   }
 
   async setConfig(id: string, config: Record<string, unknown>): Promise<HydratedPlugin> {
@@ -871,6 +882,27 @@ export class PluginsService implements OnApplicationBootstrap {
   }
 
   // ── Private helpers ───────────────────────────────────────────────────────
+
+  /**
+   * F3-s2: Runs pre-activation smoke test and stores the result.
+   * WARN-only — NEVER throws or blocks activation.
+   */
+  private async _smokeTestOnActivate(pluginId: string): Promise<void> {
+    if (!this.sandbox) return;
+    try {
+      const res = await this.sandbox.smokeTestPlugin(pluginId);
+      const data =
+        res.ok && res.result
+          ? (res.result as Record<string, unknown>)
+          : { ok: false, result: 'inconclusive', error: res.error, checks: [] };
+      await this.db.plugin.update({
+        where: { id: pluginId },
+        data: { smoke_test_result: JSON.stringify(data) },
+      });
+    } catch (e) {
+      this.log.warn(`smoke test failed for ${pluginId}: ${(e as Error).message}`); // activation still proceeds
+    }
+  }
 
   /** F3-s1: Runs static AST scan after install. NEVER throws — scan_result stays null on error. */
   private async _scanOnInstall(pluginId: string): Promise<void> {
