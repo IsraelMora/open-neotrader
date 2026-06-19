@@ -13,6 +13,13 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from reporter import generate_and_send  # type: ignore[import]
 
+
+class _HookContext:
+    """Minimal context object compatible with _SdkContext expected by inner scripts."""
+
+    def __init__(self, metadata: dict) -> None:
+        self.metadata = metadata
+
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
 
@@ -46,7 +53,8 @@ def run(ctx: dict) -> dict:
             "equity_curve": equity_curve,
             "period": period,
             "config": config,
-        }
+        },
+        _context=_HookContext(metadata=ctx),
     )
 
     ctx["weekly_report"] = result

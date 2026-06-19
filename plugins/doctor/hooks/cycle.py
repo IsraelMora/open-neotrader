@@ -14,6 +14,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from doctor import run_diagnostics  # type: ignore[import]
 
 
+class _HookContext:
+    """Minimal context object compatible with _SdkContext expected by inner scripts."""
+
+    def __init__(self, metadata: dict) -> None:
+        self.metadata = metadata
+
+
 def run(ctx: dict) -> dict:
     config = ctx.get("plugin_config", {})
     active_ids = ctx.get("active_plugin_ids", [])
@@ -28,7 +35,8 @@ def run(ctx: dict) -> dict:
             "active_plugin_ids": active_ids,
             "required_credentials": required_creds,
             "context": ctx,
-        }
+        },
+        _context=_HookContext(metadata=ctx),
     )
 
     ctx["doctor_report"] = result
