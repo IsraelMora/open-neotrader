@@ -654,7 +654,12 @@ export class PluginsService implements OnApplicationBootstrap {
     const oldLen = currentBody?.length ?? 0;
     const newLen = newBody.trim().length;
 
-    // 4. Diff-cap: absolute floor + relative delta cap
+    // 4. Diff-cap: absolute floor + relative delta cap.
+    // NOTE: The length-ratio cap does NOT catch same-length full rewrites (e.g. a body
+    // that is the same length but completely different content). This is a known limitation
+    // compensated by the snapshot+revert+audit trail: any bad write is recoverable via
+    // revertSkill, and every write is audited. Full-content diff (e.g. Levenshtein ratio)
+    // is a future hardening option if the threat model requires it.
     const floorViolation = newLen < minLen;
     const ratioViolation = oldLen > 0 && Math.abs(newLen - oldLen) / oldLen > maxRatio;
     if (floorViolation || ratioViolation) {
@@ -667,6 +672,11 @@ export class PluginsService implements OnApplicationBootstrap {
     }
 
     // 5. Snapshot current body to KV BEFORE write (FIFO cap=5)
+    if (!this.kv) {
+      this.log.warn(
+        `writeSkillGuarded: KvService is undefined — snapshot and revert unavailable for '${skillName}'. Check KvService provider configuration.`,
+      );
+    }
     const snapshotKey = `skill_snapshot:${skillName}`;
     const raw = (await this.kv?.get(snapshotKey)) ?? null;
     let arr: string[];
@@ -701,7 +711,25 @@ export class PluginsService implements OnApplicationBootstrap {
    */
   async revertSkill(
     skillName: string,
-  ): Promise<{ ok: boolean; reason?: 'no_snapshot' | 'not_found' }> {
+  ): Promise<{ ok: boolean; reason?: 'no_snapshot' | 'not_found' | 'not_writable' }> {
+    // Allowlist gate (fail-closed): only llm_writable:true skills may be reverted.
+    // Revert restores a body the kernel previously wrote; it still modifies a skill file,
+    // so the same opt-in check applies.
+    const pluginForCheck = await this.db.plugin.findFirst({
+      where: { active: true, type: 'skill', name: skillName },
+    });
+    if (pluginForCheck?.installed_path) {
+      const manifest = this.getManifest(pluginForCheck.installed_path);
+      if (manifest?.plugin.llm_writable !== true) {
+        await this.audit?.log({
+          event_type: 'skill_write_denied',
+          plugin_id: pluginForCheck.id,
+          meta: { skill: skillName, reason: 'not_writable', op: 'revert' },
+        });
+        return { ok: false, reason: 'not_writable' };
+      }
+    }
+
     const snapshotKey = `skill_snapshot:${skillName}`;
     const raw = (await this.kv?.get(snapshotKey)) ?? null;
     let arr: string[];

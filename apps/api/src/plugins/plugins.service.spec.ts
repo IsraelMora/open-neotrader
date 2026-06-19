@@ -510,34 +510,66 @@ describe('PluginsService.writeSkillGuarded', () => {
 describe('PluginsService.revertSkill', () => {
   beforeEach(() => jest.restoreAllMocks());
 
-  it('no snapshot → {ok:false, reason:"no_snapshot"}, no writeSkillContent, no audit', async () => {
+  it('no snapshot → {ok:false, reason:"no_snapshot"}, no writeSkillContent', async () => {
     const { service, audit, writeSkillContentMock } = makeServiceWithKv({
       kvValue: null,
+      manifest: {
+        plugin: {
+          id: 'test-skill',
+          name: 'Test Skill',
+          version: '1.0.0',
+          type: 'skill',
+          llm_writable: true,
+        },
+      },
     });
 
     const result = await service.revertSkill('test-skill');
 
     expect(result).toEqual({ ok: false, reason: 'no_snapshot' });
     expect(writeSkillContentMock).not.toHaveBeenCalled();
-    expect(audit.log).not.toHaveBeenCalled();
+    // audit is NOT called for no_snapshot (only called for skill_write_denied and skill_reverted)
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'skill_reverted' }),
+    );
   });
 
   it('no snapshot (empty JSON array) → {ok:false, reason:"no_snapshot"}', async () => {
     const { service, audit, writeSkillContentMock } = makeServiceWithKv({
       kvValue: JSON.stringify([]),
+      manifest: {
+        plugin: {
+          id: 'test-skill',
+          name: 'Test Skill',
+          version: '1.0.0',
+          type: 'skill',
+          llm_writable: true,
+        },
+      },
     });
 
     const result = await service.revertSkill('test-skill');
 
     expect(result).toEqual({ ok: false, reason: 'no_snapshot' });
     expect(writeSkillContentMock).not.toHaveBeenCalled();
-    expect(audit.log).not.toHaveBeenCalled();
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'skill_reverted' }),
+    );
   });
 
   it('with snapshot: pops latest, calls writeSkillContent with that body, audits skill_reverted, persists shrunken array', async () => {
     const snapshots = ['body-v1', 'body-v2', 'body-v3'];
     const { service, kv, audit, writeSkillContentMock } = makeServiceWithKv({
       kvValue: JSON.stringify(snapshots),
+      manifest: {
+        plugin: {
+          id: 'test-skill',
+          name: 'Test Skill',
+          version: '1.0.0',
+          type: 'skill',
+          llm_writable: true,
+        },
+      },
     });
 
     let savedArr: string[] | null = null;
@@ -555,5 +587,46 @@ describe('PluginsService.revertSkill', () => {
     );
     // Array shrank: 'body-v3' was popped
     expect(savedArr).toEqual(['body-v1', 'body-v2']);
+  });
+
+  it('Fix#2 revert allowlist: llm_writable absent → {ok:false, reason:"not_writable"}, audits skill_write_denied, writeSkillContent NOT called', async () => {
+    // revertSkill must enforce llm_writable just like writeSkillGuarded (fail-closed)
+    const snapshots = ['body-v1', 'body-v2'];
+    const { service, audit, writeSkillContentMock } = makeServiceWithKv({
+      kvValue: JSON.stringify(snapshots),
+      manifest: {
+        plugin: { id: 'test-skill', name: 'Test Skill', version: '1.0.0', type: 'skill' },
+        // llm_writable absent → fail-closed
+      },
+    });
+
+    const result = await service.revertSkill('test-skill');
+
+    expect(result).toEqual({ ok: false, reason: 'not_writable' });
+    expect(writeSkillContentMock).not.toHaveBeenCalled();
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'skill_write_denied' }),
+    );
+  });
+
+  it('Fix#2 revert allowlist: llm_writable:false → {ok:false, reason:"not_writable"}', async () => {
+    const snapshots = ['body-v1'];
+    const { service, writeSkillContentMock } = makeServiceWithKv({
+      kvValue: JSON.stringify(snapshots),
+      manifest: {
+        plugin: {
+          id: 'test-skill',
+          name: 'Test Skill',
+          version: '1.0.0',
+          type: 'skill',
+          llm_writable: false,
+        },
+      },
+    });
+
+    const result = await service.revertSkill('test-skill');
+
+    expect(result).toEqual({ ok: false, reason: 'not_writable' });
+    expect(writeSkillContentMock).not.toHaveBeenCalled();
   });
 });
