@@ -5,6 +5,7 @@ export type AuditEventType =
   | 'cycle_start'
   | 'cycle_complete'
   | 'cycle_fail'
+  | 'cycle_aborted'
   | 'signal'
   | 'decision'
   | 'plugin_activate'

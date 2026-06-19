@@ -19,8 +19,8 @@ import pytest
 
 RUNNER_PATH = Path(__file__).parent.parent / "runner.py"
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
-WEEKLY_REPORTER_HOOK = REPO_ROOT / "plugins" / "weekly-reporter" / "hooks" / "cycle.py"
-DOCTOR_HOOK = REPO_ROOT / "plugins" / "doctor" / "hooks" / "cycle.py"
+WEEKLY_REPORTER_HOOK = REPO_ROOT / "plugins" / "weekly-reporter" / "hooks" / "on_cycle.py"
+DOCTOR_HOOK = REPO_ROOT / "plugins" / "doctor" / "hooks" / "on_cycle.py"
 
 
 def _load_runner():
@@ -33,6 +33,14 @@ def _load_runner():
 
 def _load_hook_module(path: Path, module_name: str):
     """Load a hook module, registering it in sys.modules so dataclasses work."""
+    # Undo sandbox isolation poisoning (test_isolation.py sets urllib.request → None
+    # in sys.modules; weekly-reporter imports it, so we must clear it before loading)
+    for blocked_mod in list(sys.modules.keys()):
+        if sys.modules[blocked_mod] is None and (
+            blocked_mod.startswith("urllib") or blocked_mod in ("socket", "ssl", "http")
+        ):
+            del sys.modules[blocked_mod]
+
     spec = importlib.util.spec_from_file_location(module_name, path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = mod
@@ -153,7 +161,7 @@ def test_weekly_reporter_hook_forwards_credentials(monkeypatch):
         "plugin_config": {"weekly_report_day": today, "min_trades": 0},
     }
 
-    hook_mod.run(ctx)
+    hook_mod.on_cycle(ctx)
 
     assert received.get("_context") is not None, (
         "generate_and_send was called without _context — credentials never delivered"
@@ -203,7 +211,7 @@ def test_doctor_hook_forwards_credentials(monkeypatch):
         "plugin_config": {},
     }
 
-    hook_mod.run(ctx)
+    hook_mod.on_cycle(ctx)
 
     assert received.get("_context") is not None, (
         "run_diagnostics was called without _context — credentials never delivered"
