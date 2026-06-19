@@ -1,0 +1,320 @@
+import { AgentsService } from './agents.service';
+import type { LlmService, LlmResponse, ToolCallRequest } from '../llm/llm.service';
+import type { SandboxGateway } from '../sandbox/sandbox.gateway';
+import type { PluginsService } from '../plugins/plugins.service';
+import type { ContextMemoryService } from '../context-memory/context-memory.service';
+import type { AuditService } from '../audit/audit.service';
+import type { AlertsService } from '../alerts/alerts.service';
+
+// ── Stubs ─────────────────────────────────────────────────────────────────────
+
+function makeAudit(): jest.Mocked<Pick<AuditService, 'log'>> {
+  return { log: jest.fn().mockResolvedValue(undefined) };
+}
+
+function makePlugins(
+  activeIds: string[],
+  toolNames: string[],
+): jest.Mocked<Pick<PluginsService, 'findActive' | 'getProviderTools'>> {
+  return {
+    findActive: jest.fn().mockResolvedValue(activeIds.map((id) => ({ id, type: 'provider' }))),
+    getProviderTools: jest.fn().mockResolvedValue(
+      toolNames.map((n) => ({
+        plugin_id: n.split('__')[0],
+        name: n,
+        description: '',
+        input_schema: { type: 'object', properties: {} },
+      })),
+    ),
+  };
+}
+
+function makeAgentsService(
+  plugins: ReturnType<typeof makePlugins>,
+  audit: ReturnType<typeof makeAudit>,
+  llm?: Partial<LlmService>,
+): AgentsService {
+  return new AgentsService(
+    (llm ?? {}) as unknown as LlmService,
+    {} as unknown as SandboxGateway,
+    plugins as unknown as PluginsService,
+    {} as unknown as ContextMemoryService,
+    audit as unknown as AuditService,
+    {} as unknown as AlertsService,
+  );
+}
+
+// ── Test access to private methods via any cast ───────────────────────────────
+
+async function callValidate(
+  service: AgentsService,
+  cycleId: string,
+  calls: ToolCallRequest[],
+): Promise<ToolCallRequest[]> {
+  return (
+    service as unknown as {
+      _validateToolCalls: (c: string, t: ToolCallRequest[]) => Promise<ToolCallRequest[]>;
+    }
+  )._validateToolCalls(cycleId, calls);
+}
+
+function makeLlm(responseText: string): Partial<LlmService> {
+  const response: LlmResponse = {
+    text: responseText,
+    tool_calls: [],
+    backend: 'api',
+    skills_read: [],
+    skills_written: [],
+  };
+  return {
+    complete: jest.fn().mockResolvedValue(response),
+  };
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe('AgentsService._validateToolCalls', () => {
+  const CYCLE_ID = 'cycle-test-001';
+
+  it('returns a valid call unchanged (no audit event)', async () => {
+    const plugins = makePlugins(['alpaca-provider'], ['alpaca-provider__place_order']);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'alpaca-provider', function: 'place_order', args: { symbol: 'AAPL' } },
+    ];
+
+    const result: ToolCallRequest[] = await callValidate(service, CYCLE_ID, calls);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual(calls[0]);
+    expect(audit.log).not.toHaveBeenCalled();
+  });
+
+  it('drops a call referencing an inactive plugin and audits with reason plugin_inactive', async () => {
+    // alpaca-provider has tools declared but is NOT in active list
+    const plugins = makePlugins([], ['alpaca-provider__place_order']);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'alpaca-provider', function: 'place_order', args: {} },
+    ];
+
+    const result: ToolCallRequest[] = await callValidate(service, CYCLE_ID, calls);
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledTimes(1);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cycle_id: CYCLE_ID,
+        event_type: 'tool_call_dropped',
+        plugin_id: 'alpaca-provider',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ reason: 'plugin_inactive' }),
+      }),
+    );
+  });
+
+  it('drops a call referencing a function not declared in tools.json and audits with reason function_not_declared', async () => {
+    // Plugin is active, but 'invent_trade' is not in declared tools
+    const plugins = makePlugins(['alpaca-provider'], ['alpaca-provider__place_order']);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'alpaca-provider', function: 'invent_trade', args: {} },
+    ];
+
+    const result: ToolCallRequest[] = await callValidate(service, CYCLE_ID, calls);
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledTimes(1);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'alpaca-provider',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ reason: 'function_not_declared' }),
+      }),
+    );
+  });
+
+  it('drops a call with a completely unknown plugin_id and audits with reason plugin_not_found', async () => {
+    const plugins = makePlugins(['alpaca-provider'], ['alpaca-provider__place_order']);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'nonexistent-plugin', function: 'do_something', args: {} },
+    ];
+
+    const result: ToolCallRequest[] = await callValidate(service, CYCLE_ID, calls);
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'nonexistent-plugin',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ reason: 'plugin_not_found' }),
+      }),
+    );
+  });
+
+  it('handles mixed valid and invalid calls: valid returned, each invalid audited independently', async () => {
+    const plugins = makePlugins(['alpaca-provider'], ['alpaca-provider__place_order']);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'alpaca-provider', function: 'place_order', args: { symbol: 'AAPL' } }, // valid
+      { plugin_id: 'alpaca-provider', function: 'hallucinated_fn', args: {} }, // invalid
+      { plugin_id: 'ghost-plugin', function: 'ghost_fn', args: {} }, // invalid
+    ];
+
+    const result: ToolCallRequest[] = await callValidate(service, CYCLE_ID, calls);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].function).toBe('place_order');
+    // Two invalid calls → two audit entries
+    expect(audit.log).toHaveBeenCalledTimes(2);
+  });
+
+  it('never throws', async () => {
+    const plugins = makePlugins([], []);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    await expect(callValidate(service, CYCLE_ID, [])).resolves.toEqual([]);
+  });
+
+  it('returns [] and does not throw when getProviderTools throws', async () => {
+    const plugins = makePlugins(['alpaca-provider'], []);
+    // Override getProviderTools to throw.
+    (plugins.getProviderTools as jest.Mock).mockRejectedValue(new Error('Prisma connection lost'));
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'alpaca-provider', function: 'place_order', args: {} },
+    ];
+
+    await expect(callValidate(service, CYCLE_ID, calls)).resolves.toEqual([]);
+  });
+});
+
+// ── AgentsService._executeCycle — parseToolCalls wiring ──────────────────────
+
+describe('AgentsService._executeCycle — parse wiring', () => {
+  const CYCLE_ID = 'parse-cycle-001';
+
+  async function callExecuteCycle(
+    service: AgentsService,
+    cycleId: string,
+    context: string,
+  ): ReturnType<AgentsService['runCycle']> {
+    return (
+      service as unknown as {
+        _executeCycle: (
+          c: string,
+          ctx: string,
+          sp?: string,
+        ) => ReturnType<AgentsService['runCycle']>;
+      }
+    )._executeCycle(cycleId, context, undefined);
+  }
+
+  function makeFullPlugins(): jest.Mocked<
+    Pick<PluginsService, 'findActive' | 'getProviderTools' | 'getSkillsMetadata'>
+  > {
+    return {
+      findActive: jest.fn().mockResolvedValue([]),
+      getProviderTools: jest.fn().mockResolvedValue([]),
+      getSkillsMetadata: jest.fn().mockResolvedValue([]),
+    };
+  }
+
+  function makeSandbox(): jest.Mocked<Pick<SandboxGateway, 'runCycle' | 'callPlugin'>> {
+    return {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    };
+  }
+
+  function makeMemory(): jest.Mocked<
+    Pick<ContextMemoryService, 'toContextString' | 'appendObservation' | 'trackSignal'>
+  > {
+    return {
+      toContextString: jest.fn().mockResolvedValue(''),
+      appendObservation: jest.fn().mockResolvedValue(undefined),
+      trackSignal: jest.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  function makeFullAgentsService(
+    llm: Partial<LlmService>,
+    audit: ReturnType<typeof makeAudit>,
+    plugins: ReturnType<typeof makeFullPlugins>,
+    sandbox: ReturnType<typeof makeSandbox>,
+    memory: ReturnType<typeof makeMemory>,
+  ): AgentsService {
+    return new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+  }
+
+  it('parses tool_calls from llmResponse.text via parseToolCalls in the cycle', async () => {
+    const responseText =
+      '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","qty":1}}]</tool_calls>';
+    const llm = makeLlm(responseText);
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    // Make the plugin active and declare the tool so it passes validation.
+    plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
+    plugins.getProviderTools.mockResolvedValue([
+      {
+        plugin_id: 'alpaca-provider',
+        name: 'alpaca-provider__place_order',
+        description: '',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ] as never);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    const result = await callExecuteCycle(service, CYCLE_ID, 'run cycle');
+
+    // The cycle must have parsed and executed the tool call.
+    expect(result.decisions).toHaveLength(1);
+    expect(result.decisions[0].plugin_id).toBe('alpaca-provider');
+    expect(result.decisions[0].function).toBe('place_order');
+  });
+
+  it('fires a parse_miss audit event when llmResponse.text contains a malformed block', async () => {
+    const responseText = '<tool_calls>not valid json</tool_calls>';
+    const llm = makeLlm(responseText);
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    await callExecuteCycle(service, CYCLE_ID, 'run cycle');
+
+    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const parseMissCall = calls.find(([arg]) => arg['event_type'] === 'parse_miss');
+    expect(parseMissCall).toBeDefined();
+    expect(parseMissCall![0]).toMatchObject({
+      cycle_id: CYCLE_ID,
+      event_type: 'parse_miss',
+    });
+  });
+});
