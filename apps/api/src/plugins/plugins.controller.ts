@@ -8,10 +8,11 @@ import {
   Body,
   HttpCode,
   HttpStatus,
+  HttpException,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags, ApiOperation } from '@nestjs/swagger';
 import { PluginsService } from './plugins.service';
-import type { HydratedPlugin, PluginVerification } from './plugins.service';
+import type { HydratedPlugin, PluginVerification, WriteSkillResult } from './plugins.service';
 import { InstallPluginDto } from './dto/install-plugin.dto';
 
 /** Endpoints CRUD de plugins: instalación, activación, config, tools, skills y verificación. */
@@ -143,6 +144,35 @@ export class PluginsController {
   async manifest(@Param('id') id: string) {
     const p = await this.svc.findById(id);
     return this.svc.getManifest(p.installed_path);
+  }
+
+  @Post(':id/skill')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Guarded write of SKILL.md body (requires llm_writable:true in manifest)',
+  })
+  async writeSkill(
+    @Param('id') id: string,
+    @Body() body: { new_body: string },
+  ): Promise<WriteSkillResult> {
+    const plugin = await this.svc.findById(id);
+    const result = await this.svc.writeSkillGuarded(plugin.name, body.new_body);
+    if (!result.ok) {
+      throw new HttpException({ ok: false, reason: result.reason }, HttpStatus.BAD_REQUEST);
+    }
+    return result;
+  }
+
+  @Post(':id/revert-skill')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Revert SKILL.md to most recent KV snapshot' })
+  async revertSkill(@Param('id') id: string): Promise<{ ok: boolean; reason?: string }> {
+    const plugin = await this.svc.findById(id);
+    const result = await this.svc.revertSkill(plugin.name);
+    if (!result.ok) {
+      throw new HttpException({ ok: false, reason: result.reason }, HttpStatus.BAD_REQUEST);
+    }
+    return result;
   }
 
   @Delete(':id')
