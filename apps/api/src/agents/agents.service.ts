@@ -23,6 +23,12 @@ export interface GovernedTurnInput {
   system_prompt?: string;
   /** Reuse the caller's cycle_id; if absent, a new UUID is generated. */
   cycle_id?: string;
+  /**
+   * Pre-fetched active plugins from _executeCycle. When provided, _validateToolCalls
+   * skips its own findActive() call (single DB round-trip per cycle).
+   * Only used when source === 'cycle'.
+   */
+  _activePlugins?: import('../plugins/plugins.service').HydratedPlugin[];
 }
 
 /** Result of a single governed LLM turn (validate + dispatch + audit). */
@@ -36,6 +42,8 @@ export interface GovernedTurnResult {
   skills_read: string[];
   skills_written: string[];
   llm_response: LlmResponse;
+  /** Authoritative signals emitted by _executeToolCalls (symbol+action pairs). */
+  signalsEmitted: { symbol: string; action: string }[];
 }
 
 /** Resultado completo de un ciclo del agente, incluyendo decisiones, ejecuciones en sandbox y resumen de vetos. */
@@ -169,10 +177,14 @@ export class AgentsService {
       cycle_id,
       llmResponse.tool_calls,
       providerTools,
+      input._activePlugins,
     );
-    const { decisions, sandbox_results } = await this._executeToolCalls(cycle_id, validatedCalls);
+    const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
+      cycle_id,
+      validatedCalls,
+    );
 
-    // ── Audit the turn (only for chat source) ────────────────────────────────
+    // ── Audit the turn ────────────────────────────────────────────────────────
     if (input.source === 'chat') {
       await this.audit.log({
         cycle_id,
@@ -185,6 +197,12 @@ export class AgentsService {
           tools_called: validatedCalls.map((t) => `${t.plugin_id}.${t.function}`),
         },
       });
+    } else if (input.source === 'cycle') {
+      // Cycle owns its own audit — nothing to emit here.
+    } else {
+      this.log.warn(
+        `runGovernedTurn: unknown source discriminator '${String(input.source)}' — skipping audit`,
+      );
     }
 
     return {
@@ -197,6 +215,7 @@ export class AgentsService {
       skills_read,
       skills_written,
       llm_response: llmResponse,
+      signalsEmitted,
     };
   }
 
@@ -259,35 +278,18 @@ export class AgentsService {
       context: enrichedContext + signalSummary,
       system_prompt: systemPrompt,
       cycle_id,
+      _activePlugins: activePlugins,
     });
 
-    const { decisions, sandbox_results, llm_response: llmResponse, skills_read } = turnResult;
-
-    // Emit a llm_response stage audit (equivalent to what _executeCycle emitted before).
-    await this.audit.log({
-      cycle_id,
-      event_type: 'cycle_complete',
-      llm_text: llmResponse.text?.slice(0, 2000),
+    const {
+      decisions,
+      sandbox_results,
+      llm_response: llmResponse,
       skills_read,
-      signals_count: turnResult.tool_calls.length,
-      meta: {
-        stage: 'llm_response',
-        tools_called: turnResult.tool_calls.map((t) => `${t.plugin_id}.${t.function}`),
-      },
-    });
+      signalsEmitted,
+    } = turnResult;
 
     // ── Persistir en memoria inter-ciclos ─────────────────────────────────────
-    // Reconstruct signalsEmitted from dispatched decisions (decisions with allowed=true
-    // that have symbol+action in their args).
-    const signalsEmitted = decisions
-      .filter((d) => d.allowed)
-      .flatMap((d) => {
-        const args = d.args;
-        if (typeof args['symbol'] === 'string' && typeof args['action'] === 'string') {
-          return [{ symbol: args['symbol'], action: args['action'] }];
-        }
-        return [];
-      });
 
     await this.memory.appendObservation({
       cycle_id,
@@ -375,17 +377,20 @@ export class AgentsService {
    * Drops calls whose plugin is not active or whose function is not declared in tools.json.
    * Each dropped call is audited with event_type 'tool_call_dropped' and a specific reason.
    * Returns only valid calls. Never throws.
+   *
+   * @param preloadedActivePlugins - When provided (cycle path), skips the findActive() DB call.
    */
   private async _validateToolCalls(
     cycle_id: string,
     calls: import('../llm/llm.service').ToolCallRequest[],
     hoistedTools?: import('../plugins/plugins.service').ProviderTool[],
+    preloadedActivePlugins?: import('../plugins/plugins.service').HydratedPlugin[],
   ): Promise<import('../llm/llm.service').ToolCallRequest[]> {
     if (calls.length === 0) return [];
 
     try {
-      // Build lookup structures once.
-      const activePlugins = await this.plugins.findActive();
+      // Use pre-fetched plugins when available (cycle path) to avoid a second DB round-trip.
+      const activePlugins = preloadedActivePlugins ?? (await this.plugins.findActive());
       const activeIds = new Set(activePlugins.map((p: HydratedPlugin) => p.id));
       // Use hoisted tools when provided (from _executeCycle) to avoid a second DB round-trip.
       const providerTools = hoistedTools ?? (await this.plugins.getProviderTools());
