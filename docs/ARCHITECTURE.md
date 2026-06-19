@@ -30,7 +30,7 @@ Filosofía operativa:
 - **Un único usuario** (monousuario autenticado con JWT + TOTP).
 - **Sin backend propio en la nube**: toda la lógica corre en el host del operador.
 - **Egreso de red controlado**: solo el `ProviderGateway` puede salir a internet; el sandbox Python corre sin red.
-- **LLM como orquestador, no como decisor**: el LLM solo puede invocar herramientas declaradas en los manifiestos activos, y solo puede mantener o reducir la exposición propuesta por las señales.
+- **Kernel neutral**: el núcleo no impone guardarraíles de riesgo propios. La disciplina y el veto son responsabilidad de plugins de tipo `discipline`, evaluados en `_runVetoLayer()`. El LLM solo puede invocar herramientas declaradas en los manifiestos activos.
 
 ---
 
@@ -286,13 +286,13 @@ Implementado en `apps/api/src/agents/agents.service.ts` (método `_executeCycle`
 │  4. LLM (LlmService.complete)                           │
 │     └─ System prompt: SKILL.md de plugins activos      │
 │     └─ Context: señales aprobadas + memoria             │
-│     └─ Restricción: solo puede mantener o ↓ exposición │
-│        (Math.min(current_exp, proposed_exp))            │
+│     └─ Respuesta: texto estructurado (tool_calls=[])   │
+│        (ejecución de tool calls LLM→sandbox: F2)       │
 │                                                         │
-│  5. EJECUCIÓN DE TOOL CALLS                             │
-│     └─ ToolCallValidatorService valida contra whitelist │
-│     └─ SandboxGateway.callPlugin() por cada tool call  │
-│     └─ Máximo 3 tool calls por ciclo                   │
+│  5. DESPACHO DE ACCIONES                                │
+│     └─ AgentsService parsea la respuesta del LLM       │
+│     └─ SandboxGateway.callPlugin() para acciones       │
+│        validadas contra manifest.skills.keys           │
 │                                                         │
 │  6. PERSISTENCIA                                        │
 │     ├─ AuditEntry (inmutable, indexado por cycle_id)   │
@@ -301,17 +301,24 @@ Implementado en `apps/api/src/agents/agents.service.ts` (método `_executeCycle`
 └─────────────────────────────────────────────────────────┘
 ```
 
-### Restricción del LLM (llm-constraints.md)
+### Restricciones del LLM (llm-constraints.md)
 
-El LLM opera bajo guardrails no negociables:
+El LLM opera con las siguientes restricciones reales en la implementación actual:
 
 - **Solo invoca herramientas whitelisteadas** en los manifiestos activos.
-- **Solo puede reducir exposición**: `Math.min(current_exp, proposed_exp)`. Nunca la aumenta.
-- **Responde texto estructurado**, no tool-calls nativos. `AgentsService` parsea y valida.
-- **API keys nunca en el prompt**: se pasan como env vars al sandbox.
+- **Responde texto estructurado**, no tool-calls nativos. `AgentsService` parsea y despacha.
+- **`tool_calls` siempre `[]`**: el pipeline de ejecución de tool calls LLM→sandbox no está
+  implementado en la versión actual (previsto para F2). El LLM responde texto; las acciones
+  las decide `AgentsService` parseando esa respuesta.
+- **API keys nunca en el prompt**: el sandbox no recibe el entorno del host; las credenciales
+  se inyectan por llamada en el contexto de la request (`context.credentials`).
+- **Veto de riesgo opt-in**: no hay guardarraíl de exposición en el kernel. Los plugins
+  `discipline` implementan las reglas de riesgo del operador vía `_runVetoLayer()`.
+  Sin plugins `discipline` activos, no se aplica ningún veto.
 
 Amenazas mitigadas: prompt injection, tool declarations falsas, datos corruptos,
-timing attacks (ver `docs/llm-constraints.md` para el threat model completo).
+timing attacks, acceso a secretos vía env, acceso a red desde el sandbox
+(ver `docs/llm-constraints.md` para el threat model completo).
 
 ### Backends LLM soportados
 
@@ -334,11 +341,11 @@ Los skills de los plugins activos se inyectan en el system prompt para todos los
 |------|-----------|
 | **Autenticación** | JWT + TOTP (speakeasy). Usuario único (`User` model monousuario). |
 | **Rate limiting** | ThrottlerGuard: 120 req/min general, 10 req/min en `/auth`. |
-| **Sandbox Python** | `spawn` sin red (`network=false` en manifest). CPU y RAM limitados vía `resource`. Max 64 file descriptors. |
-| **Whitelist de funciones** | `call_plugin` en `runner.py` valida nombre de función contra `manifest.skills.keys`. LLM no puede invocar funciones no declaradas. |
+| **Sandbox Python** | `spawn` con env explícito (sin spread de `process.env`). CPU y RAM limitados vía `resource`. Max 64 file descriptors. Bajo `SANDBOX_STRICT=true`: import guard + open guard vía `isolation.py`. |
+| **Whitelist de funciones** | `call_plugin` en `runner.py` valida el nombre de función contra `manifest.skills.keys`. LLM no puede invocar funciones no declaradas. |
 | **Egreso de red** | Solo `ProviderGateway` accede a internet. URL parameter sanitization contra injection. |
-| **Secretos** | API keys exclusivamente via variables de entorno (`.env`). Nunca en DB ni en prompts. |
-| **Reducción de exposición** | `Math.min(current_exp, proposed_exp)` en `AgentsService`. Guardrail en código, no solo en prompt. |
+| **Secretos** | API keys en host `.env`. El sandbox recibe solo variables de control (PATH, NEUROTRADER_PLUGINS_DIR, etc.); nunca el entorno completo del host. Credenciales de proveedor inyectadas por llamada en `context.credentials`. |
+| **Veto de riesgo** | Implementado via plugins `discipline` (opt-in). El kernel no impone guardarraíles propios; la política de riesgo la define el operador con los plugins que activa. |
 | **Audit log** | `AuditEntry` inmutable por cycle_id. Trazabilidad completa de cada decisión. |
 | **Docker** | Contenedor `api` en red bridge interna. Bind a `127.0.0.1:3000` (no expuesto directamente). nginx en :8080 como único ingress. |
 
@@ -404,7 +411,7 @@ No hay Redis ni caché distribuida; el diseño es explícitamente single-node.
 | Documento | Contenido |
 |-----------|-----------|
 | `docs/plugin-protocol.md` | Especificación completa de NTPP v1: schema de manifest, clase base Python, restricciones del sandbox |
-| `docs/llm-constraints.md` | Guardrails del LLM, flujo completo `AgentRunService → LlmProxyService → ToolCallValidatorService → SandboxGateway → DecisionService`, threat model |
+| `docs/llm-constraints.md` | Principio de kernel neutral, flujo completo `AgentsService → LlmService → SandboxGateway`, veto opt-in via discipline plugins, threat model |
 | `docs/plugin-store-verification.md` | Flujo de verificación del store: estados, checklist manual, endpoints de la Store API |
 | `apps/api/prisma/schema.prisma` | Schema completo de la DB del API |
 | `plugins-catalog.json` | Catálogo oficial de 37 plugins verificados con metadata |

@@ -118,16 +118,20 @@ sandbox/
 
 llm/
   LlmModule
-    - LlmProxyService: llama a Claude/Gemini/OpenAI con contexto read-only
-    - ToolCallValidatorService: solo permite tool calls declarados en el plugin activo
-    - NO permite ejecutar código, solo retorna texto + tool call results
+    - LlmService: llama a Claude/Gemini/OpenAI con contexto read-only
     - LlmController: POST /llm/query (para uso del panel y plugins)
+    - Nota: ToolCallValidatorService y LlmProxyService NO fueron construidos /
+      supersedidos por el diseño de kernel neutral. LlmService implementa
+      directamente el despacho multi-backend. La validación de tool calls
+      LLM→sandbox está prevista para F2 (actualmente tool_calls=[]).
 
 agents/
   AgentsModule
-    - AgentService: ciclo de vida de un agente (conjunto de plugins + LLM)
-    - AgentRunService: ejecutar un ciclo del agente
-    - DecisionService: aplicar reglas de veto (solo puede mantener/recortar)
+    - AgentsService: ciclo de vida del agente + _executeCycle + _runVetoLayer
+    - Nota: AgentRunService y DecisionService NO fueron construidos /
+      supersedidos por AgentsService unificado. El guardarraíl de no-ampliación
+      (Math.min) no existe en el kernel; el veto de riesgo es opt-in via
+      plugins discipline evaluados en _runVetoLayer().
 ```
 
 ### 4.2 apps/sandbox — Python Runner
@@ -294,18 +298,22 @@ Verificación manual:
 - [ ] `PluginsController`: CRUD REST + endpoints de store
 - [ ] Migrar plugins built-in (skills-base, universo-base, disciplina-dsr)
 
-### Fase 4 — LLM proxy con restricciones (2-3 días)
-- [ ] `LlmModule`: soporte Claude (Anthropic SDK) + Gemini + OpenAI
-- [ ] `ToolCallValidatorService`: whitelist de tools por plugin activo
-- [ ] `LlmController`: POST /llm/query (panel) y POST /llm/agent-query (ciclo agente)
-- [ ] Tests: tool call no declarado → rechazado 400; código embebido en respuesta → ignorado
-- [ ] Documentar el contrato: qué puede y qué no puede hacer el LLM
+### Fase 4 — LLM proxy con restricciones (2-3 días) [IMPLEMENTADO — ver nota]
+- [x] `LlmModule`: soporte Claude (Anthropic SDK) + Gemini + OpenAI (implementado en LlmService)
+- [x] `LlmController`: POST /llm/query (panel) y POST /llm/agent-query (ciclo agente)
+- [ ] Ejecución de tool calls LLM→sandbox (F2 — tool_calls actualmente siempre [])
+- Nota: `ToolCallValidatorService` no fue construido / supersedido por validación
+  directa en AgentsService. `LlmProxyService` no fue construido / implementado
+  directamente como `LlmService`.
 
-### Fase 5 — Ciclo del agente (3-4 días)
-- [ ] `AgentsModule`: un agente = configuración de plugins + LLM + reglas
-- [ ] `AgentRunService`: ejecutar un ciclo completo (propuesta → auditoría → decisión)
-- [ ] Migrar lógica de veto/recorte de `trading-test` (solo puede mantener/recortar)
-- [ ] `DecisionService`: guardarraíl de no-ampliación
+### Fase 5 — Ciclo del agente (3-4 días) [IMPLEMENTADO — ver nota]
+- [x] `AgentsModule`: implementado como AgentsService unificado
+- [x] Ciclo completo (`_executeCycle`): hooks, veto layer, LLM, persistencia
+- [x] Veto de riesgo via plugins discipline (`_runVetoLayer()`)
+- Nota: `AgentRunService` no fue construido / supersedido por AgentsService.
+  `DecisionService` no fue construido / el guardarraíl de no-ampliación
+  (Math.min) no existe en el kernel; la política de riesgo es responsabilidad
+  de plugins discipline (opt-in por el operador).
 - [ ] Panel web: vista del agente, historial de decisiones, NAV
 
 ### Fase 6 — Panel web (2-3 días, paralelo a Fase 5)

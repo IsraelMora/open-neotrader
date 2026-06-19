@@ -112,28 +112,50 @@ class SymbolData:
     regime: str                       # "trending" | "ranging" | "volatile"
 ```
 
-## Restricciones del sandbox (impuestas, no declarativas)
+## Restricciones del sandbox
 
-El sandbox Python aplica las siguientes restricciones **independientemente de lo que declare el plugin**:
+El sandbox aplica restricciones en dos niveles:
 
-```python
-# isolation.py (apps/sandbox/)
-BLOCKED_MODULES = {
-    "socket", "requests", "urllib", "http.client",
-    "subprocess", "os.system", "multiprocessing",
-    "ctypes", "cffi",
-}
+### Límites de recursos del OS (siempre activos)
 
-BLOCKED_BUILTINS = {
-    "__import__",   # reemplazado por el sandbox
-    "eval", "exec", "compile",
-    "open",         # reemplazado por open_sandboxed (solo /data/plugin-{id}/)
-}
-```
+Aplicados al iniciar `runner.py` mediante el módulo `resource`:
 
-A nivel de Docker/OS:
-- `--network=none`: sin acceso a red (ni loopback entre plugins)
-- Filesystem montado read-only excepto `/data/{plugin-id}/`
+- **CPU**: configurable via `SANDBOX_CPU_SECONDS` (default: 60 s)
+- **Memoria virtual**: configurable via `SANDBOX_MEM_MB` (default: 512 MB)
+- **File descriptors**: máximo 64
+
+### Guards en-proceso Python (F1 PR3 — gated por `SANDBOX_STRICT`)
+
+> **Estado actual (PR1)**: los guards en-proceso Python son **declarativos** — el módulo
+> de aislamiento no está implementado todavía. Se añadirá en F1 PR3. Los límites de
+> recursos del OS (CPU, memoria, file descriptors) son los únicos controles activos hoy.
+
+Cuando el módulo de aislamiento esté disponible (F1 PR3), funcionará así:
+
+Bajo `SANDBOX_STRICT=true` (default de producción), `runner.py` activará guards antes de
+cargar cualquier código de plugin:
+
+- **Import guard**: bloqueará en-proceso los módulos de red y sistema más peligrosos
+  (`socket`, `ssl`, `requests`, `urllib`, `http`, `subprocess`, `multiprocessing`, `ctypes`, `cffi`,
+  entre otros). Si un plugin hace `import socket`, se lanzará `ImportError`.
+
+- **Open guard**: reemplazará `builtins.open` con una versión restringida a rutas bajo
+  `NEUROTRADER_PLUGINS_DIR`. Cualquier intento de abrir rutas del host lanzará `PermissionError`.
+
+Bajo `SANDBOX_STRICT=false` (modo dev en bare-metal), los guards se desactivarán y
+`runner.py` emitirá un aviso estructurado a stderr indicando exactamente qué está relajado.
+
+**Limitación importante**: estos guards son Python en-proceso. No son equivalentes al
+aislamiento a nivel OS. Un plugin con código nativo (`.so`) podría eludirlos. El aislamiento
+OS completo (Docker, seccomp, namespaces) es una medida de despliegue, no de runner:
+
+### Aislamiento OS (F5 / deployment-dependent — no garantizado en dev bare-metal)
+
+Las siguientes medidas se aplican **solo en despliegue con Docker / contenedor configurado**
+y NO están garantizadas cuando se ejecuta el sandbox en bare-metal de desarrollo:
+
+- `--network=none`: sin acceso a red a nivel OS
+- Filesystem montado read-only excepto el volumen de datos del plugin
 - `--cap-drop=ALL`: sin capabilities de sistema
 - Seccomp profile que bloquea syscalls peligrosas (ptrace, mount, etc.)
 
