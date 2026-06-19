@@ -50,6 +50,8 @@ export interface PretestTrade {
   price: number;
   quantity: number;
   pnl?: number;
+  /** Cost basis per share at entry (avg_price of position when trade was closed). Stored by _applySell. */
+  entry_price?: number;
 }
 
 export interface PretestPosition {
@@ -98,6 +100,8 @@ export interface SignificanceMetrics {
   max_dd: number;
   /** Count of closing trades (sell/close) that carry a pnl value. */
   n_trades: number;
+  /** Count of closing trades with pnl < 0. Used by gate min_loss_trades check. */
+  loss_trades: number;
 }
 
 /** Result of the significance gate evaluation. */
@@ -355,12 +359,12 @@ export class PretestService {
     const thresholds = await this._readGateThresholds();
 
     const stats = all.map((p) => {
-      const total_trades = p.state.trades.length;
-      const win_rate = total_trades > 0 ? p.state.win_trades / total_trades : 0;
       const return_pct = (p.state.equity - p.initial_capital) / p.initial_capital;
       const risk_adj =
         p.state.max_drawdown_pct > 0 ? return_pct / p.state.max_drawdown_pct : return_pct;
       const metrics = this.computeSignificance(p.state);
+      // Use computeSignificance win_rate (closing trades only) for consistency —
+      // avoids the deflation bug where total_trades included buy records.
       const reasons = this._evaluateGate(metrics, thresholds);
       const gate_status: 'READY' | 'NOT_READY' = reasons.length === 0 ? 'READY' : 'NOT_READY';
       return {
@@ -369,8 +373,8 @@ export class PretestService {
         equity: p.state.equity,
         return_pct: return_pct * 100,
         max_drawdown_pct: p.state.max_drawdown_pct,
-        total_trades,
-        win_rate: win_rate * 100,
+        total_trades: p.state.trades.length,
+        win_rate: metrics.win_rate * 100,
         realized_pnl: p.state.realized_pnl,
         plugin_count: p.plugin_ids.length,
         gate_status,
@@ -401,11 +405,13 @@ export class PretestService {
   /**
    * Computes significance metrics on-demand from the portfolio state's trades[].
    * Only closing trades (sell/close) with a pnl value are included.
-   * Per-trade return: r_i = pnl_i / (avg_price_i * qty_i)
-   *   where avg_price_i is approximated from the trade price (fill price at close time).
+   * Per-trade return: r_i = pnl_i / (entry_price_i * qty_i)
+   *   where entry_price_i is the cost-basis avg_price stored by _applySell.
+   *   Falls back to t.price (exit fill price) for old records missing entry_price.
    * Sharpe: mean(r) / sample_std(r, n-1). Returns 0 when n<2 or std=0.
-   * profit_factor: Σ(+pnl) / |Σ(-pnl)|. null when no losing trades (treated as PASS in gate).
+   * profit_factor: Σ(+pnl) / |Σ(-pnl)|. null when no losing trades (gate checks loss_trades separately).
    * win_rate: count(pnl>0) / n_trades.
+   * loss_trades: count(pnl<0).
    * max_dd: state.max_drawdown_pct.
    */
   computeSignificance(state: PretestState): SignificanceMetrics {
@@ -422,13 +428,16 @@ export class PretestService {
         win_rate: 0,
         max_dd: state.max_drawdown_pct,
         n_trades: 0,
+        loss_trades: 0,
       };
     }
 
-    // Per-trade return: r_i = pnl_i / (price_i * quantity_i)
-    // price_i is the fill price at close time (cost of the closed lot at avg_price basis)
+    // Per-trade return: r_i = pnl_i / (entry_price_i * quantity_i)
+    // entry_price is the cost-basis (avg_price at position open), stored by _applySell.
+    // Fall back to t.price (exit fill price) for legacy records missing entry_price.
     const returns = closingTrades.map((t) => {
-      const cost_basis = t.price * t.quantity;
+      const basis_price = t.entry_price ?? t.price;
+      const cost_basis = basis_price * t.quantity;
       return cost_basis > 0 ? t.pnl! / cost_basis : 0;
     });
 
@@ -450,12 +459,16 @@ export class PretestService {
     let sumPos = 0;
     let sumNeg = 0;
     let wins = 0;
+    let losses = 0;
     for (const t of closingTrades) {
       const pnl = t.pnl!;
       if (pnl > 0) {
         sumPos += pnl;
         wins++;
-      } else if (pnl < 0) sumNeg += Math.abs(pnl);
+      } else if (pnl < 0) {
+        sumNeg += Math.abs(pnl);
+        losses++;
+      }
     }
     const profit_factor: number | null = sumNeg > 0 ? sumPos / sumNeg : null;
     const win_rate = wins / n;
@@ -466,6 +479,7 @@ export class PretestService {
       win_rate,
       max_dd: state.max_drawdown_pct,
       n_trades: n,
+      loss_trades: losses,
     };
   }
 
@@ -482,33 +496,59 @@ export class PretestService {
     return { ready: reasons.length === 0, reasons, metrics };
   }
 
-  /** Reads gate thresholds from KvService, falling back to defaults on missing/NaN. */
+  /** Reads gate thresholds from KvService, falling back to defaults on missing/NaN.
+   * Clamps values to valid ranges to prevent misconfiguration from silently breaking the gate:
+   *   max_dd_pct  must be in (0, 100] — a value like 0.20 (fraction) would mean 0.20% and
+   *               reject everything; coerce out-of-range values to the 20% default.
+   *   min_sharpe  must be >= 0 (negative Sharpe threshold is meaningless).
+   *   min_trades  must be >= 1 (zero would mean n_trades=0 passes, defeating the purpose).
+   *   min_loss_trades must be >= 0 (zero is a valid "disabled" setting).
+   */
   private async _readGateThresholds(): Promise<{
     min_trades: number;
     min_sharpe: number;
     max_dd_pct: number;
+    min_loss_trades: number;
   }> {
     const parseNum = (raw: string | null, fallback: number): number => {
       if (raw === null) return fallback;
       const n = Number(raw);
       return isFinite(n) ? n : fallback;
     };
-    const [rawMinTrades, rawMinSharpe, rawMaxDd] = await Promise.all([
+    const [rawMinTrades, rawMinSharpe, rawMaxDd, rawMinLossTrades] = await Promise.all([
       this.kv.get('pretest.gate.min_trades'),
       this.kv.get('pretest.gate.min_sharpe'),
       this.kv.get('pretest.gate.max_dd_pct'),
+      this.kv.get('pretest.gate.min_loss_trades'),
     ]);
-    return {
-      min_trades: parseNum(rawMinTrades, 20),
-      min_sharpe: parseNum(rawMinSharpe, 1.0),
-      max_dd_pct: parseNum(rawMaxDd, 20),
-    };
+
+    const min_trades_raw = parseNum(rawMinTrades, 20);
+    const min_sharpe_raw = parseNum(rawMinSharpe, 1.0);
+    const max_dd_pct_raw = parseNum(rawMaxDd, 20);
+    const min_loss_trades_raw = parseNum(rawMinLossTrades, 3);
+
+    // Clamp: max_dd_pct must be in [1, 100] — anything below 1 almost certainly indicates
+    // a fraction was stored (e.g. 0.20 meaning 20%) rather than a percentage; coerce to default 20.
+    const max_dd_pct = max_dd_pct_raw >= 1 && max_dd_pct_raw <= 100 ? max_dd_pct_raw : 20;
+    // Clamp: min_sharpe must be >= 0
+    const min_sharpe = min_sharpe_raw >= 0 ? min_sharpe_raw : 0;
+    // Clamp: min_trades must be >= 1
+    const min_trades = min_trades_raw >= 1 ? min_trades_raw : 1;
+    // Clamp: min_loss_trades must be >= 0
+    const min_loss_trades = min_loss_trades_raw >= 0 ? min_loss_trades_raw : 0;
+
+    return { min_trades, min_sharpe, max_dd_pct, min_loss_trades };
   }
 
   /** Evaluates metrics against thresholds and returns a list of failure reasons. */
   private _evaluateGate(
     metrics: SignificanceMetrics,
-    thresholds: { min_trades: number; min_sharpe: number; max_dd_pct: number },
+    thresholds: {
+      min_trades: number;
+      min_sharpe: number;
+      max_dd_pct: number;
+      min_loss_trades: number;
+    },
   ): string[] {
     const reasons: string[] = [];
     if (metrics.n_trades < thresholds.min_trades) {
@@ -520,7 +560,13 @@ export class PretestService {
     if (metrics.max_dd > thresholds.max_dd_pct) {
       reasons.push(`max_dd exceeded: ${metrics.max_dd.toFixed(2)}% > ${thresholds.max_dd_pct}%`);
     }
-    // profit_factor null (no losses) is treated as PASS — no reason added
+    // A strategy with zero (or too few) losses has never been stress-tested — canonical overfit.
+    // profit_factor=null (no losses) now FAILS this check when min_loss_trades > 0.
+    if (metrics.loss_trades < thresholds.min_loss_trades) {
+      reasons.push(
+        `insufficient loss trades: ${metrics.loss_trades} < ${thresholds.min_loss_trades} (cannot validate risk on a strategy that never lost)`,
+      );
+    }
     return reasons;
   }
 
@@ -680,6 +726,9 @@ export class PretestService {
     const commission_cost = proceeds * commission_pct;
     const pnl = (trade.price - pos.avg_price) * qty - commission_cost;
     trade.pnl = pnl;
+    // Store the cost-basis per share so computeSignificance can use the correct
+    // denominator for per-trade returns (entry cost basis, not exit fill price).
+    trade.entry_price = pos.avg_price;
     state.cash += proceeds - commission_cost;
     state.realized_pnl += pnl;
     if (pnl > 0) state.win_trades++;
