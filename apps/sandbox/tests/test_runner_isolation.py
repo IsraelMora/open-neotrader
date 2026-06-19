@@ -129,7 +129,13 @@ class TestIsolationWiredIntoRunner:
         output = output_buf.getvalue().strip()
         assert output, "runner produced no output"
         resp = json.loads(output)
-        # Either the plugin import failed (ok=false) OR the function ran
-        # (if socket was already blocked globally). Either way no crash.
-        # We just check the response is valid JSON with ok key.
-        assert "ok" in resp
+        # The plugin tries to import socket at module-load time; under strict
+        # mode the import guard must fire and the runner must return ok=false
+        # with an error message mentioning the block.
+        assert resp.get("ok") is False, (
+            f"Expected ok=false for plugin that imports socket under strict mode, got: {resp}"
+        )
+        error_msg = str(resp.get("error", "")).lower()
+        assert "importerror" in error_msg or "blocked" in error_msg or "import" in error_msg, (
+            f"Error message should mention ImportError/blocked, got: {resp.get('error')}"
+        )
