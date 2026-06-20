@@ -22,6 +22,7 @@ import { LongTermMemoryService } from '../long-term-memory/long-term-memory.serv
 
 import type { LlmResponse } from '../llm/llm.service';
 import { parseToolCalls } from '../llm/kernel-parser';
+import { sanitizeText } from './sanitize.util';
 
 /**
  * Input for a single governed LLM turn. Used by runGovernedTurn for both
@@ -846,31 +847,6 @@ export class AgentsService {
   }
 
   /**
-   * Strip LLM control-structure tokens from episode text fields before storing.
-   * Prevents a compromised rationale from reconstructing a prompt-injection vector
-   * when the episode is later recalled into a future cycle's LLM context.
-   */
-  private _sanitizeEpisodeText(s: string): string {
-    const CONTROL_TOKENS = [
-      /\[DECISION\]/gi,
-      /\[TOOL SCHEMA\]/gi,
-      /\[SEÑALES APROBADAS[^\]]*\]/gi,
-      /\[EPISODIOS RELEVANTES\]/gi,
-      /\[OBSERVACIONES[^\]]*\]/gi,
-      /\[LESSONS\]/gi,
-      /\[PAST EPISODES\]/gi,
-      /<tool_calls>[\s\S]*?<\/tool_calls>/gi,
-      /```json[\s\S]*?```/gi,
-      /```[\s\S]*?```/gi,
-    ];
-    let result = s;
-    for (const re of CONTROL_TOKENS) {
-      result = result.replace(re, '[stripped]');
-    }
-    return result;
-  }
-
-  /**
    * Record the cycle episode to long-term memory after a governed turn.
    * outcome_pnl is null here; SnapshotService backfills it via updateOutcome().
    * Failure NEVER breaks the cycle (swallows exceptions).
@@ -887,10 +863,10 @@ export class AgentsService {
         .map((s) => `${s.action.toUpperCase()} ${s.symbol}`)
         .join(', ')
         .slice(0, 200);
-      const llmRationale = this._sanitizeEpisodeText(llmText).slice(0, 500);
+      const llmRationale = sanitizeText(llmText).slice(0, 500);
       // symbol-only regime tags for PR2; richer tags deferred to later PRs
       const regimeTags = symbols;
-      const narrative = this._sanitizeEpisodeText(
+      const narrative = sanitizeText(
         `${symbols.join(' ')} ${regimeTags.join(' ')} ${actionSummary} ${llmRationale}`.slice(
           0,
           1400,
@@ -1505,9 +1481,9 @@ export class AgentsService {
 
     // Sanitize at storage time — strip LLM control tokens so recalled lessons
     // cannot reconstruct a prompt-injection vector in a future reflection turn.
-    const sanitizedText = this._sanitizeEpisodeText(text);
+    const sanitizedText = sanitizeText(text);
     const sanitizedRationale =
-      rationale !== undefined ? this._sanitizeEpisodeText(rationale) : undefined;
+      rationale !== undefined ? sanitizeText(rationale) : undefined;
 
     // Promote the lesson (fail-soft — promote() never throws, but we guard anyway)
     await this.longTermMemory.promote({
