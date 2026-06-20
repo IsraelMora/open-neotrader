@@ -35,7 +35,9 @@ export type AuditEventType =
   | 'debate_started'
   | 'debate_stance'
   | 'debate_consensus'
-  | 'debate_skipped';
+  | 'debate_skipped'
+  // ml-feature-extractor-s2: on-device model training
+  | 'ml_model_trained';
 
 export interface AuditPayload {
   cycle_id?: string;
