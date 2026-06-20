@@ -46,6 +46,15 @@ try:
     # Número de archivos abiertos (RLIMIT_NOFILE). Default: 64.
     _resource.setrlimit(_resource.RLIMIT_NOFILE, (64, 64))
 
+    # Número de procesos hijo (RLIMIT_NPROC). Default: 64. Override via SANDBOX_MAX_PROCS.
+    # Uses getattr so only NPROC is skipped on platforms that don't support it (e.g. some containers).
+    _nproc = getattr(_resource, "RLIMIT_NPROC", None)
+    if _nproc is None:
+        print("[sandbox] RLIMIT_NPROC not available on this platform", file=sys.stderr)
+    else:
+        _max_procs = int(os.environ.get("SANDBOX_MAX_PROCS", "64"))
+        _resource.setrlimit(_nproc, (_max_procs, _max_procs))
+
 except (ImportError, ValueError, OSError):
     # El módulo resource no está disponible en Windows o en algunos contenedores
     # No es un error fatal — el sandbox sigue funcionando sin límites del OS
@@ -77,6 +86,50 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _parse_semver(v: str) -> tuple[int, int, int] | None:
+    """Parse a semver string 'X.Y.Z' into a tuple. Returns None if not parseable."""
+    import re
+    m = re.match(r'^(\d+)\.(\d+)\.(\d+)$', v)
+    return (int(m[1]), int(m[2]), int(m[3])) if m else None
+
+
+def _semver_gte(installed: str, required: str) -> bool:
+    """
+    Return True if installed >= required (semver comparison).
+    If either string is not parseable, return True (don't block — soft-check contract).
+    """
+    a, b = _parse_semver(installed), _parse_semver(required)
+    if a is None or b is None:
+        return True
+    return a >= b
+
+
+def _sdk_version_warning(m: dict) -> str | None:
+    """
+    Check if the installed neurotrader_sdk satisfies the plugin's min_sdk_version.
+
+    Returns a warning string if installed SDK < min_sdk_version, None otherwise.
+    Never raises — exceptions (ImportError, AttributeError, any other) are caught silently.
+    This is a SOFT-CHECK: it NEVER blocks plugin execution.
+    """
+    try:
+        req = m.get("plugin", {}).get("min_sdk_version")
+        if not req:
+            return None
+        try:
+            from neurotrader_sdk import __version__ as sdk_ver
+        except (ImportError, AttributeError):
+            return None
+        if _semver_gte(sdk_ver, req):
+            return None
+        return (
+            f"[sandbox] plugin requires SDK >= {req} but installed SDK is {sdk_ver}; "
+            "running anyway (soft-check)"
+        )
+    except Exception:
+        return None
 
 
 def resolve_permitted_function(
@@ -286,16 +339,23 @@ def cmd_run_hook(req: dict) -> dict:
         raise FileNotFoundError(f"Plugin no encontrado: {plugin_id}")
 
     m = _read_manifest(plugin_id)
+
+    # Soft SDK version check — never blocks, never raises
+    _w = _sdk_version_warning(m)
+
     hooks_cfg: dict = m.get("hooks", {})
     hook_file_rel: str = hooks_cfg.get(hook_name, f"hooks/{hook_name}.py")
     hook_path = plugin_dir / hook_file_rel
 
     if not hook_path.exists():
         # No es un error tener hook ausente; simplemente no hay nada que ejecutar
-        return {
+        r: dict = {
             "signals": [],
             "logs": [{"level": "debug", "msg": f"Sin hook {hook_name} en {plugin_id}"}],
         }
+        if _w:
+            r.setdefault("warnings", []).append(_w)
+        return r
 
     # Cargar dinámicamente el módulo hook
     spec = importlib.util.spec_from_file_location(f"_nt_{plugin_id}_{hook_name}", hook_path)
@@ -325,6 +385,8 @@ def cmd_run_hook(req: dict) -> dict:
     result = fn(ctx)
     if not isinstance(result, dict):
         result = {"signals": [], "logs": []}
+    if _w:
+        result.setdefault("warnings", []).append(_w)
     return result
 
 
@@ -446,19 +508,13 @@ def cmd_smoke_test(req: dict) -> dict:
         checks.append({"name": "manifest", "status": "failed", "detail": str(exc)})
         m = {}
 
-    # --- Shared minimal context for plugin calls ----------------------------
+    # --- Shared config defaults (used by both hook and skill ctx below) --------
     config_defaults: dict = {}
     if m:
         for field, spec_data in m.get("config", {}).items():
             config_defaults[field] = (
                 spec_data.get("default") if isinstance(spec_data, dict) else spec_data
             )
-    ctx = _SdkContext(
-        config=config_defaults,
-        credentials={},
-        universe=[],
-        portfolio={},
-    )
 
     # --- 2. on_activate check -----------------------------------------------
     hooks_cfg: dict = m.get("hooks", {}) if m else {}
@@ -492,7 +548,9 @@ def cmd_smoke_test(req: dict) -> dict:
                     "detail": "on_activate function not found in hook file",
                 })
             else:
-                fn(ctx)
+                # Hooks receive a plain dict (mirrors cmd_run_hook: ctx = {**context, "config": ...})
+                hook_ctx: dict = {"config": config_defaults}
+                fn(hook_ctx)
                 checks.append({"name": "on_activate", "status": "passed", "detail": "on_activate ran without error"})
         except Exception as exc:
             status, detail = _classify(exc)
@@ -530,7 +588,14 @@ def cmd_smoke_test(req: dict) -> dict:
             continue
 
         try:
-            fn(signal={}, _context=ctx)
+            # Skill fns receive a Context object (mirrors cmd_run_cycle / cmd_call_plugin:
+            # ctx = _SdkContext(plugin_id=..., operator=..., metadata=context))
+            skill_ctx = _SdkContext(
+                plugin_id=plugin_id,
+                operator="",
+                metadata={"config": config_defaults},
+            )
+            fn(signal={}, _context=skill_ctx)
             checks.append({"name": key, "status": "passed", "detail": "skill fn called without error"})
         except Exception as exc:
             status, detail = _classify(exc)
@@ -596,6 +661,14 @@ def cmd_run_cycle(req: dict) -> dict:
         }
 
     results: dict[str, Any] = {"universe": [], "signals": [], "errors": []}
+
+    # Soft SDK version check for each active plugin — never blocks, never raises
+    for pid, info in plugins_by_id.items():
+        if pid not in active_ids:
+            continue
+        _w = _sdk_version_warning(info["manifest"])
+        if _w:
+            results.setdefault("warnings", []).append(_w)
 
     # 1. Collect universe
     for pid, info in plugins_by_id.items():
