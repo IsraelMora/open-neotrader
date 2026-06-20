@@ -35,12 +35,10 @@ function makePrisma(opts?: {
   return { $transaction, $executeRaw, $queryRaw };
 }
 
-function makeService(
-  prisma: ReturnType<typeof makePrisma>,
-): MlSignalRecordService {
-  return new (MlSignalRecordService as unknown as new (
-    db: unknown,
-  ) => MlSignalRecordService)(prisma);
+function makeService(prisma: ReturnType<typeof makePrisma>): MlSignalRecordService {
+  return new (MlSignalRecordService as unknown as new (db: unknown) => MlSignalRecordService)(
+    prisma,
+  );
 }
 
 // ── computeActiveSkillHash ─────────────────────────────────────────────────────
@@ -66,7 +64,7 @@ describe('MlSignalRecordService.computeActiveSkillHash', () => {
     const h2 = svc.computeActiveSkillHash([]);
     expect(h1).toBe(h2);
     expect(typeof h1).toBe('string');
-    expect(h1.length).toBe(16);
+    expect(h1).toHaveLength(16);
   });
 
   it('result is 16 hex chars', () => {
@@ -102,7 +100,9 @@ describe('MlSignalRecordService.recordSignals', () => {
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     // The tx callback should have called $executeRaw twice (one per symbol)
-    const txFn = (prisma.$transaction as jest.Mock).mock.calls[0][0] as (tx: TxClient) => Promise<void>;
+    const txFn = ((prisma.$transaction as jest.Mock).mock.calls[0] as unknown[])[0] as (
+      tx: TxClient,
+    ) => Promise<void>;
     const txClient: TxClient = { $executeRaw: jest.fn().mockResolvedValue(1) };
     await txFn(txClient);
     expect(txClient.$executeRaw).toHaveBeenCalledTimes(2);
@@ -113,22 +113,28 @@ describe('MlSignalRecordService.recordSignals', () => {
     const svc = makeService(prisma);
     const skillVector = [{ plugin_id: 'momentum', action: 'buy', confidence: 0.82 }];
 
-    await svc.recordSignals('C2', [{ symbol: 'AAPL', skill_vector: skillVector, action: 'buy' }], 'hashABC');
+    await svc.recordSignals(
+      'C2',
+      [{ symbol: 'AAPL', skill_vector: skillVector, action: 'buy' }],
+      'hashABC',
+    );
 
     // Intercept what was passed to $executeRaw inside the transaction
-    const txFn = (prisma.$transaction as jest.Mock).mock.calls[0][0] as (tx: TxClient) => Promise<void>;
+    const txFn = ((prisma.$transaction as jest.Mock).mock.calls[0] as unknown[])[0] as (
+      tx: TxClient,
+    ) => Promise<void>;
     const txClient: TxClient = { $executeRaw: jest.fn().mockResolvedValue(1) };
     await txFn(txClient);
 
-    const rawCall = (txClient.$executeRaw as jest.Mock).mock.calls[0];
+    const rawCall = txClient.$executeRaw.mock.calls[0] as unknown[];
     // The tagged template literal produces an array where strings and values alternate
     // We need to verify the serialized JSON is in the call args
-    const callArgs = rawCall.flat(Infinity);
+    const callArgs = rawCall.flatMap((x) => (Array.isArray(x) ? (x as unknown[]) : [x]));
     const jsonArg = callArgs.find(
       (a: unknown) => typeof a === 'string' && a.includes('"momentum"'),
     );
     expect(jsonArg).toBeDefined();
-    const parsed = JSON.parse(jsonArg as string);
+    const parsed = JSON.parse(jsonArg as string) as unknown;
     expect(parsed).toEqual([{ plugin_id: 'momentum', action: 'buy', confidence: 0.82 }]);
   });
 
@@ -136,13 +142,22 @@ describe('MlSignalRecordService.recordSignals', () => {
     const prisma = makePrisma();
     const svc = makeService(prisma);
 
-    await svc.recordSignals('C3', [{ symbol: 'TSLA', skill_vector: [], action: 'hold' }], 'myhash16chars__');
+    await svc.recordSignals(
+      'C3',
+      [{ symbol: 'TSLA', skill_vector: [], action: 'hold' }],
+      'myhash16chars__',
+    );
 
-    const txFn = (prisma.$transaction as jest.Mock).mock.calls[0][0] as (tx: TxClient) => Promise<void>;
+    const txFn = ((prisma.$transaction as jest.Mock).mock.calls[0] as unknown[])[0] as (
+      tx: TxClient,
+    ) => Promise<void>;
     const txClient: TxClient = { $executeRaw: jest.fn().mockResolvedValue(1) };
     await txFn(txClient);
 
-    const callArgs = (txClient.$executeRaw as jest.Mock).mock.calls[0].flat(Infinity);
+    const rawHashArgs = txClient.$executeRaw.mock.calls[0] as unknown[];
+    const callArgs: unknown[] = rawHashArgs.flatMap((x): unknown[] =>
+      Array.isArray(x) ? (x as unknown[]) : [x],
+    );
     expect(callArgs).toContain('myhash16chars__');
   });
 
@@ -152,12 +167,16 @@ describe('MlSignalRecordService.recordSignals', () => {
 
     await svc.recordSignals('C4', [{ symbol: 'AAPL', skill_vector: [], action: 'buy' }], 'hash');
 
-    const txFn = (prisma.$transaction as jest.Mock).mock.calls[0][0] as (tx: TxClient) => Promise<void>;
+    const txFn = ((prisma.$transaction as jest.Mock).mock.calls[0] as unknown[])[0] as (
+      tx: TxClient,
+    ) => Promise<void>;
     const txClient: TxClient = { $executeRaw: jest.fn().mockResolvedValue(1) };
     await txFn(txClient);
 
     // Verify that neither a numeric pnl nor equity value is passed — only null
-    const callArgs = (txClient.$executeRaw as jest.Mock).mock.calls[0].flat(Infinity);
+    const callArgs = (txClient.$executeRaw.mock.calls[0] as unknown[]).flatMap((x) =>
+      Array.isArray(x) ? (x as unknown[]) : [x],
+    );
     // The INSERT should use NULL for outcome columns (not passing numeric values)
     const hasNullForOutcome = callArgs.includes(null);
     expect(hasNullForOutcome).toBe(true);
@@ -201,7 +220,8 @@ describe('MlSignalRecordService.updateOutcomeAggregate', () => {
     await svc.updateOutcomeAggregate('C10', 125.5, 10500);
 
     expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
-    const callArgs = (prisma.$executeRaw as jest.Mock).mock.calls[0].flat(Infinity);
+    const rawArgs = (prisma.$executeRaw as jest.Mock).mock.calls[0] as unknown[];
+    const callArgs = rawArgs.flatMap((x) => (Array.isArray(x) ? (x as unknown[]) : [x]));
     expect(callArgs).toContain('C10');
     expect(callArgs).toContain(125.5);
     expect(callArgs).toContain(10500);
@@ -250,7 +270,8 @@ describe('MlSignalRecordService.getTrainingData', () => {
     expect(result).toHaveLength(2);
     expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
     // Verify the query includes outcome_pnl IS NOT NULL
-    const callArgs = (prisma.$queryRaw as jest.Mock).mock.calls[0].flat(Infinity);
+    const rawQArgs = (prisma.$queryRaw as jest.Mock).mock.calls[0] as unknown[];
+    const callArgs = rawQArgs.flatMap((x) => (Array.isArray(x) ? (x as unknown[]) : [x]));
     const query = callArgs.join(' ');
     expect(query).toMatch(/outcome_pnl\s+IS\s+NOT\s+NULL/i);
   });
@@ -261,7 +282,8 @@ describe('MlSignalRecordService.getTrainingData', () => {
 
     await svc.getTrainingData(5);
 
-    const callArgs = (prisma.$queryRaw as jest.Mock).mock.calls[0].flat(Infinity);
+    const rawLimitArgs = (prisma.$queryRaw as jest.Mock).mock.calls[0] as unknown[];
+    const callArgs = rawLimitArgs.flatMap((x) => (Array.isArray(x) ? (x as unknown[]) : [x]));
     expect(callArgs).toContain(5);
   });
 

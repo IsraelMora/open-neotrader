@@ -12,29 +12,13 @@
  */
 import { AgentsService } from '../../agents/agents.service';
 import { MlSignalRecordService } from '../ml-signal-record.service';
-import type { LlmService, LlmResponse } from '../../llm/llm.service';
+import type { SkillContribution } from '../ml-signal-record.service';
+import type { LlmService } from '../../llm/llm.service';
 import type { SandboxGateway } from '../../sandbox/sandbox.gateway';
 import type { PluginsService } from '../../plugins/plugins.service';
 import type { ContextMemoryService } from '../../context-memory/context-memory.service';
 import type { AuditService } from '../../audit/audit.service';
-import type { AlertsService } from '../../alerts/alerts.service';
 import type { KvService } from '../../common/kv.service';
-import type { LongTermMemoryService } from '../../long-term-memory/long-term-memory.service';
-
-// ── Factories ──────────────────────────────────────────────────────────────────
-
-function makeLlm(signalsEmitted: { symbol: string; action: string }[] = []): Partial<LlmService> {
-  const response: LlmResponse = {
-    text: 'no action',
-    tool_calls: [],
-    backend: 'api',
-    skills_read: [],
-    skills_written: [],
-  };
-  return {
-    complete: jest.fn().mockResolvedValue(response),
-  };
-}
 
 function makeAudit(): jest.Mocked<Pick<AuditService, 'log'>> {
   return { log: jest.fn().mockResolvedValue(undefined) };
@@ -55,14 +39,6 @@ function makeKvSingleTurn(): jest.Mocked<Pick<KvService, 'get'>> {
     get: jest
       .fn()
       .mockImplementation((key: string) => Promise.resolve(key === 'react.max_turns' ? '1' : null)),
-  };
-}
-
-function makeLtm(): jest.Mocked<Pick<LongTermMemoryService, 'record' | 'prefetch' | 'updateOutcome'>> {
-  return {
-    record: jest.fn().mockResolvedValue(undefined),
-    prefetch: jest.fn().mockResolvedValue([]),
-    updateOutcome: jest.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -89,7 +65,7 @@ function makeAgentsServiceWithMl(
   plugins: Partial<PluginsService>,
   llm: Partial<LlmService>,
   mlSignalRecord?: Partial<MlSignalRecordService> | null,
-  ltm?: Partial<LongTermMemoryService> | null,
+  ltm?: null,
 ): AgentsService {
   return new (AgentsService as unknown as new (
     llm: unknown,
@@ -142,9 +118,27 @@ describe('AgentsService._mlCaptureSignals (ml-feature-extractor-s1)', () => {
         ok: true,
         result: {
           pending_signals: [
-            { symbol: 'AAPL', action: 'buy', confidence: 0.8, plugin_id: 'momentum-skill', type: 'skill' },
-            { symbol: 'AAPL', action: 'buy', confidence: 0.65, plugin_id: 'trend-skill', type: 'skill' },
-            { symbol: 'MSFT', action: 'sell', confidence: 0.5, plugin_id: 'momentum-skill', type: 'skill' },
+            {
+              symbol: 'AAPL',
+              action: 'buy',
+              confidence: 0.8,
+              plugin_id: 'momentum-skill',
+              type: 'skill',
+            },
+            {
+              symbol: 'AAPL',
+              action: 'buy',
+              confidence: 0.65,
+              plugin_id: 'trend-skill',
+              type: 'skill',
+            },
+            {
+              symbol: 'MSFT',
+              action: 'sell',
+              confidence: 0.5,
+              plugin_id: 'momentum-skill',
+              type: 'skill',
+            },
           ],
         },
       }),
@@ -184,12 +178,14 @@ describe('AgentsService._mlCaptureSignals (ml-feature-extractor-s1)', () => {
     // recordSignals must have been called
     expect(mlSvc.recordSignals).toHaveBeenCalled();
 
-    const [calledCycleId, calledRecords, calledHash] = (mlSvc.recordSignals as jest.Mock).mock.calls[0];
+    type RecordArg = { symbol: string; skill_vector: SkillContribution[]; action: string };
+    const [calledCycleId, calledRecords, calledHash] = (mlSvc.recordSignals as jest.Mock).mock
+      .calls[0] as [string, RecordArg[], string];
     expect(typeof calledCycleId).toBe('string');
     expect(calledHash).toBe('deadbeef12345678');
 
     // Must have one entry per symbol that had an emitted action
-    const symbols = calledRecords.map((r: { symbol: string }) => r.symbol).sort();
+    const symbols = calledRecords.map((r) => r.symbol).sort((a, b) => a.localeCompare(b));
     // At minimum AAPL should be present (MSFT depends on whether veto passes)
     expect(symbols.length).toBeGreaterThan(0);
 
@@ -213,7 +209,13 @@ describe('AgentsService._mlCaptureSignals (ml-feature-extractor-s1)', () => {
         result: {
           pending_signals: [
             // No plugin_id, but has source
-            { symbol: 'TSLA', action: 'buy', confidence: 0.7, source: 'trend-skill-v2', type: 'skill' },
+            {
+              symbol: 'TSLA',
+              action: 'buy',
+              confidence: 0.7,
+              source: 'trend-skill-v2',
+              type: 'skill',
+            },
           ],
         },
       }),
@@ -252,9 +254,14 @@ describe('AgentsService._mlCaptureSignals (ml-feature-extractor-s1)', () => {
     const svc = makeAgentsServiceWithMl(sandbox, plugins, llm, mlSvc);
     await svc.runCycle('test');
 
+    type RecordArg = { symbol: string; skill_vector: SkillContribution[]; action: string };
     if ((mlSvc.recordSignals as jest.Mock).mock.calls.length > 0) {
-      const [, calledRecords] = (mlSvc.recordSignals as jest.Mock).mock.calls[0];
-      const tslaRecord = calledRecords.find((r: { symbol: string }) => r.symbol === 'TSLA');
+      const [, calledRecords] = (mlSvc.recordSignals as jest.Mock).mock.calls[0] as [
+        string,
+        RecordArg[],
+        string,
+      ];
+      const tslaRecord = calledRecords.find((r) => r.symbol === 'TSLA');
       if (tslaRecord) {
         const sv = tslaRecord.skill_vector[0];
         // plugin_id fallback to source
@@ -291,7 +298,13 @@ describe('AgentsService._mlCaptureSignals (ml-feature-extractor-s1)', () => {
         ok: true,
         result: {
           pending_signals: [
-            { symbol: 'AAPL', action: 'buy', confidence: 0.8, plugin_id: 'momentum-skill', type: 'skill' },
+            {
+              symbol: 'AAPL',
+              action: 'buy',
+              confidence: 0.8,
+              plugin_id: 'momentum-skill',
+              type: 'skill',
+            },
           ],
         },
       }),
@@ -314,7 +327,7 @@ describe('AgentsService._mlCaptureSignals (ml-feature-extractor-s1)', () => {
     await svc.runCycle('test');
 
     if ((mlSvc.computeActiveSkillHash as jest.Mock).mock.calls.length > 0) {
-      const [hashIds] = (mlSvc.computeActiveSkillHash as jest.Mock).mock.calls[0];
+      const [hashIds] = (mlSvc.computeActiveSkillHash as jest.Mock).mock.calls[0] as [string[]];
       // Only skill-type plugins
       expect(hashIds).toContain('momentum-skill');
       expect(hashIds).not.toContain('alpaca-provider');
@@ -334,7 +347,13 @@ describe('AgentsService._executeCycle capture fail-soft', () => {
         ok: true,
         result: {
           pending_signals: [
-            { symbol: 'AAPL', action: 'buy', confidence: 0.8, plugin_id: 'momentum-skill', type: 'skill' },
+            {
+              symbol: 'AAPL',
+              action: 'buy',
+              confidence: 0.8,
+              plugin_id: 'momentum-skill',
+              type: 'skill',
+            },
           ],
         },
       }),
@@ -392,7 +411,13 @@ describe('AgentsService @Optional absent → INERT', () => {
         ok: true,
         result: {
           pending_signals: [
-            { symbol: 'AAPL', action: 'buy', confidence: 0.8, plugin_id: 'momentum-skill', type: 'skill' },
+            {
+              symbol: 'AAPL',
+              action: 'buy',
+              confidence: 0.8,
+              plugin_id: 'momentum-skill',
+              type: 'skill',
+            },
           ],
         },
       }),

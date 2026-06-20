@@ -44,7 +44,7 @@ export class MlSignalRecordService {
    * Returns 16 hex chars (first 16 chars of SHA-256 hex digest).
    */
   computeActiveSkillHash(ids: string[]): string {
-    const sorted = [...ids].sort().join(',');
+    const sorted = [...ids].sort((a, b) => a.localeCompare(b)).join(',');
     return createHash('sha256').update(sorted).digest('hex').slice(0, 16);
   }
 

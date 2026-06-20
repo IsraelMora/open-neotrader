@@ -21,7 +21,10 @@ import { KvService } from '../common/kv.service';
 import { LongTermMemoryService } from '../long-term-memory/long-term-memory.service';
 import { DebateService } from './debate.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
-import { MlSignalRecordService, SkillContribution } from '../ml-signal-record/ml-signal-record.service';
+import {
+  MlSignalRecordService,
+  SkillContribution,
+} from '../ml-signal-record/ml-signal-record.service';
 
 import type { LlmResponse } from '../llm/llm.service';
 import type { DebateConsensus } from './debate.types';
@@ -944,9 +947,15 @@ export class AgentsService {
         const symbol = typeof s['symbol'] === 'string' ? s['symbol'] : null;
         if (!symbol) continue;
         const contributions = bySymbol.get(symbol) ?? [];
+        const rawPluginId = s['plugin_id'];
+        const rawSource = s['source'];
+        const rawAction = s['action'];
+        let resolvedPluginId = '';
+        if (typeof rawPluginId === 'string') resolvedPluginId = rawPluginId;
+        else if (typeof rawSource === 'string') resolvedPluginId = rawSource;
         contributions.push({
-          plugin_id: String(s['plugin_id'] ?? s['source'] ?? ''),
-          action: String(s['action'] ?? ''),
+          plugin_id: resolvedPluginId,
+          action: typeof rawAction === 'string' ? rawAction : '',
           confidence: typeof s['confidence'] === 'number' ? s['confidence'] : 0,
         });
         bySymbol.set(symbol, contributions);

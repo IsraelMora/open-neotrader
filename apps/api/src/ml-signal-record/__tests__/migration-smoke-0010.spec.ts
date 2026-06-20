@@ -85,6 +85,8 @@ describe('Migration 0010_ml_signal_record (ml-feature-extractor-s1)', () => {
 
   it('migration.sql creates index on ts', () => {
     const content = fs.readFileSync(MIGRATION_FILE, 'utf8');
-    expect(content).toMatch(/CREATE\s+INDEX.*ml_signal_record.*ts|CREATE\s+INDEX.*ts.*ml_signal_record/i);
+    expect(content).toMatch(
+      /CREATE\s+INDEX.*ml_signal_record.*ts|CREATE\s+INDEX.*ts.*ml_signal_record/i,
+    );
   });
 });

@@ -60,9 +60,9 @@ function makeLtm(): jest.Mocked<Pick<LongTermMemoryService, 'updateOutcome'>> {
   };
 }
 
-function makeMlSvc(opts?: { throws?: boolean }): jest.Mocked<
-  Pick<MlSignalRecordService, 'updateOutcomeAggregate'>
-> {
+function makeMlSvc(opts?: {
+  throws?: boolean;
+}): jest.Mocked<Pick<MlSignalRecordService, 'updateOutcomeAggregate'>> {
   return {
     updateOutcomeAggregate: opts?.throws
       ? jest.fn().mockRejectedValue(new Error('ML DB error'))
@@ -156,11 +156,11 @@ describe('SnapshotService + MlSignalRecordService (ml-feature-extractor-s1)', ()
     // The portfolio values here are realized AFTER C10's decision
     await svc.takeSnapshot(CYCLE_ID);
 
-    const [calledCycleId, calledPnl, calledEquity] = (mlSvc.updateOutcomeAggregate as jest.Mock).mock
-      .calls[0];
+    const [calledCycleId, calledPnl, calledEquity] = (mlSvc.updateOutcomeAggregate as jest.Mock)
+      .mock.calls[0] as [string, number, number];
     expect(calledCycleId).toBe(CYCLE_ID);
-    expect(calledPnl).toBe(fakePortfolio.total_pnl);  // realized AFTER the decision
-    expect(calledEquity).toBe(fakePortfolio.equity);   // realized AFTER the decision
+    expect(calledPnl).toBe(fakePortfolio.total_pnl); // realized AFTER the decision
+    expect(calledEquity).toBe(fakePortfolio.equity); // realized AFTER the decision
   });
 
   it('both LTM and ML backfill are called in same takeSnapshot (no interference)', async () => {
@@ -172,7 +172,15 @@ describe('SnapshotService + MlSignalRecordService (ml-feature-extractor-s1)', ()
 
     await svc.takeSnapshot(CYCLE_ID);
 
-    expect(ltm.updateOutcome).toHaveBeenCalledWith(CYCLE_ID, fakePortfolio.total_pnl, fakePortfolio.equity);
-    expect(mlSvc.updateOutcomeAggregate).toHaveBeenCalledWith(CYCLE_ID, fakePortfolio.total_pnl, fakePortfolio.equity);
+    expect(ltm.updateOutcome).toHaveBeenCalledWith(
+      CYCLE_ID,
+      fakePortfolio.total_pnl,
+      fakePortfolio.equity,
+    );
+    expect(mlSvc.updateOutcomeAggregate).toHaveBeenCalledWith(
+      CYCLE_ID,
+      fakePortfolio.total_pnl,
+      fakePortfolio.equity,
+    );
   });
 });

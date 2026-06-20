@@ -73,7 +73,11 @@ export class SnapshotService {
     // Failure NEVER breaks the snapshot.
     if (cycleId && this.mlSignalRecord) {
       try {
-        await this.mlSignalRecord.updateOutcomeAggregate(cycleId, portfolio.total_pnl, portfolio.equity);
+        await this.mlSignalRecord.updateOutcomeAggregate(
+          cycleId,
+          portfolio.total_pnl,
+          portfolio.equity,
+        );
       } catch (e) {
         this.log.warn(
           `[ML] updateOutcomeAggregate failed for cycle ${cycleId} — ml outcome not backfilled: ${e}`,
