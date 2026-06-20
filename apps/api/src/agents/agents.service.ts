@@ -21,6 +21,7 @@ import { KvService } from '../common/kv.service';
 import { LongTermMemoryService } from '../long-term-memory/long-term-memory.service';
 import { DebateService } from './debate.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
+import { MlSignalRecordService, SkillContribution } from '../ml-signal-record/ml-signal-record.service';
 
 import type { LlmResponse } from '../llm/llm.service';
 import type { DebateConsensus } from './debate.types';
@@ -294,6 +295,10 @@ export class AgentsService {
     // notional calculation. Absent → _isHighImpact returns false (fail-soft).
     @Optional()
     private readonly providerGateway?: ProviderGatewayService,
+    // MlSignalRecordService injected @Optional() — s1 data capture (INERT in s1).
+    // Absent → _mlCaptureSignals short-circuits; cycle is byte-identical to pre-s1.
+    @Optional()
+    private readonly mlSignalRecord?: MlSignalRecordService,
   ) {}
 
   /**
@@ -784,6 +789,15 @@ export class AgentsService {
     // ── F6-s2 PR2: record episode after governed turn ─────────────────────────
     await this._ltmRecordEpisode(cycle_id, signalsEmitted, llmResponse.text ?? '');
 
+    // ── ml-feature-extractor-s1: capture per-skill signal vector (INERT) ──────
+    // Runs after _ltmRecordEpisode so all decision data is finalized.
+    // NEVER throws into the cycle — fail-soft wrapper inside the helper.
+    try {
+      await this._mlCaptureSignals(cycle_id, approvedSignals, signalsEmitted, activePlugins);
+    } catch (e) {
+      this.log.warn(`[ML] _mlCaptureSignals outer catch — signals not recorded: ${e}`);
+    }
+
     // ── 3c. POST-stage extra plugins (after LLM turn) ─────────────────────────
     const postFinalCtx = await this._runPostExtras(postExtras, runningCtx, cycle_id);
 
@@ -902,6 +916,59 @@ export class AgentsService {
       });
     } catch (e) {
       this.log.warn(`[LTM] record failed — episode not persisted: ${e}`);
+    }
+  }
+
+  /**
+   * ml-feature-extractor-s1: capture per-skill signal vector for each symbol.
+   * INERT in s1 — records data only, NEVER reads back into the decision path.
+   * Fail-soft: any exception is caught here AND by the outer try/catch at the call site.
+   */
+  private async _mlCaptureSignals(
+    cycleId: string,
+    approvedSignals: unknown[],
+    signalsEmitted: { symbol: string; action: string }[],
+    activePlugins: HydratedPlugin[],
+  ): Promise<void> {
+    if (!this.mlSignalRecord) return; // INERT when absent (@Optional)
+    try {
+      // Skill plugin ids only — used for the active_skill_hash
+      const skillIds = activePlugins
+        .filter((p: HydratedPlugin) => p.type === 'skill')
+        .map((p: HydratedPlugin) => p.id);
+      const activeSkillHash = this.mlSignalRecord.computeActiveSkillHash(skillIds);
+
+      // Group approved per-skill signals by symbol
+      const bySymbol = new Map<string, SkillContribution[]>();
+      for (const s of approvedSignals as Record<string, unknown>[]) {
+        const symbol = typeof s['symbol'] === 'string' ? s['symbol'] : null;
+        if (!symbol) continue;
+        const contributions = bySymbol.get(symbol) ?? [];
+        contributions.push({
+          plugin_id: String(s['plugin_id'] ?? s['source'] ?? ''),
+          action: String(s['action'] ?? ''),
+          confidence: typeof s['confidence'] === 'number' ? s['confidence'] : 0,
+        });
+        bySymbol.set(symbol, contributions);
+      }
+
+      // Resolved action per symbol from signalsEmitted (the cycle's decision)
+      const actionBySymbol = new Map(signalsEmitted.map((s) => [s.symbol, s.action]));
+
+      // Only symbols that have a resolved action (no action → no label can attach)
+      const records = [...bySymbol.entries()]
+        .filter(([sym]) => actionBySymbol.has(sym))
+        .map(([symbol, skill_vector]) => ({
+          symbol,
+          skill_vector,
+          action: actionBySymbol.get(symbol)!,
+        }));
+
+      if (records.length > 0) {
+        await this.mlSignalRecord.recordSignals(cycleId, records, activeSkillHash);
+      }
+    } catch (e) {
+      this.log.warn(`[ML] _mlCaptureSignals failed — signals not recorded: ${e}`);
     }
   }
 
