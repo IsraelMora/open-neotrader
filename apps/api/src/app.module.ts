@@ -24,6 +24,7 @@ import { RegistryModule } from './registry/registry.module';
 import { WsModule } from './ws/ws.module';
 import { OnboardingModule } from './onboarding/onboarding.module';
 import { ContextMemoryModule } from './context-memory/context-memory.module';
+import { LongTermMemoryModule } from './long-term-memory/long-term-memory.module';
 import { SnapshotModule } from './snapshot/snapshot.module';
 import { AlertsModule } from './alerts/alerts.module';
 import { PretestModule } from './pretest/pretest.module';
@@ -63,6 +64,7 @@ import { CorrelationMiddleware } from './common/correlation.middleware';
     WsModule,
     OnboardingModule,
     ContextMemoryModule,
+    LongTermMemoryModule,
     SnapshotModule,
     AlertsModule,
     PretestModule,

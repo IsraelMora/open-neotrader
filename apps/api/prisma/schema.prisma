@@ -126,6 +126,26 @@ model AuditEntry {
   @@map("audit_log")
 }
 
+// F6-s2: Long-term episodic memory — normal table only (episode_fts FTS5 virtual table is raw SQL, unmodeled).
+model EpisodeMemory {
+  id              String   @id
+  ts              DateTime @default(now())
+  cycle_id        String
+  symbols         String
+  regime_tags     String
+  action_summary  String
+  llm_rationale   String
+  narrative       String
+  outcome_pnl     Float?
+  outcome_equity  Float?
+  promoted        Int      @default(0)
+  meta            String?
+
+  @@index([cycle_id])
+  @@index([ts])
+  @@map("episode_memory")
+}
+
 // Cartera virtual de pretest — permite probar configuraciones distintas antes de usar dinero real
 // Cada pretest es independiente: tiene sus propios plugins activos, config y estado de cartera virtual
 model PretestPortfolio {
