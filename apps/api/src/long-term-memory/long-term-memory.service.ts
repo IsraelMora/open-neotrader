@@ -164,9 +164,25 @@ export class LongTermMemoryService implements MemoryProvider, OnModuleInit {
    * Return the most recent `limit` lessons ordered newest-first.
    * Fail-soft: returns [] on any error.
    */
-  async listLessons(limit: number): Promise<Array<{ id: string; ts: Date; text: string; episode_id: string | null; rationale: string | null }>> {
+  async listLessons(limit: number): Promise<
+    Array<{
+      id: string;
+      ts: Date;
+      text: string;
+      episode_id: string | null;
+      rationale: string | null;
+    }>
+  > {
     try {
-      const rows = await this.db.$queryRaw<Array<{ id: string; ts: Date; text: string; episode_id: string | null; rationale: string | null }>>`
+      const rows = await this.db.$queryRaw<
+        Array<{
+          id: string;
+          ts: Date;
+          text: string;
+          episode_id: string | null;
+          rationale: string | null;
+        }>
+      >`
         SELECT id, ts, text, episode_id, rationale
         FROM lesson_memory
         ORDER BY ts DESC
