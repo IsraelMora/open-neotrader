@@ -7342,3 +7342,394 @@ describe('AgentsService.runGovernedTurn — tool gating (F6-S4)', () => {
     expect(dropped).toBeDefined();
   });
 });
+
+// ── F6-s5 Elevated-still-obeys-policy invariant tests ────────────────────────
+//
+// Guard tests: prove that a "promoted" (elevated) plugin does NOT get a bypass path
+// through _validateToolCalls, the veto layer, or the CB/virtual_only tool-gating.
+// If a future refactor adds a "promoted plugin fast-path" in any of these layers,
+// these tests will catch the regression.
+
+describe('F6-s5 Elevated-still-obeys-policy — (a) promoted plugin tool_call still goes through _validateToolCalls', () => {
+  const CYCLE_ID = 'elev-validate-001';
+
+  it('elev.a1 — a provider plugin that was "promoted" (now active) passes _validateToolCalls normally (no fast-path bypass)', async () => {
+    // After promotion, the plugin is simply active with type='provider'.
+    // _validateToolCalls must apply the same allowlist + function-declared checks.
+    const promotedPlugin = { id: 'promoted-provider', type: 'provider' };
+    const plugins = makePlugins(['promoted-provider'], ['promoted-provider__place_order']);
+    (plugins.findActive as jest.Mock).mockResolvedValue([promotedPlugin]);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'promoted-provider', function: 'place_order', args: { symbol: 'AAPL' } },
+    ];
+
+    const result = await callValidate(service, CYCLE_ID, calls);
+
+    // Valid tool call from a promoted plugin passes through validation — no bypass, no shortcut.
+    expect(result).toHaveLength(1);
+    expect(result[0].plugin_id).toBe('promoted-provider');
+    // No tool_call_dropped audit for a valid promoted call
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'tool_call_dropped' }),
+    );
+  });
+
+  it('elev.a2 — a promoted plugin emitting an undeclared function is STILL dropped (allowlist applies regardless of origin)', async () => {
+    // Even if the plugin was promoted, if it emits an undeclared function it must be dropped.
+    const promotedPlugin = { id: 'promoted-provider', type: 'provider' };
+    const plugins = makePlugins(['promoted-provider'], ['promoted-provider__place_order']);
+    (plugins.findActive as jest.Mock).mockResolvedValue([promotedPlugin]);
+    const audit = makeAudit();
+    const service = makeAgentsService(plugins, audit);
+
+    const calls: ToolCallRequest[] = [
+      // 'hallucinated_fn' is not in the declared tools list for promoted-provider
+      { plugin_id: 'promoted-provider', function: 'hallucinated_fn', args: {} },
+    ];
+
+    const result = await callValidate(service, CYCLE_ID, calls);
+
+    expect(result).toHaveLength(0);
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'promoted-provider',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ reason: 'function_not_declared' }),
+      }),
+    );
+  });
+
+  it('elev.a3 — kernel source-gate still applies for promoted plugin using kernel tool outside reflection', async () => {
+    // After promotion, if the kernel emits a write_skill outside a reflection turn, it must
+    // be dropped — promotion of other plugins does not relax the kernel source-gate.
+    const plugins = makeKernelPluginsMock();
+    (plugins.findActive as jest.Mock).mockResolvedValue([
+      { id: 'promoted-provider', type: 'provider' },
+    ]);
+    const audit = makeAudit();
+
+    const service = new AgentsService(
+      {} as unknown as LlmService,
+      makeSandbox() as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      {} as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    const calls: ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
+    ];
+
+    // source:'cycle' — a promoted provider being active must NOT change kernel source-gate behavior
+    const result = await (
+      service as unknown as {
+        _validateToolCalls: (
+          c: string,
+          t: ToolCallRequest[],
+          hoisted: undefined,
+          preloaded: undefined,
+          virtualOnly: undefined,
+          source: string,
+        ) => Promise<ToolCallRequest[]>;
+      }
+    )._validateToolCalls(CYCLE_ID, calls, undefined, undefined, undefined, 'cycle');
+
+    expect(result).toHaveLength(0);
+    expect(plugins.writeSkillGuarded).not.toHaveBeenCalled();
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        plugin_id: 'kernel',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }),
+      }),
+    );
+  });
+});
+
+describe('F6-s5 Elevated-still-obeys-policy — (b) veto/discipline layer still runs regardless of promotion origin', () => {
+  it('elev.b1 — discipline plugin runs on cycle even when provider plugins were "promoted" (veto layer is not bypassed)', async () => {
+    // Arrange: a promoted provider plugin (type:'provider') is active alongside a discipline plugin.
+    // The veto layer must run for discipline regardless of where the provider came from.
+    const pendingSignals = [{ symbol: 'AAPL', action: 'buy' }];
+
+    const capturedContexts: string[] = [];
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { context: string }) => {
+        capturedContexts.push(opts.context);
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api' as const,
+          skills_read: [],
+          skills_written: [],
+        });
+      }),
+    };
+
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    // Simulate a promoted provider + a discipline plugin both active
+    plugins.findActive.mockResolvedValue([
+      { id: 'promoted-provider', type: 'provider', name: 'Promoted Provider' },
+      { id: 'risk-discipline', type: 'discipline', name: 'Risk Discipline' },
+    ] as never);
+
+    const sandbox = makeFullSandbox();
+    // sandbox.runCycle returns pending signals
+    sandbox.runCycle.mockResolvedValue({
+      ok: true,
+      result: { pending_signals: pendingSignals },
+    });
+    // discipline plugin vetoes the signal (returns empty pending_signals)
+    sandbox.call.mockResolvedValue({
+      ok: true,
+      result: { pending_signals: [], veto_reasons: ['risk limit reached'] },
+    });
+
+    const memory = makeMemory();
+    const service = new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+
+    await callExecuteCyclePrivate(service, 'elev-veto-001', 'market check');
+
+    // The veto layer must have run: sandbox.call must have been invoked (the discipline hook)
+    expect(sandbox.call).toHaveBeenCalledWith(
+      expect.objectContaining({ plugin_id: 'risk-discipline' }),
+    );
+
+    // The vetoed signal must NOT appear in the LLM context (post-veto approved list is empty)
+    expect(capturedContexts).toHaveLength(1);
+    const llmContext = capturedContexts[0];
+    expect(llmContext).not.toContain('AAPL');
+  });
+});
+
+describe('F6-s5 Elevated-still-obeys-policy — (c) promoted plugin tool still hidden by _computeVisibleTools when CB open', () => {
+  it('elev.c1 — provider tool from a promoted plugin is HIDDEN in [TOOL SCHEMA] when circuit-breaker is open (F6-s4 gating applies regardless of promotion)', async () => {
+    // The promoted provider tool must disappear from [TOOL SCHEMA] when CB=open,
+    // exactly as any other provider tool would. Promotion confers no schema-visibility bypass.
+    const capturedSchema: { tools: string }[] = [];
+
+    const kvValues: Record<string, string | null> = {
+      'react.max_turns': '1',
+      'scheduler:circuit_breaker': JSON.stringify({ state: 'open' }),
+    };
+
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockImplementation((key: string) => Promise.resolve(kvValues[key] ?? null)),
+    };
+
+    const promotedTool: ProviderTool = {
+      plugin_id: 'promoted-provider',
+      name: 'promoted-provider__place_order',
+      description: 'Promoted provider order',
+      input_schema: { type: 'object', properties: {} },
+      plugin_type: 'provider',
+    };
+
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+        const sp = opts.system_prompt ?? '';
+        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+        capturedSchema.push({ tools: match ? match[1] : '' });
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+
+    const plugins = makeFullPlugins('Use tools.', [promotedTool]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'promoted-provider', type: 'provider', name: 'Promoted Provider' },
+    ] as never);
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      llm,
+      makeSandbox(),
+      plugins,
+      makeMemory(),
+      makeAudit(),
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    expect(capturedSchema).toHaveLength(1);
+    // Promoted provider tool must NOT appear in [TOOL SCHEMA] when CB is open
+    expect(capturedSchema[0].tools).not.toContain('promoted-provider__place_order');
+  });
+});
+
+describe('F6-s5 Elevated-still-obeys-policy — (d) promote() hard-checks gate + require_human_confirm before apply', () => {
+  it('elev.d1 — promote() with gate NOT ready: returns gate_not_ready, never activates plugins', async () => {
+    // The F4-s4 invariant: gate must pass before promote() applies any plugin.
+    // A failed gate means the promoted portfolio is never applied — no bypass.
+    const audit = makeAudit();
+
+    // Drive _dispatchKernelTool with kernel__promote_pretest to simulate the LLM calling promote.
+    // We use a stub pretest service where promote returns gate_not_ready.
+    const pretestWithGateFail: {
+      promote: jest.Mock;
+      findAll: jest.Mock;
+      create: jest.Mock;
+      compare: jest.Mock;
+      runAllActive: jest.Mock;
+    } = {
+      promote: jest.fn().mockResolvedValue({
+        ok: false,
+        reason: 'gate_not_ready',
+        gate_reasons: ['return_pct below threshold'],
+      }),
+      findAll: jest.fn().mockResolvedValue([]),
+      create: jest.fn(),
+      compare: jest.fn(),
+      runAllActive: jest.fn(),
+    };
+
+    const serviceWithGateFail = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+    ) => AgentsService)(
+      {},
+      makeSandbox(),
+      {
+        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+        getProviderTools: jest.fn().mockResolvedValue([]),
+        findActive: jest.fn().mockResolvedValue([]),
+        writeSkillGuarded: jest.fn(),
+      },
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      pretestWithGateFail,
+    );
+
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await callDispatchKernelTool(
+      serviceWithGateFail,
+      'elev-gate-001',
+      { plugin_id: 'kernel', function: 'promote_pretest', args: { pretest_id: 'pf-123' } },
+      decisions,
+      sandboxResults,
+    );
+
+    // promote() was called but gate was not ready → decision allowed:false
+    expect(pretestWithGateFail.promote).toHaveBeenCalledWith('pf-123');
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].allowed).toBe(false);
+    // Audit must record the gate block (the kernel dispatch logs the promote result)
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_promote_requested' }),
+    );
+  });
+
+  it('elev.d2 — promote() with gate ready but no confirm: returns needs_confirmation, plugins NOT applied', async () => {
+    // Even with gate_ready, if require_human_confirm is enabled (default) and no confirm
+    // is provided, promote() returns needs_confirmation — no plugin activation occurs.
+    const audit = makeAudit();
+    const pretestWithNeedsConfirm = {
+      promote: jest.fn().mockResolvedValue({
+        ok: false,
+        reason: 'needs_confirmation',
+        pending: { plugin_ids: ['provider-a'], plugin_configs: {} },
+      }),
+      findAll: jest.fn().mockResolvedValue([]),
+      create: jest.fn(),
+      compare: jest.fn(),
+      runAllActive: jest.fn(),
+    };
+
+    const serviceWithConfirmRequired = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+    ) => AgentsService)(
+      {},
+      makeSandbox(),
+      {
+        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+        getProviderTools: jest.fn().mockResolvedValue([]),
+        findActive: jest.fn().mockResolvedValue([]),
+        writeSkillGuarded: jest.fn(),
+      },
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      pretestWithNeedsConfirm,
+    );
+
+    const decisions: import('./agents.service').Decision[] = [];
+    const sandboxResults: import('./agents.service').SandboxResult[] = [];
+
+    await callDispatchKernelTool(
+      serviceWithConfirmRequired,
+      'elev-confirm-001',
+      { plugin_id: 'kernel', function: 'promote_pretest', args: { pretest_id: 'pf-456' } },
+      decisions,
+      sandboxResults,
+    );
+
+    // The LLM called promote, but no confirm was provided → needs_confirmation
+    // decision must be allowed:false (plugin not applied)
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].allowed).toBe(false);
+    // promote was called without confirm (LLM cannot auto-confirm — no opts.confirm)
+    expect(pretestWithNeedsConfirm.promote).toHaveBeenCalledWith('pf-456');
+  });
+});

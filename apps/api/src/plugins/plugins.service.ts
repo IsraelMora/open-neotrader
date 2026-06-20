@@ -39,6 +39,17 @@ export interface WriteSkillResult {
   new_len?: number;
 }
 
+/**
+ * KV snapshot entry for a skill body written via writeSkillGuarded.
+ * Stores the previous body plus provenance metadata so a future curator
+ * can attribute and audit LLM-authored mutations without a schema migration.
+ */
+export interface SkillSnapshotEntry {
+  body: string;
+  written_by: 'llm' | 'human';
+  written_at: string; // ISO 8601
+}
+
 export interface SkillMeta {
   id: string;
   name: string;
@@ -1091,7 +1102,9 @@ export class PluginsService implements OnApplicationBootstrap {
       return { ok: false, reason: 'diff_too_large' };
     }
 
-    // 5. Snapshot current body to KV BEFORE write (FIFO cap=5)
+    // 5. Snapshot current body to KV BEFORE write (FIFO cap=5).
+    // Each snapshot entry is {body, written_by, written_at} so future tooling can
+    // attribute authorship without a schema migration. revertSkill reads `.body`.
     if (!this.kv) {
       this.log.warn(
         `writeSkillGuarded: KvService is undefined — snapshot and revert unavailable for '${skillName}'. Check KvService provider configuration.`,
@@ -1099,13 +1112,14 @@ export class PluginsService implements OnApplicationBootstrap {
     }
     const snapshotKey = `skill_snapshot:${skillName}`;
     const raw = (await this.kv?.get(snapshotKey)) ?? null;
-    let arr: string[];
+    let arr: SkillSnapshotEntry[];
     try {
-      arr = raw ? (JSON.parse(raw) as string[]) : [];
+      arr = raw ? (JSON.parse(raw) as SkillSnapshotEntry[]) : [];
     } catch {
       arr = [];
     }
-    arr.push(currentBody ?? '');
+    const writtenAt = new Date().toISOString();
+    arr.push({ body: currentBody ?? '', written_by: 'llm', written_at: writtenAt });
     if (arr.length > 5) arr.shift();
     await this.kv?.set(snapshotKey, JSON.stringify(arr));
 
@@ -1115,11 +1129,17 @@ export class PluginsService implements OnApplicationBootstrap {
       return { ok: false, reason: 'write_failed' };
     }
 
-    // 7. Audit skill_written
+    // 7. Audit skill_written — include provenance so curators can attribute LLM writes.
     await this.audit?.log({
       event_type: 'skill_written',
       plugin_id: plugin.id,
-      meta: { skill: skillName, old_len: oldLen, new_len: newLen },
+      meta: {
+        skill: skillName,
+        old_len: oldLen,
+        new_len: newLen,
+        written_by: 'llm',
+        written_at: writtenAt,
+      },
     });
 
     return { ok: true, old_len: oldLen, new_len: newLen };
@@ -1152,9 +1172,9 @@ export class PluginsService implements OnApplicationBootstrap {
 
     const snapshotKey = `skill_snapshot:${skillName}`;
     const raw = (await this.kv?.get(snapshotKey)) ?? null;
-    let arr: string[];
+    let arr: SkillSnapshotEntry[];
     try {
-      arr = raw ? (JSON.parse(raw) as string[]) : [];
+      arr = raw ? (JSON.parse(raw) as SkillSnapshotEntry[]) : [];
     } catch {
       arr = [];
     }
@@ -1163,7 +1183,9 @@ export class PluginsService implements OnApplicationBootstrap {
       return { ok: false, reason: 'no_snapshot' };
     }
 
-    const body = arr.pop()!;
+    const entry = arr.pop()!;
+    // Support both the legacy string format (pre-provenance) and the current {body, ...} shape.
+    const body = typeof entry === 'string' ? entry : entry.body;
     await this.kv?.set(snapshotKey, JSON.stringify(arr));
 
     const written = await this.writeSkillContent(skillName, body);
