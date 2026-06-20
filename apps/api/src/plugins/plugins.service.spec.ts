@@ -1739,7 +1739,11 @@ describe('PluginsService.getProviderTools — plugin_type', () => {
       [{ id: 'alpaca-provider', installed_path: '/plugins/alpaca', type: 'provider' }],
       {
         '/plugins/alpaca': JSON.stringify([
-          { name: 'place_order', description: 'Places an order', parameters: { type: 'object', properties: {} } },
+          {
+            name: 'place_order',
+            description: 'Places an order',
+            parameters: { type: 'object', properties: {} },
+          },
         ]),
       },
     );
@@ -1755,7 +1759,11 @@ describe('PluginsService.getProviderTools — plugin_type', () => {
       [{ id: 'my-skill', installed_path: '/plugins/my-skill', type: 'skill' }],
       {
         '/plugins/my-skill': JSON.stringify([
-          { name: 'analyze', description: 'Analyzes', parameters: { type: 'object', properties: {} } },
+          {
+            name: 'analyze',
+            description: 'Analyzes',
+            parameters: { type: 'object', properties: {} },
+          },
         ]),
       },
     );
@@ -1777,7 +1785,11 @@ describe('PluginsService.getProviderTools — plugin_type', () => {
           { name: 'trade', description: 'trades', parameters: { type: 'object', properties: {} } },
         ]),
         '/plugins/s1': JSON.stringify([
-          { name: 'signal', description: 'signals', parameters: { type: 'object', properties: {} } },
+          {
+            name: 'signal',
+            description: 'signals',
+            parameters: { type: 'object', properties: {} },
+          },
         ]),
       },
     );

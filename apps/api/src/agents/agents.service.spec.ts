@@ -6938,11 +6938,11 @@ function makeGatingService(kvValues: Record<string, string | null> = {}): Gating
     pretest: unknown,
     kv: unknown,
   ) => GatingAgentsService)(
-    {} as unknown as LlmService,
-    {} as unknown as SandboxGateway,
-    {} as unknown as PluginsService,
-    {} as unknown as ContextMemoryService,
-    makeAudit() as unknown as AuditService,
+    {},
+    {},
+    {},
+    {},
+    makeAudit(),
     { createBulk: jest.fn().mockResolvedValue([]) },
     undefined,
     undefined,
@@ -6960,14 +6960,9 @@ function makeGatingServiceNoKv(): GatingAgentsService {
     memory: unknown,
     audit: unknown,
     alerts: unknown,
-  ) => GatingAgentsService)(
-    {} as unknown as LlmService,
-    {} as unknown as SandboxGateway,
-    {} as unknown as PluginsService,
-    {} as unknown as ContextMemoryService,
-    makeAudit() as unknown as AuditService,
-    { createBulk: jest.fn().mockResolvedValue([]) },
-  );
+  ) => GatingAgentsService)({}, {}, {}, {}, makeAudit(), {
+    createBulk: jest.fn().mockResolvedValue([]),
+  });
 }
 
 function makeGatingServiceKvThrows(): GatingAgentsService {
@@ -6988,11 +6983,11 @@ function makeGatingServiceKvThrows(): GatingAgentsService {
     pretest: unknown,
     kv: unknown,
   ) => GatingAgentsService)(
-    {} as unknown as LlmService,
-    {} as unknown as SandboxGateway,
-    {} as unknown as PluginsService,
-    {} as unknown as ContextMemoryService,
-    makeAudit() as unknown as AuditService,
+    {},
+    {},
+    {},
+    {},
+    makeAudit(),
     { createBulk: jest.fn().mockResolvedValue([]) },
     undefined,
     undefined,
@@ -7145,17 +7140,28 @@ describe('AgentsService._computeVisibleTools', () => {
       get: jest.fn().mockResolvedValue(null),
     };
     const service = new (AgentsService as unknown as new (
-      llm: unknown, sandbox: unknown, plugins: unknown, memory: unknown,
-      audit: unknown, alerts: unknown, snapshot: unknown, cfg: unknown,
-      notifier: unknown, pretest: unknown, kv: unknown,
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
     ) => GatingAgentsService)(
-      {} as unknown as LlmService,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as ContextMemoryService,
-      makeAudit() as unknown as AuditService,
+      {},
+      {},
+      {},
+      {},
+      makeAudit(),
       { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined, undefined, undefined, undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
       kv,
     );
 
@@ -7265,9 +7271,17 @@ describe('AgentsService.runGovernedTurn — tool gating (F6-S4)', () => {
     const audit = makeAudit();
 
     const service = new (AgentsService as unknown as new (
-      llm: unknown, sandbox: unknown, plugins: unknown, memory: unknown,
-      audit: unknown, alerts: unknown, snapshot: unknown, cfg: unknown,
-      notifier: unknown, pretest: unknown, kv: unknown,
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
     ) => AgentsService)(
       llm,
       makeSandbox(),
@@ -7275,7 +7289,10 @@ describe('AgentsService.runGovernedTurn — tool gating (F6-S4)', () => {
       makeMemory(),
       audit,
       { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined, undefined, undefined, undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
       kv,
     );
 
