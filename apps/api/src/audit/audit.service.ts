@@ -29,7 +29,8 @@ export type AuditEventType =
   | 'promotion_gate_blocked'
   | 'plugin_content_changed'
   | 'react_iteration'
-  | 'react_budget_exhausted';
+  | 'react_budget_exhausted'
+  | 'lesson_recorded';
 
 export interface AuditPayload {
   cycle_id?: string;

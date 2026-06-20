@@ -211,6 +211,26 @@ const KERNEL_PROMOTE_PRETEST_TOOL: import('../plugins/plugins.service').Provider
 };
 
 /**
+ * Schema definition for the kernel__record_lesson tool.
+ * Injected into the LLM tool schema ONLY when source === 'reflection'.
+ * Stores a curated lesson into the lesson_memory store.
+ */
+const KERNEL_RECORD_LESSON_TOOL: import('../plugins/plugins.service').ProviderTool = {
+  plugin_id: 'kernel',
+  name: 'kernel__record_lesson',
+  description: 'Records a curated lesson (≤600 chars) into long-term lesson_memory. Only available during reflection turns.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      text: { type: 'string' },
+      episode_id: { type: 'string' },
+      rationale: { type: 'string' },
+    },
+    required: ['text'],
+  },
+};
+
+/**
  * Maximum number of active pretest portfolios allowed. Enforced at dispatch time by
  * counting all portfolios via PretestService.findAll() before calling create().
  * Bounds parallel simulation cost and prevents LLM-driven portfolio explosion.
@@ -227,6 +247,7 @@ const KERNEL_TOOL_REGISTRY: Set<string> = new Set([
   'create_pretest_variant',
   'run_pretest_compare',
   'promote_pretest',
+  'record_lesson',
 ]);
 
 /** Orquesta el ciclo completo del agente: memoria, hooks de plugins, capa de veto, LLM y ejecución de tool calls. */
@@ -524,6 +545,7 @@ export class AgentsService {
             KERNEL_CREATE_PRETEST_VARIANT_TOOL,
             KERNEL_RUN_PRETEST_COMPARE_TOOL,
             KERNEL_PROMOTE_PRETEST_TOOL,
+            KERNEL_RECORD_LESSON_TOOL,
           ]
         : [];
     const effectiveTools = [...providerTools, ...kernelTools];
@@ -1211,6 +1233,8 @@ export class AgentsService {
       await this._kernelRunPretestCompare(cycle_id, tc, decisions, sandbox_results);
     } else if (tc.function === 'promote_pretest') {
       await this._kernelPromotePretest(cycle_id, tc, decisions, sandbox_results);
+    } else if (tc.function === 'record_lesson') {
+      await this._kernelRecordLesson(cycle_id, tc, decisions, sandbox_results);
     } else {
       this.log.warn(`_dispatchKernelTool: unknown kernel function '${tc.function}' — dropped`);
       decisions.push({ ...tc, allowed: false, reason: 'unknown_kernel_tool' });
@@ -1432,6 +1456,68 @@ export class AgentsService {
       function: tc.function,
       ok: result.ok,
       result,
+    });
+  }
+
+  /**
+   * Handles kernel__record_lesson dispatch.
+   * Validates text is non-empty, calls longTermMemory.promote(), audits 'lesson_recorded'.
+   * NEVER calls sandbox. Fail-soft: errors are caught, decision marked allowed:false.
+   */
+  private async _kernelRecordLesson(
+    cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+  ): Promise<void> {
+    // Guard: LTM service must be available
+    if (!this.longTermMemory) {
+      decisions.push({ ...tc, allowed: false, reason: 'memory_unavailable' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'memory_unavailable',
+      });
+      return;
+    }
+
+    // Coerce and validate text
+    const rawText = tc.args['text'];
+    const text = typeof rawText === 'string' ? rawText.trim() : '';
+    if (!text) {
+      decisions.push({ ...tc, allowed: false, reason: 'invalid_lesson_args' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'invalid_lesson_args',
+      });
+      return;
+    }
+
+    // Optional fields
+    const rawEpisodeId = tc.args['episode_id'];
+    const episode_id = typeof rawEpisodeId === 'string' ? rawEpisodeId : undefined;
+    const rawRationale = tc.args['rationale'];
+    const rationale = typeof rawRationale === 'string' ? rawRationale : undefined;
+
+    // Promote the lesson (fail-soft — promote() never throws, but we guard anyway)
+    await this.longTermMemory.promote({ text, episode_id, rationale });
+
+    // Audit the lesson recording
+    await this.audit.log({
+      cycle_id,
+      event_type: 'lesson_recorded',
+      meta: { text: text.slice(0, 200), episode_id, rationale: rationale?.slice(0, 200) },
+    });
+
+    decisions.push({ ...tc, allowed: true });
+    sandbox_results.push({
+      plugin_id: 'kernel',
+      function: tc.function,
+      ok: true,
+      result: { text, episode_id, rationale },
     });
   }
 
