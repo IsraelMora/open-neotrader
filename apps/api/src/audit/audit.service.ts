@@ -30,7 +30,12 @@ export type AuditEventType =
   | 'plugin_content_changed'
   | 'react_iteration'
   | 'react_budget_exhausted'
-  | 'lesson_recorded';
+  | 'lesson_recorded'
+  // F6-S3: Multi-agent debate / consensus events
+  | 'debate_started'
+  | 'debate_stance'
+  | 'debate_consensus'
+  | 'debate_skipped';
 
 export interface AuditPayload {
   cycle_id?: string;

@@ -1537,3 +1537,160 @@ describe('F3-s4 — KV weight override in getTrustReport (AC-6)', () => {
     expect(report.breakdown.weights_used).not.toHaveProperty('votes');
   });
 });
+
+// ── F6-S3 Task A4.1: PluginsService.getActiveDebateRoles tests ───────────────
+
+import type { DebateRole } from '../agents/debate.types';
+
+// Reuse makeReflectionService factory — identical shape, no duplication.
+const makeDebateService = makeReflectionService;
+
+const THREE_DEBATE_ROLES: PluginManifest['debate'] = {
+  roles: [
+    { name: 'bull', prompt: 'You are bullish.', block: false },
+    { name: 'bear', prompt: 'You are bearish.', block: false },
+    { name: 'risk-auditor', prompt: 'You are the auditor.', block: true },
+  ],
+};
+
+describe('PluginsService.getActiveDebateRoles', () => {
+  beforeEach(() => jest.restoreAllMocks());
+
+  it('f6s3-a4.1a — returns null when 0 active plugins declare a [debate] section', async () => {
+    const service = makeDebateService(
+      [{ id: 'no-debate-plugin', installed_path: '/plugins/no-debate-plugin' }],
+      {
+        '/plugins/no-debate-plugin': {
+          plugin: { id: 'no-debate-plugin', name: 'No Debate', version: '1.0.0', type: 'extra' },
+        },
+      },
+    );
+    const logSpy = jest.spyOn(service['log'], 'error');
+
+    const result = await service.getActiveDebateRoles();
+
+    expect(result).toBeNull();
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it('f6s3-a4.1b — returns 3 DebateRole objects when exactly 1 active plugin has [debate]', async () => {
+    const service = makeDebateService(
+      [{ id: 'debate-plugin', installed_path: '/plugins/debate-plugin' }],
+      {
+        '/plugins/debate-plugin': {
+          plugin: { id: 'debate-plugin', name: 'Debate Plugin', version: '1.0.0', type: 'extra' },
+          debate: THREE_DEBATE_ROLES,
+        },
+      },
+    );
+
+    const result = await service.getActiveDebateRoles();
+
+    expect(result).not.toBeNull();
+    expect(result).toHaveLength(3);
+    const auditor = result!.find((r: DebateRole) => r.name === 'risk-auditor');
+    expect(auditor?.block).toBe(true);
+  });
+
+  it('f6s3-a4.1c — returns null and logs CRITICAL when >1 active plugins declare [debate]', async () => {
+    const service = makeDebateService(
+      [
+        { id: 'debate-a', installed_path: '/plugins/debate-a' },
+        { id: 'debate-b', installed_path: '/plugins/debate-b' },
+      ],
+      {
+        '/plugins/debate-a': {
+          plugin: { id: 'debate-a', name: 'Debate A', version: '1.0.0', type: 'extra' },
+          debate: THREE_DEBATE_ROLES,
+        },
+        '/plugins/debate-b': {
+          plugin: { id: 'debate-b', name: 'Debate B', version: '1.0.0', type: 'extra' },
+          debate: THREE_DEBATE_ROLES,
+        },
+      },
+    );
+    const logSpy = jest.spyOn(service['log'], 'error');
+
+    const result = await service.getActiveDebateRoles();
+
+    expect(result).toBeNull();
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    const logMessage: string = (logSpy.mock.calls[0] as string[])[0];
+    expect(logMessage).toContain('[CRITICAL]');
+    expect(logMessage).toContain('debate-a');
+    expect(logMessage).toContain('debate-b');
+  });
+
+  it('f6s3-a4.1d — inline prompt wins over prompt_file when both are present', async () => {
+    const service = makeDebateService(
+      [{ id: 'inline-wins', installed_path: '/plugins/inline-wins' }],
+      {
+        '/plugins/inline-wins': {
+          plugin: { id: 'inline-wins', name: 'Inline Wins', version: '1.0.0', type: 'extra' },
+          debate: {
+            roles: [
+              { name: 'bull', prompt: 'Inline prompt!', prompt_file: 'BULL.md', block: false },
+            ],
+          },
+        },
+      },
+    );
+    // Intercept fs.readFileSync so we can verify it's NOT called for prompt_file
+    const readFileSyncSpy = fs.readFileSync as jest.Mock;
+
+    const result = await service.getActiveDebateRoles();
+
+    expect(result).not.toBeNull();
+    expect(result![0].prompt).toBe('Inline prompt!');
+    // readFileSync should NOT be called for BULL.md when prompt is present
+    const bullCalls = readFileSyncSpy.mock.calls.filter(
+      (args: unknown[]) => typeof args[0] === 'string' && args[0].includes('BULL'),
+    );
+    expect(bullCalls).toHaveLength(0);
+  });
+
+  it('f6s3-a4.1e — path traversal in prompt_file is rejected (basename-only guard)', async () => {
+    const readFileSyncSpy = (fs.readFileSync as jest.Mock).mockReturnValue('safe content');
+
+    const service = makeDebateService(
+      [{ id: 'traversal-test', installed_path: '/plugins/traversal-test' }],
+      {
+        '/plugins/traversal-test': {
+          plugin: { id: 'traversal-test', name: 'Traversal Test', version: '1.0.0', type: 'extra' },
+          debate: {
+            roles: [{ name: 'bear', prompt_file: '../../etc/passwd', block: false }],
+          },
+        },
+      },
+    );
+
+    await service.getActiveDebateRoles();
+
+    // Must have used path.join('/plugins/traversal-test', 'passwd') — basename only
+    const traversalCalls = readFileSyncSpy.mock.calls.filter(
+      (args: unknown[]) => typeof args[0] === 'string' && args[0].includes('etc/passwd'),
+    );
+    expect(traversalCalls).toHaveLength(0);
+
+    readFileSyncSpy.mockReset();
+    (fs.readFileSync as jest.Mock).mockImplementation(
+      jest.requireActual<typeof import('fs')>('fs').readFileSync,
+    );
+  });
+
+  it('f6s3-a4.1f — never throws', async () => {
+    const service = makeDebateService(
+      [{ id: 'throws-plugin', installed_path: '/plugins/throws-plugin' }],
+      {
+        '/plugins/throws-plugin': {
+          plugin: { id: 'throws-plugin', name: 'Throws', version: '1.0.0', type: 'extra' },
+          debate: THREE_DEBATE_ROLES,
+        },
+      },
+    );
+    // Override findActive to throw
+    jest.spyOn(service, 'findActive').mockRejectedValue(new Error('DB error'));
+
+    await expect(service.getActiveDebateRoles()).resolves.toBeNull();
+  });
+});

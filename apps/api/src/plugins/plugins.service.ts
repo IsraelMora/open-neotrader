@@ -21,6 +21,7 @@ import {
   type PluginManifest,
   type ConfigFieldSpec,
 } from './manifest';
+import type { DebateRole } from '../agents/debate.types';
 import { scanLocalManifests } from './local-sync';
 import type { Plugin } from '@prisma/client';
 import type { KvService } from '../common/kv.service';
@@ -595,6 +596,64 @@ export class PluginsService implements OnApplicationBootstrap {
       }
 
       return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Returns debate roles from the single active plugin that declares a [debate] manifest
+   * section. Behavior mirrors getActiveReflectionPrompt:
+   *   - 0 active debate plugins → null (no log)
+   *   - 1 active debate plugin  → DebateRole[] (inline prompt wins over prompt_file)
+   *   - >1 active debate plugins → null + Logger.error("[CRITICAL] ...")
+   * Never throws.
+   */
+  async getActiveDebateRoles(): Promise<DebateRole[] | null> {
+    try {
+      const active = await this.findActive();
+      const debatePlugins = active.filter((p) => {
+        const manifest = this.getManifest(p.installed_path);
+        return (
+          manifest?.debate &&
+          Array.isArray(manifest.debate.roles) &&
+          manifest.debate.roles.length > 0
+        );
+      });
+
+      if (debatePlugins.length === 0) return null;
+
+      if (debatePlugins.length > 1) {
+        const ids = debatePlugins.map((p) => p.id).join(', ');
+        this.log.error(
+          `[CRITICAL] multiple debate plugins active: ${ids}. No debate roles injected this cycle.`,
+        );
+        return null;
+      }
+
+      // Exactly one.
+      const plugin = debatePlugins[0];
+      const manifest = this.getManifest(plugin.installed_path)!;
+      const rawRoles = manifest.debate!.roles;
+
+      const roles: DebateRole[] = rawRoles.map((r) => {
+        if (r.prompt) {
+          // Inline prompt wins
+          return { name: r.name, prompt: r.prompt, block: r.block };
+        }
+        if (r.prompt_file && plugin.installed_path) {
+          const safeName = path.basename(r.prompt_file);
+          try {
+            const prompt = fs.readFileSync(path.join(plugin.installed_path, safeName), 'utf8');
+            return { name: r.name, prompt, block: r.block };
+          } catch {
+            return { name: r.name, block: r.block };
+          }
+        }
+        return { name: r.name, block: r.block };
+      });
+
+      return roles;
     } catch {
       return null;
     }

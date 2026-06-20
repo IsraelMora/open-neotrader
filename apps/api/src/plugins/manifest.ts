@@ -86,6 +86,15 @@ export interface PluginManifest {
     prompt?: string;
     prompt_file?: string;
   };
+  /** Optional debate capability: defines a multi-agent panel for high-impact trade gating (F6-S3). */
+  debate?: {
+    roles: {
+      name: string;
+      prompt?: string;
+      prompt_file?: string;
+      block?: boolean;
+    }[];
+  };
 }
 
 // ── Parser ─────────────────────────────────────────────────────────────────────

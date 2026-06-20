@@ -20,6 +20,11 @@ const KNOWN_EVENT_TYPES: AuditEventType[] = [
   'pretest_variant_created',
   'pretest_compared',
   'pretest_cap_reached',
+  // F6-S3 debate event types
+  'debate_started',
+  'debate_stance',
+  'debate_consensus',
+  'debate_skipped',
 ];
 
 describe('AuditEventType', () => {
@@ -68,6 +73,28 @@ describe('AuditEventType', () => {
 
   it('s3 — includes pretest_cap_reached as a valid event type (compile-guard)', () => {
     const eventType: AuditEventType = 'pretest_cap_reached';
+    expect(KNOWN_EVENT_TYPES).toContain(eventType);
+  });
+
+  // ── F6-S3 Task A2.1 — debate event types compile-guard ───────────────────────
+
+  it('f6s3 — includes debate_started as a valid event type (compile-guard)', () => {
+    const eventType: AuditEventType = 'debate_started';
+    expect(KNOWN_EVENT_TYPES).toContain(eventType);
+  });
+
+  it('f6s3 — includes debate_stance as a valid event type (compile-guard)', () => {
+    const eventType: AuditEventType = 'debate_stance';
+    expect(KNOWN_EVENT_TYPES).toContain(eventType);
+  });
+
+  it('f6s3 — includes debate_consensus as a valid event type (compile-guard)', () => {
+    const eventType: AuditEventType = 'debate_consensus';
+    expect(KNOWN_EVENT_TYPES).toContain(eventType);
+  });
+
+  it('f6s3 — includes debate_skipped as a valid event type (compile-guard)', () => {
+    const eventType: AuditEventType = 'debate_skipped';
     expect(KNOWN_EVENT_TYPES).toContain(eventType);
   });
 });
