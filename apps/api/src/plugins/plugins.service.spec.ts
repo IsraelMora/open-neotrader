@@ -1694,3 +1694,110 @@ describe('PluginsService.getActiveDebateRoles', () => {
     await expect(service.getActiveDebateRoles()).resolves.toBeNull();
   });
 });
+
+// ── F6-S4: getProviderTools plugin_type annotation ────────────────────────────
+
+describe('PluginsService.getProviderTools — plugin_type', () => {
+  function makeGetProviderToolsService(
+    plugins: { id: string; installed_path: string | null; type: string }[],
+    toolsJsonMap: Record<string, string>, // installedPath -> raw JSON string
+  ): PluginsService {
+    const db = {
+      plugin: {
+        findMany: jest.fn().mockResolvedValue(plugins),
+        findUnique: jest.fn(),
+        findFirst: jest.fn(),
+        create: jest.fn(),
+        update: jest.fn(),
+        delete: jest.fn(),
+      },
+    } as unknown as PrismaService;
+    const events = { emit: jest.fn() } as unknown as PluginEventsService;
+    const cfg = { get: jest.fn().mockReturnValue('/var/plugins') } as unknown as ConfigService;
+    const service = new PluginsService(db, events, cfg);
+
+    // Intercept readFileSync only for tools.json paths
+    (fs.readFileSync as jest.Mock).mockImplementation((p: unknown, _enc?: unknown) => {
+      if (typeof p === 'string' && p.endsWith('tools.json')) {
+        const dir = p.replace(/[\\/]tools\.json$/, '');
+        if (toolsJsonMap[dir] !== undefined) return toolsJsonMap[dir];
+      }
+      throw new Error(`ENOENT: ${String(p)}`);
+    });
+
+    return service;
+  }
+
+  afterEach(() => {
+    (fs.readFileSync as jest.Mock).mockImplementation(
+      jest.requireActual<typeof import('fs')>('fs').readFileSync,
+    );
+  });
+
+  it('f6s4-p1.1 — provider plugin tools carry plugin_type "provider"', async () => {
+    const service = makeGetProviderToolsService(
+      [{ id: 'alpaca-provider', installed_path: '/plugins/alpaca', type: 'provider' }],
+      {
+        '/plugins/alpaca': JSON.stringify([
+          { name: 'place_order', description: 'Places an order', parameters: { type: 'object', properties: {} } },
+        ]),
+      },
+    );
+
+    const tools = await service.getProviderTools();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0].plugin_type).toBe('provider');
+  });
+
+  it('f6s4-p1.2 — skill plugin tools carry plugin_type "skill"', async () => {
+    const service = makeGetProviderToolsService(
+      [{ id: 'my-skill', installed_path: '/plugins/my-skill', type: 'skill' }],
+      {
+        '/plugins/my-skill': JSON.stringify([
+          { name: 'analyze', description: 'Analyzes', parameters: { type: 'object', properties: {} } },
+        ]),
+      },
+    );
+
+    const tools = await service.getProviderTools();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0].plugin_type).toBe('skill');
+  });
+
+  it('f6s4-p1.3 — multiple plugins each tool carries its own plugin_type', async () => {
+    const service = makeGetProviderToolsService(
+      [
+        { id: 'p1', installed_path: '/plugins/p1', type: 'provider' },
+        { id: 's1', installed_path: '/plugins/s1', type: 'skill' },
+      ],
+      {
+        '/plugins/p1': JSON.stringify([
+          { name: 'trade', description: 'trades', parameters: { type: 'object', properties: {} } },
+        ]),
+        '/plugins/s1': JSON.stringify([
+          { name: 'signal', description: 'signals', parameters: { type: 'object', properties: {} } },
+        ]),
+      },
+    );
+
+    const tools = await service.getProviderTools();
+
+    expect(tools).toHaveLength(2);
+    const providerTool = tools.find((t) => t.plugin_id === 'p1');
+    const skillTool = tools.find((t) => t.plugin_id === 's1');
+    expect(providerTool?.plugin_type).toBe('provider');
+    expect(skillTool?.plugin_type).toBe('skill');
+  });
+
+  it('f6s4-p1.4 — plugin with no tools.json contributes no tools (plugin_type irrelevant)', async () => {
+    const service = makeGetProviderToolsService(
+      [{ id: 'no-tools', installed_path: '/plugins/no-tools', type: 'provider' }],
+      {}, // no tools.json entry → readFileSync throws
+    );
+
+    const tools = await service.getProviderTools();
+    expect(tools).toHaveLength(0);
+  });
+});
