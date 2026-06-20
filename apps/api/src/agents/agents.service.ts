@@ -218,7 +218,8 @@ const KERNEL_PROMOTE_PRETEST_TOOL: import('../plugins/plugins.service').Provider
 const KERNEL_RECORD_LESSON_TOOL: import('../plugins/plugins.service').ProviderTool = {
   plugin_id: 'kernel',
   name: 'kernel__record_lesson',
-  description: 'Records a curated lesson (≤600 chars) into long-term lesson_memory. Only available during reflection turns.',
+  description:
+    'Records a curated lesson (≤600 chars) into long-term lesson_memory. Only available during reflection turns.',
   input_schema: {
     type: 'object',
     properties: {
@@ -1675,6 +1676,48 @@ export class AgentsService {
     return (header + '\n' + portfolioLines).slice(0, cap);
   }
 
+  /** Build the [LESSONS] section string, or null if no lessons or LTM absent. Fail-soft. */
+  private async _buildLessonsSection(cap: number): Promise<string | null> {
+    if (!this.longTermMemory) return null;
+    try {
+      const lessons = await this.longTermMemory.listLessons(3);
+      if (lessons.length === 0) return null;
+      return lessons
+        .map((l, i) => `${String(i + 1)}. ${l.text}`)
+        .join('\n')
+        .slice(0, cap);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Build the [PAST EPISODES] section string, or null if no hits or LTM absent. Fail-soft. */
+  private async _buildPastEpisodesSection(
+    auditEntries: Array<{ event_type: string; symbol?: string | null }>,
+    cap: number,
+  ): Promise<string | null> {
+    if (!this.longTermMemory) return null;
+    try {
+      const recentSymbols = auditEntries
+        .filter((e) => e.event_type === 'signal' || e.event_type === 'cycle_complete')
+        .map((e) => e.symbol)
+        .filter((s): s is string => typeof s === 'string' && s.length > 0)
+        .slice(0, 5);
+      const query = recentSymbols.join(' ') || 'market';
+      const episodes = await this.longTermMemory.prefetch(query, 2);
+      if (episodes.length === 0) return null;
+      return episodes
+        .map(
+          (ep) =>
+            `[${ep.cycle_id}] ${ep.action_summary} | P&L:${ep.outcome_pnl ?? 'pending'} | ${ep.llm_rationale}`,
+        )
+        .join('\n')
+        .slice(0, cap);
+    } catch {
+      return null;
+    }
+  }
+
   private async _assembleReflectionContext(): Promise<string> {
     const BUDGET = 4000;
     // PR3: reduced proportionally to make room for [LESSONS] (600) + [PAST EPISODES] (800).
@@ -1764,46 +1807,13 @@ export class AgentsService {
     }
 
     // Section: LESSONS — top-3 curated lessons from lesson_memory
-    let lessonsSection: string | null = null;
-    if (this.longTermMemory) {
-      try {
-        const lessons = await this.longTermMemory.listLessons(3);
-        if (lessons.length > 0) {
-          lessonsSection = lessons
-            .map((l, i) => `${String(i + 1)}. ${l.text}`)
-            .join('\n')
-            .slice(0, LESSONS_CAP);
-        }
-      } catch {
-        // Memory failure → section omitted, never breaks reflection
-      }
-    }
+    const lessonsSection = await this._buildLessonsSection(LESSONS_CAP);
 
     // Section: PAST EPISODES — top-2 prefetch hits (using recent symbol query from audit)
-    let pastEpisodesSection: string | null = null;
-    if (this.longTermMemory) {
-      try {
-        // Build a query from recent cycle signal symbols in audit entries
-        const recentSymbols = auditEntries
-          .filter((e) => e.event_type === 'signal' || e.event_type === 'cycle_complete')
-          .map((e) => e.symbol)
-          .filter((s): s is string => typeof s === 'string' && s.length > 0)
-          .slice(0, 5);
-        const query = recentSymbols.join(' ') || 'market';
-        const episodes = await this.longTermMemory.prefetch(query, 2);
-        if (episodes.length > 0) {
-          pastEpisodesSection = episodes
-            .map(
-              (ep) =>
-                `[${ep.cycle_id}] ${ep.action_summary} | P&L:${ep.outcome_pnl ?? 'pending'} | ${ep.llm_rationale}`,
-            )
-            .join('\n')
-            .slice(0, PAST_EPISODES_CAP);
-        }
-      } catch {
-        // Memory failure → section omitted, never breaks reflection
-      }
-    }
+    const pastEpisodesSection = await this._buildPastEpisodesSection(
+      auditEntries,
+      PAST_EPISODES_CAP,
+    );
 
     const parts: string[] = [
       `[AUDIT RECENT]\n${auditSection}`,
