@@ -172,6 +172,14 @@ describe('PluginsController — GET :id/reputation (F3-s3 Phase 5)', () => {
       scan_result: null,
       smoke_test_result: null,
       reputation_score: 55,
+      trust_score: null,
+      badge: false,
+      content_checksum: null,
+      breakdown: {
+        inputs: { scan: null, smoke: null, reputation: null, votes: 50 },
+        weights_used: {},
+        threshold: 80,
+      },
     });
 
     const result = await controller.trustReport('plugin-trust');

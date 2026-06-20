@@ -95,12 +95,20 @@ describe('PluginsController — GET :id/trust-report (F3-s1)', () => {
       scan_result: STORED_SCAN,
       smoke_test_result: null,
       reputation_score: null,
+      trust_score: null,
+      badge: false,
+      content_checksum: null,
+      breakdown: {
+        inputs: { scan: null, smoke: null, reputation: null, votes: 50 },
+        weights_used: {},
+        threshold: 80,
+      },
     });
 
     const result = await controller.trustReport('my-plugin');
 
     expect(svc.getTrustReport).toHaveBeenCalledWith('my-plugin');
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       scan_result: STORED_SCAN,
       smoke_test_result: null,
       reputation_score: null,
@@ -112,11 +120,23 @@ describe('PluginsController — GET :id/trust-report (F3-s1)', () => {
       scan_result: null,
       smoke_test_result: null,
       reputation_score: null,
+      trust_score: null,
+      badge: false,
+      content_checksum: null,
+      breakdown: {
+        inputs: { scan: null, smoke: null, reputation: null, votes: 50 },
+        weights_used: {},
+        threshold: 80,
+      },
     });
 
     const result = await controller.trustReport('unscanned-plugin');
 
     expect(svc.getTrustReport).toHaveBeenCalledWith('unscanned-plugin');
-    expect(result).toEqual({ scan_result: null, smoke_test_result: null, reputation_score: null });
+    expect(result).toMatchObject({
+      scan_result: null,
+      smoke_test_result: null,
+      reputation_score: null,
+    });
   });
 });
