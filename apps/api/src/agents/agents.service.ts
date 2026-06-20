@@ -823,6 +823,31 @@ export class AgentsService {
   }
 
   /**
+   * Strip LLM control-structure tokens from episode text fields before storing.
+   * Prevents a compromised rationale from reconstructing a prompt-injection vector
+   * when the episode is later recalled into a future cycle's LLM context.
+   */
+  private _sanitizeEpisodeText(s: string): string {
+    const CONTROL_TOKENS = [
+      /\[DECISION\]/gi,
+      /\[TOOL SCHEMA\]/gi,
+      /\[SEÑALES APROBADAS[^\]]*\]/gi,
+      /\[EPISODIOS RELEVANTES\]/gi,
+      /\[OBSERVACIONES[^\]]*\]/gi,
+      /\[LESSONS\]/gi,
+      /\[PAST EPISODES\]/gi,
+      /<tool_calls>[\s\S]*?<\/tool_calls>/gi,
+      /```json[\s\S]*?```/gi,
+      /```[\s\S]*?```/gi,
+    ];
+    let result = s;
+    for (const re of CONTROL_TOKENS) {
+      result = result.replace(re, '[stripped]');
+    }
+    return result;
+  }
+
+  /**
    * Record the cycle episode to long-term memory after a governed turn.
    * outcome_pnl is null here; SnapshotService backfills it via updateOutcome().
    * Failure NEVER breaks the cycle (swallows exceptions).
@@ -839,14 +864,15 @@ export class AgentsService {
         .map((s) => `${s.action.toUpperCase()} ${s.symbol}`)
         .join(', ')
         .slice(0, 200);
-      const llmRationale = llmText.slice(0, 500);
+      const llmRationale = this._sanitizeEpisodeText(llmText).slice(0, 500);
       // symbol-only regime tags for PR2; richer tags deferred to later PRs
       const regimeTags = symbols;
-      const narrative =
+      const narrative = this._sanitizeEpisodeText(
         `${symbols.join(' ')} ${regimeTags.join(' ')} ${actionSummary} ${llmRationale}`.slice(
           0,
           1400,
-        );
+        ),
+      );
       await this.longTermMemory.record({
         cycle_id,
         symbols,
