@@ -1,6 +1,6 @@
 import { CycleSchedulerService } from './cycle-scheduler.service';
 import type { KvService } from '../common/kv.service';
-import type { PanelService } from '../panel/panel.service';
+import type { CycleExecutorService } from '../cycle/cycle-executor.service';
 import type { PluginsService } from '../plugins/plugins.service';
 
 // ── Stubs ─────────────────────────────────────────────────────────────────────
@@ -15,11 +15,11 @@ function makeKv(
   };
 }
 
-function makePanel(opts: {
+function makeCycleExecutor(opts: {
   running?: boolean;
   reflectNowResult?: Record<string, unknown>;
   reflectNowThrows?: boolean;
-}): jest.Mocked<Pick<PanelService, 'getRunStatus' | 'runCycle' | 'reflectNow'>> {
+}): jest.Mocked<Pick<CycleExecutorService, 'getRunStatus' | 'runCycle' | 'reflectNow'>> {
   const running = opts.running ?? false;
   return {
     getRunStatus: jest.fn().mockReturnValue({ running, last: null }),
@@ -54,11 +54,11 @@ async function callMaybeReflect(service: CycleSchedulerService): Promise<void> {
 
 function makeSchedulerService(
   kv: ReturnType<typeof makeKv>,
-  panel: ReturnType<typeof makePanel>,
+  cycleExecutor: ReturnType<typeof makeCycleExecutor>,
 ): CycleSchedulerService {
   return new CycleSchedulerService(
     kv as unknown as KvService,
-    panel as unknown as PanelService,
+    cycleExecutor as unknown as CycleExecutorService,
     makePlugins() as unknown as PluginsService,
   );
 }
@@ -71,12 +71,12 @@ describe('F4-S2 Phase 3.1 — CycleSchedulerService._maybeReflect cadence', () =
       reflection: JSON.stringify({ every_n_cycles: 0 }),
       'reflection.cycle_counter': '5',
     });
-    const panel = makePanel({});
-    const service = makeSchedulerService(kv, panel);
+    const cycleExecutor = makeCycleExecutor({});
+    const service = makeSchedulerService(kv, cycleExecutor);
 
     await callMaybeReflect(service);
 
-    expect(panel.reflectNow).not.toHaveBeenCalled();
+    expect(cycleExecutor.reflectNow).not.toHaveBeenCalled();
     // counter must NOT be incremented when disabled
     expect(kv.set).not.toHaveBeenCalledWith('reflection.cycle_counter', expect.any(String));
   });
@@ -86,13 +86,13 @@ describe('F4-S2 Phase 3.1 — CycleSchedulerService._maybeReflect cadence', () =
       reflection: JSON.stringify({ every_n_cycles: 3 }),
       'reflection.cycle_counter': '2',
     });
-    const panel = makePanel({});
-    const service = makeSchedulerService(kv, panel);
+    const cycleExecutor = makeCycleExecutor({});
+    const service = makeSchedulerService(kv, cycleExecutor);
 
     await callMaybeReflect(service);
 
     // reflectNow must have been called
-    expect(panel.reflectNow).toHaveBeenCalledTimes(1);
+    expect(cycleExecutor.reflectNow).toHaveBeenCalledTimes(1);
     // counter reset to '0'
     expect(kv.set).toHaveBeenCalledWith('reflection.cycle_counter', '0');
   });
@@ -102,27 +102,27 @@ describe('F4-S2 Phase 3.1 — CycleSchedulerService._maybeReflect cadence', () =
       reflection: JSON.stringify({ every_n_cycles: 3 }),
       'reflection.cycle_counter': '1',
     });
-    const panel = makePanel({});
-    const service = makeSchedulerService(kv, panel);
+    const cycleExecutor = makeCycleExecutor({});
+    const service = makeSchedulerService(kv, cycleExecutor);
 
     await callMaybeReflect(service);
 
-    expect(panel.reflectNow).not.toHaveBeenCalled();
+    expect(cycleExecutor.reflectNow).not.toHaveBeenCalled();
     // counter advanced to '2'
     expect(kv.set).toHaveBeenCalledWith('reflection.cycle_counter', '2');
   });
 
-  it('3.1d — panel.getRunStatus().running===true → skip, counter NOT incremented', async () => {
+  it('3.1d — cycleExecutor.getRunStatus().running===true → skip, counter NOT incremented', async () => {
     const kv = makeKv({
       reflection: JSON.stringify({ every_n_cycles: 3 }),
       'reflection.cycle_counter': '2',
     });
-    const panel = makePanel({ running: true });
-    const service = makeSchedulerService(kv, panel);
+    const cycleExecutor = makeCycleExecutor({ running: true });
+    const service = makeSchedulerService(kv, cycleExecutor);
 
     await callMaybeReflect(service);
 
-    expect(panel.reflectNow).not.toHaveBeenCalled();
+    expect(cycleExecutor.reflectNow).not.toHaveBeenCalled();
     // Counter must NOT be updated when cycle is running
     expect(kv.set).not.toHaveBeenCalled();
   });
@@ -132,13 +132,13 @@ describe('F4-S2 Phase 3.1 — CycleSchedulerService._maybeReflect cadence', () =
       // No 'reflection' key — should default to 10
       'reflection.cycle_counter': '9',
     });
-    const panel = makePanel({});
-    const service = makeSchedulerService(kv, panel);
+    const cycleExecutor = makeCycleExecutor({});
+    const service = makeSchedulerService(kv, cycleExecutor);
 
     await callMaybeReflect(service);
 
     // counter 9 → 10 → fires (10 >= 10)
-    expect(panel.reflectNow).toHaveBeenCalledTimes(1);
+    expect(cycleExecutor.reflectNow).toHaveBeenCalledTimes(1);
     expect(kv.set).toHaveBeenCalledWith('reflection.cycle_counter', '0');
   });
 });
@@ -149,14 +149,14 @@ describe('F4-S2 Fix #3 — _maybeReflect counter reset only on reflectNow succes
       reflection: JSON.stringify({ every_n_cycles: 3 }),
       'reflection.cycle_counter': '2',
     });
-    const panel = makePanel({ reflectNowThrows: true });
-    const service = makeSchedulerService(kv, panel);
+    const cycleExecutor = makeCycleExecutor({ reflectNowThrows: true });
+    const service = makeSchedulerService(kv, cycleExecutor);
 
     // Should not throw (error is caught + logged)
     await callMaybeReflect(service);
 
     // reflectNow was called
-    expect(panel.reflectNow).toHaveBeenCalledTimes(1);
+    expect(cycleExecutor.reflectNow).toHaveBeenCalledTimes(1);
     // Counter must NOT have been reset to '0'
     expect(kv.set).not.toHaveBeenCalledWith('reflection.cycle_counter', '0');
   });
@@ -166,12 +166,12 @@ describe('F4-S2 Fix #3 — _maybeReflect counter reset only on reflectNow succes
       reflection: JSON.stringify({ every_n_cycles: 3 }),
       'reflection.cycle_counter': '2',
     });
-    const panel = makePanel({});
-    const service = makeSchedulerService(kv, panel);
+    const cycleExecutor = makeCycleExecutor({});
+    const service = makeSchedulerService(kv, cycleExecutor);
 
     await callMaybeReflect(service);
 
-    expect(panel.reflectNow).toHaveBeenCalledTimes(1);
+    expect(cycleExecutor.reflectNow).toHaveBeenCalledTimes(1);
     expect(kv.set).toHaveBeenCalledWith('reflection.cycle_counter', '0');
   });
 });

@@ -16,6 +16,7 @@ import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger'
 import { Public } from '../auth/decorators/public.decorator';
 import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 import { PanelService } from './panel.service';
+import { CycleExecutorService } from '../cycle/cycle-executor.service';
 import { RunCycleDto } from './dto/run-cycle.dto';
 import { ChatDto } from './dto/chat.dto';
 import { UniverseEditDto } from './dto/universe-edit.dto';
@@ -25,7 +26,10 @@ import { UniverseEditDto } from './dto/universe-edit.dto';
 @ApiBearerAuth()
 @Controller()
 export class PanelController {
-  constructor(private readonly svc: PanelService) {}
+  constructor(
+    private readonly svc: PanelService,
+    private readonly cycleExecutor: CycleExecutorService,
+  ) {}
 
   // ── Sistema ──────────────────────────────────────────────────────────────
 
@@ -45,7 +49,7 @@ export class PanelController {
   @Get('run-status')
   @ApiOperation({ summary: '¿Hay un ciclo en ejecución ahora mismo?' })
   runStatus() {
-    return this.svc.getRunStatus();
+    return this.cycleExecutor.getRunStatus();
   }
 
   // ── Config ────────────────────────────────────────────────────────────────
@@ -82,7 +86,7 @@ export class PanelController {
       'Lanzar un ciclo (dry_run o real). El prompt es opcional — lo pueden proporcionar los plugins.',
   })
   runCycle(@Body() dto: RunCycleDto) {
-    return this.svc.runCycle(dto.dry_run ?? false, dto.prompt);
+    return this.cycleExecutor.runCycle(dto.dry_run ?? false, dto.prompt);
   }
 
   // ── Chat ──────────────────────────────────────────────────────────────────

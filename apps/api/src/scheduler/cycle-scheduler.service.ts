@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { KvService } from '../common/kv.service';
-import { PanelService } from '../panel/panel.service';
+import { CycleExecutorService } from '../cycle/cycle-executor.service';
 import { PluginsService } from '../plugins/plugins.service';
 
 const CONFIG_KEY = 'scheduler';
@@ -82,7 +82,7 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
 
   constructor(
     private readonly store: KvService,
-    private readonly panel: PanelService,
+    private readonly cycleExecutor: CycleExecutorService,
     private readonly plugins: PluginsService,
   ) {}
 
@@ -266,7 +266,7 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
     const effectiveInterval = this.computeEffectiveInterval(cfg, pluginSchedules);
     const lastRun = cfg.last_run ? new Date(cfg.last_run).getTime() : 0;
     if (Date.now() < lastRun + effectiveInterval) return;
-    if (this.panel.getRunStatus().running) return;
+    if (this.cycleExecutor.getRunStatus().running) return;
 
     this.running = true;
     this.log.log(
@@ -291,7 +291,7 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
 
   private async executeTick(cfg: SchedulerConfig, cb: CircuitBreakerState): Promise<void> {
     try {
-      const result = this.panel.runCycle(false, cfg.prompt);
+      const result = this.cycleExecutor.runCycle(false, cfg.prompt);
       if (!result.accepted) {
         this.log.warn('Ciclo rechazado por panel (ya hay uno en curso)');
         return;
@@ -324,18 +324,15 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Checks the reflection cadence and triggers a reflection via PanelService.reflectNow()
+   * Checks the reflection cadence and triggers a reflection via CycleExecutorService.reflectNow()
    * if the counter has reached the configured threshold.
    *
    * Config (KV key "reflection" JSON): { every_n_cycles: number }  default: 10
    * Counter (KV key "reflection.cycle_counter"): integer string, default "0"
-   *
-   * Routing via panel.reflectNow() avoids injecting AgentsService into the scheduler
-   * (which would risk circular module dependency). The scheduler→panel edge already exists.
    */
   private async _maybeReflect(): Promise<void> {
-    // Skip if a cycle is still in progress (runCycle is fire-and-forget; panel tracks the flag).
-    if (this.panel.getRunStatus().running) {
+    // Skip if a cycle is still in progress (runCycle is fire-and-forget; cycleExecutor tracks the flag).
+    if (this.cycleExecutor.getRunStatus().running) {
       return;
     }
 
@@ -365,12 +362,12 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
     if (counter >= everyNCycles) {
       // Threshold reached: trigger reflection, reset counter only on success.
       try {
-        await this.panel.reflectNow();
+        await this.cycleExecutor.reflectNow();
         await this.store.set('reflection.cycle_counter', '0');
       } catch (err: unknown) {
         // Log but don't propagate — reflection failure must not disrupt the cycle scheduler.
         // Counter is NOT reset: next cycle will retry immediately (counter still at threshold).
-        this.log.warn(`_maybeReflect: panel.reflectNow() error — ${String(err)}`);
+        this.log.warn(`_maybeReflect: cycleExecutor.reflectNow() error — ${String(err)}`);
       }
     } else {
       await this.store.set('reflection.cycle_counter', String(counter));
@@ -406,13 +403,13 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
 
   /** Dispara un ciclo inmediato fuera del intervalo programado; lanza si ya hay uno en curso. */
   async runNow(prompt?: string): Promise<void> {
-    if (this.running || this.panel.getRunStatus().running) {
+    if (this.running || this.cycleExecutor.getRunStatus().running) {
       throw new Error('Ya hay un ciclo en ejecución. Espera a que termine.');
     }
     this.running = true;
     try {
-      const result = this.panel.runCycle(false, prompt);
-      if (!result.accepted) throw new Error('Ciclo rechazado por panel (ya hay uno en curso)');
+      const result = this.cycleExecutor.runCycle(false, prompt);
+      if (!result.accepted) throw new Error('Ciclo rechazado (ya hay uno en curso)');
       const cfg = await this.getConfig();
       await this.store.set(
         CONFIG_KEY,

@@ -2,7 +2,7 @@ import { Controller, Post, UseGuards } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
-import { PanelService } from '../panel/panel.service';
+import { CycleExecutorService } from '../cycle/cycle-executor.service';
 import type { ReflectionTurnResult } from './agents.service';
 
 /**
@@ -10,21 +10,21 @@ import type { ReflectionTurnResult } from './agents.service';
  *
  * POST /agents/reflect  — triggers a manual reflection turn.
  *   Requires JWT authentication + TOTP second factor.
- *   Delegates to PanelService.reflectNow() which guards against concurrent cycles.
+ *   Delegates to CycleExecutorService.reflectNow() which guards against concurrent cycles.
  *   Returns 409 ConflictException if a cycle is running; 200 with ReflectionTurnResult otherwise.
  */
 @ApiTags('agents')
 @ApiBearerAuth()
 @Controller('agents')
 export class AgentsController {
-  constructor(private readonly panel: PanelService) {}
+  constructor(private readonly cycleExecutor: CycleExecutorService) {}
 
   @Post('reflect')
   @UseGuards(JwtAuthGuard, TotpRequiredGuard)
   @ApiOperation({ summary: 'Trigger a manual reflection turn (requires TOTP)' })
   async reflect(): Promise<ReflectionTurnResult> {
-    // Delegates to PanelService so the concurrency guard (runState.running) is respected.
-    // Reuses the existing panel→agents dependency edge; no new module cycle is introduced.
-    return this.panel.reflectNow();
+    // Delegates to CycleExecutorService — the cycle lock owner after F5 Slice 2.
+    // CycleExecutorService is provided via PanelModule (which exports it via forwardRef(CycleExecutorModule)).
+    return this.cycleExecutor.reflectNow();
   }
 }

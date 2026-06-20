@@ -1,17 +1,17 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConflictException } from '@nestjs/common';
 import { AgentsController } from './agents.controller';
-import { PanelService } from '../panel/panel.service';
+import { CycleExecutorService } from '../cycle/cycle-executor.service';
 import type { ReflectionTurnResult } from './agents.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 
 // ── Stubs ─────────────────────────────────────────────────────────────────────
 
-function makePanelStub(opts: {
+function makeCycleExecutorStub(opts: {
   reflectResult?: ReflectionTurnResult;
   reflectThrows?: Error;
-}): Partial<PanelService> {
+}): Partial<CycleExecutorService> {
   return {
     reflectNow: opts.reflectThrows
       ? jest.fn().mockRejectedValue(opts.reflectThrows)
@@ -23,13 +23,15 @@ function makePanelStub(opts: {
   };
 }
 
-async function buildModule(panelStub: Partial<PanelService>): Promise<TestingModule> {
+async function buildModule(
+  cycleExecutorStub: Partial<CycleExecutorService>,
+): Promise<TestingModule> {
   return Test.createTestingModule({
     controllers: [AgentsController],
     providers: [
       {
-        provide: PanelService,
-        useValue: panelStub,
+        provide: CycleExecutorService,
+        useValue: cycleExecutorStub,
       },
     ],
   })
@@ -44,10 +46,10 @@ async function buildModule(panelStub: Partial<PanelService>): Promise<TestingMod
 
 describe('F4-S2 Phase 4 — AgentsController POST /agents/reflect', () => {
   it('4.1a — no reflection plugin → 200 {skipped:true}', async () => {
-    const panelStub = makePanelStub({
+    const stub = makeCycleExecutorStub({
       reflectResult: { skipped: true, reason: 'no_reflection_plugin' },
     });
-    const module = await buildModule(panelStub);
+    const module = await buildModule(stub);
     const controller = module.get(AgentsController);
 
     const result = await controller.reflect();
@@ -57,10 +59,10 @@ describe('F4-S2 Phase 4 — AgentsController POST /agents/reflect', () => {
   });
 
   it('4.1b — reflection runs successfully → 200 {skipped:false, cycle_id}', async () => {
-    const panelStub = makePanelStub({
+    const stub = makeCycleExecutorStub({
       reflectResult: { skipped: false, cycle_id: 'cycle-xyz', skills_written: 1 },
     });
-    const module = await buildModule(panelStub);
+    const module = await buildModule(stub);
     const controller = module.get(AgentsController);
 
     const result = await controller.reflect();
@@ -70,10 +72,10 @@ describe('F4-S2 Phase 4 — AgentsController POST /agents/reflect', () => {
   });
 
   it('4.1c — cycle running → 409 ConflictException propagated', async () => {
-    const panelStub = makePanelStub({
+    const stub = makeCycleExecutorStub({
       reflectThrows: new ConflictException('A cycle is currently running'),
     });
-    const module = await buildModule(panelStub);
+    const module = await buildModule(stub);
     const controller = module.get(AgentsController);
 
     await expect(controller.reflect()).rejects.toThrow(ConflictException);
