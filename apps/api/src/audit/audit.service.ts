@@ -39,7 +39,9 @@ export type AuditEventType =
   // ml-feature-extractor-s2: on-device model training
   | 'ml_model_trained'
   // ml-feature-extractor-s3: live confidence adjustment via on_cycle hook
-  | 'ml_signals_adjusted';
+  | 'ml_signals_adjusted'
+  // adaptive-parameters: kernel__tune_plugin_param success
+  | 'param_tuned';
 
 export interface AuditPayload {
   cycle_id?: string;

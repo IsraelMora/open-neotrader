@@ -698,6 +698,19 @@ export class PluginsService implements OnApplicationBootstrap {
     }
   }
 
+  /**
+   * Public wrapper over the private validateField.
+   * Resolves the config schema for the plugin, locates the ConfigFieldSpec for `param`,
+   * and delegates to the existing private validateField logic.
+   * Returns [] for valid input; non-empty array of error strings otherwise.
+   * Returns ['param not in schema'] when the schema is absent or `param` is not a key.
+   */
+  async validateSingleField(id: string, param: string, value: unknown): Promise<string[]> {
+    const schema = await this.getConfigSchema(id);
+    if (!schema || !(param in schema)) return ['param not in schema'];
+    return this.validateField(param, value, schema[param]);
+  }
+
   /** Fusiona config parcial sobre la existente (sin reemplazar campos no enviados). */
   async mergeConfig(id: string, patch: Record<string, unknown>): Promise<HydratedPlugin> {
     const p = await this.findById(id);

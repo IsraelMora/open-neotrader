@@ -1945,3 +1945,115 @@ describe('PluginsService.getProviderTools — plugin_type', () => {
     expect(tools).toHaveLength(0);
   });
 });
+
+// ── adaptive-parameters PR1: validateSingleField ──────────────────────────────
+
+describe('validateSingleField', () => {
+  function makeValidateSingleFieldService(
+    pluginRecord: { id: string; installed_path: string | null },
+    manifest: PluginManifest | null,
+  ): PluginsService {
+    const db = {
+      plugin: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: pluginRecord.id,
+          installed_path: pluginRecord.installed_path,
+          active: true,
+          type: 'skill',
+          name: pluginRecord.id,
+          version: '1.0.0',
+          description: null,
+          source: null,
+          config: null,
+          credentials: null,
+          stack_plugins: null,
+          symbols: null,
+          verification: 'unverified',
+          trust_score: null,
+          reputation_score: null,
+          reputation_detail: null,
+          content_checksum: null,
+          created_at: new Date(),
+          updated_at: new Date(),
+        }),
+        findMany: jest.fn().mockResolvedValue([]),
+        findFirst: jest.fn().mockResolvedValue(null),
+        create: jest.fn(),
+        update: jest.fn(),
+        delete: jest.fn(),
+      },
+    } as unknown as PrismaService;
+
+    const events = { emit: jest.fn() } as unknown as PluginEventsService;
+    const cfg = { get: jest.fn().mockReturnValue('/var/plugins') } as unknown as ConfigService;
+    const service = new PluginsService(db, events, cfg);
+
+    service.getManifest = jest.fn().mockReturnValue(manifest);
+    return service;
+  }
+
+  const SCHEMA_MANIFEST: PluginManifest = {
+    plugin: { id: 'my-skill', name: 'My Skill', version: '1.0.0', type: 'skill' },
+    config: {
+      ratio: { type: 'number', min: 0, max: 1, default: 0.5 },
+      mode: { type: 'string', enum: ['fast', 'slow'], default: 'fast' },
+    },
+  };
+
+  it('1.1a — in-range valid number → returns []', async () => {
+    const service = makeValidateSingleFieldService(
+      { id: 'my-skill', installed_path: '/plugins/my-skill' },
+      SCHEMA_MANIFEST,
+    );
+    const result = await service.validateSingleField('my-skill', 'ratio', 0.5);
+    expect(result).toEqual([]);
+  });
+
+  it('1.1b — out-of-range value → returns non-empty errors array', async () => {
+    const service = makeValidateSingleFieldService(
+      { id: 'my-skill', installed_path: '/plugins/my-skill' },
+      SCHEMA_MANIFEST,
+    );
+    const result = await service.validateSingleField('my-skill', 'ratio', 1.5);
+    expect(result.length).toBeGreaterThan(0);
+  });
+
+  it('1.1c — param not in schema → returns errors', async () => {
+    const service = makeValidateSingleFieldService(
+      { id: 'my-skill', installed_path: '/plugins/my-skill' },
+      SCHEMA_MANIFEST,
+    );
+    const result = await service.validateSingleField('my-skill', 'nonexistent_param', 42);
+    expect(result.length).toBeGreaterThan(0);
+    expect(result[0]).toMatch(/param not in schema/);
+  });
+
+  it('1.1d — no config schema (manifest null) → returns errors', async () => {
+    const service = makeValidateSingleFieldService(
+      { id: 'my-skill', installed_path: '/plugins/my-skill' },
+      null,
+    );
+    const result = await service.validateSingleField('my-skill', 'ratio', 0.5);
+    expect(result.length).toBeGreaterThan(0);
+    expect(result[0]).toMatch(/param not in schema/);
+  });
+
+  it('1.1e — wrong type value → returns errors', async () => {
+    const service = makeValidateSingleFieldService(
+      { id: 'my-skill', installed_path: '/plugins/my-skill' },
+      SCHEMA_MANIFEST,
+    );
+    // 'ratio' expects number, pass a string
+    const result = await service.validateSingleField('my-skill', 'ratio', 'high');
+    expect(result.length).toBeGreaterThan(0);
+  });
+
+  it('1.1f — valid enum value → returns []', async () => {
+    const service = makeValidateSingleFieldService(
+      { id: 'my-skill', installed_path: '/plugins/my-skill' },
+      SCHEMA_MANIFEST,
+    );
+    const result = await service.validateSingleField('my-skill', 'mode', 'fast');
+    expect(result).toEqual([]);
+  });
+});
