@@ -2000,8 +2000,11 @@ export class AgentsService {
   > {
     const { cycle_id, plugin_id, param, value, hypothesis, pluginConfig, disciplineConfig } = args;
 
+    // Guard — KV is required for journal persistence; without it governance cannot be enforced
+    if (!this.kv) return { gateReason: 'kv_unavailable' };
+
     // Step 6 — Load journal from KV + check lock
-    const rawJournal = await this.kv?.get('param:journal');
+    const rawJournal = await this.kv.get('param:journal');
     const journal: unknown[] = rawJournal ? (JSON.parse(rawJournal) as unknown[]) : [];
 
     const lockRes = await this.sandbox.callPlugin('param-discipline', 'check_lock', {
@@ -2030,16 +2033,22 @@ export class AgentsService {
     const jeResult = (jeRes.result ?? {}) as Record<string, unknown>;
     if (!jeRes.ok || !jeResult['ok']) return { gateReason: 'journal_rejected' };
 
-    // Step 9 — Config apply (mergeConfig re-validates = defense in depth)
+    // Step 9 — Persist journal BEFORE applying config (conservative: phantom lock > silent bypass)
+    // If KV write fails, return a distinct gate reason (fail-closed; config NOT applied)
+    const updatedJournal = jeResult['journal'] as unknown[];
+    try {
+      await this.kv.set('param:journal', JSON.stringify(updatedJournal));
+    } catch {
+      return { gateReason: 'journal_persist_failed' };
+    }
+
+    // Step 10 — Config apply (mergeConfig re-validates = defense in depth)
+    // If this fails, the journal entry already persists (phantom lock, acceptable over silent bypass)
     const applyOk = await this.plugins
       .mergeConfig(plugin_id, { [param]: value })
       .then(() => true)
       .catch(() => false);
     if (!applyOk) return { gateReason: 'apply_failed' };
-
-    // Step 10a — Persist updated journal
-    const updatedJournal = jeResult['journal'] as unknown[];
-    await this.kv?.set('param:journal', JSON.stringify(updatedJournal));
 
     return {
       gateReason: undefined,

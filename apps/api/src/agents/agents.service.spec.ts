@@ -9247,7 +9247,9 @@ function makeTunePluginsMock(overrides: Partial<TunePluginsMock> = {}): TunePlug
   return {
     findActive: jest.fn().mockResolvedValue([]),
     getProviderTools: jest.fn().mockResolvedValue([]),
-    findById: jest.fn().mockResolvedValue({ id: 'my-skill', type: 'skill', config: { ratio: 0.5 } }),
+    findById: jest
+      .fn()
+      .mockResolvedValue({ id: 'my-skill', type: 'skill', config: { ratio: 0.5 } }),
     getConfigSchema: jest.fn().mockResolvedValue({
       ratio: { type: 'number', min: 0, max: 1, default: 0.5 },
     }),
@@ -9257,7 +9259,9 @@ function makeTunePluginsMock(overrides: Partial<TunePluginsMock> = {}): TunePlug
   };
 }
 
-function makeTuneKvMock(journalValue: string | null = null): jest.Mocked<Pick<KvService, 'get' | 'set'>> {
+function makeTuneKvMock(
+  journalValue: string | null = null,
+): jest.Mocked<Pick<KvService, 'get' | 'set'>> {
   return {
     get: jest.fn().mockImplementation((key: string) => {
       if (key === 'param:journal') return Promise.resolve(journalValue);
@@ -9268,12 +9272,30 @@ function makeTuneKvMock(journalValue: string | null = null): jest.Mocked<Pick<Kv
   };
 }
 
-function makeTuneSandboxMock(overrides: Partial<jest.Mocked<Pick<SandboxGateway, 'callPlugin' | 'runCycle'>>> = {}): jest.Mocked<Pick<SandboxGateway, 'callPlugin' | 'runCycle'>> {
+function makeTuneSandboxMock(
+  overrides: Partial<jest.Mocked<Pick<SandboxGateway, 'callPlugin' | 'runCycle'>>> = {},
+): jest.Mocked<Pick<SandboxGateway, 'callPlugin' | 'runCycle'>> {
   return {
     runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
     callPlugin: jest.fn().mockImplementation((_pluginId: string, fn: string) => {
-      if (fn === 'check_lock') return Promise.resolve({ ok: true, result: { locked: false, plugin_id: 'my-skill' } });
-      if (fn === 'journal_entry') return Promise.resolve({ ok: true, result: { ok: true, entry_id: 'abc123', journal: [{ plugin_id: 'my-skill', params_before: { ratio: 0.5 }, params_after: { ratio: 0.8 }, cycles_since: 0 }] } });
+      if (fn === 'check_lock')
+        return Promise.resolve({ ok: true, result: { locked: false, plugin_id: 'my-skill' } });
+      if (fn === 'journal_entry')
+        return Promise.resolve({
+          ok: true,
+          result: {
+            ok: true,
+            entry_id: 'abc123',
+            journal: [
+              {
+                plugin_id: 'my-skill',
+                params_before: { ratio: 0.5 },
+                params_after: { ratio: 0.8 },
+                cycles_since: 0,
+              },
+            ],
+          },
+        });
       return Promise.resolve({ ok: true, result: null });
     }),
     ...overrides,
@@ -9300,17 +9322,17 @@ function makeTuneAgentsService(opts: {
     pretest: unknown,
     kv: unknown,
   ) => AgentsService)(
-    {} as unknown as LlmService,
-    opts.sandbox as unknown as SandboxGateway,
-    opts.plugins as unknown as PluginsService,
-    {} as unknown as ContextMemoryService,
-    opts.audit as unknown as AuditService,
-    { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    {},
+    opts.sandbox,
+    opts.plugins,
+    {},
+    opts.audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
     undefined,
     undefined,
     undefined,
     undefined,
-    opts.kv as unknown as KvService,
+    opts.kv,
   );
 }
 
@@ -9341,7 +9363,8 @@ const TUNE_TC: ToolCallRequest = {
     plugin_id: 'my-skill',
     param: 'ratio',
     value: 0.8,
-    hypothesis: 'This is a sufficiently long hypothesis to pass the length check in param discipline.',
+    hypothesis:
+      'This is a sufficiently long hypothesis to pass the length check in param discipline.',
   },
 };
 
@@ -9369,9 +9392,17 @@ describe('kernel__tune_plugin_param — reflection gate', () => {
     const kv = makeTuneKvMock();
 
     return new (AgentsService as unknown as new (
-      llm: unknown, sandbox: unknown, plugins: unknown, memory: unknown,
-      audit: unknown, alerts: unknown, snapshot: unknown, cfg: unknown,
-      notifier: unknown, pretest: unknown, kv: unknown,
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
     ) => AgentsService)(
       llm,
       makeTuneSandboxMock(),
@@ -9379,7 +9410,10 @@ describe('kernel__tune_plugin_param — reflection gate', () => {
       makeMemory(),
       { log: jest.fn().mockResolvedValue(undefined) },
       { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined, undefined, undefined, undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
       kv,
     );
   }
@@ -9441,10 +9475,20 @@ describe('kernel__tune_plugin_param — KERNEL_TOOL_REGISTRY', () => {
     };
 
     const calls: ToolCallRequest[] = [
-      { plugin_id: 'kernel', function: 'tune_plugin_param', args: { plugin_id: 'my-skill', param: 'ratio', value: 0.8, hypothesis: 'test' } },
+      {
+        plugin_id: 'kernel',
+        function: 'tune_plugin_param',
+        args: { plugin_id: 'my-skill', param: 'ratio', value: 0.8, hypothesis: 'test' },
+      },
     ];
 
-    const result = await callValidateWithHoisted(service, 'tune-reg-001', calls, [kernelTool], 'reflection');
+    const result = await callValidateWithHoisted(
+      service,
+      'tune-reg-001',
+      calls,
+      [kernelTool],
+      'reflection',
+    );
 
     expect(result).toHaveLength(1);
     expect(result[0].function).toBe('tune_plugin_param');
@@ -9500,7 +9544,9 @@ describe('_kernelTunePluginParam — fail-closed chain', () => {
 
   it('1.3b — not_a_skill: plugin.type !== skill → mergeConfig NEVER called, allowed:false, reason:not_a_skill', async () => {
     const plugins = makeTunePluginsMock({
-      findById: jest.fn().mockResolvedValue({ id: 'param-discipline', type: 'discipline', config: {} }),
+      findById: jest
+        .fn()
+        .mockResolvedValue({ id: 'param-discipline', type: 'discipline', config: {} }),
     });
     const audit = makeAudit();
     const sandbox = makeTuneSandboxMock();
@@ -9536,7 +9582,9 @@ describe('_kernelTunePluginParam — fail-closed chain', () => {
 
   it('1.3d — param_not_in_schema: param absent from schema → mergeConfig NEVER called, allowed:false', async () => {
     const plugins = makeTunePluginsMock({
-      getConfigSchema: jest.fn().mockResolvedValue({ other_param: { type: 'number', min: 0, max: 1, default: 0.5 } }),
+      getConfigSchema: jest
+        .fn()
+        .mockResolvedValue({ other_param: { type: 'number', min: 0, max: 1, default: 0.5 } }),
     });
     const audit = makeAudit();
     const sandbox = makeTuneSandboxMock();
@@ -9571,9 +9619,9 @@ describe('_kernelTunePluginParam — fail-closed chain', () => {
 
   it('1.3f — discipline_inactive: param-discipline not in findActive → mergeConfig NEVER called, allowed:false, reason:discipline_inactive', async () => {
     const plugins = makeTunePluginsMock({
-      findActive: jest.fn().mockResolvedValue([
-        { id: 'some-other-discipline', type: 'discipline', config: {} },
-      ]),
+      findActive: jest
+        .fn()
+        .mockResolvedValue([{ id: 'some-other-discipline', type: 'discipline', config: {} }]),
     });
     const audit = makeAudit();
     const sandbox = makeTuneSandboxMock();
@@ -9591,9 +9639,11 @@ describe('_kernelTunePluginParam — fail-closed chain', () => {
 
   it('1.3g — param_locked: check_lock returns locked:true → mergeConfig NEVER called, journal_entry NEVER called, allowed:false, reason:param_locked', async () => {
     const plugins = makeTunePluginsMock({
-      findActive: jest.fn().mockResolvedValue([
-        { id: 'param-discipline', type: 'discipline', config: { lock_after_change_cycles: 3 } },
-      ]),
+      findActive: jest
+        .fn()
+        .mockResolvedValue([
+          { id: 'param-discipline', type: 'discipline', config: { lock_after_change_cycles: 3 } },
+        ]),
     });
     const audit = makeAudit();
     const sandbox = makeTuneSandboxMock({
@@ -9622,15 +9672,22 @@ describe('_kernelTunePluginParam — fail-closed chain', () => {
 
   it('1.3h — journal_rejected: journal_entry returns ok:false → mergeConfig NEVER called, allowed:false, reason:journal_rejected', async () => {
     const plugins = makeTunePluginsMock({
-      findActive: jest.fn().mockResolvedValue([
-        { id: 'param-discipline', type: 'discipline', config: { lock_after_change_cycles: 3 } },
-      ]),
+      findActive: jest
+        .fn()
+        .mockResolvedValue([
+          { id: 'param-discipline', type: 'discipline', config: { lock_after_change_cycles: 3 } },
+        ]),
     });
     const audit = makeAudit();
     const sandbox = makeTuneSandboxMock({
       callPlugin: jest.fn().mockImplementation((_id: string, fn: string) => {
-        if (fn === 'check_lock') return Promise.resolve({ ok: true, result: { locked: false, plugin_id: 'my-skill' } });
-        if (fn === 'journal_entry') return Promise.resolve({ ok: true, result: { ok: false, error: 'budget_exceeded', journal: [] } });
+        if (fn === 'check_lock')
+          return Promise.resolve({ ok: true, result: { locked: false, plugin_id: 'my-skill' } });
+        if (fn === 'journal_entry')
+          return Promise.resolve({
+            ok: true,
+            result: { ok: false, error: 'budget_exceeded', journal: [] },
+          });
         return Promise.resolve({ ok: true, result: null });
       }),
     });
@@ -9650,10 +9707,16 @@ describe('_kernelTunePluginParam — fail-closed chain', () => {
 
   it('1.3i — apply_failed: mergeConfig throws → allowed:false, reason:apply_failed, no param_tuned audit', async () => {
     const plugins = makeTunePluginsMock({
-      findActive: jest.fn().mockResolvedValue([
-        { id: 'param-discipline', type: 'discipline', config: { lock_after_change_cycles: 3 } },
-      ]),
-      mergeConfig: jest.fn().mockRejectedValue(Object.assign(new Error('BadRequest: Config inválida'), { status: 400 })),
+      findActive: jest
+        .fn()
+        .mockResolvedValue([
+          { id: 'param-discipline', type: 'discipline', config: { lock_after_change_cycles: 3 } },
+        ]),
+      mergeConfig: jest
+        .fn()
+        .mockRejectedValue(
+          Object.assign(new Error('BadRequest: Config inválida'), { status: 400 }),
+        ),
     });
     const audit = makeAudit();
     const sandbox = makeTuneSandboxMock();
@@ -9676,28 +9739,44 @@ describe('_kernelTunePluginParam — happy path', () => {
   const CYCLE_ID = 'tune-happy-001';
 
   it('1.4 — happy path: check_lock, journal_entry, mergeConfig, kv.set, param_tuned audit all called with correct args', async () => {
-    const disciplineConfig = { lock_after_change_cycles: 3, max_changes_per_week: 5, min_hypothesis_length: 50, require_hypothesis: true };
+    const disciplineConfig = {
+      lock_after_change_cycles: 3,
+      max_changes_per_week: 5,
+      min_hypothesis_length: 50,
+      require_hypothesis: true,
+    };
     const existingJournal = [{ plugin_id: 'other-skill', cycles_since: 10 }];
     const updatedJournal = [
       { plugin_id: 'other-skill', cycles_since: 10 },
-      { plugin_id: 'my-skill', params_before: { ratio: 0.5 }, params_after: { ratio: 0.8 }, cycles_since: 0 },
+      {
+        plugin_id: 'my-skill',
+        params_before: { ratio: 0.5 },
+        params_after: { ratio: 0.8 },
+        cycles_since: 0,
+      },
     ];
 
     const plugins = makeTunePluginsMock({
-      findActive: jest.fn().mockResolvedValue([
-        { id: 'param-discipline', type: 'discipline', config: disciplineConfig },
-      ]),
-      findById: jest.fn().mockResolvedValue({ id: 'my-skill', type: 'skill', config: { ratio: 0.5 } }),
+      findActive: jest
+        .fn()
+        .mockResolvedValue([
+          { id: 'param-discipline', type: 'discipline', config: disciplineConfig },
+        ]),
+      findById: jest
+        .fn()
+        .mockResolvedValue({ id: 'my-skill', type: 'skill', config: { ratio: 0.5 } }),
     });
 
     const audit = makeAudit();
     const sandbox = makeTuneSandboxMock({
       callPlugin: jest.fn().mockImplementation((_id: string, fn: string) => {
-        if (fn === 'check_lock') return Promise.resolve({ ok: true, result: { locked: false, plugin_id: 'my-skill' } });
-        if (fn === 'journal_entry') return Promise.resolve({
-          ok: true,
-          result: { ok: true, entry_id: 'abc123', journal: updatedJournal },
-        });
+        if (fn === 'check_lock')
+          return Promise.resolve({ ok: true, result: { locked: false, plugin_id: 'my-skill' } });
+        if (fn === 'journal_entry')
+          return Promise.resolve({
+            ok: true,
+            result: { ok: true, entry_id: 'abc123', journal: updatedJournal },
+          });
         return Promise.resolve({ ok: true, result: null });
       }),
     });
@@ -9712,7 +9791,11 @@ describe('_kernelTunePluginParam — happy path', () => {
     expect(sandbox.callPlugin).toHaveBeenCalledWith(
       'param-discipline',
       'check_lock',
-      expect.objectContaining({ plugin_id: 'my-skill', journal: existingJournal, config: disciplineConfig }),
+      expect.objectContaining({
+        plugin_id: 'my-skill',
+        journal: existingJournal,
+        config: disciplineConfig,
+      }),
     );
 
     // journal_entry called with exact arg names
@@ -9764,16 +9847,32 @@ describe('_kernelTunePluginParam — journal KV round-trip', () => {
   const CYCLE_ID_2 = 'tune-roundtrip-001b';
 
   it('1.5 — second tune on same plugin receives persisted journal → check_lock sees it → param_locked', async () => {
-    const disciplineConfig = { lock_after_change_cycles: 3, max_changes_per_week: 5, min_hypothesis_length: 50, require_hypothesis: true };
+    const disciplineConfig = {
+      lock_after_change_cycles: 3,
+      max_changes_per_week: 5,
+      min_hypothesis_length: 50,
+      require_hypothesis: true,
+    };
     const journalAfterFirstTune = [
-      { id: 'abc123', plugin_id: 'my-skill', params_before: { ratio: 0.5 }, params_after: { ratio: 0.8 }, cycles_since: 0, ts: '2026-01-01T00:00:00Z' },
+      {
+        id: 'abc123',
+        plugin_id: 'my-skill',
+        params_before: { ratio: 0.5 },
+        params_after: { ratio: 0.8 },
+        cycles_since: 0,
+        ts: '2026-01-01T00:00:00Z',
+      },
     ];
 
     const plugins = makeTunePluginsMock({
-      findActive: jest.fn().mockResolvedValue([
-        { id: 'param-discipline', type: 'discipline', config: disciplineConfig },
-      ]),
-      findById: jest.fn().mockResolvedValue({ id: 'my-skill', type: 'skill', config: { ratio: 0.5 } }),
+      findActive: jest
+        .fn()
+        .mockResolvedValue([
+          { id: 'param-discipline', type: 'discipline', config: disciplineConfig },
+        ]),
+      findById: jest
+        .fn()
+        .mockResolvedValue({ id: 'my-skill', type: 'skill', config: { ratio: 0.5 } }),
     });
 
     const audit = makeAudit();
@@ -9794,18 +9893,24 @@ describe('_kernelTunePluginParam — journal KV round-trip', () => {
 
     // Call 1: unlocked → succeeds and persists journal
     const sandbox1 = makeTuneSandboxMock({
-      callPlugin: jest.fn().mockImplementation((_id: string, fn: string, args: Record<string, unknown>) => {
-        if (fn === 'check_lock') {
-          // Initially empty journal → not locked
-          const j = (args['journal'] as unknown[]) ?? [];
-          return Promise.resolve({ ok: true, result: { locked: j.length > 0 && true, plugin_id: 'my-skill' } });
-        }
-        if (fn === 'journal_entry') return Promise.resolve({
-          ok: true,
-          result: { ok: true, entry_id: 'abc123', journal: journalAfterFirstTune },
-        });
-        return Promise.resolve({ ok: true, result: null });
-      }),
+      callPlugin: jest
+        .fn()
+        .mockImplementation((_id: string, fn: string, args: Record<string, unknown>) => {
+          if (fn === 'check_lock') {
+            // Initially empty journal → not locked
+            const j = (args['journal'] as unknown[]) ?? [];
+            return Promise.resolve({
+              ok: true,
+              result: { locked: j.length > 0, plugin_id: 'my-skill' },
+            });
+          }
+          if (fn === 'journal_entry')
+            return Promise.resolve({
+              ok: true,
+              result: { ok: true, entry_id: 'abc123', journal: journalAfterFirstTune },
+            });
+          return Promise.resolve({ ok: true, result: null });
+        }),
     });
 
     const service1 = makeTuneAgentsService({ plugins, audit, sandbox: sandbox1, kv });
@@ -9818,14 +9923,21 @@ describe('_kernelTunePluginParam — journal KV round-trip', () => {
 
     // Call 2: check_lock receives the persisted journal → locked
     const sandbox2 = makeTuneSandboxMock({
-      callPlugin: jest.fn().mockImplementation((_id: string, fn: string, args: Record<string, unknown>) => {
-        if (fn === 'check_lock') {
-          const j = (args['journal'] as unknown[]) ?? [];
-          const locked = j.some((e) => (e as Record<string, unknown>)['plugin_id'] === 'my-skill');
-          return Promise.resolve({ ok: true, result: { locked, plugin_id: 'my-skill', reason: 'Cambio reciente' } });
-        }
-        return Promise.resolve({ ok: true, result: null });
-      }),
+      callPlugin: jest
+        .fn()
+        .mockImplementation((_id: string, fn: string, args: Record<string, unknown>) => {
+          if (fn === 'check_lock') {
+            const j = (args['journal'] as unknown[]) ?? [];
+            const locked = j.some(
+              (e) => (e as Record<string, unknown>)['plugin_id'] === 'my-skill',
+            );
+            return Promise.resolve({
+              ok: true,
+              result: { locked, plugin_id: 'my-skill', reason: 'Cambio reciente' },
+            });
+          }
+          return Promise.resolve({ ok: true, result: null });
+        }),
     });
 
     const service2 = makeTuneAgentsService({ plugins, audit, sandbox: sandbox2, kv });
@@ -9834,11 +9946,12 @@ describe('_kernelTunePluginParam — journal KV round-trip', () => {
     await callKernelTunePluginParam(service2, CYCLE_ID_2, TUNE_TC, decisions2, sbr2);
 
     // check_lock on call 2 must receive the persisted journal
-    const checkLockCall = (sandbox2.callPlugin as jest.Mock).mock.calls.find(
-      (c: unknown[]) => c[1] === 'check_lock',
-    );
+    const allCalls = (sandbox2.callPlugin as jest.Mock).mock.calls as unknown[][];
+    const checkLockCall = allCalls.find((c) => c[1] === 'check_lock');
     expect(checkLockCall).toBeDefined();
-    const passedJournal = ((checkLockCall as unknown[])[2] as Record<string, unknown>)['journal'] as unknown[];
+    const passedJournal = ((checkLockCall as unknown[])[2] as Record<string, unknown>)[
+      'journal'
+    ] as unknown[];
     expect(passedJournal).toHaveLength(journalAfterFirstTune.length);
 
     // Second call must be blocked: param_locked
@@ -9853,9 +9966,9 @@ describe('_kernelTunePluginParam — fail-soft containment', () => {
 
   it('1.6a — sandbox.callPlugin throws → handler returns reject tune_error, no exception escapes', async () => {
     const plugins = makeTunePluginsMock({
-      findActive: jest.fn().mockResolvedValue([
-        { id: 'param-discipline', type: 'discipline', config: {} },
-      ]),
+      findActive: jest
+        .fn()
+        .mockResolvedValue([{ id: 'param-discipline', type: 'discipline', config: {} }]),
     });
     const audit = makeAudit();
     const sandbox = makeTuneSandboxMock({
@@ -9877,9 +9990,9 @@ describe('_kernelTunePluginParam — fail-soft containment', () => {
 
   it('1.6b — kv.get throws → handler catches, returns tune_error, reflection survives', async () => {
     const plugins = makeTunePluginsMock({
-      findActive: jest.fn().mockResolvedValue([
-        { id: 'param-discipline', type: 'discipline', config: {} },
-      ]),
+      findActive: jest
+        .fn()
+        .mockResolvedValue([{ id: 'param-discipline', type: 'discipline', config: {} }]),
     });
     const audit = makeAudit();
     const sandbox = makeTuneSandboxMock();
@@ -9899,5 +10012,196 @@ describe('_kernelTunePluginParam — fail-soft containment', () => {
     ).resolves.not.toThrow();
 
     expect(decisions[0]).toMatchObject({ allowed: false, reason: 'tune_error' });
+  });
+});
+
+// Fix 1 — journal-before-apply reorder (governance: persist lock before mutating config)
+describe('_kernelTunePluginParam — journal-before-apply order (Fix 1)', () => {
+  const CYCLE_ID = 'tune-order-001';
+
+  it('Fix1-a — happy path: kv.set is called BEFORE mergeConfig', async () => {
+    const callOrder: string[] = [];
+    const plugins = makeTunePluginsMock({
+      findActive: jest
+        .fn()
+        .mockResolvedValue([
+          { id: 'param-discipline', type: 'discipline', config: { lock_after_change_cycles: 3 } },
+        ]),
+      mergeConfig: jest.fn().mockImplementation(() => {
+        callOrder.push('mergeConfig');
+        return Promise.resolve({ id: 'my-skill', config: { ratio: 0.8 } });
+      }),
+    });
+    const audit = makeAudit();
+    const sandbox = makeTuneSandboxMock();
+    const kv: jest.Mocked<Pick<KvService, 'get' | 'set'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'param:journal') return Promise.resolve(null);
+        if (key === 'react.max_turns') return Promise.resolve('1');
+        return Promise.resolve(null);
+      }),
+      set: jest.fn().mockImplementation(() => {
+        callOrder.push('kv.set');
+        return Promise.resolve(undefined);
+      }),
+    };
+    const service = makeTuneAgentsService({ plugins, audit, sandbox, kv });
+    const decisions: import('./agents.service').Decision[] = [];
+    const sbr: import('./agents.service').SandboxResult[] = [];
+
+    await callKernelTunePluginParam(service, CYCLE_ID, TUNE_TC, decisions, sbr);
+
+    expect(decisions[0]).toMatchObject({ allowed: true });
+    const kvSetIdx = callOrder.indexOf('kv.set');
+    const mergeIdx = callOrder.indexOf('mergeConfig');
+    expect(kvSetIdx).toBeGreaterThanOrEqual(0);
+    expect(mergeIdx).toBeGreaterThanOrEqual(0);
+    // kv.set MUST come before mergeConfig
+    expect(kvSetIdx).toBeLessThan(mergeIdx);
+  });
+
+  it('Fix1-b — kv.set throws → mergeConfig NEVER called, reason journal_persist_failed or tune_error, no param_tuned audit', async () => {
+    const plugins = makeTunePluginsMock({
+      findActive: jest
+        .fn()
+        .mockResolvedValue([
+          { id: 'param-discipline', type: 'discipline', config: { lock_after_change_cycles: 3 } },
+        ]),
+    });
+    const audit = makeAudit();
+    const sandbox = makeTuneSandboxMock();
+    const kv: jest.Mocked<Pick<KvService, 'get' | 'set'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'param:journal') return Promise.resolve(null);
+        if (key === 'react.max_turns') return Promise.resolve('1');
+        return Promise.resolve(null);
+      }),
+      set: jest.fn().mockRejectedValue(new Error('KV write timeout')),
+    };
+    const service = makeTuneAgentsService({ plugins, audit, sandbox, kv });
+    const decisions: import('./agents.service').Decision[] = [];
+    const sbr: import('./agents.service').SandboxResult[] = [];
+
+    await callKernelTunePluginParam(service, CYCLE_ID, TUNE_TC, decisions, sbr);
+
+    expect(decisions[0]).toMatchObject({ allowed: false });
+    // reason must be journal_persist_failed or tune_error (fail-closed)
+    expect(['journal_persist_failed', 'tune_error']).toContain(decisions[0].reason);
+    // mergeConfig MUST NOT be called when kv.set throws
+    expect(plugins.mergeConfig).not.toHaveBeenCalled();
+    // no param_tuned success audit
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'param_tuned' }),
+    );
+  });
+
+  it('Fix1-c — mergeConfig throws AFTER kv.set succeeds → apply_failed, no param_tuned audit (phantom journal acceptable)', async () => {
+    const plugins = makeTunePluginsMock({
+      findActive: jest
+        .fn()
+        .mockResolvedValue([
+          { id: 'param-discipline', type: 'discipline', config: { lock_after_change_cycles: 3 } },
+        ]),
+      mergeConfig: jest.fn().mockRejectedValue(new Error('Config validation failed')),
+    });
+    const audit = makeAudit();
+    const sandbox = makeTuneSandboxMock();
+    const kv = makeTuneKvMock(null);
+    const service = makeTuneAgentsService({ plugins, audit, sandbox, kv });
+    const decisions: import('./agents.service').Decision[] = [];
+    const sbr: import('./agents.service').SandboxResult[] = [];
+
+    await callKernelTunePluginParam(service, CYCLE_ID, TUNE_TC, decisions, sbr);
+
+    expect(decisions[0]).toMatchObject({ allowed: false, reason: 'apply_failed' });
+    // kv.set was called (journal written) but mergeConfig failed → phantom lock is acceptable
+    expect(kv.set).toHaveBeenCalledWith('param:journal', expect.any(String));
+    // no param_tuned success audit
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'param_tuned' }),
+    );
+  });
+});
+
+// Fix 2 — kv_unavailable guard (governance requires KV; absent KV → block all tuning)
+describe('_kernelTunePluginParam — kv_unavailable guard (Fix 2)', () => {
+  const CYCLE_ID = 'tune-kvguard-001';
+
+  /** Build a service with kv=undefined (simulates @Optional KV absent) */
+  function makeTuneServiceNoKv(opts: {
+    plugins: TunePluginsMock;
+    audit: ReturnType<typeof makeAudit>;
+    sandbox: ReturnType<typeof makeTuneSandboxMock>;
+  }): AgentsService {
+    return new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      {},
+      opts.sandbox,
+      opts.plugins,
+      {},
+      opts.audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined, // kv absent
+    );
+  }
+
+  it('Fix2-a — kv absent + valid tune request → allowed:false, reason:kv_unavailable, mergeConfig NEVER called, no mutation', async () => {
+    const plugins = makeTunePluginsMock({
+      findActive: jest
+        .fn()
+        .mockResolvedValue([
+          { id: 'param-discipline', type: 'discipline', config: { lock_after_change_cycles: 3 } },
+        ]),
+    });
+    const audit = makeAudit();
+    const sandbox = makeTuneSandboxMock();
+    const service = makeTuneServiceNoKv({ plugins, audit, sandbox });
+    const decisions: import('./agents.service').Decision[] = [];
+    const sbr: import('./agents.service').SandboxResult[] = [];
+
+    await callKernelTunePluginParam(service, CYCLE_ID, TUNE_TC, decisions, sbr);
+
+    expect(decisions[0]).toMatchObject({ allowed: false, reason: 'kv_unavailable' });
+    expect(plugins.mergeConfig).not.toHaveBeenCalled();
+    // no param_tuned success audit
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'param_tuned' }),
+    );
+  });
+
+  it('Fix2-b — kv absent → check_lock NEVER called (guard fires before any lock/journal work)', async () => {
+    const plugins = makeTunePluginsMock({
+      findActive: jest
+        .fn()
+        .mockResolvedValue([{ id: 'param-discipline', type: 'discipline', config: {} }]),
+    });
+    const audit = makeAudit();
+    const sandbox = makeTuneSandboxMock();
+    const service = makeTuneServiceNoKv({ plugins, audit, sandbox });
+    const decisions: import('./agents.service').Decision[] = [];
+    const sbr: import('./agents.service').SandboxResult[] = [];
+
+    await callKernelTunePluginParam(service, CYCLE_ID, TUNE_TC, decisions, sbr);
+
+    expect(decisions[0]).toMatchObject({ allowed: false, reason: 'kv_unavailable' });
+    const callPluginMock = sandbox.callPlugin as jest.Mock;
+    const calledFns = (callPluginMock.mock.calls as unknown[][]).map((c) => c[1]);
+    expect(calledFns).not.toContain('check_lock');
+    expect(calledFns).not.toContain('journal_entry');
   });
 });
