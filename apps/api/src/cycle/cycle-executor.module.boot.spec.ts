@@ -137,7 +137,9 @@ const auditMock = {
 
 const agentsMock = {
   runCycle: jest.fn().mockResolvedValue({ decisions: [], llm_response: null, llm_text: '' }),
-  runReflectionTurn: jest.fn().mockResolvedValue({ skipped: false, cycle_id: 'x', skills_written: 0 }),
+  runReflectionTurn: jest
+    .fn()
+    .mockResolvedValue({ skipped: false, cycle_id: 'x', skills_written: 0 }),
   runGovernedTurn: jest.fn().mockResolvedValue({ text: '', tool_calls: [], backend: 'api' }),
 };
 
@@ -151,7 +153,9 @@ const panelMock = {
 };
 
 const schedulerMock = {
-  getConfig: jest.fn().mockResolvedValue({ enabled: false, override_interval_ms: null, run_count: 0 }),
+  getConfig: jest
+    .fn()
+    .mockResolvedValue({ enabled: false, override_interval_ms: null, run_count: 0 }),
   getStatus: jest.fn().mockResolvedValue({}),
   onModuleInit: jest.fn(),
   onModuleDestroy: jest.fn(),

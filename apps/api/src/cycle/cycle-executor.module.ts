@@ -7,13 +7,7 @@ import { AuditModule } from '../audit/audit.module';
 import { PanelModule } from '../panel/panel.module';
 
 @Module({
-  imports: [
-    AgentsModule,
-    SandboxModule,
-    PluginsModule,
-    AuditModule,
-    forwardRef(() => PanelModule),
-  ],
+  imports: [AgentsModule, SandboxModule, PluginsModule, AuditModule, forwardRef(() => PanelModule)],
   providers: [CycleExecutorService],
   exports: [CycleExecutorService],
 })

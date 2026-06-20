@@ -24,16 +24,16 @@ function makeAgentsStub(opts: {
           ),
     runCycle:
       opts.runCycleMock ??
-      jest
-        .fn()
-        .mockResolvedValue({ decisions: [], llm_response: null, llm_text: '' }),
+      jest.fn().mockResolvedValue({ decisions: [], llm_response: null, llm_text: '' }),
   };
 }
 
-function makeSandboxStub(opts: {
-  runCycleOk?: boolean;
-  runCycleError?: string;
-} = {}): jest.Mocked<Pick<SandboxGateway, 'runCycle'>> {
+function makeSandboxStub(
+  opts: {
+    runCycleOk?: boolean;
+    runCycleError?: string;
+  } = {},
+): jest.Mocked<Pick<SandboxGateway, 'runCycle'>> {
   return {
     runCycle: jest
       .fn()
