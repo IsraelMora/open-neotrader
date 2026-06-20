@@ -2,6 +2,7 @@ import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService, Portfolio } from '../providers/provider-gateway.service';
 import { LongTermMemoryService } from '../long-term-memory/long-term-memory.service';
+import { MlSignalRecordService } from '../ml-signal-record/ml-signal-record.service';
 
 export interface NavEntry {
   id: string;
@@ -26,6 +27,10 @@ export class SnapshotService {
     // F6-s2 PR2: backfills episode outcome_pnl/equity via updateOutcome.
     @Optional()
     private readonly longTermMemory?: LongTermMemoryService,
+    // MlSignalRecordService injected @Optional() — s1 outcome backfill (INERT in s1).
+    // Absent → updateOutcomeAggregate call is skipped; snapshot is byte-identical to pre-s1.
+    @Optional()
+    private readonly mlSignalRecord?: MlSignalRecordService,
   ) {}
 
   /** Toma un snapshot del NAV actual desde el provider por defecto. */
@@ -58,6 +63,20 @@ export class SnapshotService {
       } catch (e) {
         this.log.warn(
           `[LTM] updateOutcome failed for cycle ${cycleId} — episode outcome not backfilled: ${e}`,
+        );
+      }
+    }
+
+    // ── ml-feature-extractor-s1: backfill ML signal outcome (INERT) ──────────
+    // Same timing as LTM updateOutcome: the snapshot reflects POSTERIOR realized values.
+    // NO lookahead: outcome_pnl comes from this snapshot, not from the decision cycle.
+    // Failure NEVER breaks the snapshot.
+    if (cycleId && this.mlSignalRecord) {
+      try {
+        await this.mlSignalRecord.updateOutcomeAggregate(cycleId, portfolio.total_pnl, portfolio.equity);
+      } catch (e) {
+        this.log.warn(
+          `[ML] updateOutcomeAggregate failed for cycle ${cycleId} — ml outcome not backfilled: ${e}`,
         );
       }
     }
