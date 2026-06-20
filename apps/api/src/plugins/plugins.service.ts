@@ -907,18 +907,20 @@ export class PluginsService implements OnApplicationBootstrap {
     await this._scanOnInstall(id);
 
     // F3-s4: Compute + persist content checksum — NEVER blocks install
+    let installedPlugin: Plugin = plugin;
     try {
       const checksum = this.computeContentChecksum(installedPath);
-      await this.db.plugin.update({
+      const updated = await this.db.plugin.update({
         where: { id },
         data: { content_checksum: checksum },
       });
+      if (updated) installedPlugin = updated;
     } catch (e) {
       this.log.warn(`content_checksum compute failed for ${id}: ${(e as Error).message}`);
     }
 
     this.events.emit('plugin.installed', { plugin_id: id, version: plugin.version });
-    return hydrate(plugin);
+    return hydrate(installedPlugin);
   }
 
   async update(id: string): Promise<{ ok: boolean; output: string }> {
@@ -951,7 +953,7 @@ export class PluginsService implements OnApplicationBootstrap {
     try {
       const prevChecksum = p.content_checksum ?? null;
       const nextChecksum = this.computeContentChecksum(p.installed_path);
-      if (prevChecksum && nextChecksum && prevChecksum !== nextChecksum) {
+      if (prevChecksum !== null && prevChecksum !== nextChecksum) {
         await this.audit?.log({
           event_type: 'plugin_content_changed',
           plugin_id: id,

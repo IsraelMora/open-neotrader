@@ -1115,6 +1115,26 @@ describe('F3-s4 — install() content_checksum wiring', () => {
     // install() must NOT throw — neutral-kernel principle
     await expect(svc.install('https://github.com/user/my-plugin.git')).resolves.toBeDefined();
   });
+
+  it('4.1c — install() returned object has content_checksum equal to the computed checksum (not null)', async () => {
+    const row = makePluginRow('my-plugin');
+    const { svc, dbUpdateSpy, dbCreateSpy } = makePluginsSvcForWiring({ pluginRow: row });
+
+    (readManifest as unknown as jest.Mock).mockReturnValue({
+      plugin: { id: 'my-plugin', name: 'My Plugin', version: '1.0.0', type: 'skill' },
+    });
+    (svc as unknown as SvcPrivate).db.plugin.findUnique = jest.fn().mockResolvedValue(null);
+    dbCreateSpy.mockResolvedValue(makePluginRow('my-plugin'));
+    // db.plugin.update returns the row with content_checksum populated
+    dbUpdateSpy.mockResolvedValue(makePluginRow('my-plugin', { content_checksum: 'abc123hash' }));
+    jest.spyOn(svc as unknown as SvcPrivate, 'gitClone').mockResolvedValue(undefined);
+    jest.spyOn(svc as unknown as SvcPrivate, '_scanOnInstall').mockResolvedValue(undefined);
+    jest.spyOn(svc, 'computeContentChecksum').mockReturnValue('abc123hash');
+
+    const result = await svc.install('https://github.com/user/my-plugin.git');
+
+    expect(result.content_checksum).toBe('abc123hash');
+  });
 });
 
 // ── Task 4.2: update() checksum change detection ──────────────────────────────
@@ -1213,6 +1233,48 @@ describe('F3-s4 — update() checksum change detection', () => {
     });
 
     await expect(svc.update('git-plugin')).resolves.toEqual(expect.objectContaining({ ok: true }));
+  });
+
+  it('4.2d — update() prev hash + next null (covered files removed) → audit plugin_content_changed fires + null checksum persisted', async () => {
+    const auditLog = jest.fn().mockResolvedValue(undefined);
+    const { svc, dbUpdateSpy } = makeUpdateSvc({
+      storedChecksum: 'prev-hash',
+      computedChecksum: null,
+      auditLogMock: auditLog,
+    });
+
+    const result = await svc.update('git-plugin');
+
+    expect(result.ok).toBe(true);
+    expect(auditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'plugin_content_changed',
+        plugin_id: 'git-plugin',
+        meta: expect.objectContaining({ old: 'prev-hash', new: null }) as unknown,
+      }),
+    );
+    const call = findUpdateCallWithKey(dbUpdateSpy, 'content_checksum');
+    expect(call).toBeDefined();
+    expect(call!.data.content_checksum).toBeNull();
+  });
+
+  it('4.2e — update() prev null + next hash (first-time checksum) → NO audit, new checksum persisted', async () => {
+    const auditLog = jest.fn().mockResolvedValue(undefined);
+    const { svc, dbUpdateSpy } = makeUpdateSvc({
+      storedChecksum: null,
+      computedChecksum: 'first-hash',
+      auditLogMock: auditLog,
+    });
+
+    const result = await svc.update('git-plugin');
+
+    expect(result.ok).toBe(true);
+    expect(auditLog).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'plugin_content_changed' }),
+    );
+    const call = findUpdateCallWithKey(dbUpdateSpy, 'content_checksum');
+    expect(call).toBeDefined();
+    expect(call!.data.content_checksum).toBe('first-hash');
   });
 });
 
