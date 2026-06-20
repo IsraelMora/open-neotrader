@@ -28,6 +28,7 @@ import {
 
 import type { LlmResponse } from '../llm/llm.service';
 import type { DebateConsensus } from './debate.types';
+import type { ConfigFieldSpec } from '../plugins/manifest';
 import { parseToolCalls } from '../llm/kernel-parser';
 import { sanitizeText } from './sanitize.util';
 
@@ -2473,8 +2474,163 @@ export class AgentsService {
     }
   }
 
+  /** Render a single param entry: 'pluginId.param(type,constraints)=currentVal'. */
+  private _renderParamLine(
+    pluginId: string,
+    paramName: string,
+    spec: ConfigFieldSpec,
+    currentConfig: Record<string, unknown>,
+  ): string {
+    const constraints: string[] = [spec.type];
+    if (spec.min !== undefined && spec.max !== undefined) {
+      constraints.push(`${spec.min}..${spec.max}`);
+    } else if (spec.enum) {
+      constraints.push(spec.enum.join('|'));
+    }
+    const rawVal = currentConfig[paramName] ?? spec.default ?? '';
+    const currentVal =
+      typeof rawVal === 'object'
+        ? JSON.stringify(rawVal)
+        : `${rawVal as string | number | boolean}`;
+    return `${pluginId}.${paramName}(${constraints.join(',')})=${currentVal}`;
+  }
+
+  /**
+   * Build the [TUNABLE PARAMS] section string, or null if no active skill has a config schema.
+   * Enumerates each param as 'plugin_id.param(type,min..max)=current_value'.
+   * Fail-soft: per-plugin errors silently skip that plugin; section omitted when nothing renders.
+   */
+  private async _buildTunableParamsSection(cap: number): Promise<string | null> {
+    try {
+      const allActive = await this.plugins.findActive();
+      const skillPlugins = allActive.filter((p) => p.type === 'skill');
+      const paramLines: string[] = [];
+      for (const plugin of skillPlugins) {
+        try {
+          const schema = await this.plugins.getConfigSchema(plugin.id);
+          if (!schema) continue;
+          const currentConfig = plugin.config ?? {};
+          for (const [paramName, spec] of Object.entries(schema)) {
+            paramLines.push(this._renderParamLine(plugin.id, paramName, spec, currentConfig));
+          }
+        } catch {
+          // Per-plugin error: skip this plugin silently
+        }
+      }
+      if (paramLines.length === 0) return null;
+      return paramLines.join('\n').slice(0, cap);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Build the [PARAM LOCK STATUS] section string, or null if param-discipline is inactive.
+   * Calls sandbox check_lock per tunable skill plugin. Read-only — never mutates state.
+   * Fail-soft: per-plugin check_lock errors silently skip that plugin.
+   */
+  private async _buildParamLockStatusSection(cap: number): Promise<string | null> {
+    try {
+      const allActive = await this.plugins.findActive();
+      const disciplinePlugin = allActive.find((p) => p.id === 'param-discipline');
+      if (!disciplinePlugin) return null;
+      const disciplineConfig = disciplinePlugin.config ?? {};
+      const rawJournal = this.kv ? await this.kv.get('param:journal') : null;
+      const journal: unknown[] = rawJournal ? (JSON.parse(rawJournal) as unknown[]) : [];
+      const tunableSkills = allActive.filter((p) => p.type === 'skill');
+      const lockLines: string[] = [];
+      for (const plugin of tunableSkills) {
+        try {
+          const lockRes = await this.sandbox.callPlugin('param-discipline', 'check_lock', {
+            plugin_id: plugin.id,
+            journal,
+            config: disciplineConfig,
+          });
+          const result = lockRes.result as { locked?: boolean; cycles_remaining?: number };
+          if (result?.locked) {
+            lockLines.push(`${plugin.id}: locked(${result.cycles_remaining ?? '?'} cycles left)`);
+          } else {
+            lockLines.push(`${plugin.id}: unlocked`);
+          }
+        } catch {
+          // Per-plugin check_lock error: skip this plugin silently
+        }
+      }
+      if (lockLines.length === 0) return null;
+      return lockLines.join('\n').slice(0, cap);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Build the [CURRENT REGIME] section string, or null if no regime signal in audit entries.
+   * Scans already-fetched auditEntries for the most recent signal with volatility_regime meta.
+   * Fail-soft: JSON parse errors or missing fields are silently ignored.
+   * The cap applies to the rendered content only; caller must account for the section header.
+   */
+  private _buildCurrentRegimeSection(
+    auditEntries: Array<{ event_type: string; meta?: string | null }>,
+    contentCap: number,
+  ): string | null {
+    try {
+      const regimeEntry = [...auditEntries].reverse().find((e) => {
+        if (e.event_type !== 'signal' || !e.meta) return false;
+        try {
+          const parsed = JSON.parse(e.meta) as Record<string, unknown>;
+          return Boolean(parsed.volatility_regime);
+        } catch {
+          return false;
+        }
+      });
+      if (!regimeEntry?.meta) return null;
+      const parsed = JSON.parse(regimeEntry.meta) as Record<string, unknown>;
+      const toStr = (v: unknown): string =>
+        v !== null && typeof v === 'object' ? JSON.stringify(v) : String(v);
+      const regime = typeof parsed.regime !== 'undefined' ? toStr(parsed.regime) : '';
+      const vix = typeof parsed.vix !== 'undefined' ? toStr(parsed.vix) : '';
+      const description =
+        typeof parsed.description !== 'undefined' ? toStr(parsed.description) : '';
+      const regimeLine = [
+        regime ? `regime: ${regime}` : '',
+        vix ? `vix: ${vix}` : '',
+        description ? `description: ${description}` : '',
+      ]
+        .filter(Boolean)
+        .join(', ');
+      return regimeLine.slice(0, contentCap) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Build the [AUDIT RECENT] section string from already-fetched audit entries. Fail-soft. */
+  private _buildAuditSection(
+    auditEntries: Array<{ event_type: string; symbol?: string | null; action?: string | null }>,
+    cap: number,
+  ): string {
+    try {
+      const relevantTypes = new Set([
+        'signal',
+        'decision',
+        'cycle_complete',
+        'skill_written',
+        'reflection_turn',
+      ]);
+      const lines = auditEntries
+        .filter((e) => relevantTypes.has(e.event_type))
+        .map((e) => `${e.event_type} ${e.symbol ?? ''} ${e.action ?? ''}`.trim());
+      return lines.join('\n').slice(0, cap);
+    } catch {
+      return '(unavailable)';
+    }
+  }
+
   private async _assembleReflectionContext(): Promise<string> {
-    const BUDGET = 4000;
+    // PR2 (adaptive-parameters): raised from 4000 to 5000 to accommodate 3 new sections.
+    // Cap arithmetic: AUDIT700+EQUITY250+VETO550+PRETEST700+LESSONS600+PAST800=3600
+    //   + TUNABLE600+LOCK400+REGIME200 = 1200 → total cap 4800 ≤ 5000 (headroom 200).
+    const BUDGET = 5000;
     // PR3: reduced proportionally to make room for [LESSONS] (600) + [PAST EPISODES] (800).
     // Old caps: AUDIT=1200, EQUITY=400, VETO=800, PRETEST=1200 → total 3600.
     // New caps: AUDIT=700, EQUITY=250, VETO=550, PRETEST=700 → total 2200.
@@ -2486,6 +2642,10 @@ export class AgentsService {
     const PRETEST_CAP = 700;
     const LESSONS_CAP = 600;
     const PAST_EPISODES_CAP = 800;
+    // PR2 new section caps
+    const TUNABLE_PARAMS_CAP = 600;
+    const PARAM_LOCK_STATUS_CAP = 400;
+    const REGIME_CAP = 200;
 
     // Single audit query (limit 20) shared by AUDIT and VETO sections — avoids two DB calls.
     type AuditEntry = {
@@ -2503,24 +2663,9 @@ export class AgentsService {
     }
 
     // Section: AUDIT
-    let auditSection = '(unavailable)';
-    if (!auditQueryFailed) {
-      try {
-        const relevantTypes = new Set([
-          'signal',
-          'decision',
-          'cycle_complete',
-          'skill_written',
-          'reflection_turn',
-        ]);
-        const lines = auditEntries
-          .filter((e) => relevantTypes.has(e.event_type))
-          .map((e) => `${e.event_type} ${e.symbol ?? ''} ${e.action ?? ''}`.trim());
-        auditSection = lines.join('\n').slice(0, AUDIT_CAP);
-      } catch {
-        auditSection = '(unavailable)';
-      }
-    }
+    const auditSection = auditQueryFailed
+      ? '(unavailable)'
+      : this._buildAuditSection(auditEntries, AUDIT_CAP);
 
     // Section: EQUITY
     let equitySection = '(unavailable)';
@@ -2570,18 +2715,37 @@ export class AgentsService {
       PAST_EPISODES_CAP,
     );
 
+    // Section: TUNABLE PARAMS (cap 600) — LLM action space: active skill params with type/constraints/current.
+    const tunableParamsSection = await this._buildTunableParamsSection(TUNABLE_PARAMS_CAP);
+
+    // Section: PARAM LOCK STATUS (cap 400) — per-plugin lock state via param-discipline check_lock.
+    const paramLockStatusSection = await this._buildParamLockStatusSection(PARAM_LOCK_STATUS_CAP);
+
+    // Section: CURRENT REGIME (cap 200) — most recent volatility_regime signal from audit.
+    // Cap accounts for '[CURRENT REGIME]\n' header (17 chars) so total section ≤ REGIME_CAP.
+    const REGIME_HEADER_LEN = '[CURRENT REGIME]\n'.length;
+    const regimeAuditEntries = auditQueryFailed ? [] : auditEntries;
+    const currentRegimeSection = this._buildCurrentRegimeSection(
+      regimeAuditEntries,
+      REGIME_CAP - REGIME_HEADER_LEN,
+    );
+
+    // Assemble: fixed sections first, then optional sections filtered from null.
     const parts: string[] = [
       `[AUDIT RECENT]\n${auditSection}`,
       `[EQUITY CURVE]\n${equitySection}`,
       `[VETO SUMMARY]\n${vetoSection}`,
       `[PRETEST COMPARE]\n${pretestSection}`,
     ];
-
-    if (lessonsSection !== null) {
-      parts.push(`[LESSONS]\n${lessonsSection}`);
-    }
-    if (pastEpisodesSection !== null) {
-      parts.push(`[PAST EPISODES]\n${pastEpisodesSection}`);
+    const optionalSections: Array<[string, string | null]> = [
+      ['[LESSONS]', lessonsSection],
+      ['[PAST EPISODES]', pastEpisodesSection],
+      ['[TUNABLE PARAMS]', tunableParamsSection],
+      ['[PARAM LOCK STATUS]', paramLockStatusSection],
+      ['[CURRENT REGIME]', currentRegimeSection],
+    ];
+    for (const [header, content] of optionalSections) {
+      if (content !== null) parts.push(`${header}\n${content}`);
     }
 
     const assembled = parts.join('\n\n');

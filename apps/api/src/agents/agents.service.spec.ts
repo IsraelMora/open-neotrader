@@ -10205,3 +10205,536 @@ describe('_kernelTunePluginParam — kv_unavailable guard (Fix 2)', () => {
     expect(calledFns).not.toContain('journal_entry');
   });
 });
+
+// ── adaptive-parameters PR2: reflection context sections ─────────────────────
+
+/**
+ * Extended assembler factory for PR2 sections.
+ * Accepts kv, sandbox, and an extended plugins mock with getConfigSchema.
+ */
+interface PR2AssemblerOpts {
+  auditEntries?: Array<{
+    event_type: string;
+    symbol?: string | null;
+    action?: string | null;
+    meta?: string | null;
+  }>;
+  /** Active plugins list. Defaults to []. */
+  activePlugins?: Array<{
+    id: string;
+    type: string;
+    config?: Record<string, unknown>;
+    name?: string;
+  }>;
+  /**
+   * Map from plugin_id → config schema. getConfigSchema returns the schema for that id,
+   * or null if not present.
+   */
+  configSchemas?: Record<string, Record<string, { type: string; min?: number; max?: number }>>;
+  /** If set, sandbox.callPlugin resolves/rejects per override. */
+  sandboxCallPlugin?: jest.Mock;
+  /** param:journal KV value (JSON string). Defaults to null. */
+  journalKv?: string | null;
+  /** If true, kv.get throws for param:journal key. */
+  kvThrows?: boolean;
+}
+
+function makeAssemblerServicePR2(opts: PR2AssemblerOpts = {}): AgentsService {
+  const auditEntries = (opts.auditEntries ?? []).map((e) => ({
+    event_type: e.event_type,
+    symbol: e.symbol ?? null,
+    action: e.action ?? null,
+    meta: e.meta ?? null,
+  }));
+
+  const audit = {
+    log: jest.fn().mockResolvedValue(undefined),
+    query: jest.fn().mockResolvedValue(auditEntries),
+  };
+
+  const activePlugins = opts.activePlugins ?? [];
+  const configSchemas = opts.configSchemas ?? {};
+
+  const plugins = {
+    getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+    getActiveReflectionPrompt: jest.fn().mockResolvedValue(null),
+    getProviderTools: jest.fn().mockResolvedValue([]),
+    findActive: jest.fn().mockResolvedValue(activePlugins),
+    getConfigSchema: jest.fn().mockImplementation((id: string) => {
+      return Promise.resolve(configSchemas[id] ?? null);
+    }),
+  };
+
+  const defaultSandboxCallPlugin = jest
+    .fn()
+    .mockImplementation((_pluginId: string, fn: string, args: Record<string, unknown>) => {
+      if (fn === 'check_lock') {
+        return Promise.resolve({ ok: true, result: { locked: false, plugin_id: args.plugin_id } });
+      }
+      return Promise.resolve({ ok: true, result: null });
+    });
+
+  const sandboxCallPlugin = opts.sandboxCallPlugin ?? defaultSandboxCallPlugin;
+  const sandbox = {
+    callPlugin: sandboxCallPlugin,
+    runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+  };
+
+  const kvGetFn = opts.kvThrows
+    ? jest.fn().mockRejectedValue(new Error('kv unavailable'))
+    : jest.fn().mockImplementation((key: string) => {
+        if (key === 'param:journal') return Promise.resolve(opts.journalKv ?? null);
+        if (key === 'react.max_turns') return Promise.resolve('1');
+        return Promise.resolve(null);
+      });
+
+  const kv = {
+    get: kvGetFn,
+    set: jest.fn().mockResolvedValue(undefined),
+  };
+
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+  ) => AgentsService)(
+    {},
+    sandbox,
+    plugins,
+    {},
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    kv,
+  );
+}
+
+// ── Task 4.1: [TUNABLE PARAMS] section ───────────────────────────────────────
+
+describe('_assembleReflectionContext — [TUNABLE PARAMS]', () => {
+  it('4.1a — active skill plugin with config schema → section rendered with plugin_id.param(type,...)', async () => {
+    const service = makeAssemblerServicePR2({
+      activePlugins: [{ id: 'my-skill', type: 'skill', config: { ratio: 0.5 } }],
+      configSchemas: {
+        'my-skill': { ratio: { type: 'number', min: 0, max: 1 } },
+      },
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx).toContain('[TUNABLE PARAMS]');
+    // Must render plugin_id.param with type and constraints
+    expect(ctx).toMatch(/my-skill\.ratio\(number/);
+  });
+
+  it('4.1b — no active skill plugin with config schema → section omitted entirely', async () => {
+    const service = makeAssemblerServicePR2({
+      activePlugins: [{ id: 'some-discipline', type: 'discipline' }],
+      configSchemas: {},
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx).not.toContain('[TUNABLE PARAMS]');
+  });
+
+  it('4.1c — skill plugin but getConfigSchema returns null → plugin skipped, no throw, section omitted', async () => {
+    const service = makeAssemblerServicePR2({
+      activePlugins: [{ id: 'my-skill', type: 'skill', config: { ratio: 0.5 } }],
+      configSchemas: {}, // no schema registered → null returned
+    });
+
+    await expect(callAssembleReflectionContext(service)).resolves.not.toThrow();
+    const ctx = await callAssembleReflectionContext(service);
+    expect(ctx).not.toContain('[TUNABLE PARAMS]');
+  });
+
+  it('4.1d — getConfigSchema throws for one plugin → that plugin skipped, no exception escapes', async () => {
+    const plugins = {
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+      getActiveReflectionPrompt: jest.fn().mockResolvedValue(null),
+      getProviderTools: jest.fn().mockResolvedValue([]),
+      findActive: jest.fn().mockResolvedValue([
+        { id: 'bad-skill', type: 'skill', config: {} },
+        { id: 'good-skill', type: 'skill', config: { threshold: 0.7 } },
+      ]),
+      getConfigSchema: jest.fn().mockImplementation((id: string) => {
+        if (id === 'bad-skill') throw new Error('schema unavailable');
+        return Promise.resolve({ threshold: { type: 'number', min: 0, max: 1 } });
+      }),
+    };
+
+    const kv = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'react.max_turns') return Promise.resolve('1');
+        return Promise.resolve(null);
+      }),
+      set: jest.fn().mockResolvedValue(undefined),
+    };
+
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: { locked: false } }),
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+    };
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      {},
+      sandbox,
+      plugins,
+      {},
+      { log: jest.fn().mockResolvedValue(undefined), query: jest.fn().mockResolvedValue([]) },
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    // Must not throw; good-skill should appear, bad-skill silently skipped
+    const ctx = await callAssembleReflectionContext(service);
+    expect(ctx).toContain('[TUNABLE PARAMS]');
+    expect(ctx).toContain('good-skill');
+    expect(ctx).not.toContain('bad-skill');
+  });
+});
+
+// ── Task 4.2: [PARAM LOCK STATUS] section ────────────────────────────────────
+
+describe('_assembleReflectionContext — [PARAM LOCK STATUS]', () => {
+  it('4.2a — param-discipline active, plugin unlocked → section rendered with "unlocked"', async () => {
+    const disciplineConfig = { lock_after_change_cycles: 3, max_changes_per_week: 5 };
+    const service = makeAssemblerServicePR2({
+      activePlugins: [
+        { id: 'my-skill', type: 'skill', config: { ratio: 0.5 } },
+        { id: 'param-discipline', type: 'discipline', config: disciplineConfig },
+      ],
+      configSchemas: {
+        'my-skill': { ratio: { type: 'number', min: 0, max: 1 } },
+      },
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx).toContain('[PARAM LOCK STATUS]');
+    expect(ctx).toMatch(/my-skill.*unlocked/i);
+  });
+
+  it('4.2b — param-discipline active, plugin locked → section shows locked(N cycles left)', async () => {
+    const disciplineConfig = { lock_after_change_cycles: 3, max_changes_per_week: 5 };
+    const sandboxCallPlugin = jest
+      .fn()
+      .mockImplementation((_pluginId: string, fn: string, args: Record<string, unknown>) => {
+        if (fn === 'check_lock') {
+          return Promise.resolve({
+            ok: true,
+            result: { locked: true, cycles_remaining: 2, plugin_id: args.plugin_id },
+          });
+        }
+        return Promise.resolve({ ok: true, result: null });
+      });
+
+    const service = makeAssemblerServicePR2({
+      activePlugins: [
+        { id: 'my-skill', type: 'skill', config: { ratio: 0.5 } },
+        { id: 'param-discipline', type: 'discipline', config: disciplineConfig },
+      ],
+      configSchemas: {
+        'my-skill': { ratio: { type: 'number', min: 0, max: 1 } },
+      },
+      sandboxCallPlugin,
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx).toContain('[PARAM LOCK STATUS]');
+    expect(ctx).toMatch(/my-skill.*locked/i);
+    expect(ctx).toContain('2');
+  });
+
+  it('4.2c — param-discipline NOT active → section omitted, no error', async () => {
+    const service = makeAssemblerServicePR2({
+      activePlugins: [{ id: 'my-skill', type: 'skill', config: { ratio: 0.5 } }],
+      configSchemas: {
+        'my-skill': { ratio: { type: 'number', min: 0, max: 1 } },
+      },
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx).not.toContain('[PARAM LOCK STATUS]');
+  });
+
+  it('4.2d — check_lock throws for one plugin → that plugin skipped in LOCK STATUS, others listed, no throw', async () => {
+    const disciplineConfig = { lock_after_change_cycles: 3 };
+    const sandboxCallPlugin = jest
+      .fn()
+      .mockImplementation((_pluginId: string, fn: string, args: Record<string, unknown>) => {
+        if (fn === 'check_lock') {
+          if ((args.plugin_id as string) === 'bad-skill') {
+            throw new Error('sandbox timeout');
+          }
+          return Promise.resolve({
+            ok: true,
+            result: { locked: false, plugin_id: args.plugin_id },
+          });
+        }
+        return Promise.resolve({ ok: true, result: null });
+      });
+
+    const service = makeAssemblerServicePR2({
+      activePlugins: [
+        { id: 'bad-skill', type: 'skill', config: { threshold: 0.5 } },
+        { id: 'good-skill', type: 'skill', config: { ratio: 0.8 } },
+        { id: 'param-discipline', type: 'discipline', config: disciplineConfig },
+      ],
+      configSchemas: {
+        'bad-skill': { threshold: { type: 'number', min: 0, max: 1 } },
+        'good-skill': { ratio: { type: 'number', min: 0, max: 1 } },
+      },
+      sandboxCallPlugin,
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    // Section must still render (not omitted) because good-skill succeeded
+    expect(ctx).toContain('[PARAM LOCK STATUS]');
+
+    // Extract the [PARAM LOCK STATUS] section content specifically
+    const lockStart = ctx.indexOf('[PARAM LOCK STATUS]');
+    const lockEnd = ctx.indexOf('\n\n[', lockStart + 1);
+    const lockSection = lockEnd === -1 ? ctx.slice(lockStart) : ctx.slice(lockStart, lockEnd);
+
+    // good-skill must appear in lock status
+    expect(lockSection).toContain('good-skill');
+    // bad-skill must NOT appear in lock status (check_lock threw → skipped)
+    expect(lockSection).not.toContain('bad-skill');
+  });
+});
+
+// ── Task 4.3: [CURRENT REGIME] section ───────────────────────────────────────
+
+describe('_assembleReflectionContext — [CURRENT REGIME]', () => {
+  it('4.3a — audit has a signal with volatility_regime meta → section rendered with regime and vix', async () => {
+    const regimeMeta = JSON.stringify({
+      volatility_regime: true,
+      regime: 'HIGH_VOL',
+      vix: 28.5,
+      description: 'Elevated volatility regime',
+    });
+
+    const service = makeAssemblerServicePR2({
+      auditEntries: [
+        { event_type: 'cycle_complete', symbol: 'AAPL', action: 'buy', meta: null },
+        {
+          event_type: 'signal',
+          symbol: 'VOL',
+          action: null,
+          meta: regimeMeta,
+        },
+      ],
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx).toContain('[CURRENT REGIME]');
+    expect(ctx).toContain('HIGH_VOL');
+  });
+
+  it('4.3b — no signal with volatility_regime meta → section omitted, no error', async () => {
+    const service = makeAssemblerServicePR2({
+      auditEntries: [
+        { event_type: 'cycle_complete', symbol: 'AAPL', action: 'buy', meta: null },
+        {
+          event_type: 'signal',
+          symbol: 'TSLA',
+          action: 'sell',
+          meta: JSON.stringify({ some_other_key: true }),
+        },
+      ],
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx).not.toContain('[CURRENT REGIME]');
+  });
+
+  it('4.3c — [CURRENT REGIME] section ≤ 200 chars when regime present', async () => {
+    const regimeMeta = JSON.stringify({
+      volatility_regime: true,
+      regime: 'HIGH_VOL',
+      vix: 28.5,
+      description: 'X'.repeat(500), // very long description
+    });
+
+    const service = makeAssemblerServicePR2({
+      auditEntries: [
+        {
+          event_type: 'signal',
+          symbol: 'VOL',
+          action: null,
+          meta: regimeMeta,
+        },
+      ],
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+    expect(ctx).toContain('[CURRENT REGIME]');
+
+    // Extract the section content and check length
+    const regimeStart = ctx.indexOf('[CURRENT REGIME]');
+    const nextSection = ctx.indexOf('\n\n[', regimeStart + 1);
+    const sectionContent =
+      nextSection === -1 ? ctx.slice(regimeStart) : ctx.slice(regimeStart, nextSection);
+    expect(sectionContent.length).toBeLessThanOrEqual(200);
+  });
+
+  it('4.3d — no audit entries at all → [CURRENT REGIME] omitted, no error', async () => {
+    const service = makeAssemblerServicePR2({
+      auditEntries: [],
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx).not.toContain('[CURRENT REGIME]');
+  });
+});
+
+// ── Task 4.4: budget ≤ 5000 and existing sections still present ──────────────
+
+describe('_assembleReflectionContext — budget ≤ 5000 and all sections present', () => {
+  it('4.4a — all sections at cap: assembled context ≤ 5000 chars', async () => {
+    const disciplineConfig = { lock_after_change_cycles: 3, max_changes_per_week: 5 };
+
+    // Many audit entries to push AUDIT section to its cap
+    const bigAuditEntries = [
+      ...Array.from({ length: 10 }, (_, i) => ({
+        event_type: 'cycle_complete',
+        symbol: `SYM${i}`.repeat(5),
+        action: 'buy',
+        meta: null,
+      })),
+      {
+        event_type: 'signal',
+        symbol: 'VOL',
+        action: null,
+        meta: JSON.stringify({
+          volatility_regime: true,
+          regime: 'HIGH_VOL',
+          vix: 28.5,
+          description: 'Elevated volatility',
+        }),
+      },
+    ];
+
+    // Many params to push TUNABLE PARAMS section toward cap
+    const bigSchema: Record<string, { type: string; min: number; max: number }> = {};
+    for (let i = 0; i < 20; i++) {
+      bigSchema[`param_${i}`] = { type: 'number', min: 0, max: 1 };
+    }
+
+    const service = makeAssemblerServicePR2({
+      auditEntries: bigAuditEntries,
+      activePlugins: [
+        {
+          id: 'my-skill',
+          type: 'skill',
+          config: Object.fromEntries(Object.keys(bigSchema).map((k) => [k, 0.5])),
+        },
+        { id: 'param-discipline', type: 'discipline', config: disciplineConfig },
+      ],
+      configSchemas: {
+        'my-skill': bigSchema,
+      },
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx.length).toBeLessThanOrEqual(5000);
+  });
+
+  it('4.4b — existing sections still present in output (AUDIT, EQUITY, VETO, PRETEST)', async () => {
+    const service = makeAssemblerServicePR2({
+      auditEntries: [{ event_type: 'cycle_complete', symbol: 'AAPL', action: 'buy', meta: null }],
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx).toContain('[AUDIT RECENT]');
+    expect(ctx).toContain('[EQUITY CURVE]');
+    expect(ctx).toContain('[VETO SUMMARY]');
+    expect(ctx).toContain('[PRETEST COMPARE]');
+  });
+
+  it('4.4c — total never exceeds 5000 even when all sections rendered at max cap', async () => {
+    // Verify arithmetic: AUDIT700 + EQUITY250 + VETO550 + PRETEST700 + LESSONS600 + PAST800
+    //   + TUNABLE600 + LOCK400 + REGIME200 = 4800 ≤ 5000
+    const disciplineConfig = { lock_after_change_cycles: 1 };
+    const bigSchema: Record<string, { type: string; min: number; max: number }> = {};
+    for (let i = 0; i < 30; i++) {
+      bigSchema[`param_very_long_name_${i}`] = { type: 'number', min: 0, max: 1 };
+    }
+
+    const manySkills = Array.from({ length: 5 }, (_, i) => ({
+      id: `skill-${i}`,
+      type: 'skill' as const,
+      config: Object.fromEntries(Object.keys(bigSchema).map((k) => [k, 0.5])),
+    }));
+
+    const allSchemas: Record<string, typeof bigSchema> = {};
+    for (const skill of manySkills) {
+      allSchemas[skill.id] = bigSchema;
+    }
+
+    const regimeMeta = JSON.stringify({
+      volatility_regime: true,
+      regime: 'EXTREME_VOL',
+      vix: 99.9,
+      description: 'D'.repeat(300),
+    });
+
+    const service = makeAssemblerServicePR2({
+      auditEntries: [
+        ...Array.from({ length: 20 }, (_, i) => ({
+          event_type: 'decision',
+          symbol: `SYM${i}`,
+          action: 'buy',
+          meta: JSON.stringify({ veto_reasons: ['reason1', 'reason2', 'reason3'] }),
+        })),
+        { event_type: 'signal', symbol: 'V', action: null, meta: regimeMeta },
+      ],
+      activePlugins: [
+        ...manySkills,
+        { id: 'param-discipline', type: 'discipline', config: disciplineConfig },
+      ],
+      configSchemas: allSchemas,
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+
+    expect(ctx.length).toBeLessThanOrEqual(5000);
+  });
+});
