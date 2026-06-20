@@ -19,8 +19,11 @@ import { ConfigService } from '@nestjs/config';
 import { PretestService } from '../pretest/pretest.service';
 import { KvService } from '../common/kv.service';
 import { LongTermMemoryService } from '../long-term-memory/long-term-memory.service';
+import { DebateService } from './debate.service';
+import { ProviderGatewayService } from '../providers/provider-gateway.service';
 
 import type { LlmResponse } from '../llm/llm.service';
+import type { DebateConsensus } from './debate.types';
 import { parseToolCalls } from '../llm/kernel-parser';
 import { sanitizeText } from './sanitize.util';
 
@@ -282,6 +285,15 @@ export class AgentsService {
     // F6-s2 PR2: prefetch before runGovernedTurn + record after.
     @Optional()
     private readonly longTermMemory?: LongTermMemoryService,
+    // DebateService injected @Optional() — absent until F6-s3 PR-B is enabled.
+    // The debate gate is fully nested under `if (this.debate)` so existing tests
+    // that do not provide it remain byte-identical to pre-change behaviour.
+    @Optional()
+    private readonly debate?: DebateService,
+    // ProviderGatewayService injected @Optional() — needed only for _isHighImpact
+    // notional calculation. Absent → _isHighImpact returns false (fail-soft).
+    @Optional()
+    private readonly providerGateway?: ProviderGatewayService,
   ) {}
 
   /**
@@ -1511,6 +1523,157 @@ export class AgentsService {
     });
   }
 
+  /**
+   * Reads debate feature configuration from KV with full fail-safe parsing.
+   * Mirrors _resolveMaxTurns pattern: any missing key or parse error returns the safe default.
+   * The overall default is enabled=false so the feature is inert until explicitly enabled.
+   */
+  private async _readDebateConfig(): Promise<{
+    enabled: boolean;
+    minPct: number;
+    maxRoles: number;
+    failMode: 'allow' | 'block';
+  }> {
+    const DEFAULTS = { enabled: false, minPct: 0.1, maxRoles: 3, failMode: 'allow' as const };
+    if (!this.kv) return DEFAULTS;
+    try {
+      const [rawEnabled, rawMinPct, rawMaxRoles, rawFailMode] = await Promise.all([
+        this.kv.get('debate.enabled'),
+        this.kv.get('debate.min_notional_pct'),
+        this.kv.get('debate.max_roles'),
+        this.kv.get('debate.fail_mode'),
+      ]);
+
+      const enabled = rawEnabled === 'true';
+
+      const parsedPct = rawMinPct !== null ? Number(rawMinPct) : NaN;
+      const minPct = Number.isFinite(parsedPct) && parsedPct > 0 ? parsedPct : DEFAULTS.minPct;
+
+      const parsedRoles = rawMaxRoles !== null ? Number(rawMaxRoles) : NaN;
+      const maxRoles = Number.isFinite(parsedRoles)
+        ? Math.min(5, Math.max(1, Math.trunc(parsedRoles)))
+        : DEFAULTS.maxRoles;
+
+      const failMode: 'allow' | 'block' = rawFailMode === 'block' ? 'block' : 'allow';
+
+      return { enabled, minPct, maxRoles, failMode };
+    } catch {
+      return DEFAULTS;
+    }
+  }
+
+  /**
+   * Returns true when the tool call qualifies as high-impact for debate gating.
+   *
+   * Fast path: promote_pretest is always high-impact (zero I/O).
+   * Slow path: provider trade — notional (qty × quote.last) >= equityPctThreshold × equity.
+   *
+   * FAIL-SOFT: any error (missing qty/symbol, gateway absent, quote/portfolio throws,
+   * equity/last ≤ 0) returns false. This method NEVER blocks a normal trade.
+   */
+  private async _isHighImpact(
+    tc: import('../llm/llm.service').ToolCallRequest,
+    equityPctThreshold: number,
+  ): Promise<boolean> {
+    // Fast path — promote_pretest is always high-impact; zero I/O cost.
+    if (tc.plugin_id === 'kernel' && tc.function === 'promote_pretest') return true;
+
+    // Provider trade notional check — fail-soft, ANY failure returns false.
+    try {
+      if (!this.providerGateway) return false;
+
+      const rawQty = tc.args['qty'] ?? tc.args['quantity'];
+      const qty = Number(rawQty);
+      if (!Number.isFinite(qty) || qty <= 0) return false;
+
+      const symbol = tc.args['symbol'];
+      if (typeof symbol !== 'string' || symbol.length === 0) return false;
+
+      const [quote, portfolio] = await Promise.all([
+        this.providerGateway.getQuote(null, symbol),
+        this.providerGateway.getPortfolio(null),
+      ]);
+
+      if (portfolio.equity <= 0) return false;
+      if (quote.last <= 0) return false;
+
+      return qty * quote.last >= equityPctThreshold * portfolio.equity;
+    } catch {
+      return false; // NEVER block a normal trade on data failure
+    }
+  }
+
+  /**
+   * Builds a compressed summary of a tool call for the debate panel prompt.
+   * Bounded to ~300 chars so it fits neatly in each role's prompt context.
+   */
+  private _buildDebateSummary(tc: import('../llm/llm.service').ToolCallRequest): string {
+    const symbol = typeof tc.args['symbol'] === 'string' ? tc.args['symbol'] : '';
+    const action = typeof tc.args['action'] === 'string' ? tc.args['action'] : '';
+    const rawQty = tc.args['qty'] ?? tc.args['quantity'];
+    const qty = typeof rawQty === 'string' || typeof rawQty === 'number' ? String(rawQty) : '';
+    return `tool:${tc.plugin_id}.${tc.function} symbol:${symbol} action:${action} qty:${qty}`.slice(
+      0,
+      300,
+    );
+  }
+
+  /**
+   * Runs the debate gate for a single tool call.
+   * Returns a `DebateGateResult` indicating whether to skip dispatch (drop=true)
+   * or proceed to the existing dispatch chain (drop=false).
+   *
+   * Extracted from _executeToolCalls to keep cognitive complexity within the sonarjs limit.
+   * Only called when `this.debate` is defined — the outer guard ensures that.
+   */
+  private async _runDebateGate(
+    cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+  ): Promise<boolean /* drop */> {
+    const cfg = await this._readDebateConfig();
+    if (!cfg.enabled) return false;
+
+    const roles = await this.plugins.getActiveDebateRoles();
+    if (!roles || roles.length === 0) return false;
+    if (!(await this._isHighImpact(tc, cfg.minPct))) return false;
+
+    const clamped = roles.slice(0, cfg.maxRoles);
+    await this.audit.log({
+      cycle_id,
+      event_type: 'debate_started',
+      plugin_id: tc.plugin_id,
+      meta: { function: tc.function },
+    });
+
+    let consensus: DebateConsensus | null = null;
+    try {
+      // this.debate is guaranteed non-null by the caller
+      consensus = await this.debate!.runPanel(this._buildDebateSummary(tc), clamped, cycle_id);
+    } catch (e: unknown) {
+      await this.audit.log({ cycle_id, event_type: 'debate_skipped', meta: { reason: String(e) } });
+      if (cfg.failMode === 'block') {
+        decisions.push({ ...tc, allowed: false, reason: 'debate_failed' });
+        return true; // drop
+      }
+      return false; // allow → fall through to normal dispatch
+    }
+
+    if (!consensus) return false;
+
+    for (const s of consensus.stances) {
+      await this.audit.log({ cycle_id, event_type: 'debate_stance', meta: { ...s } });
+    }
+    await this.audit.log({ cycle_id, event_type: 'debate_consensus', meta: { ...consensus } });
+
+    if (consensus.recommendation === 'reject') {
+      decisions.push({ ...tc, allowed: false, reason: 'debate_rejected' });
+      return true; // drop — promote_pretest: _kernelPromotePretest NEVER called
+    }
+
+    return false; // approved → fall through to normal dispatch
+  }
+
   private async _executeToolCalls(
     cycle_id: string,
     toolCalls: import('../llm/llm.service').ToolCallRequest[],
@@ -1525,6 +1688,15 @@ export class AgentsService {
 
     for (const tc of toolCalls) {
       try {
+        // ── DEBATE GATE — additive; short-circuits to byte-identical legacy path when off.
+        // Fully nested under `if (this.debate)` — when @Optional resolves to undefined
+        // (every existing test + production with feature off) this is a single falsy check:
+        // zero awaits, zero audits, zero allocations. The existing dispatch runs unchanged.
+        if (this.debate && (await this._runDebateGate(cycle_id, tc, decisions))) {
+          continue;
+        }
+        // ↓↓↓ EXISTING dispatch — UNCHANGED ↓↓↓
+
         // Pre-step: kernel tools bypass the sandbox entirely.
         if (tc.plugin_id === 'kernel') {
           await this._dispatchKernelTool(cycle_id, tc, decisions, sandbox_results);

@@ -24,13 +24,21 @@ function abstainFor(roleName: string): DebateStance {
  */
 @Injectable()
 export class DebateService {
-  private readonly panelTimeoutMs: number;
+  /** Panel timeout in ms. Set only by tests via the static factory below; production uses default. */
+  private readonly panelTimeoutMs: number = DEFAULT_PANEL_TIMEOUT_MS;
 
-  constructor(
-    private readonly llm: LlmService,
-    panelTimeoutMs: number = DEFAULT_PANEL_TIMEOUT_MS,
-  ) {
-    this.panelTimeoutMs = panelTimeoutMs;
+  constructor(private readonly llm: LlmService) {}
+
+  /**
+   * Returns a DebateService instance with a custom panel timeout.
+   * Only used in tests — production always uses the DEFAULT_PANEL_TIMEOUT_MS.
+   * This avoids emitting a `Number` constructor parameter in reflect-metadata, which
+   * would confuse NestJS DI and cause a resolution error in the real module boot test.
+   */
+  static withTimeout(llm: LlmService, timeoutMs: number): DebateService {
+    const svc = new DebateService(llm);
+    (svc as unknown as { panelTimeoutMs: number }).panelTimeoutMs = timeoutMs;
+    return svc;
   }
 
   // ── parseStance ──────────────────────────────────────────────────────────────
