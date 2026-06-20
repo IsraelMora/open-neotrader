@@ -211,6 +211,27 @@ const KERNEL_PROMOTE_PRETEST_TOOL: import('../plugins/plugins.service').Provider
 };
 
 /**
+ * Schema definition for the kernel__record_lesson tool.
+ * Injected into the LLM tool schema ONLY when source === 'reflection'.
+ * Stores a curated lesson into the lesson_memory store.
+ */
+const KERNEL_RECORD_LESSON_TOOL: import('../plugins/plugins.service').ProviderTool = {
+  plugin_id: 'kernel',
+  name: 'kernel__record_lesson',
+  description:
+    'Records a curated lesson (≤600 chars) into long-term lesson_memory. Only available during reflection turns.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      text: { type: 'string' },
+      episode_id: { type: 'string' },
+      rationale: { type: 'string' },
+    },
+    required: ['text'],
+  },
+};
+
+/**
  * Maximum number of active pretest portfolios allowed. Enforced at dispatch time by
  * counting all portfolios via PretestService.findAll() before calling create().
  * Bounds parallel simulation cost and prevents LLM-driven portfolio explosion.
@@ -227,6 +248,7 @@ const KERNEL_TOOL_REGISTRY: Set<string> = new Set([
   'create_pretest_variant',
   'run_pretest_compare',
   'promote_pretest',
+  'record_lesson',
 ]);
 
 /** Orquesta el ciclo completo del agente: memoria, hooks de plugins, capa de veto, LLM y ejecución de tool calls. */
@@ -524,6 +546,7 @@ export class AgentsService {
             KERNEL_CREATE_PRETEST_VARIANT_TOOL,
             KERNEL_RUN_PRETEST_COMPARE_TOOL,
             KERNEL_PROMOTE_PRETEST_TOOL,
+            KERNEL_RECORD_LESSON_TOOL,
           ]
         : [];
     const effectiveTools = [...providerTools, ...kernelTools];
@@ -1211,6 +1234,8 @@ export class AgentsService {
       await this._kernelRunPretestCompare(cycle_id, tc, decisions, sandbox_results);
     } else if (tc.function === 'promote_pretest') {
       await this._kernelPromotePretest(cycle_id, tc, decisions, sandbox_results);
+    } else if (tc.function === 'record_lesson') {
+      await this._kernelRecordLesson(cycle_id, tc, decisions, sandbox_results);
     } else {
       this.log.warn(`_dispatchKernelTool: unknown kernel function '${tc.function}' — dropped`);
       decisions.push({ ...tc, allowed: false, reason: 'unknown_kernel_tool' });
@@ -1435,6 +1460,82 @@ export class AgentsService {
     });
   }
 
+  /**
+   * Handles kernel__record_lesson dispatch.
+   * Validates text is non-empty, calls longTermMemory.promote(), audits 'lesson_recorded'.
+   * NEVER calls sandbox. Fail-soft: errors are caught, decision marked allowed:false.
+   */
+  private async _kernelRecordLesson(
+    cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+  ): Promise<void> {
+    // Guard: LTM service must be available
+    if (!this.longTermMemory) {
+      decisions.push({ ...tc, allowed: false, reason: 'memory_unavailable' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'memory_unavailable',
+      });
+      return;
+    }
+
+    // Coerce and validate text
+    const rawText = tc.args['text'];
+    const text = typeof rawText === 'string' ? rawText.trim() : '';
+    if (!text) {
+      decisions.push({ ...tc, allowed: false, reason: 'invalid_lesson_args' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'invalid_lesson_args',
+      });
+      return;
+    }
+
+    // Optional fields
+    const rawEpisodeId = tc.args['episode_id'];
+    const episode_id = typeof rawEpisodeId === 'string' ? rawEpisodeId : undefined;
+    const rawRationale = tc.args['rationale'];
+    const rationale = typeof rawRationale === 'string' ? rawRationale : undefined;
+
+    // Sanitize at storage time — strip LLM control tokens so recalled lessons
+    // cannot reconstruct a prompt-injection vector in a future reflection turn.
+    const sanitizedText = this._sanitizeEpisodeText(text);
+    const sanitizedRationale =
+      rationale !== undefined ? this._sanitizeEpisodeText(rationale) : undefined;
+
+    // Promote the lesson (fail-soft — promote() never throws, but we guard anyway)
+    await this.longTermMemory.promote({
+      text: sanitizedText,
+      episode_id,
+      rationale: sanitizedRationale,
+    });
+
+    // Audit the lesson recording
+    await this.audit.log({
+      cycle_id,
+      event_type: 'lesson_recorded',
+      meta: {
+        text: sanitizedText.slice(0, 200),
+        episode_id,
+        rationale: sanitizedRationale?.slice(0, 200),
+      },
+    });
+
+    decisions.push({ ...tc, allowed: true });
+    sandbox_results.push({
+      plugin_id: 'kernel',
+      function: tc.function,
+      ok: true,
+      result: { text, episode_id, rationale },
+    });
+  }
+
   private async _executeToolCalls(
     cycle_id: string,
     toolCalls: import('../llm/llm.service').ToolCallRequest[],
@@ -1589,12 +1690,61 @@ export class AgentsService {
     return (header + '\n' + portfolioLines).slice(0, cap);
   }
 
+  /** Build the [LESSONS] section string, or null if no lessons or LTM absent. Fail-soft. */
+  private async _buildLessonsSection(cap: number): Promise<string | null> {
+    if (!this.longTermMemory) return null;
+    try {
+      const lessons = await this.longTermMemory.listLessons(3);
+      if (lessons.length === 0) return null;
+      return lessons
+        .map((l, i) => `${String(i + 1)}. ${l.text}`)
+        .join('\n')
+        .slice(0, cap);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Build the [PAST EPISODES] section string, or null if no hits or LTM absent. Fail-soft. */
+  private async _buildPastEpisodesSection(
+    auditEntries: Array<{ event_type: string; symbol?: string | null }>,
+    cap: number,
+  ): Promise<string | null> {
+    if (!this.longTermMemory) return null;
+    try {
+      const recentSymbols = auditEntries
+        .filter((e) => e.event_type === 'signal' || e.event_type === 'cycle_complete')
+        .map((e) => e.symbol)
+        .filter((s): s is string => typeof s === 'string' && s.length > 0)
+        .slice(0, 5);
+      const query = recentSymbols.join(' ') || 'market';
+      const episodes = await this.longTermMemory.prefetch(query, 2);
+      if (episodes.length === 0) return null;
+      return episodes
+        .map(
+          (ep) =>
+            `[${ep.cycle_id}] ${ep.action_summary} | P&L:${ep.outcome_pnl ?? 'pending'} | ${ep.llm_rationale}`,
+        )
+        .join('\n')
+        .slice(0, cap);
+    } catch {
+      return null;
+    }
+  }
+
   private async _assembleReflectionContext(): Promise<string> {
     const BUDGET = 4000;
-    const AUDIT_CAP = 1200;
-    const EQUITY_CAP = 400;
-    const VETO_CAP = 800;
-    const PRETEST_CAP = 1200;
+    // PR3: reduced proportionally to make room for [LESSONS] (600) + [PAST EPISODES] (800).
+    // Old caps: AUDIT=1200, EQUITY=400, VETO=800, PRETEST=1200 → total 3600.
+    // New caps: AUDIT=700, EQUITY=250, VETO=550, PRETEST=700 → total 2200.
+    // New sections: LESSONS=600, PAST_EPISODES=800 → 1400.
+    // Grand total cap budget: 2200 + 1400 = 3600 + section labels/separators fits within 4000.
+    const AUDIT_CAP = 700;
+    const EQUITY_CAP = 250;
+    const VETO_CAP = 550;
+    const PRETEST_CAP = 700;
+    const LESSONS_CAP = 600;
+    const PAST_EPISODES_CAP = 800;
 
     // Single audit query (limit 20) shared by AUDIT and VETO sections — avoids two DB calls.
     type AuditEntry = {
@@ -1670,12 +1820,30 @@ export class AgentsService {
       pretestSection = '(unavailable)';
     }
 
-    const assembled = [
+    // Section: LESSONS — top-3 curated lessons from lesson_memory
+    const lessonsSection = await this._buildLessonsSection(LESSONS_CAP);
+
+    // Section: PAST EPISODES — top-2 prefetch hits (using recent symbol query from audit)
+    const pastEpisodesSection = await this._buildPastEpisodesSection(
+      auditEntries,
+      PAST_EPISODES_CAP,
+    );
+
+    const parts: string[] = [
       `[AUDIT RECENT]\n${auditSection}`,
       `[EQUITY CURVE]\n${equitySection}`,
       `[VETO SUMMARY]\n${vetoSection}`,
       `[PRETEST COMPARE]\n${pretestSection}`,
-    ].join('\n\n');
+    ];
+
+    if (lessonsSection !== null) {
+      parts.push(`[LESSONS]\n${lessonsSection}`);
+    }
+    if (pastEpisodesSection !== null) {
+      parts.push(`[PAST EPISODES]\n${pastEpisodesSection}`);
+    }
+
+    const assembled = parts.join('\n\n');
 
     // Hard global budget slice (defense in depth after per-section caps)
     return assembled.slice(0, BUDGET);

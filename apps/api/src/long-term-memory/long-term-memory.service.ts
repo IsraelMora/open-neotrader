@@ -133,10 +133,69 @@ export class LongTermMemoryService implements MemoryProvider, OnModuleInit {
     }
   }
 
-  // ── promote (PR3 stub) ─────────────────────────────────────────────────────
+  // ── promote + listLessons (PR3) ───────────────────────────────────────────
 
-  /** No-op stub. Implemented in PR3 (curated lessons). */
-  async promote(_lesson: LessonRecord): Promise<void> {
-    // PR3 stub — no-op
+  /**
+   * Insert a lesson into lesson_memory. After insert, FIFO-prune to keep at most 30 rows
+   * (oldest by ts are deleted). Fail-soft: never throws.
+   */
+  async promote(lesson: LessonRecord): Promise<void> {
+    try {
+      const id = randomUUID();
+      // INSERT + FIFO prune in a single transaction: a prune failure after a committed
+      // insert would leak a row (count → 31). Both succeed or neither does.
+      await this.db.$transaction(async (tx) => {
+        await tx.$executeRaw`
+          INSERT INTO lesson_memory (id, text, episode_id, rationale)
+          VALUES (${id}, ${lesson.text}, ${lesson.episode_id ?? null}, ${lesson.rationale ?? null})
+        `;
+        // FIFO prune: delete oldest rows when count exceeds 30
+        await tx.$executeRaw`
+          DELETE FROM lesson_memory
+          WHERE id IN (
+            SELECT id FROM lesson_memory
+            ORDER BY ts ASC
+            LIMIT MAX(0, (SELECT COUNT(*) FROM lesson_memory) - 30)
+          )
+        `;
+      });
+    } catch (e) {
+      this.log.warn(`promote failed: ${e}`);
+    }
+  }
+
+  /**
+   * Return the most recent `limit` lessons ordered newest-first.
+   * Fail-soft: returns [] on any error.
+   */
+  async listLessons(limit: number): Promise<
+    Array<{
+      id: string;
+      ts: Date;
+      text: string;
+      episode_id: string | null;
+      rationale: string | null;
+    }>
+  > {
+    try {
+      const rows = await this.db.$queryRaw<
+        Array<{
+          id: string;
+          ts: Date;
+          text: string;
+          episode_id: string | null;
+          rationale: string | null;
+        }>
+      >`
+        SELECT id, ts, text, episode_id, rationale
+        FROM lesson_memory
+        ORDER BY ts DESC
+        LIMIT ${limit}
+      `;
+      return rows;
+    } catch (e) {
+      this.log.warn(`listLessons failed: ${e}`);
+      return [];
+    }
   }
 }

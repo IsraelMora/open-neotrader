@@ -146,6 +146,19 @@ model EpisodeMemory {
   @@map("episode_memory")
 }
 
+// F6-s2 PR3: Curated lesson store — FIFO cap (max 30 rows) enforced by service at insert time.
+model LessonMemory {
+  id         String   @id
+  ts         DateTime @default(now())
+  text       String
+  episode_id String?
+  rationale  String?
+  meta       String?
+
+  @@index([ts])
+  @@map("lesson_memory")
+}
+
 // Cartera virtual de pretest — permite probar configuraciones distintas antes de usar dinero real
 // Cada pretest es independiente: tiene sus propios plugins activos, config y estado de cartera virtual
 model PretestPortfolio {

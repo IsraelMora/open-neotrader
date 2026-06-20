@@ -312,6 +312,128 @@ describe('LongTermMemoryService record + prefetch (integration)', () => {
   });
 });
 
+// ── Task 3.3 / 3.4: promote + listLessons + FIFO prune ───────────────────────
+
+const MIGRATION_FILE_0009 = path.resolve(
+  __dirname,
+  '../..',
+  'prisma/migrations/0009_lesson_memory/migration.sql',
+);
+
+/** Build a real in-memory DB with both 0008 and 0009 schema applied. */
+function makeDb0009(): Database.Database {
+  const db = new Database(':memory:');
+  const sql0008 = fs.readFileSync(MIGRATION_FILE, 'utf8');
+  db.exec(sql0008);
+  const sql0009 = fs.readFileSync(MIGRATION_FILE_0009, 'utf8');
+  db.exec(sql0009);
+  return db;
+}
+
+describe('LongTermMemoryService promote + listLessons (integration)', () => {
+  let service: LongTermMemoryService;
+  let db: Database.Database;
+
+  beforeEach(async () => {
+    db = makeDb0009();
+    const prisma = makePrismaFromDb(db);
+    service = new LongTermMemoryService(prisma);
+    await service.onModuleInit();
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it('promote inserts a lesson row into lesson_memory', async () => {
+    await service.promote({ text: 'Lesson A', rationale: 'why A' });
+    const count = (db.prepare('SELECT COUNT(*) as n FROM lesson_memory').get() as { n: number }).n;
+    expect(count).toBe(1);
+  });
+
+  it('promote stores text and rationale correctly', async () => {
+    await service.promote({ text: 'Important lesson', rationale: 'because', episode_id: 'ep-1' });
+    const row = db
+      .prepare('SELECT text, rationale, episode_id FROM lesson_memory LIMIT 1')
+      .get() as { text: string; rationale: string; episode_id: string };
+    expect(row.text).toBe('Important lesson');
+    expect(row.rationale).toBe('because');
+    expect(row.episode_id).toBe('ep-1');
+  });
+
+  it('promote never throws on DB error (fail-soft)', async () => {
+    const brokenPrisma = {
+      $executeRaw: jest.fn().mockRejectedValue(new Error('DB error')),
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      $transaction: jest.fn().mockRejectedValue(new Error('DB error')),
+    } as unknown as PrismaService;
+    const s = new LongTermMemoryService(brokenPrisma);
+    await expect(s.promote({ text: 'lesson' })).resolves.not.toThrow();
+  });
+
+  it('FIFO prune: after inserting 31st lesson, count stays at 30', async () => {
+    // Insert 30 lessons
+    for (let i = 0; i < 30; i++) {
+      await service.promote({ text: `Lesson ${String(i)}` });
+    }
+    let count = (db.prepare('SELECT COUNT(*) as n FROM lesson_memory').get() as { n: number }).n;
+    expect(count).toBe(30);
+
+    // Insert the 31st — oldest should be deleted
+    await service.promote({ text: 'Lesson 31 — newest' });
+    count = (db.prepare('SELECT COUNT(*) as n FROM lesson_memory').get() as { n: number }).n;
+    expect(count).toBe(30);
+  });
+
+  it('FIFO prune: the oldest lesson is deleted (not the newest)', async () => {
+    // Insert 30 lessons with distinct text
+    await service.promote({ text: 'OLDEST LESSON' });
+    for (let i = 1; i < 30; i++) {
+      await service.promote({ text: `Filler ${String(i)}` });
+    }
+    // Insert the 31st
+    await service.promote({ text: 'NEWEST LESSON' });
+
+    const rows = db.prepare('SELECT text FROM lesson_memory ORDER BY ts ASC').all() as {
+      text: string;
+    }[];
+    const texts = rows.map((r) => r.text);
+    // Oldest ('OLDEST LESSON') should be gone
+    expect(texts).not.toContain('OLDEST LESSON');
+    // Newest should still be present
+    expect(texts).toContain('NEWEST LESSON');
+  });
+
+  it('listLessons returns the most recent N lessons ordered newest-first', async () => {
+    await service.promote({ text: 'First lesson' });
+    await service.promote({ text: 'Second lesson' });
+    await service.promote({ text: 'Third lesson' });
+
+    const lessons = await service.listLessons(2);
+    expect(lessons).toHaveLength(2);
+    // Most recent first
+    expect(lessons[0]?.text).toBe('Third lesson');
+    expect(lessons[1]?.text).toBe('Second lesson');
+  });
+
+  it('listLessons returns empty array when no lessons', async () => {
+    const lessons = await service.listLessons(3);
+    expect(lessons).toEqual([]);
+  });
+
+  it('listLessons never throws on DB error (fail-soft)', async () => {
+    const brokenPrisma = {
+      $executeRaw: jest.fn().mockResolvedValue(0),
+      $queryRaw: jest.fn().mockRejectedValue(new Error('DB error')),
+      $transaction: jest.fn().mockResolvedValue(undefined),
+    } as unknown as PrismaService;
+    const s = new LongTermMemoryService(brokenPrisma);
+    await expect(s.listLessons(3)).resolves.not.toThrow();
+    const result = await s.listLessons(3).catch(() => 'threw');
+    expect(result).not.toBe('threw');
+  });
+});
+
 // ── Task 1.11 / 1.12: updateOutcome integration ───────────────────────────────
 
 describe('LongTermMemoryService updateOutcome (integration)', () => {
@@ -343,7 +465,9 @@ describe('LongTermMemoryService updateOutcome (integration)', () => {
     await expect(service.updateOutcome('UNKNOWN', 0, 0)).resolves.not.toThrow();
   });
 
-  it('promote() is a no-op stub (PR3)', async () => {
+  it('promote() does not throw (lesson_memory table not available in 0008-only DB — fail-soft)', async () => {
+    // promote() inserts into lesson_memory which doesn't exist in the 0008 DB.
+    // It must swallow the error and not throw (fail-soft contract).
     await expect(service.promote({ text: 'test lesson' })).resolves.not.toThrow();
   });
 });
