@@ -137,11 +137,14 @@ export class DebateService {
    * The CALLER is responsible for catching that rejection and applying fail_mode.
    */
   async runPanel(summary: string, roles: DebateRole[], _cycleId: string): Promise<DebateConsensus> {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), this.panelTimeoutMs);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const timeoutPromise = new Promise<never>((_res, rej) => {
+      timer = setTimeout(() => rej(new Error('panel timeout')), this.panelTimeoutMs);
+    });
 
     try {
-      const stances = await Promise.all(
+      const panelPromise = Promise.all(
         roles.map((role) => {
           const prompt = role.prompt ?? '';
           return this.llm
@@ -158,6 +161,7 @@ export class DebateService {
         }),
       );
 
+      const stances = await Promise.race([panelPromise, timeoutPromise]);
       return this.synthesizeConsensus(stances);
     } finally {
       clearTimeout(timer);

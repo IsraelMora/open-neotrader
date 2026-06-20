@@ -295,4 +295,67 @@ describe('DebateService.runPanel', () => {
       expect.objectContaining({ system_prompt: BULL_ROLE.prompt }),
     );
   });
+
+  // ── timeout tests ─────────────────────────────────────────────────────────────
+
+  it('runPanel rejects with panel timeout error when llm.complete never resolves', async () => {
+    // llm.complete returns a promise that never settles — simulates a hung LLM call
+    const neverResolve = new Promise<never>(() => undefined);
+    const llm: jest.Mocked<Pick<LlmService, 'complete'>> = {
+      complete: jest.fn().mockReturnValue(neverResolve),
+    };
+    // Use a very short timeout so the test runs fast
+    const service = DebateService.withTimeout(
+      llm as unknown as import('../llm/llm.service').LlmService,
+      50,
+    );
+
+    await expect(service.runPanel('buy AAPL', [BULL_ROLE], 'cycle-timeout-1')).rejects.toThrow(
+      'panel timeout',
+    );
+  });
+
+  it('runPanel rejects promptly when llm.complete resolves AFTER the timeout', async () => {
+    // llm.complete resolves after 200 ms; timeout is 50 ms → race should reject first
+    const slowResolve = new Promise<{ text: string }>((res) =>
+      setTimeout(
+        () => res({ text: '{"stance":"approve","confidence":0.9,"rationale":"late"}' }),
+        200,
+      ),
+    );
+    const llm: jest.Mocked<Pick<LlmService, 'complete'>> = {
+      complete: jest.fn().mockReturnValue(slowResolve),
+    };
+    const service = DebateService.withTimeout(
+      llm as unknown as import('../llm/llm.service').LlmService,
+      50,
+    );
+
+    const start = Date.now();
+    await expect(service.runPanel('buy MSFT', [BULL_ROLE], 'cycle-timeout-2')).rejects.toThrow(
+      'panel timeout',
+    );
+    // Should reject well before the 200 ms slow resolve — allow generous headroom for CI
+    expect(Date.now() - start).toBeLessThan(180);
+  });
+
+  it('per-role catch still abstains; timeout guards the WHOLE panel', async () => {
+    // First role fails immediately (per-role catch → abstain).
+    // Second role never resolves → timeout guards overall panel.
+    const neverResolve = new Promise<never>(() => undefined);
+    const llm: jest.Mocked<Pick<LlmService, 'complete'>> = {
+      complete: jest
+        .fn()
+        .mockRejectedValueOnce(new Error('individual failure'))
+        .mockReturnValueOnce(neverResolve),
+    };
+    const service = DebateService.withTimeout(
+      llm as unknown as import('../llm/llm.service').LlmService,
+      50,
+    );
+
+    await expect(
+      service.runPanel('sell TSLA', [BULL_ROLE, BEAR_ROLE], 'cycle-timeout-3'),
+    ).rejects.toThrow('panel timeout');
+  });
 });

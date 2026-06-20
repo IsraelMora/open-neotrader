@@ -6585,12 +6585,13 @@ describe('F6-S3 PR-B B4 — _executeToolCalls debate intercept', () => {
   it('T1 — debate NOT provided → runPanel 0 calls + dispatch byte-identical (load-bearing regression gate)', async () => {
     const sandbox = makeSandbox();
     const audit = makeAudit();
+    const kv = makeKvDebate({ 'debate.enabled': 'true' });
     // No debate, no gateway
     const service = makeDebateAgentsService({
       sandbox,
       audit,
       plugins: makePluginsWithDebate(),
-      kv: makeKvDebate({ 'debate.enabled': 'true' }),
+      kv,
       debate: null,
       gateway: null,
     });
@@ -6611,6 +6612,12 @@ describe('F6-S3 PR-B B4 — _executeToolCalls debate intercept', () => {
       ),
     );
     expect(debateAudits).toHaveLength(0);
+    // LOCK: when this.debate is undefined the entire gate is a single falsy check.
+    // Assert ZERO kv.get calls for any debate.* key — a future refactor that leaks a
+    // KV read outside `if (this.debate)` will trip this gate immediately.
+    const kvGetCalls = (kv.get as jest.Mock).mock.calls as Array<[string]>;
+    const debateKvReads = kvGetCalls.filter(([k]) => k.startsWith('debate.'));
+    expect(debateKvReads).toHaveLength(0);
   });
 
   // T2: debate provided but enabled=false → byte-identical dispatch, runPanel 0 calls
