@@ -34,6 +34,10 @@ def _load_runner(plugins_dir: Path):
     sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     mod.PLUGINS_DIR = plugins_dir
+    # Disable in-process resource limits: _apply_resource_limits() would cap
+    # the pytest process (RLIMIT_AS=512MB). Enforcement is verified via
+    # test_rlimit_nproc.py subprocesses.
+    mod._apply_resource_limits = lambda: None
     return mod
 
 

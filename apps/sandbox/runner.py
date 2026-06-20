@@ -29,36 +29,45 @@ from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Sandbox resource limits — aplicados antes de cualquier código de plugin
+# Sandbox resource limits — applied inside main() before any plugin code runs
 # ---------------------------------------------------------------------------
-try:
-    import resource as _resource
+def _apply_resource_limits() -> None:
+    """
+    Apply OS-level resource limits for the sandbox process.
 
-    # CPU time en segundos (RLIMIT_CPU). Default: 60s. Override via SANDBOX_CPU_SECONDS.
-    _cpu_seconds = int(os.environ.get("SANDBOX_CPU_SECONDS", "60"))
-    _resource.setrlimit(_resource.RLIMIT_CPU, (_cpu_seconds, _cpu_seconds))
+    Called as the first thing in main() so that:
+      - a real sandbox invocation (python3 runner.py → __main__ → main()) still
+        enforces all limits before any plugin module is loaded;
+      - importing runner (e.g. in tests) does NOT cap the importing process.
+    """
+    try:
+        import resource as _resource
 
-    # Memoria virtual en bytes (RLIMIT_AS). Default: 512 MB. Override via SANDBOX_MEM_MB.
-    _mem_mb = int(os.environ.get("SANDBOX_MEM_MB", "512"))
-    _mem_bytes = _mem_mb * 1024 * 1024
-    _resource.setrlimit(_resource.RLIMIT_AS, (_mem_bytes, _mem_bytes))
+        # CPU time en segundos (RLIMIT_CPU). Default: 60s. Override via SANDBOX_CPU_SECONDS.
+        _cpu_seconds = int(os.environ.get("SANDBOX_CPU_SECONDS", "60"))
+        _resource.setrlimit(_resource.RLIMIT_CPU, (_cpu_seconds, _cpu_seconds))
 
-    # Número de archivos abiertos (RLIMIT_NOFILE). Default: 64.
-    _resource.setrlimit(_resource.RLIMIT_NOFILE, (64, 64))
+        # Memoria virtual en bytes (RLIMIT_AS). Default: 512 MB. Override via SANDBOX_MEM_MB.
+        _mem_mb = int(os.environ.get("SANDBOX_MEM_MB", "512"))
+        _mem_bytes = _mem_mb * 1024 * 1024
+        _resource.setrlimit(_resource.RLIMIT_AS, (_mem_bytes, _mem_bytes))
 
-    # Número de procesos hijo (RLIMIT_NPROC). Default: 64. Override via SANDBOX_MAX_PROCS.
-    # Uses getattr so only NPROC is skipped on platforms that don't support it (e.g. some containers).
-    _nproc = getattr(_resource, "RLIMIT_NPROC", None)
-    if _nproc is None:
-        print("[sandbox] RLIMIT_NPROC not available on this platform", file=sys.stderr)
-    else:
-        _max_procs = int(os.environ.get("SANDBOX_MAX_PROCS", "64"))
-        _resource.setrlimit(_nproc, (_max_procs, _max_procs))
+        # Número de archivos abiertos (RLIMIT_NOFILE). Default: 64.
+        _resource.setrlimit(_resource.RLIMIT_NOFILE, (64, 64))
 
-except (ImportError, ValueError, OSError):
-    # El módulo resource no está disponible en Windows o en algunos contenedores
-    # No es un error fatal — el sandbox sigue funcionando sin límites del OS
-    pass
+        # Número de procesos hijo (RLIMIT_NPROC). Default: 64. Override via SANDBOX_MAX_PROCS.
+        # Uses getattr so only NPROC is skipped on platforms that don't support it (e.g. some containers).
+        _nproc = getattr(_resource, "RLIMIT_NPROC", None)
+        if _nproc is None:
+            print("[sandbox] RLIMIT_NPROC not available on this platform", file=sys.stderr)
+        else:
+            _max_procs = int(os.environ.get("SANDBOX_MAX_PROCS", "64"))
+            _resource.setrlimit(_nproc, (_max_procs, _max_procs))
+
+    except (ImportError, ValueError, OSError):
+        # El módulo resource no está disponible en Windows o en algunos contenedores
+        # No es un error fatal — el sandbox sigue funcionando sin límites del OS
+        pass
 
 # Import SDK Context so we can pass proper objects to plugin functions
 try:
@@ -751,6 +760,9 @@ COMMANDS = {
 
 
 def main() -> None:
+    # Apply OS resource limits first — before any plugin code or isolation guards.
+    _apply_resource_limits()
+
     # Apply in-process isolation guards AFTER resource limits and BEFORE any
     # plugin module is loaded.  Gated by SANDBOX_STRICT (default: true).
     if _isolation is not None:
