@@ -7733,3 +7733,513 @@ describe('F6-s5 Elevated-still-obeys-policy — (d) promote() hard-checks gate +
     expect(pretestWithNeedsConfirm.promote).toHaveBeenCalledWith('pf-456');
   });
 });
+
+// ── ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch ─────────────
+
+import type { MlSignalRecordService, MlSignalRow } from '../ml-signal-record/ml-signal-record.service';
+
+/** Minimal MlSignalRecordService stub. */
+function makeMlSignalRecord(rows: MlSignalRow[]): jest.Mocked<
+  Pick<MlSignalRecordService, 'getTrainingData'>
+> {
+  return {
+    getTrainingData: jest.fn().mockResolvedValue(rows),
+  };
+}
+
+/** Minimal KvService stub with get + set. */
+function makePr2Kv(): jest.Mocked<Pick<KvService, 'get' | 'set'>> {
+  return {
+    get: jest
+      .fn()
+      .mockImplementation((key: string) => Promise.resolve(key === 'react.max_turns' ? '1' : null)),
+    set: jest.fn().mockResolvedValue(undefined),
+  };
+}
+
+/** Build AgentsService with mlSignalRecord and kv injected (14-arg constructor). */
+function makeMlTrainAgentsService(
+  audit: ReturnType<typeof makeAudit>,
+  sandbox: ReturnType<typeof makeSandbox>,
+  mlSignalRecord?: ReturnType<typeof makeMlSignalRecord> | null,
+  kv?: ReturnType<typeof makePr2Kv> | null,
+): AgentsService {
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+    longTermMemory: unknown,
+    debate: unknown,
+    providerGateway: unknown,
+    mlSignalRecord: unknown,
+  ) => AgentsService)(
+    {},
+    sandbox,
+    {
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+      getProviderTools: jest.fn().mockResolvedValue([]),
+      findActive: jest.fn().mockResolvedValue([]),
+    },
+    {},
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    kv ?? makePr2Kv(),
+    undefined,
+    undefined,
+    undefined,
+    mlSignalRecord ?? undefined,
+  );
+}
+
+/** Call _dispatchKernelTool directly (PR2 variant). */
+async function callDispatchKernelToolPr2(
+  service: AgentsService,
+  cycleId: string,
+  tc: import('../llm/llm.service').ToolCallRequest,
+): Promise<{
+  decisions: import('./agents.service').Decision[];
+  sandbox_results: import('./agents.service').SandboxResult[];
+}> {
+  const decisions: import('./agents.service').Decision[] = [];
+  const sandbox_results: import('./agents.service').SandboxResult[] = [];
+  await (
+    service as unknown as {
+      _dispatchKernelTool: (
+        c: string,
+        tc: import('../llm/llm.service').ToolCallRequest,
+        d: import('./agents.service').Decision[],
+        s: import('./agents.service').SandboxResult[],
+      ) => Promise<void>;
+    }
+  )._dispatchKernelTool(cycleId, tc, decisions, sandbox_results);
+  return { decisions, sandbox_results };
+}
+
+/** Build 60 synthetic MlSignalRows (labeled, sufficient for training). */
+function makeTrainingRows(count: number): MlSignalRow[] {
+  return Array.from({ length: count }, (_, i) => ({
+    id: `row-${String(i)}`,
+    ts: new Date(),
+    cycle_id: `cycle-${String(i)}`,
+    symbol: 'AAPL',
+    skill_vector: JSON.stringify([{ plugin_id: 'skill-a', action: 'buy', confidence: 0.8 }]),
+    action: 'buy',
+    outcome_pnl: i % 2 === 0 ? 100 : -50,
+    outcome_equity: 10000,
+    active_skill_hash: 'abc123def456abcd',
+    meta: null,
+  }));
+}
+
+describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () => {
+  const CYCLE_ID = 'pr2-ml-001';
+
+  // ── 6.1 Registry and schema tests ─────────────────────────────────────────
+
+  it('6.1 — train_ml_model is in KERNEL_TOOL_REGISTRY (not dropped as unknown_kernel_tool at reflection)', async () => {
+    const audit = makeAudit();
+    const sandbox = makeSandbox();
+    const mlSignalRecord = makeMlSignalRecord([]);
+    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'train_ml_model',
+      args: {},
+    };
+
+    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'reflection');
+    expect(valid).toHaveLength(1);
+    expect(valid[0]?.function).toBe('train_ml_model');
+  });
+
+  it('6.2 — source:reflection → kernel__train_ml_model IS in kernelTools (visible in tool schema)', async () => {
+    const audit = makeAudit();
+    const sandbox = makeSandbox();
+    const mlSignalRecord = makeMlSignalRecord([]);
+    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord);
+    const captured: { tools: string[] }[] = [];
+
+    (
+      service as unknown as {
+        _buildToolSchema: (tools: import('../plugins/plugins.service').ProviderTool[]) => string;
+      }
+    );
+
+    // We check via runGovernedTurn injection: kernel__train_ml_model must appear in the
+    // tools array passed to llm.complete when source==='reflection'.
+    const fakeLlm = {
+      complete: jest.fn().mockImplementation(
+        (opts: { system: string; context: string; tools: { name: string }[] }) => {
+          captured.push({ tools: opts.tools.map((t) => t.name) });
+          return Promise.resolve({
+            text: 'done',
+            tool_calls: [],
+            backend: 'api' as const,
+            skills_read: [],
+            skills_written: [],
+          });
+        },
+      ),
+    };
+
+    const svcWithLlm = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+      longTermMemory: unknown,
+      debate: unknown,
+      providerGateway: unknown,
+      mlSignalRecord: unknown,
+    ) => AgentsService)(
+      fakeLlm,
+      sandbox,
+      {
+        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+        getProviderTools: jest.fn().mockResolvedValue([]),
+        findActive: jest.fn().mockResolvedValue([]),
+        getSkillsMetadata: jest.fn().mockResolvedValue([]),
+      },
+      { toContextString: jest.fn().mockResolvedValue(''), appendObservation: jest.fn(), trackSignal: jest.fn() },
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      makePr2Kv(),
+      undefined,
+      undefined,
+      undefined,
+      mlSignalRecord,
+    );
+
+    await svcWithLlm.runGovernedTurn({ source: 'reflection', context: 'reflect' });
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.tools).toContain('kernel__train_ml_model');
+  });
+
+  it('6.3 — source:cycle → kernel__train_ml_model NOT in kernelTools (dropped kernel_source_not_allowed)', async () => {
+    const audit = makeAudit();
+    const sandbox = makeSandbox();
+    const mlSignalRecord = makeMlSignalRecord([]);
+    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'train_ml_model',
+      args: {},
+    };
+
+    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'cycle');
+    expect(valid).toHaveLength(0);
+
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const dropped = auditCalls.find(
+      ([a]) =>
+        a['event_type'] === 'tool_call_dropped' &&
+        (a['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
+    );
+    expect(dropped).toBeDefined();
+  });
+
+  it('6.4 — source:chat → kernel__train_ml_model dropped (kernel_source_not_allowed)', async () => {
+    const audit = makeAudit();
+    const sandbox = makeSandbox();
+    const mlSignalRecord = makeMlSignalRecord([]);
+    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'train_ml_model',
+      args: {},
+    };
+
+    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'chat');
+    expect(valid).toHaveLength(0);
+  });
+
+  it('6.5 — source:pretest → kernel__train_ml_model dropped (kernel_source_not_allowed)', async () => {
+    const audit = makeAudit();
+    const sandbox = makeSandbox();
+    const mlSignalRecord = makeMlSignalRecord([]);
+    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'train_ml_model',
+      args: {},
+    };
+
+    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'pretest');
+    expect(valid).toHaveLength(0);
+  });
+
+  // ── 6.6 Happy path — rows >= 50, plugin returns 'trained' ─────────────────
+
+  it('6.6 — happy path: rows>=50, plugin returns trained → kv.set + audit ml_model_trained{trained}', async () => {
+    const audit = makeAudit();
+    const kv = makePr2Kv();
+    const rows = makeTrainingRows(60);
+    const mlSignalRecord = makeMlSignalRecord(rows);
+    const trainResult = {
+      status: 'trained',
+      model_blob: 'base64blob==',
+      active_skill_hash: 'abc123def456abcd',
+      feature_names: ['skill-a__action_encoded', 'skill-a__confidence'],
+      n_samples: 60,
+    };
+    const sandbox = makeSandbox();
+    (sandbox.callPlugin as jest.Mock).mockResolvedValue({ ok: true, result: trainResult });
+
+    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord, kv);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'train_ml_model',
+      args: {},
+    };
+
+    const { decisions, sandbox_results } = await callDispatchKernelToolPr2(service, CYCLE_ID, tc);
+
+    // getTrainingData(1000) called
+    expect(mlSignalRecord.getTrainingData).toHaveBeenCalledWith(1000);
+
+    // callPlugin('ml-feature-extractor', 'train', { training_data: rows })
+    expect(sandbox.callPlugin).toHaveBeenCalledWith(
+      'ml-feature-extractor',
+      'train',
+      { training_data: rows },
+    );
+
+    // kv.set('ml:model:current', ...) with the blob and metadata
+    expect(kv.set).toHaveBeenCalledTimes(1);
+    const [kvKey, kvValue] = ((kv.set as jest.Mock).mock.calls as Array<[string, string]>)[0];
+    expect(kvKey).toBe('ml:model:current');
+    const stored = JSON.parse(kvValue) as Record<string, unknown>;
+    expect(stored['blob_b64']).toBe('base64blob==');
+    expect(stored['active_skill_hash']).toBe('abc123def456abcd');
+    expect(stored['feature_names']).toEqual(['skill-a__action_encoded', 'skill-a__confidence']);
+    expect(stored['n_samples']).toBe(60);
+    expect(typeof stored['trained_at']).toBe('string');
+
+    // audit 'ml_model_trained' with status 'trained'
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_model_trained');
+    expect(mlAudit).toBeDefined();
+    const mlMeta = mlAudit![0]['meta'] as Record<string, unknown>;
+    expect(mlMeta['status']).toBe('trained');
+    expect(mlMeta['n_samples']).toBe(60);
+
+    // decision allowed:true
+    expect(decisions[0]?.allowed).toBe(true);
+    expect(sandbox_results[0]?.ok).toBe(true);
+  });
+
+  // ── 6.7 Cold start — rows < 50 ────────────────────────────────────────────
+
+  it('6.7 — cold_start (rows<50): no callPlugin, no kv.set, audit ml_model_trained{cold_start}', async () => {
+    const audit = makeAudit();
+    const kv = makePr2Kv();
+    const rows = makeTrainingRows(49); // below MIN_ML_SAMPLES=50
+    const mlSignalRecord = makeMlSignalRecord(rows);
+    const sandbox = makeSandbox();
+
+    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord, kv);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'train_ml_model',
+      args: {},
+    };
+
+    const { decisions } = await callDispatchKernelToolPr2(service, CYCLE_ID, tc);
+
+    // callPlugin must NOT be called (rows < MIN_ML_SAMPLES)
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+
+    // kv.set must NOT be called (do not overwrite a good model with cold-start)
+    expect(kv.set).not.toHaveBeenCalled();
+
+    // audit ml_model_trained with status cold_start
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_model_trained');
+    expect(mlAudit).toBeDefined();
+    const mlMeta = mlAudit![0]['meta'] as Record<string, unknown>;
+    expect(mlMeta['status']).toBe('cold_start');
+    expect(mlMeta['n_samples']).toBe(49);
+
+    // decision allowed:true (training was attempted; cold_start is not an error)
+    expect(decisions[0]?.allowed).toBe(true);
+  });
+
+  // ── 6.8 Plugin returns cold_start (single-class or internal error in Python) ─
+
+  it('6.8 — plugin returns cold_start (>=50 rows, but single-class): no kv.set, audit cold_start', async () => {
+    const audit = makeAudit();
+    const kv = makePr2Kv();
+    const rows = makeTrainingRows(60);
+    const mlSignalRecord = makeMlSignalRecord(rows);
+    const sandbox = makeSandbox();
+    (sandbox.callPlugin as jest.Mock).mockResolvedValue({
+      ok: true,
+      result: { status: 'cold_start', model_blob: null, n_samples: 60 },
+    });
+
+    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord, kv);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'train_ml_model',
+      args: {},
+    };
+
+    await callDispatchKernelToolPr2(service, CYCLE_ID, tc);
+
+    // kv.set must NOT be called (plugin returned cold_start — do not clobber existing model)
+    expect(kv.set).not.toHaveBeenCalled();
+
+    // audit ml_model_trained with status cold_start
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_model_trained');
+    expect(mlAudit).toBeDefined();
+    const mlMeta = mlAudit![0]['meta'] as Record<string, unknown>;
+    expect(mlMeta['status']).toBe('cold_start');
+  });
+
+  // ── 6.9 ml_unavailable — mlSignalRecord absent ────────────────────────────
+
+  it('6.9 — ml_unavailable: mlSignalRecord absent → decision allowed:false reason ml_unavailable, no callPlugin', async () => {
+    const audit = makeAudit();
+    const kv = makePr2Kv();
+    const sandbox = makeSandbox();
+    // null → not injected (simulates @Optional() returning undefined)
+    const service = makeMlTrainAgentsService(audit, sandbox, null, kv);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'train_ml_model',
+      args: {},
+    };
+
+    const { decisions, sandbox_results } = await callDispatchKernelToolPr2(service, CYCLE_ID, tc);
+
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+    expect(kv.set).not.toHaveBeenCalled();
+    expect(decisions[0]?.allowed).toBe(false);
+    expect(decisions[0]?.reason).toBe('ml_unavailable');
+    expect(sandbox_results[0]?.ok).toBe(false);
+  });
+
+  // ── 6.10 Fail-soft — callPlugin throws ────────────────────────────────────
+
+  it('6.10 — fail-soft: callPlugin throws → audit ml_model_trained{error}, decision ml_train_failed, no rethrow', async () => {
+    const audit = makeAudit();
+    const kv = makePr2Kv();
+    const rows = makeTrainingRows(60);
+    const mlSignalRecord = makeMlSignalRecord(rows);
+    const sandbox = makeSandbox();
+    (sandbox.callPlugin as jest.Mock).mockRejectedValue(new Error('sandbox timeout'));
+
+    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord, kv);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'train_ml_model',
+      args: {},
+    };
+
+    // MUST NOT throw — reflection turn must survive
+    const { decisions, sandbox_results } = await callDispatchKernelToolPr2(service, CYCLE_ID, tc);
+
+    // kv.set must NOT be called
+    expect(kv.set).not.toHaveBeenCalled();
+
+    // audit ml_model_trained with status error
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_model_trained');
+    expect(mlAudit).toBeDefined();
+    const mlMeta = mlAudit![0]['meta'] as Record<string, unknown>;
+    expect(mlMeta['status']).toBe('error');
+
+    // decision allowed:false with reason ml_train_failed
+    expect(decisions[0]?.allowed).toBe(false);
+    expect(decisions[0]?.reason).toBe('ml_train_failed');
+    expect(sandbox_results[0]?.ok).toBe(false);
+  });
+
+  // ── 6.11 No-clobber: cold_start does not overwrite an existing valid KV model ─
+
+  it('6.11 — no-clobber: cold_start (rows<50) does NOT call kv.set even if ml:model:current exists', async () => {
+    const audit = makeAudit();
+    const kv = makePr2Kv();
+    // kv already has a stored model
+    (kv.get as jest.Mock).mockImplementation((key: string) => {
+      if (key === 'react.max_turns') return Promise.resolve('1');
+      if (key === 'ml:model:current') return Promise.resolve(JSON.stringify({ blob_b64: 'existingblob==' }));
+      return Promise.resolve(null);
+    });
+
+    const rows = makeTrainingRows(10); // well below 50
+    const mlSignalRecord = makeMlSignalRecord(rows);
+    const sandbox = makeSandbox();
+
+    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord, kv);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'train_ml_model',
+      args: {},
+    };
+
+    await callDispatchKernelToolPr2(service, CYCLE_ID, tc);
+
+    // kv.set must NOT be called — existing blob preserved
+    expect(kv.set).not.toHaveBeenCalled();
+  });
+
+  // ── 6.12 Regression: unknown kernel function still dropped ─────────────────
+
+  it('6.12 — unknown kernel function still dropped (regression: registry unchanged for unknown)', async () => {
+    const audit = makeAudit();
+    const sandbox = makeSandbox();
+    const service = makeMlTrainAgentsService(audit, sandbox, null);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'nonexistent_kernel_fn',
+      args: {},
+    };
+
+    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'reflection');
+    expect(valid).toHaveLength(0);
+
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const dropped = auditCalls.find(
+      ([a]) =>
+        a['event_type'] === 'tool_call_dropped' &&
+        (a['meta'] as Record<string, unknown>)?.['reason'] === 'unknown_kernel_tool',
+    );
+    expect(dropped).toBeDefined();
+  });
+});
