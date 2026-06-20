@@ -5462,3 +5462,278 @@ describe('F6-S1 T10 — existing suite regression: _executeCycle reads accumulat
     expect(memory.appendObservation).toHaveBeenCalled();
   });
 });
+
+// ── F6-S2 PR3 — kernel__record_lesson tests ───────────────────────────────────
+
+import type { LessonRecord } from '../long-term-memory/memory-provider.interface';
+
+/** Extended LTM stub that includes promote + listLessons for PR3. */
+function makeLtmPr3(): jest.Mocked<
+  Pick<LongTermMemoryService, 'prefetch' | 'record' | 'updateOutcome' | 'promote' | 'listLessons'>
+> {
+  return {
+    prefetch: jest.fn().mockResolvedValue([]),
+    record: jest.fn().mockResolvedValue(undefined),
+    updateOutcome: jest.fn().mockResolvedValue(undefined),
+    promote: jest.fn().mockResolvedValue(undefined),
+    listLessons: jest.fn().mockResolvedValue([]),
+  };
+}
+
+/** Build an AgentsService with 12 constructor args + promote/listLessons in LTM. */
+function makeLtmPr3AgentsService(
+  llm: Partial<LlmService>,
+  audit: ReturnType<typeof makeAudit>,
+  plugins: ReturnType<typeof makeFullPlugins>,
+  sandbox: ReturnType<typeof makeSandbox> | ReturnType<typeof makeFullSandbox>,
+  memory: ReturnType<typeof makeMemory>,
+  ltm?: ReturnType<typeof makeLtmPr3> | null,
+  snapshot?: Partial<SnapshotService>,
+  pretest?: Partial<PretestService>,
+): AgentsService {
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+    longTermMemory: unknown,
+  ) => AgentsService)(
+    llm,
+    sandbox,
+    plugins,
+    memory,
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    snapshot ?? undefined,
+    undefined,
+    undefined,
+    pretest ?? undefined,
+    makeKvSingleTurn(),
+    ltm ?? undefined,
+  );
+}
+
+/** Call _dispatchKernelTool directly via private cast (PR3 variant). */
+async function callDispatchKernelToolPr3(
+  service: AgentsService,
+  cycleId: string,
+  tc: import('../llm/llm.service').ToolCallRequest,
+): Promise<{ decisions: import('./agents.service').Decision[]; sandbox_results: import('./agents.service').SandboxResult[] }> {
+  const decisions: import('./agents.service').Decision[] = [];
+  const sandbox_results: import('./agents.service').SandboxResult[] = [];
+  await (
+    service as unknown as {
+      _dispatchKernelTool: (
+        c: string,
+        tc: import('../llm/llm.service').ToolCallRequest,
+        d: import('./agents.service').Decision[],
+        s: import('./agents.service').SandboxResult[],
+      ) => Promise<void>;
+    }
+  )._dispatchKernelTool(cycleId, tc, decisions, sandbox_results);
+  return { decisions, sandbox_results };
+}
+
+/** Call _validateToolCalls with a given source. */
+async function callValidateWithSource(
+  service: AgentsService,
+  cycleId: string,
+  calls: import('../llm/llm.service').ToolCallRequest[],
+  source: string,
+): Promise<import('../llm/llm.service').ToolCallRequest[]> {
+  return (
+    service as unknown as {
+      _validateToolCalls: (
+        c: string,
+        t: import('../llm/llm.service').ToolCallRequest[],
+        tools: unknown,
+        plugins: unknown,
+        virtual: unknown,
+        source: string,
+      ) => Promise<import('../llm/llm.service').ToolCallRequest[]>;
+    }
+  )._validateToolCalls(cycleId, calls, undefined, undefined, undefined, source);
+}
+
+describe('F6-S2 PR3 — kernel__record_lesson dispatch', () => {
+  const CYCLE_ID = 'pr3-lesson-001';
+
+  it('3.5a — kernel__record_lesson in KERNEL_TOOL_REGISTRY (not dropped as unknown_kernel_tool)', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const ltm = makeLtmPr3();
+    const service = makeLtmPr3AgentsService(
+      makeLlm(''),
+      audit,
+      plugins,
+      makeSandbox(),
+      makeMemory(),
+      ltm,
+    );
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'record_lesson',
+      args: { text: 'Exit when VIX > 30' },
+    };
+
+    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'reflection');
+    // Must NOT be dropped — 'record_lesson' must be in KERNEL_TOOL_REGISTRY
+    expect(valid).toHaveLength(1);
+    expect(valid[0]?.function).toBe('record_lesson');
+  });
+
+  it('3.5b — kernel__record_lesson from reflection → promote() called, audit lesson_recorded', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const ltm = makeLtmPr3();
+    const service = makeLtmPr3AgentsService(
+      makeLlm(''),
+      audit,
+      plugins,
+      makeSandbox(),
+      makeMemory(),
+      ltm,
+    );
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'record_lesson',
+      args: { text: 'Always exit before FOMC', episode_id: 'ep-1', rationale: 'FOMC volatility' },
+    };
+
+    const { decisions, sandbox_results } = await callDispatchKernelToolPr3(service, CYCLE_ID, tc);
+
+    // promote() must have been called with the lesson record
+    expect(ltm.promote).toHaveBeenCalledTimes(1);
+    const lesson = (ltm.promote as jest.Mock).mock.calls[0][0] as LessonRecord;
+    expect(lesson.text).toBe('Always exit before FOMC');
+    expect(lesson.episode_id).toBe('ep-1');
+    expect(lesson.rationale).toBe('FOMC volatility');
+
+    // audit 'lesson_recorded' must have been emitted
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const lessonAudit = auditCalls.find(([a]) => a['event_type'] === 'lesson_recorded');
+    expect(lessonAudit).toBeDefined();
+
+    // Decision allowed
+    expect(decisions[0]?.allowed).toBe(true);
+    // sandbox_result ok
+    expect(sandbox_results[0]?.ok).toBe(true);
+  });
+
+  it('3.5c — kernel__record_lesson with empty text → invalid_lesson_args, promote NOT called', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const ltm = makeLtmPr3();
+    const service = makeLtmPr3AgentsService(
+      makeLlm(''),
+      audit,
+      plugins,
+      makeSandbox(),
+      makeMemory(),
+      ltm,
+    );
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'record_lesson',
+      args: { text: '' }, // empty
+    };
+
+    const { decisions, sandbox_results } = await callDispatchKernelToolPr3(service, CYCLE_ID, tc);
+
+    expect(ltm.promote).not.toHaveBeenCalled();
+    expect(decisions[0]?.allowed).toBe(false);
+    expect(decisions[0]?.reason).toBe('invalid_lesson_args');
+    expect(sandbox_results[0]?.ok).toBe(false);
+  });
+
+  it('3.5d — kernel__record_lesson when longTermMemory is absent → memory_unavailable', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const service = makeLtmPr3AgentsService(
+      makeLlm(''),
+      audit,
+      plugins,
+      makeSandbox(),
+      makeMemory(),
+      null, // no LTM
+    );
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'record_lesson',
+      args: { text: 'a lesson' },
+    };
+
+    const { decisions, sandbox_results } = await callDispatchKernelToolPr3(service, CYCLE_ID, tc);
+
+    expect(decisions[0]?.allowed).toBe(false);
+    expect(decisions[0]?.reason).toBe('memory_unavailable');
+    expect(sandbox_results[0]?.ok).toBe(false);
+  });
+
+  it('3.5e — kernel__record_lesson from source=cycle is dropped (kernel_source_not_allowed)', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const ltm = makeLtmPr3();
+    const service = makeLtmPr3AgentsService(
+      makeLlm(''),
+      audit,
+      plugins,
+      makeSandbox(),
+      makeMemory(),
+      ltm,
+    );
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'record_lesson',
+      args: { text: 'should be dropped' },
+    };
+
+    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'cycle');
+    // Must be dropped — source=cycle is not allowed
+    expect(valid).toHaveLength(0);
+
+    // audit tool_call_dropped with reason kernel_source_not_allowed
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const dropped = auditCalls.find(
+      ([a]) =>
+        a['event_type'] === 'tool_call_dropped' &&
+        (a['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
+    );
+    expect(dropped).toBeDefined();
+  });
+
+  it('3.5f — kernel__record_lesson from source=chat is dropped (kernel_source_not_allowed)', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const ltm = makeLtmPr3();
+    const service = makeLtmPr3AgentsService(
+      makeLlm(''),
+      audit,
+      plugins,
+      makeSandbox(),
+      makeMemory(),
+      ltm,
+    );
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'record_lesson',
+      args: { text: 'should be dropped from chat' },
+    };
+
+    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'chat');
+    expect(valid).toHaveLength(0);
+  });
+});
