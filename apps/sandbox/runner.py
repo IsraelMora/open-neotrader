@@ -46,6 +46,15 @@ try:
     # Número de archivos abiertos (RLIMIT_NOFILE). Default: 64.
     _resource.setrlimit(_resource.RLIMIT_NOFILE, (64, 64))
 
+    # Número de procesos hijo (RLIMIT_NPROC). Default: 64. Override via SANDBOX_MAX_PROCS.
+    # Uses getattr so only NPROC is skipped on platforms that don't support it (e.g. some containers).
+    _nproc = getattr(_resource, "RLIMIT_NPROC", None)
+    if _nproc is None:
+        print("[sandbox] RLIMIT_NPROC not available on this platform", file=sys.stderr)
+    else:
+        _max_procs = int(os.environ.get("SANDBOX_MAX_PROCS", "64"))
+        _resource.setrlimit(_nproc, (_max_procs, _max_procs))
+
 except (ImportError, ValueError, OSError):
     # El módulo resource no está disponible en Windows o en algunos contenedores
     # No es un error fatal — el sandbox sigue funcionando sin límites del OS
