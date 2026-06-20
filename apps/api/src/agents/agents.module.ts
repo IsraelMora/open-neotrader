@@ -1,5 +1,6 @@
 import { Module, forwardRef } from '@nestjs/common';
 import { AgentsService } from './agents.service';
+import { DebateService } from './debate.service';
 import { LlmModule } from '../llm/llm.module';
 import { SandboxModule } from '../sandbox/sandbox.module';
 import { PluginsModule } from '../plugins/plugins.module';
@@ -11,6 +12,7 @@ import { NotifierModule } from '../notifier/notifier.module';
 import { PretestModule } from '../pretest/pretest.module';
 import { KvService } from '../common/kv.service';
 import { LongTermMemoryModule } from '../long-term-memory/long-term-memory.module';
+import { ProvidersModule } from '../providers/providers.module';
 
 @Module({
   imports: [
@@ -29,8 +31,11 @@ import { LongTermMemoryModule } from '../long-term-memory/long-term-memory.modul
     forwardRef(() => PretestModule),
     // LongTermMemoryModule is a leaf (PrismaModule only) — no circular dep risk.
     LongTermMemoryModule,
+    // ProvidersModule exports ProviderGatewayService needed by AgentsService._isHighImpact.
+    // providers never imports agents — no circular dep.
+    ProvidersModule,
   ],
-  providers: [AgentsService, KvService],
+  providers: [AgentsService, KvService, DebateService],
   exports: [AgentsService],
 })
 export class AgentsModule {}
