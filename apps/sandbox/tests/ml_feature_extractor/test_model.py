@@ -71,7 +71,7 @@ def _make_rows(n: int, plugin_ids: list[str], two_class: bool = True) -> list[di
                 "skill_vector": json.dumps(sv),
                 "action": "buy",
                 "outcome_pnl": pnl,
-                "active_skill_hash": "abc123",
+                "active_skill_hash": hashlib.sha256(",".join(sorted(plugin_ids)).encode()).hexdigest()[:16],
             }
         )
     return rows
@@ -334,3 +334,62 @@ def test_active_skill_hash_parity(model):
     # (documents the cross-language contract)
     assert len(expected) == 16, "Hash must be 16 hex chars"
     assert all(c in "0123456789abcdef" for c in expected), "Hash must be lowercase hex"
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 (CRITICAL): train() must use active_skill_hash from rows[0], NOT
+# re-derive it from feature_names.
+#
+# Rationale: TS _mlResolveModelInjection hashes ALL active skill plugin ids
+# (including skills that emitted no signals this cycle). Python re-deriving
+# from feature_names only includes skills that appeared in training data,
+# producing a different hash whenever a skill was signal-silent → the model
+# always appears stale → the ML feature is permanently inert in production.
+#
+# Single source of truth: the s1-TS-captured hash stored in each training row.
+# rows[0] is the most-recent row (getTrainingData returns ts DESC).
+# ---------------------------------------------------------------------------
+
+def test_train_uses_row_hash_not_feature_names_hash(model):
+    """
+    train() must set active_skill_hash = rows[0]['active_skill_hash'] (the
+    most-recent row's TS-captured hash), NOT a recomputation from feature_names.
+
+    RED: currently model.py re-derives the hash from real plugin_ids in
+    feature_names, so when an active skill is signal-silent the hashes diverge.
+    GREEN: model.py reads rows[0]['active_skill_hash'] verbatim.
+    """
+    # Use a realistic 16-char hash (simulating a set that includes a signal-silent skill)
+    stored_hash = hashlib.sha256("skill-a,skill-b,skill-silent".encode()).hexdigest()[:16]
+    rows = _make_rows(60, ["skill-a", "skill-b"])
+    # Stamp every row with the stored_hash (as s1 capture does)
+    for r in rows:
+        r["active_skill_hash"] = stored_hash
+
+    result = model.train(rows, DEFAULT_CFG)
+
+    assert result["status"] == "trained"
+    # Must echo the stored hash, NOT a recomputed one
+    assert result["active_skill_hash"] == stored_hash, (
+        f"Expected stored hash {stored_hash!r}, got {result['active_skill_hash']!r}. "
+        "train() must use rows[0]['active_skill_hash'], not recompute from feature_names."
+    )
+
+
+def test_train_hash_fallback_when_row_missing_field(model):
+    """
+    If rows lack active_skill_hash, train() must fall back gracefully
+    (None or empty string) — not crash. The TS validator's mismatch→identity
+    path remains safe.
+    """
+    rows = _make_rows(60, ["skill-a", "skill-b"])
+    for r in rows:
+        r.pop("active_skill_hash", None)  # Remove the field entirely
+
+    result = model.train(rows, DEFAULT_CFG)
+
+    assert result["status"] == "trained"
+    # Fallback must be None or '' — either is safe (TS will see mismatch → identity)
+    assert result["active_skill_hash"] in (None, ""), (
+        f"Expected None or '' fallback, got {result['active_skill_hash']!r}"
+    )
