@@ -80,7 +80,11 @@ describe('F6-S2 PR2 — SnapshotService + LongTermMemory', () => {
     expect(result).toBeDefined();
     expect(result!.cycle_id).toBe(CYCLE_ID);
     expect(ltm.updateOutcome).toHaveBeenCalledTimes(1);
-    expect(ltm.updateOutcome).toHaveBeenCalledWith(CYCLE_ID, fakePortfolio.total_pnl, fakePortfolio.equity);
+    expect(ltm.updateOutcome).toHaveBeenCalledWith(
+      CYCLE_ID,
+      fakePortfolio.total_pnl,
+      fakePortfolio.equity,
+    );
   });
 
   it('2.5b — updateOutcome() throws → snapshot still returned, no rethrow', async () => {
