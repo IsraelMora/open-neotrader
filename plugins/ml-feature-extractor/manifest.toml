@@ -22,7 +22,12 @@ min_samples    = 50
 multiplier_min = 0.5
 multiplier_max = 1.5
 
+[hooks]
+# s3: on_cycle hook applies predict() multipliers to pending_signals.confidence.
+# Mirrors signal-aggregator convention: file = hooks/cycle.py, function = on_cycle.
+# Runner resolves: hooks_cfg.get('on_cycle', 'hooks/on_cycle.py') → 'hooks/cycle.py'.
+on_cycle = "hooks/cycle.py"
+
 [permissions]
 network      = false
 emit_events  = false
-# NOTE: NO [hooks] in s2. The on_cycle hook that APPLIES multipliers is s3.

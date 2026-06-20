@@ -25,6 +25,8 @@ const KNOWN_EVENT_TYPES: AuditEventType[] = [
   'debate_stance',
   'debate_consensus',
   'debate_skipped',
+  // ml-feature-extractor-s3: live confidence adjustment audit event
+  'ml_signals_adjusted',
 ];
 
 describe('AuditEventType', () => {
@@ -95,6 +97,14 @@ describe('AuditEventType', () => {
 
   it('f6s3 — includes debate_skipped as a valid event type (compile-guard)', () => {
     const eventType: AuditEventType = 'debate_skipped';
+    expect(KNOWN_EVENT_TYPES).toContain(eventType);
+  });
+
+  // ── ml-feature-extractor-s3 Task 1.1/1.2 — ml_signals_adjusted compile-guard ─
+
+  it('ml-s3 — includes ml_signals_adjusted as a valid event type (compile-guard)', () => {
+    // Compile-time gate: tsc rejects if 'ml_signals_adjusted' is not in the AuditEventType union.
+    const eventType: AuditEventType = 'ml_signals_adjusted';
     expect(KNOWN_EVENT_TYPES).toContain(eventType);
   });
 });
