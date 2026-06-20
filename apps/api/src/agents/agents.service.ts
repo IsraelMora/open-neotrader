@@ -254,6 +254,30 @@ const KERNEL_TRAIN_ML_MODEL_TOOL: import('../plugins/plugins.service').ProviderT
 };
 
 /**
+ * Schema definition for the kernel__tune_plugin_param tool.
+ * Injected into the LLM tool schema ONLY when source === 'reflection'.
+ * Mutates a live skill plugin's config via plugins.mergeConfig, governed by
+ * param-discipline check_lock + journal_entry. Fail-closed: any gate fails → no mutation.
+ * Only skill plugins are tunable (not disciplines, providers, universes, or param-discipline itself).
+ */
+const KERNEL_TUNE_PLUGIN_PARAM_TOOL: import('../plugins/plugins.service').ProviderTool = {
+  plugin_id: 'kernel',
+  name: 'kernel__tune_plugin_param',
+  description:
+    'Tunes a live skill plugin config parameter via param-discipline governance. Reflection turns only. Fail-closed: any gate (type, schema, lock, budget, hypothesis) fails → no mutation.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      plugin_id: { type: 'string' },
+      param: { type: 'string' },
+      value: {},
+      hypothesis: { type: 'string' },
+    },
+    required: ['plugin_id', 'param', 'value', 'hypothesis'],
+  },
+};
+
+/**
  * Cold-start threshold: minimum number of labeled rows required to attempt training.
  * Mirrors manifest [config].min_samples = 50 in plugins/ml-feature-extractor/manifest.toml.
  * Below this, the handler audits cold_start and returns without writing KV.
@@ -279,6 +303,7 @@ const KERNEL_TOOL_REGISTRY: Set<string> = new Set([
   'promote_pretest',
   'record_lesson',
   'train_ml_model',
+  'tune_plugin_param',
 ]);
 
 /** Plugin id of the ML discipline — used for opt-in injection and ML-first sort. */
@@ -597,6 +622,7 @@ export class AgentsService {
             KERNEL_PROMOTE_PRETEST_TOOL,
             KERNEL_RECORD_LESSON_TOOL,
             KERNEL_TRAIN_ML_MODEL_TOOL,
+            KERNEL_TUNE_PLUGIN_PARAM_TOOL,
           ]
         : [];
     const effectiveTools = [...providerTools, ...kernelTools];
@@ -1423,6 +1449,8 @@ export class AgentsService {
       await this._kernelRecordLesson(cycle_id, tc, decisions, sandbox_results);
     } else if (tc.function === 'train_ml_model') {
       await this._kernelTrainMlModel(cycle_id, tc, decisions, sandbox_results);
+    } else if (tc.function === 'tune_plugin_param') {
+      await this._kernelTunePluginParam(cycle_id, tc, decisions, sandbox_results);
     } else {
       this.log.warn(`_dispatchKernelTool: unknown kernel function '${tc.function}' — dropped`);
       decisions.push({ ...tc, allowed: false, reason: 'unknown_kernel_tool' });
@@ -1833,6 +1861,200 @@ export class AgentsService {
         error: String(e),
       });
     }
+  }
+
+  /**
+   * Handles kernel__tune_plugin_param dispatch.
+   * Reflection-gated (injection side guarantees source==='reflection').
+   * Fail-closed: any gate failure → Decision{allowed:false} + sandbox_result{ok:false} + continue.
+   * Never rethrows — reflection turn always survives.
+   * Journal KV round-trip: load before check_lock, persist ONLY on success (Step 10).
+   * All lock/budget/hypothesis logic delegated to param-discipline via sandbox (no TS duplication).
+   */
+  private async _kernelTunePluginParam(
+    cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+  ): Promise<void> {
+    // Helper: push a rejection result without throwing
+    const reject = (reason: string, detail?: string) => {
+      decisions.push({ ...tc, allowed: false, reason, ...(detail ? { detail } : {}) });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: reason,
+      });
+    };
+
+    try {
+      // Coerce args
+      const plugin_id = typeof tc.args['plugin_id'] === 'string' ? tc.args['plugin_id'] : '';
+      const param = typeof tc.args['param'] === 'string' ? tc.args['param'] : '';
+      const value = tc.args['value'];
+      const hypothesis = typeof tc.args['hypothesis'] === 'string' ? tc.args['hypothesis'] : '';
+
+      // Step 1 — Plugin resolution (null sentinel avoids nested try/catch)
+      const plugin = await this.plugins.findById(plugin_id).catch(() => null);
+      if (!plugin) {
+        reject('plugin_not_found');
+        return;
+      }
+
+      // Step 2 — Skill-only guard
+      if (plugin.type !== 'skill') {
+        reject('not_a_skill');
+        return;
+      }
+
+      // Step 3 — Schema lookup
+      const schema = await this.plugins.getConfigSchema(plugin_id);
+      if (!schema || !(param in schema)) {
+        reject('param_not_in_schema');
+        return;
+      }
+
+      // Step 4 — Value validation (delegates to validateSingleField → validateField)
+      const validationErrors = await this.plugins.validateSingleField(plugin_id, param, value);
+      if (validationErrors.length > 0) {
+        reject('invalid_value', validationErrors.join('; '));
+        return;
+      }
+
+      // Step 5 — Discipline activation check
+      const activePlugins = await this.plugins.findActive();
+      const disciplinePlugin = activePlugins.find((p) => p.id === 'param-discipline');
+      if (!disciplinePlugin) {
+        reject('discipline_inactive');
+        return;
+      }
+      const disciplineConfig: Record<string, unknown> = disciplinePlugin.config ?? {};
+
+      // Steps 6–10: delegate to _runTuneChain (extracted to manage cognitive complexity)
+      const chainResult = await this._runTuneChain({
+        cycle_id,
+        plugin_id,
+        param,
+        value,
+        hypothesis,
+        pluginConfig: plugin.config ?? {},
+        disciplineConfig,
+      });
+
+      if (chainResult.gateReason) {
+        reject(chainResult.gateReason);
+        return;
+      }
+
+      // Step 10b — Audit + return success
+      await this.audit.log({
+        cycle_id,
+        plugin_id,
+        event_type: 'param_tuned',
+        meta: {
+          plugin_id,
+          param,
+          before: chainResult.before,
+          after: value,
+          hypothesis,
+          entry_id: chainResult.entry_id,
+        },
+      });
+
+      decisions.push({ ...tc, allowed: true });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: true,
+        result: { ok: true, entry_id: chainResult.entry_id },
+      });
+    } catch (e: unknown) {
+      // FAIL-SOFT: catch-all — any unexpected error must not break the reflection turn
+      this.log.warn(`[tune_plugin_param] unexpected error: ${String(e)}`);
+      await this.audit.log({
+        cycle_id,
+        event_type: 'param_tuned',
+        meta: { status: 'error', error: String(e) },
+      });
+      reject('tune_error');
+    }
+  }
+
+  /**
+   * Internal helper for _kernelTunePluginParam steps 6–10 (journal/lock chain).
+   * Extracted to keep _kernelTunePluginParam within sonarjs cognitive-complexity limit.
+   * Returns { gateReason } on any reject gate, or { before, entry_id, updatedJournal } on success.
+   */
+  private async _runTuneChain(args: {
+    cycle_id: string;
+    plugin_id: string;
+    param: string;
+    value: unknown;
+    hypothesis: string;
+    pluginConfig: Record<string, unknown>;
+    disciplineConfig: Record<string, unknown>;
+  }): Promise<
+    | { gateReason: string; before?: undefined; entry_id?: undefined }
+    | { gateReason: undefined; before: unknown; entry_id: string }
+  > {
+    const { cycle_id, plugin_id, param, value, hypothesis, pluginConfig, disciplineConfig } = args;
+
+    // Guard — KV is required for journal persistence; without it governance cannot be enforced
+    if (!this.kv) return { gateReason: 'kv_unavailable' };
+
+    // Step 6 — Load journal from KV + check lock
+    const rawJournal = await this.kv.get('param:journal');
+    const journal: unknown[] = rawJournal ? (JSON.parse(rawJournal) as unknown[]) : [];
+
+    const lockRes = await this.sandbox.callPlugin('param-discipline', 'check_lock', {
+      plugin_id,
+      journal,
+      config: disciplineConfig,
+    });
+    if (!lockRes.ok) return { gateReason: 'lock_check_failed' };
+    const lockResult = (lockRes.result ?? {}) as Record<string, unknown>;
+    if (lockResult['locked']) return { gateReason: 'param_locked' };
+
+    // Step 7 — Read current value (params_before)
+    const before = pluginConfig[param];
+
+    // Step 8 — Journal entry (covers budget + hypothesis checks)
+    const jeRes = await this.sandbox.callPlugin('param-discipline', 'journal_entry', {
+      plugin_id,
+      params_before: { [param]: before },
+      params_after: { [param]: value },
+      reason: hypothesis,
+      hypothesis,
+      cycle_id,
+      journal,
+      config: disciplineConfig,
+    });
+    const jeResult = (jeRes.result ?? {}) as Record<string, unknown>;
+    if (!jeRes.ok || !jeResult['ok']) return { gateReason: 'journal_rejected' };
+
+    // Step 9 — Persist journal BEFORE applying config (conservative: phantom lock > silent bypass)
+    // If KV write fails, return a distinct gate reason (fail-closed; config NOT applied)
+    const updatedJournal = jeResult['journal'] as unknown[];
+    try {
+      await this.kv.set('param:journal', JSON.stringify(updatedJournal));
+    } catch {
+      return { gateReason: 'journal_persist_failed' };
+    }
+
+    // Step 10 — Config apply (mergeConfig re-validates = defense in depth)
+    // If this fails, the journal entry already persists (phantom lock, acceptable over silent bypass)
+    const applyOk = await this.plugins
+      .mergeConfig(plugin_id, { [param]: value })
+      .then(() => true)
+      .catch(() => false);
+    if (!applyOk) return { gateReason: 'apply_failed' };
+
+    return {
+      gateReason: undefined,
+      before,
+      entry_id: typeof jeResult['entry_id'] === 'string' ? jeResult['entry_id'] : '',
+    };
   }
 
   /**
