@@ -5020,6 +5020,292 @@ describe('F6-S1 T9 — _composeIterationContext: context cap enforced', () => {
   });
 });
 
+// ── F6-S2 PR2 — LongTermMemory integration tests (RED phase) ─────────────────
+
+import type { LongTermMemoryService } from '../long-term-memory/long-term-memory.service';
+import type { EpisodeInput } from '../long-term-memory/memory-provider.interface';
+
+/** Typed LTM stub that mirrors MemoryProvider methods needed by PR2. */
+function makeLtm(): jest.Mocked<
+  Pick<LongTermMemoryService, 'prefetch' | 'record' | 'updateOutcome'>
+> {
+  return {
+    prefetch: jest.fn().mockResolvedValue([]),
+    record: jest.fn().mockResolvedValue(undefined),
+    updateOutcome: jest.fn().mockResolvedValue(undefined),
+  };
+}
+
+/** Build an AgentsService with 12 constructor args (adds longTermMemory as 12th). */
+function makeLtmAgentsService(
+  llm: Partial<LlmService>,
+  audit: ReturnType<typeof makeAudit>,
+  plugins: ReturnType<typeof makeFullPlugins>,
+  sandbox: ReturnType<typeof makeSandbox> | ReturnType<typeof makeFullSandbox>,
+  memory: ReturnType<typeof makeMemory>,
+  ltm?: jest.Mocked<Pick<LongTermMemoryService, 'prefetch' | 'record' | 'updateOutcome'>> | null,
+): AgentsService {
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+    longTermMemory: unknown,
+  ) => AgentsService)(
+    llm,
+    sandbox,
+    plugins,
+    memory,
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    makeKvSingleTurn(),
+    ltm ?? undefined,
+  );
+}
+
+async function callExecuteCycleLtm(
+  service: AgentsService,
+  cycleId: string,
+  context: string,
+) {
+  return (
+    service as unknown as {
+      _executeCycle: (c: string, ctx: string, sp?: string) => Promise<unknown>;
+    }
+  )._executeCycle(cycleId, context, undefined);
+}
+
+describe('F6-S2 PR2 — LongTermMemory in _executeCycle', () => {
+  const CYCLE_ID = 'ltm-cycle-001';
+
+  it('2.1a — record() called after cycle with outcome_pnl null and correct fields', async () => {
+    const ltm = makeLtm();
+    // Prefetch returns empty → no injection
+    ltm.prefetch.mockResolvedValue([]);
+
+    const toolText =
+      '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"SPY","action":"exit","qty":1}}]</tool_calls>';
+    const plugins = makeFullPlugins('Decide.', [
+      {
+        plugin_id: 'alpaca-provider',
+        name: 'alpaca-provider__place_order',
+        description: '',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ]);
+    plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
+    const sandbox = makeFullSandbox();
+    sandbox.runCycle.mockResolvedValue({
+      ok: true,
+      result: { pending_signals: [{ symbol: 'SPY', action: 'exit' }] },
+    } as never);
+
+    const llm = makeLlm(toolText);
+    const audit = makeAudit();
+    const memory = makeMemory();
+    const service = makeLtmAgentsService(llm, audit, plugins, sandbox, memory, ltm);
+
+    await callExecuteCycleLtm(service, CYCLE_ID, 'run cycle');
+
+    expect(ltm.record).toHaveBeenCalledTimes(1);
+    const ep = (ltm.record as jest.Mock).mock.calls[0][0] as EpisodeInput;
+    expect(ep.cycle_id).toBe(CYCLE_ID);
+    // outcome is not set by record — it stays null until snapshot
+    expect('outcome_pnl' in ep).toBe(false);
+    expect(Array.isArray(ep.symbols)).toBe(true);
+    expect(typeof ep.action_summary).toBe('string');
+    expect(ep.action_summary.length).toBeLessThanOrEqual(200);
+    expect(typeof ep.llm_rationale).toBe('string');
+    expect(ep.llm_rationale.length).toBeLessThanOrEqual(500);
+    expect(typeof ep.narrative).toBe('string');
+  });
+
+  it('2.1b — prefetch hits → [EPISODIOS RELEVANTES] block injected into LLM context', async () => {
+    const ltm = makeLtm();
+    // Return a fake hit so prefetch > 0
+    ltm.prefetch.mockResolvedValue([
+      {
+        id: 'ep-1',
+        ts: new Date(),
+        cycle_id: 'old-cycle',
+        symbols: '["SPY"]',
+        regime_tags: '[]',
+        action_summary: 'EXIT SPY',
+        llm_rationale: 'market turned bearish',
+        narrative: 'SPY EXIT market turned bearish',
+        outcome_pnl: -50,
+        outcome_equity: 9950,
+        promoted: false,
+        meta: null,
+      },
+    ]);
+
+    const capturedContexts: string[] = [];
+    const llmComplete = jest.fn().mockImplementation((opts: { context: string }) => {
+      capturedContexts.push(opts.context);
+      return Promise.resolve({
+        text: '',
+        tool_calls: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+      } as LlmResponse);
+    });
+
+    const plugins = makeFullPlugins(null, []);
+    plugins.findActive.mockResolvedValue([] as never);
+    const sandbox = makeFullSandbox();
+    sandbox.runCycle.mockResolvedValue({
+      ok: true,
+      result: { pending_signals: [{ symbol: 'SPY', action: 'exit' }] },
+    } as never);
+
+    const audit = makeAudit();
+    const memory = makeMemory();
+    const service = makeLtmAgentsService(
+      { complete: llmComplete } as Partial<LlmService>,
+      audit,
+      plugins,
+      sandbox,
+      memory,
+      ltm,
+    );
+
+    await callExecuteCycleLtm(service, CYCLE_ID, 'run cycle');
+
+    expect(capturedContexts.length).toBeGreaterThan(0);
+    // The context passed to LLM must contain [EPISODIOS RELEVANTES]
+    expect(capturedContexts[0]).toContain('[EPISODIOS RELEVANTES]');
+    // Block must fit within 800 chars after the marker
+    const blockStart = capturedContexts[0].indexOf('[EPISODIOS RELEVANTES]');
+    const block = capturedContexts[0].slice(blockStart);
+    expect(block.length).toBeLessThanOrEqual(800);
+  });
+
+  it('2.1c — prefetch empty → [EPISODIOS RELEVANTES] NOT injected', async () => {
+    const ltm = makeLtm();
+    ltm.prefetch.mockResolvedValue([]); // no hits
+
+    const capturedContexts: string[] = [];
+    const llmComplete = jest.fn().mockImplementation((opts: { context: string }) => {
+      capturedContexts.push(opts.context);
+      return Promise.resolve({
+        text: '',
+        tool_calls: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+      } as LlmResponse);
+    });
+
+    const plugins = makeFullPlugins(null, []);
+    plugins.findActive.mockResolvedValue([] as never);
+    const sandbox = makeFullSandbox();
+    sandbox.runCycle.mockResolvedValue({
+      ok: true,
+      result: { pending_signals: [{ symbol: 'QQQ', action: 'hold' }] },
+    } as never);
+
+    const audit = makeAudit();
+    const memory = makeMemory();
+    const service = makeLtmAgentsService(
+      { complete: llmComplete } as Partial<LlmService>,
+      audit,
+      plugins,
+      sandbox,
+      memory,
+      ltm,
+    );
+
+    await callExecuteCycleLtm(service, CYCLE_ID, 'run cycle');
+
+    expect(capturedContexts.length).toBeGreaterThan(0);
+    expect(capturedContexts[0]).not.toContain('[EPISODIOS RELEVANTES]');
+  });
+
+  it('2.1d — record() throws → cycle still completes, no rethrow', async () => {
+    const ltm = makeLtm();
+    ltm.prefetch.mockResolvedValue([]);
+    ltm.record.mockRejectedValue(new Error('DB write failed'));
+
+    const llm = makeLlm('');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    plugins.findActive.mockResolvedValue([] as never);
+    const sandbox = makeFullSandbox();
+    sandbox.runCycle.mockResolvedValue({ ok: true, result: {} } as never);
+    const memory = makeMemory();
+    const service = makeLtmAgentsService(llm, audit, plugins, sandbox, memory, ltm);
+
+    // Must NOT throw
+    await expect(callExecuteCycleLtm(service, CYCLE_ID, 'run cycle')).resolves.toBeDefined();
+  });
+
+  it('2.1e — prefetch() throws → cycle still completes, block NOT injected', async () => {
+    const ltm = makeLtm();
+    ltm.prefetch.mockRejectedValue(new Error('FTS5 gone'));
+    ltm.record.mockResolvedValue(undefined);
+
+    const capturedContexts: string[] = [];
+    const llmComplete = jest.fn().mockImplementation((opts: { context: string }) => {
+      capturedContexts.push(opts.context);
+      return Promise.resolve({
+        text: '',
+        tool_calls: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+      } as LlmResponse);
+    });
+
+    const plugins = makeFullPlugins(null, []);
+    plugins.findActive.mockResolvedValue([] as never);
+    const sandbox = makeFullSandbox();
+    sandbox.runCycle.mockResolvedValue({ ok: true, result: {} } as never);
+    const audit = makeAudit();
+    const memory = makeMemory();
+    const service = makeLtmAgentsService(
+      { complete: llmComplete } as Partial<LlmService>,
+      audit,
+      plugins,
+      sandbox,
+      memory,
+      ltm,
+    );
+
+    // Must NOT throw and block must NOT appear
+    await expect(callExecuteCycleLtm(service, CYCLE_ID, 'run cycle')).resolves.toBeDefined();
+    if (capturedContexts.length > 0) {
+      expect(capturedContexts[0]).not.toContain('[EPISODIOS RELEVANTES]');
+    }
+  });
+
+  it('2.1f — @Optional null (no LTM injected) → cycle runs fine, no crash', async () => {
+    const llm = makeLlm('');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    plugins.findActive.mockResolvedValue([] as never);
+    const sandbox = makeFullSandbox();
+    sandbox.runCycle.mockResolvedValue({ ok: true, result: {} } as never);
+    const memory = makeMemory();
+    // Pass null explicitly → longTermMemory is undefined in service
+    const service = makeLtmAgentsService(llm, audit, plugins, sandbox, memory, null);
+
+    await expect(callExecuteCycleLtm(service, CYCLE_ID, 'run cycle')).resolves.toBeDefined();
+  });
+});
+
 // ── T10: Full existing suite regression guard ─────────────────────────────────
 
 describe('F6-S1 T10 — existing suite regression: _executeCycle reads accumulated signals/decisions', () => {
