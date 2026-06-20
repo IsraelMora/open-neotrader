@@ -37,6 +37,35 @@ SANDBOX_DIR = Path(__file__).parent.parent
 RUNNER_PATH = SANDBOX_DIR / "runner.py"
 SDK_PATH = SANDBOX_DIR.parent.parent / "packages" / "plugin-sdk"
 
+# Module names that this file loads into sys.modules and must clean up.
+_SDK_MODULE_NAMES = (
+    "neurotrader_sdk",
+    "neurotrader_sdk.context",
+    "neurotrader_sdk.decorators",
+    "_runner_sdk_check",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_sys_state():
+    """Snapshot sys.path and SDK-related sys.modules entries before each test
+    and fully restore them after, preventing leakage into other test files."""
+    # Capture state before test
+    path_snapshot = list(sys.path)
+    modules_snapshot = {k: sys.modules.get(k) for k in _SDK_MODULE_NAMES}
+
+    yield
+
+    # Restore sys.path
+    sys.path[:] = path_snapshot
+
+    # Restore sys.modules: re-insert original value or remove the key entirely
+    for name, original in modules_snapshot.items():
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+
 
 def _load_runner():
     """Load a fresh runner module to get helpers and command functions.
@@ -46,6 +75,8 @@ def _load_runner():
     - Patches isolation.apply so it does not install the open() guard in-process
       (prevents the guard from blocking file access in subsequent tests that use
       different tmp_path directories).
+    - The SDK path is added to sys.path here; _isolate_sys_state restores it after
+      the test so it does not leak into other test files.
     """
     if str(SDK_PATH) not in sys.path:
         sys.path.insert(0, str(SDK_PATH))
