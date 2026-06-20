@@ -5,6 +5,7 @@ import type { SandboxGateway } from '../sandbox/sandbox.gateway';
 import type { PluginsService } from '../plugins/plugins.service';
 import type { PluginEventsService } from '../plugins/plugin-events.service';
 import type { AuditService } from '../audit/audit.service';
+import type { CycleExecutorService } from '../cycle/cycle-executor.service';
 import { PanelService } from './panel.service';
 
 // ── Stubs ─────────────────────────────────────────────────────────────────────
@@ -34,6 +35,10 @@ function makeAgents(): jest.Mocked<Pick<AgentsService, 'runGovernedTurn'>> {
   };
 }
 
+function makeCycleExecutorStub(): Pick<CycleExecutorService, 'getRunStatus'> {
+  return { getRunStatus: jest.fn().mockReturnValue({ running: false, last: null }) };
+}
+
 function makePanelService(
   agents: jest.Mocked<Pick<AgentsService, 'runGovernedTurn'>>,
 ): PanelService {
@@ -45,6 +50,7 @@ function makePanelService(
     {} as unknown as PluginsService,
     {} as unknown as PluginEventsService,
     {} as unknown as AuditService,
+    makeCycleExecutorStub() as unknown as CycleExecutorService,
   );
 }
 

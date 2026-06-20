@@ -1,18 +1,13 @@
-import { BadRequestException, ConflictException, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, Logger, forwardRef } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { AgentsService, ReflectionTurnResult } from '../agents/agents.service';
+import { AgentsService } from '../agents/agents.service';
 import { LlmService } from '../llm/llm.service';
 import { SandboxGateway } from '../sandbox/sandbox.gateway';
 import { PluginsService } from '../plugins/plugins.service';
 import { PluginEventsService } from '../plugins/plugin-events.service';
 import { AuditService } from '../audit/audit.service';
 import { UniverseEditDto } from './dto/universe-edit.dto';
-
-/** Estado en memoria del último ciclo ejecutado: si está corriendo ahora y el resultado previo. */
-export interface RunState {
-  running: boolean;
-  last: { ok: boolean; dry_run: boolean; started_at: string; error?: string } | null;
-}
+import { CycleExecutorService } from '../cycle/cycle-executor.service';
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [k: string]: JsonValue };
 
@@ -23,7 +18,6 @@ const VALID_LOG_STREAM = /^[a-z][a-z0-9_]{0,63}$/;
 @Injectable()
 export class PanelService {
   private readonly log = new Logger(PanelService.name);
-  private runState: RunState = { running: false, last: null };
 
   constructor(
     private readonly db: PrismaService,
@@ -33,6 +27,8 @@ export class PanelService {
     private readonly plugins: PluginsService,
     private readonly pluginEvents: PluginEventsService,
     private readonly audit: AuditService,
+    @Inject(forwardRef(() => CycleExecutorService))
+    private readonly cycleExecutor: CycleExecutorService,
   ) {}
 
   // ── Config ────────────────────────────────────────────────────────────────
@@ -104,100 +100,8 @@ export class PanelService {
           }
         }),
       ),
-      last_run: this.runState.last,
+      last_run: this.cycleExecutor.getRunStatus().last,
     };
-  }
-
-  /** Devuelve el estado en memoria del ciclo actual (sincrono, sin I/O). */
-  getRunStatus() {
-    return this.runState;
-  }
-
-  // ── Cycle ─────────────────────────────────────────────────────────────────
-
-  /**
-   * Lanza un ciclo del agente de forma asíncrona.
-   * Devuelve inmediatamente con {accepted: true} si no hay otro ciclo en curso.
-   * Si `dryRun` es true, solo ejecuta plugins sin llamar al LLM.
-   */
-  runCycle(dryRun: boolean, prompt?: string): { accepted: boolean; message: string } {
-    if (this.runState.running) return { accepted: false, message: 'Ya hay un ciclo en curso' };
-    this.runState.running = true;
-    const startedAt = new Date().toISOString();
-    const cycleId = crypto.randomUUID();
-    this.pluginEvents.emit('cycle.started', { started_at: startedAt, dry_run: dryRun });
-    void this.audit.log({
-      cycle_id: cycleId,
-      event_type: 'cycle_start',
-      meta: { dry_run: dryRun, prompt },
-    });
-    this.executeCycle(dryRun, startedAt, cycleId, prompt).catch((err) =>
-      this.log.error('Error en ciclo', err),
-    );
-    return { accepted: true, message: dryRun ? 'Ciclo dry-run iniciado' : 'Ciclo iniciado' };
-  }
-
-  private async executeCycle(dryRun: boolean, startedAt: string, cycleId: string, prompt?: string) {
-    try {
-      let decisions = 0;
-      let skillsRead: string[] = [];
-      let skillsWritten: string[] = [];
-      let llmText: string | undefined;
-
-      if (dryRun) {
-        const active = await this.plugins.findActive();
-        const res = await this.sandbox.runCycle(
-          active.map((p) => p.id),
-          { dry_run: true, started_at: startedAt },
-        );
-        this.runState.last = { ok: res.ok, dry_run: true, started_at: startedAt, error: res.error };
-      } else {
-        const context = prompt ?? startedAt;
-        const result = await this.agents.runCycle(context);
-        decisions = result.decisions.length;
-        skillsRead = result.llm_response?.skills_read ?? [];
-        skillsWritten = result.llm_response?.skills_written ?? [];
-        llmText = result.llm_text;
-        this.runState.last = { ok: true, dry_run: false, started_at: startedAt };
-        this.log.log(`Ciclo completado: ${decisions} decisiones`);
-      }
-
-      this.pluginEvents.emit('cycle.completed', {
-        started_at: startedAt,
-        dry_run: dryRun,
-        decisions,
-        skills_read: skillsRead,
-        skills_written: skillsWritten,
-      });
-      await this.appendLog('agent_cycles', {
-        ok: this.runState.last?.ok,
-        dry_run: dryRun,
-        started_at: startedAt,
-        decisions,
-      });
-      void this.audit.log({
-        cycle_id: cycleId,
-        event_type: 'cycle_complete',
-        llm_text: llmText,
-        signals_count: decisions,
-        skills_read: skillsRead,
-        skills_written: skillsWritten,
-        sandbox_ok: true,
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.runState.last = { ok: false, dry_run: dryRun, started_at: startedAt, error: msg };
-      this.pluginEvents.emit('cycle.failed', { started_at: startedAt, error: msg });
-      await this.appendLog('agent_cycles', {
-        ok: false,
-        dry_run: dryRun,
-        started_at: startedAt,
-        error: msg,
-      });
-      void this.audit.log({ cycle_id: cycleId, event_type: 'cycle_fail', error: msg });
-    } finally {
-      this.runState.running = false;
-    }
   }
 
   // ── Chat ──────────────────────────────────────────────────────────────────
@@ -360,31 +264,5 @@ export class PanelService {
       throw new BadRequestException(`clave de métrica inválida: ${JSON.stringify(key)}`);
     }
     return this.getCfgKey(key, null);
-  }
-
-  // ── F4-S2: Manual reflection trigger ──────────────────────────────────────
-
-  /**
-   * Triggers a reflection turn immediately, bypassing the cadence check.
-   * Guards against concurrent execution: throws 409 ConflictException if a cycle
-   * (or another reflection) is currently running.
-   *
-   * This endpoint is reachable via POST /agents/reflect (guarded by JwtAuthGuard
-   * and TotpRequiredGuard). The scheduler also calls this via _maybeReflect to
-   * avoid injecting AgentsService directly into CycleSchedulerService (which would
-   * risk a circular module dependency: scheduler→panel already exists; no new edge needed).
-   */
-  async reflectNow(): Promise<ReflectionTurnResult> {
-    if (this.runState.running) {
-      throw new ConflictException(
-        'A cycle is currently running — reflection cannot start concurrently',
-      );
-    }
-    this.runState.running = true;
-    try {
-      return await this.agents.runReflectionTurn();
-    } finally {
-      this.runState.running = false;
-    }
   }
 }
