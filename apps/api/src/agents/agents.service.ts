@@ -406,6 +406,8 @@ export class AgentsService {
     context: string;
     system_prompt?: string;
     effectiveTools: import('../plugins/plugins.service').ProviderTool[];
+    /** F6-s4: filtered subset for [TOOL SCHEMA] injection only. _validateToolCalls still uses effectiveTools. */
+    visibleTools: import('../plugins/plugins.service').ProviderTool[];
     _activePlugins?: import('../plugins/plugins.service').HydratedPlugin[];
     virtual_only?: boolean;
     /** Pre-resolved decision prompt (hoisted once per governed turn — avoids N DB round-trips). */
@@ -421,14 +423,15 @@ export class AgentsService {
     skills_written: string[];
     hadToolCalls: boolean;
   }> {
-    const { cycle_id, source, effectiveTools, decisionPrompt } = args;
+    const { cycle_id, source, effectiveTools, visibleTools, decisionPrompt } = args;
 
     // ── Build system prompt with decision prompt + tool schema ────────────────
     // decisionPrompt is resolved ONCE per governed turn in runGovernedTurn and passed
     // here to avoid N DB round-trips (one per iteration) for a value constant per turn.
+    // F6-s4: [TOOL SCHEMA] uses visibleTools (pre-inference gate); _validateToolCalls uses effectiveTools.
     let builtSystemPrompt = args.system_prompt ?? '';
     if (decisionPrompt !== null) {
-      const toolSchemaJson = JSON.stringify(effectiveTools);
+      const toolSchemaJson = JSON.stringify(visibleTools);
       if (toolSchemaJson.length > 8000) {
         this.log.warn(
           `token-budget guard: injected tool schema is ${toolSchemaJson.length} chars — consider reducing active tools`,
@@ -563,6 +566,10 @@ export class AgentsService {
           ]
         : [];
     const effectiveTools = [...providerTools, ...kernelTools];
+    // F6-s4: compute visibleTools ONCE per governed turn (pre-inference gate).
+    // visibleTools is used for [TOOL SCHEMA] only; _validateToolCalls keeps effectiveTools (defense in depth).
+    // When nothing is hidden, _computeVisibleTools returns the same array reference → byte-identical schema.
+    const visibleTools = await this._computeVisibleTools(effectiveTools, input.virtual_only);
     // Hoisted ONCE per governed turn — avoids N DB round-trips for a value that is
     // constant for the lifetime of this turn (decision prompt does not change mid-loop).
     const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
@@ -587,6 +594,7 @@ export class AgentsService {
         context: iterContext,
         system_prompt: input.system_prompt,
         effectiveTools,
+        visibleTools,
         _activePlugins: input._activePlugins,
         virtual_only: input.virtual_only,
         decisionPrompt,
@@ -1521,6 +1529,66 @@ export class AgentsService {
       ok: true,
       result: { text, episode_id, rationale },
     });
+  }
+
+  /**
+   * F6-s4: Reads gating configuration from KV.
+   * Fail-safe: absent KV service, absent key, or any read error → default ON (hide providers when CB open).
+   * Only the literal string 'false' disables hiding. All other values (including null, 'true', thrown) → true.
+   * Mirrors _readDebateConfig pattern.
+   */
+  private async _readGatingConfig(): Promise<{ hideTradesWhenCbOpen: boolean }> {
+    const DEFAULTS = { hideTradesWhenCbOpen: true };
+    if (!this.kv) return DEFAULTS;
+    try {
+      const raw = await this.kv.get('gating.hide_trades_when_cb_open');
+      return { hideTradesWhenCbOpen: raw !== 'false' }; // strict: only literal 'false' disables
+    } catch {
+      return DEFAULTS;
+    }
+  }
+
+  /**
+   * F6-s4: Computes the visible tool subset for the LLM [TOOL SCHEMA].
+   * NEVER throws — any error returns effectiveTools unchanged (fail-safe: show all; validate guards).
+   *
+   * Short-circuit: if no tool has plugin_type === 'provider', skip BOTH KV reads and return effectiveTools.
+   * Otherwise:
+   *   - Read 'scheduler:circuit_breaker' KV → JSON.parse → state === 'open' (try/catch → false).
+   *   - Read gating config.
+   *   - hide = (cfg.hideTradesWhenCbOpen && cbOpen) || virtual_only === true
+   *   - If hide → filter(plugin_type !== 'provider'), else → return same ref (byte-identical).
+   */
+  private async _computeVisibleTools(
+    effectiveTools: import('../plugins/plugins.service').ProviderTool[],
+    virtual_only?: boolean,
+  ): Promise<import('../plugins/plugins.service').ProviderTool[]> {
+    try {
+      // Short-circuit: no provider-type tools → skip all KV reads, return identity
+      const hasProvider = effectiveTools.some((t) => t.plugin_type === 'provider');
+      if (!hasProvider) return effectiveTools;
+
+      let cbOpen = false;
+      if (this.kv) {
+        try {
+          const raw = await this.kv.get('scheduler:circuit_breaker');
+          if (raw) {
+            const cb = JSON.parse(raw) as { state?: string };
+            cbOpen = cb.state === 'open'; // strictly 'open'; half_open/closed/absent → false
+          }
+        } catch {
+          cbOpen = false; // malformed or read error → treat as not-open (fail-safe)
+        }
+      }
+
+      const gating = await this._readGatingConfig();
+      const hide = (gating.hideTradesWhenCbOpen && cbOpen) || virtual_only === true;
+
+      if (!hide) return effectiveTools; // identity → byte-identical schema
+      return effectiveTools.filter((t) => t.plugin_type !== 'provider');
+    } catch {
+      return effectiveTools; // any unexpected error → safe (show all; validation guards)
+    }
   }
 
   /**

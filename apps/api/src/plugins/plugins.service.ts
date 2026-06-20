@@ -50,6 +50,8 @@ export interface ProviderTool {
   name: string;
   description: string;
   input_schema: { type: 'object'; properties: Record<string, unknown>; required?: string[] };
+  /** Source plugin type — populated by getProviderTools() for pre-inference gating (F6-s4). Optional for backward compat. */
+  plugin_type?: import('./manifest').PluginType;
 }
 
 const execFileAsync = promisify(execFile);
@@ -494,6 +496,8 @@ export class PluginsService implements OnApplicationBootstrap {
                 type: 'object',
                 properties: {},
               }) as ProviderTool['input_schema'],
+            // F6-s4: carry plugin type so _computeVisibleTools can gate by plugin_type without DB query
+            plugin_type: plugin.type as import('./manifest').PluginType,
           });
         }
       } catch {

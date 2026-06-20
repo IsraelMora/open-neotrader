@@ -6904,3 +6904,441 @@ describe('F6-S3 PR-B B4 — _executeToolCalls debate intercept', () => {
     expect(decisions[0]?.reason).toBe('debate_failed');
   });
 });
+
+// ── F6-S4: Pre-inference tool gating ─────────────────────────────────────────
+
+import type { ProviderTool } from '../plugins/plugins.service';
+import type { PluginType } from '../plugins/manifest';
+
+// Helper: create a minimal AgentsService with only kv injected (for gating unit tests)
+interface GatingMethods {
+  _readGatingConfig: () => Promise<{ hideTradesWhenCbOpen: boolean }>;
+  _computeVisibleTools: (tools: ProviderTool[], virtual_only?: boolean) => Promise<ProviderTool[]>;
+}
+type GatingAgentsService = Omit<AgentsService, never> & GatingMethods;
+
+function makeGatingService(kvValues: Record<string, string | null> = {}): GatingAgentsService {
+  const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+    get: jest.fn().mockImplementation((key: string) => {
+      if (key in kvValues) return Promise.resolve(kvValues[key]);
+      return Promise.resolve(null);
+    }),
+  };
+
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+  ) => GatingAgentsService)(
+    {},
+    {},
+    {},
+    {},
+    makeAudit(),
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    kv,
+  );
+}
+
+function makeGatingServiceNoKv(): GatingAgentsService {
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+  ) => GatingAgentsService)({}, {}, {}, {}, makeAudit(), {
+    createBulk: jest.fn().mockResolvedValue([]),
+  });
+}
+
+function makeGatingServiceKvThrows(): GatingAgentsService {
+  const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+    get: jest.fn().mockRejectedValue(new Error('KV error')),
+  };
+
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+  ) => GatingAgentsService)(
+    {},
+    {},
+    {},
+    {},
+    makeAudit(),
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    kv,
+  );
+}
+
+function makeProviderToolFixture(type: PluginType, name: string): ProviderTool {
+  return {
+    plugin_id: `${type}-plugin`,
+    name,
+    description: `A ${type} tool`,
+    input_schema: { type: 'object', properties: {} },
+    plugin_type: type,
+  };
+}
+
+function makeCbKvValue(state: string): string {
+  return JSON.stringify({ state, tripped_at: Date.now(), threshold: 3 });
+}
+
+describe('AgentsService._readGatingConfig', () => {
+  it('f6s4-rc1 — kv absent (no KvService) → hideTradesWhenCbOpen: true', async () => {
+    const service = makeGatingServiceNoKv();
+    const cfg = await service._readGatingConfig();
+    expect(cfg.hideTradesWhenCbOpen).toBe(true);
+  });
+
+  it('f6s4-rc2 — key not set (null) → hideTradesWhenCbOpen: true', async () => {
+    const service = makeGatingService({ 'gating.hide_trades_when_cb_open': null });
+    const cfg = await service._readGatingConfig();
+    expect(cfg.hideTradesWhenCbOpen).toBe(true);
+  });
+
+  it("f6s4-rc3 — value 'false' → hideTradesWhenCbOpen: false", async () => {
+    const service = makeGatingService({ 'gating.hide_trades_when_cb_open': 'false' });
+    const cfg = await service._readGatingConfig();
+    expect(cfg.hideTradesWhenCbOpen).toBe(false);
+  });
+
+  it("f6s4-rc4 — value 'true' → hideTradesWhenCbOpen: true", async () => {
+    const service = makeGatingService({ 'gating.hide_trades_when_cb_open': 'true' });
+    const cfg = await service._readGatingConfig();
+    expect(cfg.hideTradesWhenCbOpen).toBe(true);
+  });
+
+  it('f6s4-rc5 — kv.get throws → hideTradesWhenCbOpen: true (fail-safe)', async () => {
+    const service = makeGatingServiceKvThrows();
+    const cfg = await service._readGatingConfig();
+    expect(cfg.hideTradesWhenCbOpen).toBe(true);
+  });
+});
+
+describe('AgentsService._computeVisibleTools', () => {
+  const providerTool = makeProviderToolFixture('provider', 'alpaca-provider__place_order');
+  const kernelTool: ProviderTool = {
+    plugin_id: 'kernel',
+    name: 'kernel__write_skill',
+    description: 'writes a skill',
+    input_schema: { type: 'object', properties: {} },
+    // kernel tools have no plugin_type
+  };
+  const skillTool = makeProviderToolFixture('skill', 'my-skill__analyze');
+
+  it('f6s4-cv1 — CB open → provider tool excluded; kernel/skill tools remain', async () => {
+    const service = makeGatingService({
+      'scheduler:circuit_breaker': makeCbKvValue('open'),
+    });
+    const tools = [providerTool, kernelTool, skillTool];
+    const visible = await service._computeVisibleTools(tools);
+    expect(visible.some((t) => t.plugin_id === 'provider-plugin')).toBe(false);
+    expect(visible.some((t) => t.plugin_id === 'kernel')).toBe(true);
+    expect(visible.some((t) => t.plugin_id === 'skill-plugin')).toBe(true);
+  });
+
+  it('f6s4-cv2 — CB closed → all tools visible (identity)', async () => {
+    const service = makeGatingService({
+      'scheduler:circuit_breaker': makeCbKvValue('closed'),
+    });
+    const tools = [providerTool, kernelTool];
+    const visible = await service._computeVisibleTools(tools);
+    expect(visible).toBe(tools); // same reference — byte-identical
+  });
+
+  it('f6s4-cv3 — CB half_open → all tools visible (probe allowed)', async () => {
+    const service = makeGatingService({
+      'scheduler:circuit_breaker': makeCbKvValue('half_open'),
+    });
+    const tools = [providerTool, kernelTool];
+    const visible = await service._computeVisibleTools(tools);
+    expect(visible).toBe(tools);
+  });
+
+  it('f6s4-cv4 — CB key absent → all tools visible (fail-safe: not-open)', async () => {
+    const service = makeGatingService({}); // no CB key
+    const tools = [providerTool, kernelTool];
+    const visible = await service._computeVisibleTools(tools);
+    expect(visible).toBe(tools);
+  });
+
+  it('f6s4-cv5 — CB value malformed JSON → all tools visible (fail-safe)', async () => {
+    const service = makeGatingService({
+      'scheduler:circuit_breaker': 'not-valid-json{{{',
+    });
+    const tools = [providerTool, kernelTool];
+    const visible = await service._computeVisibleTools(tools);
+    expect(visible).toBe(tools);
+  });
+
+  it('f6s4-cv6 — virtual_only=true → provider excluded even when CB closed', async () => {
+    const service = makeGatingService({
+      'scheduler:circuit_breaker': makeCbKvValue('closed'),
+    });
+    const tools = [providerTool, kernelTool, skillTool];
+    const visible = await service._computeVisibleTools(tools, true);
+    expect(visible.some((t) => t.plugin_id === 'alpaca-provider')).toBe(false);
+    expect(visible.some((t) => t.plugin_id === 'kernel')).toBe(true);
+  });
+
+  it('f6s4-cv7 — kernel tools (no plugin_type) NEVER excluded by CB open', async () => {
+    const service = makeGatingService({
+      'scheduler:circuit_breaker': makeCbKvValue('open'),
+    });
+    const tools = [kernelTool];
+    const visible = await service._computeVisibleTools(tools);
+    // Short-circuit: no provider tools → effectiveTools returned as-is
+    expect(visible).toBe(tools);
+  });
+
+  it('f6s4-cv8 — gating disabled (KV="false") + CB open → no hide', async () => {
+    const service = makeGatingService({
+      'scheduler:circuit_breaker': makeCbKvValue('open'),
+      'gating.hide_trades_when_cb_open': 'false',
+    });
+    const tools = [providerTool, kernelTool];
+    const visible = await service._computeVisibleTools(tools);
+    expect(visible).toBe(tools);
+  });
+
+  it('f6s4-cv9 — kv.get throws → returns effectiveTools unchanged (never throws)', async () => {
+    const service = makeGatingServiceKvThrows();
+    const tools = [providerTool, kernelTool];
+    await expect(service._computeVisibleTools(tools)).resolves.toBe(tools);
+  });
+
+  it('f6s4-cv10 — no provider tools in list → kv.get NOT called (short-circuit)', async () => {
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockResolvedValue(null),
+    };
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => GatingAgentsService)(
+      {},
+      {},
+      {},
+      {},
+      makeAudit(),
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    const tools = [kernelTool, skillTool]; // no provider tools
+    const visible = await service._computeVisibleTools(tools);
+
+    expect(visible).toBe(tools);
+    expect(kv.get).not.toHaveBeenCalled();
+  });
+
+  it('f6s4-cv11 — CB open + default gating → byte-identical check: JSON.stringify matches when nothing filtered for non-provider list', async () => {
+    // When no provider tools present → short-circuit → same ref → same JSON
+    const service = makeGatingService({
+      'scheduler:circuit_breaker': makeCbKvValue('open'),
+    });
+    const tools = [kernelTool, skillTool];
+    const visible = await service._computeVisibleTools(tools);
+    expect(JSON.stringify(visible)).toBe(JSON.stringify(tools));
+  });
+
+  it('f6s4-cv12 — CB closed + default gating → visibleTools === effectiveTools (same ref, byte-identical regression gate)', async () => {
+    const service = makeGatingService({
+      'scheduler:circuit_breaker': makeCbKvValue('closed'),
+    });
+    const tools = [providerTool, kernelTool, skillTool];
+    const visible = await service._computeVisibleTools(tools, false);
+    expect(visible).toBe(tools); // same reference
+    expect(JSON.stringify(visible)).toBe(JSON.stringify(tools)); // byte-identical
+  });
+});
+
+// ── F6-S4 Phase 3: runGovernedTurn tool gating integration ───────────────────
+
+describe('AgentsService.runGovernedTurn — tool gating (F6-S4)', () => {
+  const PROVIDER_TOOL: ProviderTool = {
+    plugin_id: 'alpaca-provider',
+    name: 'alpaca-provider__place_order',
+    description: 'Places a real order',
+    input_schema: { type: 'object', properties: {} },
+    plugin_type: 'provider',
+  };
+  const KERNEL_TOOL: ProviderTool = {
+    plugin_id: 'kernel',
+    name: 'kernel__write_skill',
+    description: 'writes a skill',
+    input_schema: { type: 'object', properties: {} },
+  };
+
+  /**
+   * Build an AgentsService that:
+   * - has a decision prompt (so [TOOL SCHEMA] is injected)
+   * - returns a fixed provider tool from getProviderTools
+   * - captures the [TOOL SCHEMA] string sent to the LLM
+   * - has KV set to given values
+   * - LLM response can be configured to emit a tool call
+   */
+  function buildGatingService(opts: {
+    cbState?: string;
+    gatingDisabled?: boolean;
+    llmEmitsProviderCall?: boolean;
+    capturedSchema?: { tools: string }[];
+  }): {
+    service: AgentsService;
+    audit: ReturnType<typeof makeAudit>;
+    capturedSchema: { tools: string }[];
+  } {
+    const capturedSchema: { tools: string }[] = opts.capturedSchema ?? [];
+
+    const kvValues: Record<string, string | null> = {
+      'react.max_turns': '1',
+    };
+    if (opts.cbState !== undefined) {
+      kvValues['scheduler:circuit_breaker'] = makeCbKvValue(opts.cbState);
+    }
+    if (opts.gatingDisabled) {
+      kvValues['gating.hide_trades_when_cb_open'] = 'false';
+    }
+
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key in kvValues) return Promise.resolve(kvValues[key]);
+        return Promise.resolve(null);
+      }),
+    };
+
+    const llmText = opts.llmEmitsProviderCall
+      ? '<tool_calls>[{"plugin_id":"alpaca-provider","function":"place_order","args":{}}]</tool_calls>'
+      : '';
+
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((llmOpts: { system_prompt?: string }) => {
+        const sp = llmOpts.system_prompt ?? '';
+        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+        capturedSchema.push({ tools: match ? match[1] : '' });
+        return Promise.resolve({
+          text: llmText,
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+
+    const plugins = makeFullPlugins('Use tools.', [PROVIDER_TOOL, KERNEL_TOOL]);
+
+    const audit = makeAudit();
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      llm,
+      makeSandbox(),
+      plugins,
+      makeMemory(),
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    return { service, audit, capturedSchema };
+  }
+
+  it('f6s4-rgt1 — CB open → [TOOL SCHEMA] excludes provider tool name', async () => {
+    const { service, capturedSchema } = buildGatingService({ cbState: 'open' });
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    expect(capturedSchema).toHaveLength(1);
+    expect(capturedSchema[0].tools).not.toContain('place_order');
+    expect(capturedSchema[0].tools).not.toContain('alpaca-provider');
+  });
+
+  it('f6s4-rgt2 — CB closed + default gating → schema byte-identical regression gate', async () => {
+    const { service, capturedSchema } = buildGatingService({ cbState: 'closed' });
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    // Schema must contain provider tool (nothing hidden)
+    expect(capturedSchema).toHaveLength(1);
+    expect(capturedSchema[0].tools).toContain('place_order');
+    // Byte-identical: JSON of visibleTools equals JSON of all tools (both provider+kernel)
+    const expectedSchema = JSON.stringify([PROVIDER_TOOL, KERNEL_TOOL]);
+    expect(capturedSchema[0].tools).toBe(expectedSchema);
+  });
+
+  it('f6s4-rgt3 — defense-in-depth: CB open + LLM emits provider call → _validateToolCalls drops it', async () => {
+    const { service, audit } = buildGatingService({
+      cbState: 'open',
+      llmEmitsProviderCall: true,
+    });
+
+    const result = await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    // LLM schema excluded provider tool, but even if LLM emits it, _validateToolCalls drops it
+    // because the plugin is not active (makeFullPlugins returns [] for findActive)
+    // The call should be dropped (decisions empty or decision allowed=false)
+    const allowedDecisions = result.decisions.filter((d) => d.allowed);
+    expect(allowedDecisions).toHaveLength(0);
+
+    // Verify _validateToolCalls emitted tool_call_dropped audit
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const dropped = auditCalls.find(([a]) => a['event_type'] === 'tool_call_dropped');
+    expect(dropped).toBeDefined();
+  });
+});
