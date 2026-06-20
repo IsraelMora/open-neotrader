@@ -10,9 +10,7 @@ import { validateManifest } from './manifest';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function makeMinimalManifest(
-  overrides: Partial<PluginManifest['plugin']> = {},
-): PluginManifest {
+function makeMinimalManifest(overrides: Partial<PluginManifest['plugin']> = {}): PluginManifest {
   return {
     plugin: {
       id: 'test-plugin',
