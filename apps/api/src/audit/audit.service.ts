@@ -37,7 +37,9 @@ export type AuditEventType =
   | 'debate_consensus'
   | 'debate_skipped'
   // ml-feature-extractor-s2: on-device model training
-  | 'ml_model_trained';
+  | 'ml_model_trained'
+  // ml-feature-extractor-s3: live confidence adjustment via on_cycle hook
+  | 'ml_signals_adjusted';
 
 export interface AuditPayload {
   cycle_id?: string;
