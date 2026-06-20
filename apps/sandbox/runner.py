@@ -508,19 +508,13 @@ def cmd_smoke_test(req: dict) -> dict:
         checks.append({"name": "manifest", "status": "failed", "detail": str(exc)})
         m = {}
 
-    # --- Shared minimal context for plugin calls ----------------------------
+    # --- Shared config defaults (used by both hook and skill ctx below) --------
     config_defaults: dict = {}
     if m:
         for field, spec_data in m.get("config", {}).items():
             config_defaults[field] = (
                 spec_data.get("default") if isinstance(spec_data, dict) else spec_data
             )
-    ctx = _SdkContext(
-        config=config_defaults,
-        credentials={},
-        universe=[],
-        portfolio={},
-    )
 
     # --- 2. on_activate check -----------------------------------------------
     hooks_cfg: dict = m.get("hooks", {}) if m else {}
@@ -554,7 +548,9 @@ def cmd_smoke_test(req: dict) -> dict:
                     "detail": "on_activate function not found in hook file",
                 })
             else:
-                fn(ctx)
+                # Hooks receive a plain dict (mirrors cmd_run_hook: ctx = {**context, "config": ...})
+                hook_ctx: dict = {"config": config_defaults}
+                fn(hook_ctx)
                 checks.append({"name": "on_activate", "status": "passed", "detail": "on_activate ran without error"})
         except Exception as exc:
             status, detail = _classify(exc)
@@ -592,7 +588,14 @@ def cmd_smoke_test(req: dict) -> dict:
             continue
 
         try:
-            fn(signal={}, _context=ctx)
+            # Skill fns receive a Context object (mirrors cmd_run_cycle / cmd_call_plugin:
+            # ctx = _SdkContext(plugin_id=..., operator=..., metadata=context))
+            skill_ctx = _SdkContext(
+                plugin_id=plugin_id,
+                operator="",
+                metadata={"config": config_defaults},
+            )
+            fn(signal={}, _context=skill_ctx)
             checks.append({"name": key, "status": "passed", "detail": "skill fn called without error"})
         except Exception as exc:
             status, detail = _classify(exc)

@@ -14,6 +14,9 @@ Contract (spec AC-1 through AC-9):
   - Absent on_activate → that check 'passed'
   - Worst-of aggregation: failed > inconclusive > passed
   - Missing plugin dir (FileNotFoundError) propagates; caller (main) wraps → ok=false
+
+F5-s1 regression: cmd_smoke_test must use the REAL SDK Context shape (plugin_id,
+operator, metadata only) so smoke results are faithful in production.
 """
 from __future__ import annotations
 
@@ -24,6 +27,16 @@ import sys
 from pathlib import Path
 
 import pytest
+
+# Path to real neurotrader_sdk package (packages/plugin-sdk)
+_SDK_PATH = Path(__file__).parent.parent.parent.parent / "packages" / "plugin-sdk"
+
+# SDK-related module names that the real-Context test injects and must clean up.
+_SDK_MODULE_NAMES = (
+    "neurotrader_sdk",
+    "neurotrader_sdk.context",
+    "neurotrader_sdk.decorators",
+)
 
 SANDBOX_DIR = Path(__file__).parent.parent
 RUNNER_PATH = SANDBOX_DIR / "runner.py"
@@ -542,3 +555,86 @@ class TestSmokeTestDispatch:
         inner = resp.get("result", {})
         assert "result" in inner, f"Expected 'result' field in inner, got: {inner}"
         assert "checks" in inner, f"Expected 'checks' field in inner, got: {inner}"
+
+
+class TestSmokeTestRealSdkContext:
+    """
+    F5-s1 regression: cmd_smoke_test must work with the REAL SDK Context.
+
+    In production, neurotrader_sdk is on PYTHONPATH so runner.py resolves
+    _SdkContext to the real dataclass (plugin_id, operator, metadata only).
+    The old code passed config=/credentials=/universe=/portfolio= to _SdkContext,
+    which raises TypeError in production because the real Context dataclass does
+    not accept those keyword arguments.
+
+    This test exercises cmd_smoke_test with the real SDK on sys.path, so the real
+    Context class is used, and asserts a clean plugin → result='passed' (not TypeError).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_sdk_state(self):
+        """Snapshot and restore sys.path + SDK modules so this test doesn't pollute others."""
+        path_snapshot = list(sys.path)
+        modules_snapshot = {k: sys.modules.get(k) for k in _SDK_MODULE_NAMES}
+
+        yield
+
+        sys.path[:] = path_snapshot
+        for name, original in modules_snapshot.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+    def _load_runner_with_real_sdk(self, plugins_dir: Path):
+        """Load a fresh runner with the real neurotrader_sdk on sys.path."""
+        # Remove stale SDK modules so the fresh runner import picks up the real package
+        for name in _SDK_MODULE_NAMES:
+            sys.modules.pop(name, None)
+
+        sdk_path = str(_SDK_PATH)
+        if sdk_path not in sys.path:
+            sys.path.insert(0, sdk_path)
+
+        os.environ["NEUROTRADER_PLUGINS_DIR"] = str(plugins_dir)
+        mod_name = f"runner_real_sdk_{id(plugins_dir)}"
+        spec = importlib.util.spec_from_file_location(mod_name, RUNNER_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        mod.PLUGINS_DIR = plugins_dir
+        return mod
+
+    def test_clean_plugin_passes_with_real_sdk_context(self, plugins_dir):
+        """
+        RED (before fix): TypeError: Context.__init__() got unexpected keyword argument 'config'
+        GREEN (after fix): result='passed', all checks pass, no TypeError.
+
+        This is the latent production bug: cmd_smoke_test built _SdkContext with
+        config=/credentials=/universe=/portfolio= kwargs that the real Context dataclass
+        rejects. The fix must mirror the real execution paths in runner.py.
+        """
+        # Verify the real SDK is actually resolvable from _SDK_PATH
+        assert (_SDK_PATH / "neurotrader_sdk" / "context.py").exists(), (
+            f"Real SDK not found at {_SDK_PATH} — check path"
+        )
+
+        _make_clean_plugin(plugins_dir, "real-sdk-clean-plugin")
+        runner = self._load_runner_with_real_sdk(plugins_dir)
+
+        # Verify runner loaded the REAL Context (not the fallback **kw class)
+        # The real Context is a dataclass; the fallback is not.
+        import dataclasses
+        assert dataclasses.is_dataclass(runner._SdkContext), (
+            "runner._SdkContext must be the real dataclass when SDK is on sys.path; "
+            "got the fallback **kw class — SDK path injection failed"
+        )
+
+        # This must NOT raise TypeError about unexpected kwargs
+        result = runner.COMMANDS["smoke_test"]({"plugin_id": "real-sdk-clean-plugin"})
+
+        assert result["ok"] is True, f"Expected ok=True, got: {result}"
+        assert result["result"] == "passed", (
+            f"Clean plugin with real SDK Context must → 'passed', got: {result['result']}. "
+            f"Checks: {result.get('checks')}"
+        )
