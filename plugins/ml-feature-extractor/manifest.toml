@@ -1,0 +1,28 @@
+[plugin]
+id          = "ml-feature-extractor"
+name        = "ML Feature Extractor"
+version     = "0.1.0"
+type        = "discipline"
+description = "On-device sklearn model: learns which of the agent's own skill signals made money and adjusts per-signal confidence multiplicatively in [0.5x, 1.5x]. INFORMS, never a barrier. Cold-start/error → identity."
+author      = "neurotrader"
+license     = "MIT"
+active      = false
+
+# Callable functions — the ONLY runner-permitted way to invoke train/predict via cmd=call_plugin.
+# resolve_permitted_function gates against these full keys (runner.py L307).
+[skills]
+keys = [
+  "ml-feature-extractor.train",
+  "ml-feature-extractor.predict",
+]
+
+[config]
+model_type     = "logreg"
+min_samples    = 50
+multiplier_min = 0.5
+multiplier_max = 1.5
+
+[permissions]
+network      = false
+emit_events  = false
+# NOTE: NO [hooks] in s2. The on_cycle hook that APPLIES multipliers is s3.
