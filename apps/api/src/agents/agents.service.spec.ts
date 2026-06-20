@@ -8223,3 +8223,593 @@ describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () =
     expect(dropped).toBeDefined();
   });
 });
+
+// ── ml-feature-extractor-s3 PR2 — kernel injection + sort + wiring ────────────
+//
+// Tests for:
+//   Phase 3 — _mlResolveModelInjection (opt-in, hash-validated, fail-soft)
+//   Phase 4 — _runVetoLayer ML-first sort + per-plugin injection (no blob leak)
+//   Phase 5 — _executeCycle wiring + audit emit ('ml_signals_adjusted')
+//
+// All tests in this section follow STRICT TDD: RED first (method absent) → GREEN.
+
+const ML_PLUGIN_ID_TEST = 'ml-feature-extractor';
+
+/**
+ * Extended MlSignalRecordService stub that also exposes computeActiveSkillHash.
+ * Matches the real service's method signatures needed for s3.
+ */
+function makeMlSignalRecordS3(opts?: {
+  hashReturn?: string;
+}): jest.Mocked<Pick<MlSignalRecordService, 'getTrainingData' | 'computeActiveSkillHash'>> {
+  return {
+    getTrainingData: jest.fn().mockResolvedValue([]),
+    computeActiveSkillHash: jest.fn().mockReturnValue(opts?.hashReturn ?? 'deadbeefdeadbeef'),
+  };
+}
+
+/**
+ * Extended KvService stub for s3 (get + set, configurable per test).
+ */
+function makeS3Kv(opts?: {
+  modelCurrentValue?: string | null;
+}): jest.Mocked<Pick<KvService, 'get' | 'set'>> {
+  return {
+    get: jest.fn().mockImplementation((key: string) => {
+      if (key === 'react.max_turns') return Promise.resolve('1');
+      if (key === 'ml:model:current') {
+        const v = opts?.modelCurrentValue;
+        return Promise.resolve(v === undefined ? null : v);
+      }
+      return Promise.resolve(null);
+    }),
+    set: jest.fn().mockResolvedValue(undefined),
+  };
+}
+
+/**
+ * Build AgentsService wired for s3 tests (all 15 constructor args).
+ * Accepts overrides for kv, mlSignalRecord, sandbox, plugins, audit, llm.
+ */
+function makeS3AgentsService(opts: {
+  kv?: jest.Mocked<Pick<KvService, 'get' | 'set'>>;
+  mlSignalRecord?: jest.Mocked<
+    Pick<MlSignalRecordService, 'getTrainingData' | 'computeActiveSkillHash'>
+  >;
+  sandbox?: jest.Mocked<
+    Pick<SandboxGateway, 'runCycle' | 'callPlugin' | 'call' | 'getPluginStage'>
+  >;
+  plugins?: jest.Mocked<
+    Pick<
+      PluginsService,
+      'findActive' | 'getProviderTools' | 'getSkillsMetadata' | 'getActiveDecisionPrompt'
+    >
+  >;
+  audit?: ReturnType<typeof makeAudit>;
+  llm?: Partial<LlmService>;
+}): AgentsService {
+  const audit = opts.audit ?? makeAudit();
+  const llm: Partial<LlmService> = opts.llm ?? {
+    complete: jest.fn().mockResolvedValue({
+      text: '',
+      tool_calls: [],
+      backend: 'api' as const,
+      skills_read: [],
+      skills_written: [],
+    }),
+  };
+  const sandbox = opts.sandbox ?? {
+    runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+    callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+    getPluginStage: jest.fn().mockReturnValue('post'),
+  };
+  const plugins = opts.plugins ?? {
+    findActive: jest.fn().mockResolvedValue([]),
+    getProviderTools: jest.fn().mockResolvedValue([]),
+    getSkillsMetadata: jest.fn().mockResolvedValue([]),
+    getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+  };
+
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+    longTermMemory: unknown,
+    debate: unknown,
+    providerGateway: unknown,
+    mlSignalRecord: unknown,
+  ) => AgentsService)(
+    llm,
+    sandbox,
+    plugins,
+    {
+      toContextString: jest.fn().mockResolvedValue(''),
+      appendObservation: jest.fn(),
+      trackSignal: jest.fn(),
+    },
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    opts.kv ?? makeS3Kv(),
+    undefined,
+    undefined,
+    undefined,
+    opts.mlSignalRecord ?? makeMlSignalRecordS3(),
+  );
+}
+
+/**
+ * Call private _mlResolveModelInjection via cast.
+ */
+function callMlResolveModelInjection(
+  service: AgentsService,
+  activePlugins: { id: string; type: string; name?: string }[],
+): Promise<{ model_blob?: string; feature_names?: string[] }> {
+  return (
+    service as unknown as {
+      _mlResolveModelInjection: (
+        plugins: { id: string; type: string; name?: string }[],
+      ) => Promise<{ model_blob?: string; feature_names?: string[] }>;
+    }
+  )._mlResolveModelInjection(activePlugins);
+}
+
+/**
+ * Call private _runVetoLayer via cast (s3 signature includes mlInjection).
+ */
+function callRunVetoLayerS3(
+  service: AgentsService,
+  cycleId: string,
+  disciplinePlugins: { id: string; type: string; name: string }[],
+  hookCtx: Record<string, unknown>,
+  pendingSignals: unknown[],
+  mlInjection: { model_blob?: string; feature_names?: string[] },
+): Promise<{ vetoCtx: Record<string, unknown>; vetoSummary: unknown }> {
+  return (
+    service as unknown as {
+      _runVetoLayer: (
+        cycleId: string,
+        disc: { id: string; type: string; name: string }[],
+        hookCtx: Record<string, unknown>,
+        pendingSignals: unknown[],
+        mlInjection: { model_blob?: string; feature_names?: string[] },
+      ) => Promise<{ vetoCtx: Record<string, unknown>; vetoSummary: unknown }>;
+    }
+  )._runVetoLayer(cycleId, disciplinePlugins, hookCtx, pendingSignals, mlInjection);
+}
+
+// ── Phase 3: _mlResolveModelInjection ────────────────────────────────────────
+
+describe('ml-feature-extractor-s3 Phase 3 — _mlResolveModelInjection', () => {
+  // 3.1-a (GOLDEN OPT-IN): ml-feature-extractor NOT in activePlugins → kv.get NEVER called
+  it('3.1-a GOLDEN opt-in: plugin INACTIVE → kv.get never called; returns {}', async () => {
+    const kv = makeS3Kv({
+      modelCurrentValue: JSON.stringify({
+        blob_b64: 'someblob',
+        active_skill_hash: 'abc',
+        feature_names: ['f1'],
+      }),
+    });
+    const mlSignalRecord = makeMlSignalRecordS3({ hashReturn: 'abc' });
+    const service = makeS3AgentsService({ kv, mlSignalRecord });
+
+    // Active plugins do NOT include ml-feature-extractor
+    const activePlugins = [
+      { id: 'signal-aggregator', type: 'discipline', name: 'Signal Aggregator' },
+      { id: 'risk-discipline', type: 'discipline', name: 'Risk' },
+    ];
+
+    const result = await callMlResolveModelInjection(service, activePlugins);
+
+    // kv.get must NEVER be called — byte-identical opt-in guarantee (AC-S3-1/12)
+    expect(kv.get).not.toHaveBeenCalled();
+    expect(result).toEqual({});
+  });
+
+  // 3.1-b: active + hash MATCH → returns { model_blob, feature_names }
+  it('3.1-b: plugin ACTIVE + hash match → returns { model_blob, feature_names }', async () => {
+    const HASH = 'deadbeefdeadbeef';
+    const kv = makeS3Kv({
+      modelCurrentValue: JSON.stringify({
+        blob_b64: 'blobdata==',
+        active_skill_hash: HASH,
+        feature_names: ['confidence', 'vol'],
+        n_samples: 100,
+        trained_at: '2026-01-01',
+      }),
+    });
+    const mlSignalRecord = makeMlSignalRecordS3({ hashReturn: HASH });
+    const service = makeS3AgentsService({ kv, mlSignalRecord });
+
+    const activePlugins = [
+      { id: ML_PLUGIN_ID_TEST, type: 'discipline', name: 'ML Feature Extractor' },
+      { id: 'skill-a', type: 'skill', name: 'Skill A' },
+    ];
+
+    const result = await callMlResolveModelInjection(service, activePlugins);
+
+    expect(result).toEqual({ model_blob: 'blobdata==', feature_names: ['confidence', 'vol'] });
+    expect(kv.get).toHaveBeenCalledWith('ml:model:current');
+  });
+
+  // 3.1-c: active + hash MISMATCH → returns {}; warn logged (AC-S3-3)
+  it('3.1-c: plugin ACTIVE + hash mismatch → returns {}', async () => {
+    const kv = makeS3Kv({
+      modelCurrentValue: JSON.stringify({
+        blob_b64: 'staleblob==',
+        active_skill_hash: 'oldhashhhhhhhhh',
+        feature_names: [],
+      }),
+    });
+    const mlSignalRecord = makeMlSignalRecordS3({ hashReturn: 'currenthashcurr' });
+    const service = makeS3AgentsService({ kv, mlSignalRecord });
+
+    const activePlugins = [
+      { id: ML_PLUGIN_ID_TEST, type: 'discipline', name: 'ML Feature Extractor' },
+    ];
+
+    const result = await callMlResolveModelInjection(service, activePlugins);
+
+    expect(result).toEqual({});
+  });
+
+  // 3.1-d: active + kv.get returns null → returns {} (AC-S3-4)
+  it('3.1-d: plugin ACTIVE + kv returns null → returns {}', async () => {
+    const kv = makeS3Kv({ modelCurrentValue: null });
+    const mlSignalRecord = makeMlSignalRecordS3({ hashReturn: 'somehash12345678' });
+    const service = makeS3AgentsService({ kv, mlSignalRecord });
+
+    const activePlugins = [
+      { id: ML_PLUGIN_ID_TEST, type: 'discipline', name: 'ML Feature Extractor' },
+    ];
+
+    const result = await callMlResolveModelInjection(service, activePlugins);
+
+    expect(result).toEqual({});
+  });
+
+  // 3.1-e: active + kv.get rejects → swallowed, returns {}, warn only (AC-S3-10)
+  it('3.1-e: plugin ACTIVE + kv.get throws → swallowed, returns {}', async () => {
+    const kv = makeS3Kv();
+    (kv.get as jest.Mock).mockImplementation((key: string) => {
+      if (key === 'ml:model:current') return Promise.reject(new Error('Redis down'));
+      return Promise.resolve(null);
+    });
+    const mlSignalRecord = makeMlSignalRecordS3({ hashReturn: 'somehash12345678' });
+    const service = makeS3AgentsService({ kv, mlSignalRecord });
+
+    const activePlugins = [
+      { id: ML_PLUGIN_ID_TEST, type: 'discipline', name: 'ML Feature Extractor' },
+    ];
+
+    // Must not throw
+    await expect(callMlResolveModelInjection(service, activePlugins)).resolves.toEqual({});
+  });
+});
+
+// ── Phase 4: _runVetoLayer ML-first sort + per-plugin injection ───────────────
+
+describe('ml-feature-extractor-s3 Phase 4 — _runVetoLayer ML-first sort + injection', () => {
+  // 4.1-a: input [signal-aggregator, ml-feature-extractor] → ML runs FIRST
+  it('4.1-a: aggregator-first input → run_hook sequence has ML first', async () => {
+    const audit = makeAudit();
+    const capturedPluginIds: string[] = [];
+
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockImplementation((args: Record<string, unknown>) => {
+        if (args['cmd'] === 'run_hook') {
+          capturedPluginIds.push(args['plugin_id'] as string);
+        }
+        return Promise.resolve({ ok: true, result: { pending_signals: [] } });
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+
+    const service = makeS3AgentsService({ sandbox, audit });
+
+    // Aggregator first (alphabetical DB order), ML second — sort must flip them
+    const disciplinePlugins = [
+      { id: 'signal-aggregator', type: 'discipline', name: 'Signal Aggregator' },
+      { id: ML_PLUGIN_ID_TEST, type: 'discipline', name: 'ML Feature Extractor' },
+    ];
+
+    await callRunVetoLayerS3(service, 'cycle-sort-001', disciplinePlugins, {}, [], {});
+
+    expect(capturedPluginIds[0]).toBe(ML_PLUGIN_ID_TEST);
+    expect(capturedPluginIds[1]).toBe('signal-aggregator');
+  });
+
+  // 4.1-b: reversed input [ml-feature-extractor, signal-aggregator] → same ML-first order
+  it('4.1-b: ML-first input → still ML first (sort is stable, structural)', async () => {
+    const capturedPluginIds: string[] = [];
+
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockImplementation((args: Record<string, unknown>) => {
+        if (args['cmd'] === 'run_hook') capturedPluginIds.push(args['plugin_id'] as string);
+        return Promise.resolve({ ok: true, result: { pending_signals: [] } });
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+
+    const service = makeS3AgentsService({ sandbox });
+
+    // ML already first in input — must still be first
+    const disciplinePlugins = [
+      { id: ML_PLUGIN_ID_TEST, type: 'discipline', name: 'ML Feature Extractor' },
+      { id: 'signal-aggregator', type: 'discipline', name: 'Signal Aggregator' },
+    ];
+
+    await callRunVetoLayerS3(service, 'cycle-sort-002', disciplinePlugins, {}, [], {});
+
+    expect(capturedPluginIds[0]).toBe(ML_PLUGIN_ID_TEST);
+    expect(capturedPluginIds[1]).toBe('signal-aggregator');
+  });
+
+  // 4.1-c: hash-match → ML plugin hookCtx has model_blob+feature_names; others do NOT
+  it('4.1-c: hash-match injection → ML plugin ctx has model_blob; other plugins do NOT (no leak)', async () => {
+    const capturedCtxByPlugin: Record<string, Record<string, unknown>> = {};
+
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockImplementation((args: Record<string, unknown>) => {
+        if (args['cmd'] === 'run_hook') {
+          const pid = args['plugin_id'] as string;
+          capturedCtxByPlugin[pid] = args['context'] as Record<string, unknown>;
+        }
+        return Promise.resolve({ ok: true, result: { pending_signals: [] } });
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+
+    const service = makeS3AgentsService({ sandbox });
+
+    const disciplinePlugins = [
+      { id: 'signal-aggregator', type: 'discipline', name: 'Signal Aggregator' },
+      { id: ML_PLUGIN_ID_TEST, type: 'discipline', name: 'ML Feature Extractor' },
+    ];
+
+    const mlInjection = { model_blob: 'blobcontent==', feature_names: ['f1', 'f2'] };
+    await callRunVetoLayerS3(service, 'cycle-inject-001', disciplinePlugins, {}, [], mlInjection);
+
+    // ML plugin gets model_blob
+    expect(capturedCtxByPlugin[ML_PLUGIN_ID_TEST]?.['model_blob']).toBe('blobcontent==');
+    expect(capturedCtxByPlugin[ML_PLUGIN_ID_TEST]?.['feature_names']).toEqual(['f1', 'f2']);
+
+    // Signal aggregator does NOT get model_blob (no leak — D2)
+    expect(capturedCtxByPlugin['signal-aggregator']?.['model_blob']).toBeUndefined();
+    expect(capturedCtxByPlugin['signal-aggregator']?.['feature_names']).toBeUndefined();
+  });
+
+  // 4.1-d: mlInjection={} → NO plugin receives model_blob
+  it('4.1-d: mlInjection={} → no plugin receives model_blob in ctx', async () => {
+    const capturedCtxByPlugin: Record<string, Record<string, unknown>> = {};
+
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockImplementation((args: Record<string, unknown>) => {
+        if (args['cmd'] === 'run_hook') {
+          const pid = args['plugin_id'] as string;
+          capturedCtxByPlugin[pid] = args['context'] as Record<string, unknown>;
+        }
+        return Promise.resolve({ ok: true, result: { pending_signals: [] } });
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+
+    const service = makeS3AgentsService({ sandbox });
+
+    const disciplinePlugins = [
+      { id: 'signal-aggregator', type: 'discipline', name: 'Signal Aggregator' },
+      { id: ML_PLUGIN_ID_TEST, type: 'discipline', name: 'ML Feature Extractor' },
+    ];
+
+    await callRunVetoLayerS3(service, 'cycle-noinject-001', disciplinePlugins, {}, [], {});
+
+    expect(capturedCtxByPlugin[ML_PLUGIN_ID_TEST]?.['model_blob']).toBeUndefined();
+    expect(capturedCtxByPlugin['signal-aggregator']?.['model_blob']).toBeUndefined();
+  });
+
+  // 4.1-e: hook returns ok:false → _runVetoLayer handles via existing warn+audit path; cycle completes
+  it('4.1-e: discipline hook ok:false → veto layer handles warn+audit; cycle does not throw', async () => {
+    const audit = makeAudit();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({ ok: false, error: 'plugin error', result: null }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+
+    const service = makeS3AgentsService({ sandbox, audit });
+
+    const disciplinePlugins = [
+      { id: ML_PLUGIN_ID_TEST, type: 'discipline', name: 'ML Feature Extractor' },
+    ];
+
+    // Must not throw
+    await expect(
+      callRunVetoLayerS3(service, 'cycle-hook-fail', disciplinePlugins, {}, [], {}),
+    ).resolves.toBeDefined();
+
+    // cycle_fail audit emitted
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const cycleFail = auditCalls.find(([a]) => a['event_type'] === 'cycle_fail');
+    expect(cycleFail).toBeDefined();
+  });
+});
+
+// ── Phase 5: _executeCycle wiring + audit emit ────────────────────────────────
+
+describe('ml-feature-extractor-s3 Phase 5 — _executeCycle wiring + audit', () => {
+  // 5.1-a: active + hash-match → _mlResolveModelInjection called once + audit 'ml_signals_adjusted'
+  it('5.1-a: active + hash-match → mlResolve called, audit ml_signals_adjusted emitted', async () => {
+    const HASH = 'aabbccddaabbccdd';
+    const audit = makeAudit();
+    const kv = makeS3Kv({
+      modelCurrentValue: JSON.stringify({
+        blob_b64: 'blobtest==',
+        active_skill_hash: HASH,
+        feature_names: ['f1'],
+        n_samples: 80,
+        trained_at: '2026-01-01',
+      }),
+    });
+    const mlSignalRecord = makeMlSignalRecordS3({ hashReturn: HASH });
+
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { pending_signals: [{ symbol: 'AAPL', action: 'buy', confidence: 0.8 }] },
+      }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { pending_signals: [{ symbol: 'AAPL', action: 'buy', confidence: 0.72 }] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([
+        { id: ML_PLUGIN_ID_TEST, type: 'discipline', name: 'ML Feature Extractor' },
+        { id: 'skill-a', type: 'skill', name: 'Skill A' },
+      ]),
+      getProviderTools: jest.fn().mockResolvedValue([]),
+      getSkillsMetadata: jest.fn().mockResolvedValue([]),
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+    };
+
+    const service = makeS3AgentsService({ kv, mlSignalRecord, sandbox, plugins, audit });
+
+    // Track calls by wrapping the instance method
+    let resolveCallCount = 0;
+    const svcAsAny = service as unknown as Record<string, unknown>;
+    type ResolveMethod = (
+      ...args: unknown[]
+    ) => Promise<{ model_blob?: string; feature_names?: string[] }>;
+    const origResolve = svcAsAny['_mlResolveModelInjection'] as ResolveMethod | undefined;
+    svcAsAny['_mlResolveModelInjection'] = (
+      ...args: unknown[]
+    ): Promise<{ model_blob?: string; feature_names?: string[] }> => {
+      resolveCallCount++;
+      if (origResolve) return origResolve.apply(service, args);
+      return Promise.resolve({});
+    };
+
+    await (
+      service as unknown as { _executeCycle: (c: string, ctx: string) => Promise<unknown> }
+    )._executeCycle('cycle-wire-001', 'test');
+
+    // _mlResolveModelInjection called once
+    expect(resolveCallCount).toBe(1);
+
+    // audit 'ml_signals_adjusted' emitted
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_signals_adjusted');
+    expect(mlAudit).toBeDefined();
+    const meta = mlAudit![0]['meta'] as Record<string, unknown>;
+    expect(meta['hash_match']).toBe(true);
+    expect(typeof meta['n_signals']).toBe('number');
+  });
+
+  // 5.1-b: ml-feature-extractor INACTIVE → audit 'ml_signals_adjusted' NOT emitted; kv.get NOT called
+  it('5.1-b: ML INACTIVE → ml_signals_adjusted NOT emitted; kv.get NOT called', async () => {
+    const audit = makeAudit();
+    const kv = makeS3Kv();
+    const mlSignalRecord = makeMlSignalRecordS3();
+
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([
+        // ML plugin NOT active — only aggregator
+        { id: 'signal-aggregator', type: 'discipline', name: 'Signal Aggregator' },
+        { id: 'skill-a', type: 'skill', name: 'Skill A' },
+      ]),
+      getProviderTools: jest.fn().mockResolvedValue([]),
+      getSkillsMetadata: jest.fn().mockResolvedValue([]),
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+    };
+
+    const service = makeS3AgentsService({ kv, mlSignalRecord, sandbox, plugins, audit });
+
+    await (
+      service as unknown as { _executeCycle: (c: string, ctx: string) => Promise<unknown> }
+    )._executeCycle('cycle-inactive-001', 'test');
+
+    // kv.get must NOT be called for ml:model:current (byte-identical, opt-in, AC-S3-1/12)
+    const kvCalls = (kv.get as jest.Mock).mock.calls as Array<[string]>;
+    const mlKvCalls = kvCalls.filter(([k]) => k === 'ml:model:current');
+    expect(mlKvCalls).toHaveLength(0);
+
+    // audit 'ml_signals_adjusted' must NOT be emitted
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_signals_adjusted');
+    expect(mlAudit).toBeUndefined();
+  });
+
+  // 5.1-c: _mlResolveModelInjection throws (unexpected) → cycle completes; no audit; no rethrow
+  it('5.1-c: resolver throws unexpectedly → cycle completes; no ml_signals_adjusted; no rethrow', async () => {
+    const audit = makeAudit();
+    const kv = makeS3Kv();
+    const mlSignalRecord = makeMlSignalRecordS3();
+
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+
+    const plugins = {
+      findActive: jest
+        .fn()
+        .mockResolvedValue([
+          { id: ML_PLUGIN_ID_TEST, type: 'discipline', name: 'ML Feature Extractor' },
+        ]),
+      getProviderTools: jest.fn().mockResolvedValue([]),
+      getSkillsMetadata: jest.fn().mockResolvedValue([]),
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+    };
+
+    const service = makeS3AgentsService({ kv, mlSignalRecord, sandbox, plugins, audit });
+
+    // Force _mlResolveModelInjection to throw by replacing it on the instance
+    (service as unknown as Record<string, unknown>)['_mlResolveModelInjection'] = () =>
+      Promise.reject(new Error('Unexpected error'));
+
+    // Must not throw — .catch(()=>({})) in _executeCycle swallows it
+    await expect(
+      (
+        service as unknown as { _executeCycle: (c: string, ctx: string) => Promise<unknown> }
+      )._executeCycle('cycle-throw-001', 'test'),
+    ).resolves.toBeDefined();
+
+    // No ml_signals_adjusted audit
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_signals_adjusted');
+    expect(mlAudit).toBeUndefined();
+  });
+});
