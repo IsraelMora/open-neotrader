@@ -4,11 +4,14 @@ import { SnapshotController } from './snapshot.controller';
 import { PrismaModule } from '../prisma/prisma.module';
 import { ProvidersModule } from '../providers/providers.module';
 import { LongTermMemoryModule } from '../long-term-memory/long-term-memory.module';
+import { MlSignalRecordModule } from '../ml-signal-record/ml-signal-record.module';
+import { MlSignalRecordService } from '../ml-signal-record/ml-signal-record.service';
 
 @Module({
   // LongTermMemoryModule is a leaf (PrismaModule only) — no circular dep risk.
-  imports: [PrismaModule, ProvidersModule, LongTermMemoryModule],
-  providers: [SnapshotService],
+  // MlSignalRecordModule is a leaf (PrismaModule only) — no circular dep risk.
+  imports: [PrismaModule, ProvidersModule, LongTermMemoryModule, MlSignalRecordModule],
+  providers: [SnapshotService, MlSignalRecordService],
   controllers: [SnapshotController],
   exports: [SnapshotService],
 })

@@ -13,6 +13,8 @@ import { PretestModule } from '../pretest/pretest.module';
 import { KvService } from '../common/kv.service';
 import { LongTermMemoryModule } from '../long-term-memory/long-term-memory.module';
 import { ProvidersModule } from '../providers/providers.module';
+import { MlSignalRecordModule } from '../ml-signal-record/ml-signal-record.module';
+import { MlSignalRecordService } from '../ml-signal-record/ml-signal-record.service';
 
 @Module({
   imports: [
@@ -34,8 +36,10 @@ import { ProvidersModule } from '../providers/providers.module';
     // ProvidersModule exports ProviderGatewayService needed by AgentsService._isHighImpact.
     // providers never imports agents — no circular dep.
     ProvidersModule,
+    // MlSignalRecordModule is a leaf (PrismaModule only) — no circular dep risk.
+    MlSignalRecordModule,
   ],
-  providers: [AgentsService, KvService, DebateService],
+  providers: [AgentsService, KvService, DebateService, MlSignalRecordService],
   exports: [AgentsService],
 })
 export class AgentsModule {}

@@ -159,6 +159,26 @@ model LessonMemory {
   @@map("lesson_memory")
 }
 
+// ml-feature-extractor-s1: per-skill signal -> outcome capture for the on-device ML feature extractor.
+// One row per (cycle_id, symbol). skill_vector is JSON [{plugin_id, action, confidence}].
+// outcome_* are NULL at capture, backfilled by the NEXT snapshot (no lookahead).
+model MlSignalRecord {
+  id                String   @id
+  ts                DateTime @default(now())
+  cycle_id          String
+  symbol            String
+  skill_vector      String   // JSON: [{plugin_id, action, confidence}]
+  action            String
+  outcome_pnl       Float?
+  outcome_equity    Float?
+  active_skill_hash String
+  meta              String?
+
+  @@index([cycle_id])
+  @@index([ts])
+  @@map("ml_signal_record")
+}
+
 // Cartera virtual de pretest — permite probar configuraciones distintas antes de usar dinero real
 // Cada pretest es independiente: tiene sus propios plugins activos, config y estado de cartera virtual
 model PretestPortfolio {
