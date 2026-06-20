@@ -18,6 +18,7 @@ import { NotifierBridge } from '../notifier/notifier-bridge';
 import { ConfigService } from '@nestjs/config';
 import { PretestService } from '../pretest/pretest.service';
 import { KvService } from '../common/kv.service';
+import { LongTermMemoryService } from '../long-term-memory/long-term-memory.service';
 
 import type { LlmResponse } from '../llm/llm.service';
 import { parseToolCalls } from '../llm/kernel-parser';
@@ -254,6 +255,10 @@ export class AgentsService {
     // without KvService continue compiling; _resolveMaxTurns falls back to REACT_MAX_TURNS_DEFAULT.
     @Optional()
     private readonly kv?: KvService,
+    // LongTermMemoryService injected @Optional() — cycles run normally when absent.
+    // F6-s2 PR2: prefetch before runGovernedTurn + record after.
+    @Optional()
+    private readonly longTermMemory?: LongTermMemoryService,
   ) {}
 
   /**
@@ -622,7 +627,7 @@ export class AgentsService {
   ): Promise<AgentCycleResult> {
     // ── 1. Inyectar memoria inter-ciclos ──────────────────────────────────────
     const memContext = await this.memory.toContextString();
-    const enrichedContext = memContext
+    let enrichedContext = memContext
       ? `${memContext}\n\n[CONTEXTO DEL CICLO ACTUAL]\n${context}`
       : context;
 
@@ -709,6 +714,13 @@ export class AgentsService {
         ? `\n\n[SEÑALES APROBADAS POR LAS DISCIPLINAS]\n${JSON.stringify(approvedSignals, null, 2)}\n`
         : '\n\n[NO HAY SEÑALES APROBADAS EN ESTE CICLO]\n';
 
+    // ── F6-s2 PR2: prefetch relevant episodes (retrieve-on-demand) ─────────────
+    enrichedContext = await this._ltmPrefetchInject(
+      enrichedContext,
+      approvedSignals,
+      pendingSignals,
+    );
+
     const turnResult = await this.runGovernedTurn({
       source: 'cycle',
       context: enrichedContext + signalSummary,
@@ -724,6 +736,9 @@ export class AgentsService {
       skills_read,
       signalsEmitted,
     } = turnResult;
+
+    // ── F6-s2 PR2: record episode after governed turn ─────────────────────────
+    await this._ltmRecordEpisode(cycle_id, signalsEmitted, llmResponse.text ?? '');
 
     // ── 3c. POST-stage extra plugins (after LLM turn) ─────────────────────────
     const postFinalCtx = await this._runPostExtras(postExtras, runningCtx, cycle_id);
@@ -771,6 +786,106 @@ export class AgentsService {
    *   - cycle_abort      : handled before merge is called
    *   - cycle_abort_reason
    */
+  // ── F6-s2 PR2 LTM helpers ─────────────────────────────────────────────────
+
+  /**
+   * Prefetch relevant past episodes and inject [EPISODIOS RELEVANTES] block into
+   * the enriched context ONLY when prefetch returns at least one hit.
+   * Failure NEVER breaks the cycle (swallows exceptions, returns ctx unchanged).
+   */
+  private async _ltmPrefetchInject(
+    enrichedContext: string,
+    approvedSignals: unknown[],
+    pendingSignals: unknown[],
+  ): Promise<string> {
+    if (!this.longTermMemory) return enrichedContext;
+    try {
+      const extract = (sigs: unknown[]): string[] =>
+        sigs
+          .map((s) => (s as Record<string, unknown>)['symbol'])
+          .filter((sym): sym is string => typeof sym === 'string');
+      const uniqueSymbols = [...new Set([...extract(approvedSignals), ...extract(pendingSignals)])];
+      if (uniqueSymbols.length === 0) return enrichedContext;
+      const hits = await this.longTermMemory.prefetch(uniqueSymbols.join(' '), 5);
+      if (hits.length === 0) return enrichedContext;
+      const text = hits
+        .map(
+          (ep) =>
+            `[${ep.cycle_id}] ${ep.action_summary} | P&L: ${ep.outcome_pnl ?? 'pending'} | ${ep.llm_rationale}`,
+        )
+        .join('\n');
+      const block = `[EPISODIOS RELEVANTES]\n${text}`.slice(0, 800);
+      return `${enrichedContext}\n\n${block}`;
+    } catch (e) {
+      this.log.warn(`[LTM] prefetch failed — continuing without episode context: ${e}`);
+      return enrichedContext;
+    }
+  }
+
+  /**
+   * Strip LLM control-structure tokens from episode text fields before storing.
+   * Prevents a compromised rationale from reconstructing a prompt-injection vector
+   * when the episode is later recalled into a future cycle's LLM context.
+   */
+  private _sanitizeEpisodeText(s: string): string {
+    const CONTROL_TOKENS = [
+      /\[DECISION\]/gi,
+      /\[TOOL SCHEMA\]/gi,
+      /\[SEÑALES APROBADAS[^\]]*\]/gi,
+      /\[EPISODIOS RELEVANTES\]/gi,
+      /\[OBSERVACIONES[^\]]*\]/gi,
+      /\[LESSONS\]/gi,
+      /\[PAST EPISODES\]/gi,
+      /<tool_calls>[\s\S]*?<\/tool_calls>/gi,
+      /```json[\s\S]*?```/gi,
+      /```[\s\S]*?```/gi,
+    ];
+    let result = s;
+    for (const re of CONTROL_TOKENS) {
+      result = result.replace(re, '[stripped]');
+    }
+    return result;
+  }
+
+  /**
+   * Record the cycle episode to long-term memory after a governed turn.
+   * outcome_pnl is null here; SnapshotService backfills it via updateOutcome().
+   * Failure NEVER breaks the cycle (swallows exceptions).
+   */
+  private async _ltmRecordEpisode(
+    cycle_id: string,
+    signalsEmitted: { symbol: string; action: string }[],
+    llmText: string,
+  ): Promise<void> {
+    if (!this.longTermMemory) return;
+    try {
+      const symbols = signalsEmitted.map((s) => s.symbol);
+      const actionSummary = signalsEmitted
+        .map((s) => `${s.action.toUpperCase()} ${s.symbol}`)
+        .join(', ')
+        .slice(0, 200);
+      const llmRationale = this._sanitizeEpisodeText(llmText).slice(0, 500);
+      // symbol-only regime tags for PR2; richer tags deferred to later PRs
+      const regimeTags = symbols;
+      const narrative = this._sanitizeEpisodeText(
+        `${symbols.join(' ')} ${regimeTags.join(' ')} ${actionSummary} ${llmRationale}`.slice(
+          0,
+          1400,
+        ),
+      );
+      await this.longTermMemory.record({
+        cycle_id,
+        symbols,
+        regime_tags: regimeTags,
+        action_summary: actionSummary,
+        llm_rationale: llmRationale,
+        narrative,
+      });
+    } catch (e) {
+      this.log.warn(`[LTM] record failed — episode not persisted: ${e}`);
+    }
+  }
+
   private _mergeExtraCtx(
     base: Record<string, unknown>,
     extra: Record<string, unknown>,

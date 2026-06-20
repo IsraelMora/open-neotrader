@@ -10,6 +10,7 @@ import { SnapshotModule } from '../snapshot/snapshot.module';
 import { NotifierModule } from '../notifier/notifier.module';
 import { PretestModule } from '../pretest/pretest.module';
 import { KvService } from '../common/kv.service';
+import { LongTermMemoryModule } from '../long-term-memory/long-term-memory.module';
 
 @Module({
   imports: [
@@ -26,6 +27,8 @@ import { KvService } from '../common/kv.service';
     // PretestService injects AgentsService (to run governed turns for pretest cycles).
     // AgentsService injects PretestService (to create/compare pretest portfolios in reflection).
     forwardRef(() => PretestModule),
+    // LongTermMemoryModule is a leaf (PrismaModule only) — no circular dep risk.
+    LongTermMemoryModule,
   ],
   providers: [AgentsService, KvService],
   exports: [AgentsService],

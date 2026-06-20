@@ -1,6 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService, Portfolio } from '../providers/provider-gateway.service';
+import { LongTermMemoryService } from '../long-term-memory/long-term-memory.service';
 
 export interface NavEntry {
   id: string;
@@ -21,6 +22,10 @@ export class SnapshotService {
   constructor(
     private readonly db: PrismaService,
     private readonly gateway: ProviderGatewayService,
+    // LongTermMemoryService injected @Optional() — snapshots run normally when absent.
+    // F6-s2 PR2: backfills episode outcome_pnl/equity via updateOutcome.
+    @Optional()
+    private readonly longTermMemory?: LongTermMemoryService,
   ) {}
 
   /** Toma un snapshot del NAV actual desde el provider por defecto. */
@@ -43,6 +48,19 @@ export class SnapshotService {
         total_pnl: portfolio.total_pnl,
       },
     });
+
+    // ── F6-s2 PR2: backfill episode outcome after snapshot ───────────────────
+    // Calls updateOutcome only when a cycleId is known and LTM is available.
+    // Failure NEVER breaks the snapshot.
+    if (cycleId && this.longTermMemory) {
+      try {
+        await this.longTermMemory.updateOutcome(cycleId, portfolio.total_pnl, portfolio.equity);
+      } catch (e) {
+        this.log.warn(
+          `[LTM] updateOutcome failed for cycle ${cycleId} — episode outcome not backfilled: ${e}`,
+        );
+      }
+    }
 
     return this._hydrate(entry);
   }

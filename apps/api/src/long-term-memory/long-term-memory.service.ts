@@ -21,7 +21,7 @@ import type {
 
 @Injectable()
 export class LongTermMemoryService implements MemoryProvider, OnModuleInit {
-  readonly log = new Logger(LongTermMemoryService.name);
+  private readonly log = new Logger(LongTermMemoryService.name);
   private fts5Available = false;
 
   constructor(private readonly db: PrismaService) {}
