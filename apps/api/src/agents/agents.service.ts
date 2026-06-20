@@ -281,6 +281,9 @@ const KERNEL_TOOL_REGISTRY: Set<string> = new Set([
   'train_ml_model',
 ]);
 
+/** Plugin id of the ML discipline — used for opt-in injection and ML-first sort. */
+const ML_PLUGIN_ID = 'ml-feature-extractor';
+
 /** Orquesta el ciclo completo del agente: memoria, hooks de plugins, capa de veto, LLM y ejecución de tool calls. */
 @Injectable()
 export class AgentsService {
@@ -748,12 +751,31 @@ export class AgentsService {
     // gate (_validateToolCalls), and HITL review. Treating the veto as a tool-call firewall
     // would be incorrect and would contradict the design.
     const disciplinePlugins = activePlugins.filter((p: HydratedPlugin) => p.type === 'discipline');
+
+    // ml-feature-extractor-s3: resolve model injection (opt-in, hash-validated, fail-soft).
+    // Returns {} when ML plugin is inactive — no KV read, cycle byte-identical (AC-S3-1/12).
+    const mlInjection: { model_blob?: string; feature_names?: string[] } =
+      await this._mlResolveModelInjection(activePlugins).catch(() => ({}));
+
     const { vetoCtx, vetoSummary } = await this._runVetoLayer(
       cycle_id,
       disciplinePlugins,
       hookCtx,
       pendingSignals,
+      mlInjection,
     );
+
+    // ml-feature-extractor-s3 D6: audit when a model was actually applied (blob injected).
+    if (mlInjection.model_blob) {
+      const postVetoSignals: unknown[] = Array.isArray(vetoCtx['pending_signals'])
+        ? (vetoCtx['pending_signals'] as unknown[])
+        : [];
+      await this.audit.log({
+        cycle_id,
+        event_type: 'ml_signals_adjusted',
+        meta: { n_signals: postVetoSignals.length, hash_match: true },
+      });
+    }
 
     // ── 3b. PRE-stage extra plugins (before LLM turn) ─────────────────────────
     const extraPlugins = activePlugins.filter((p: HydratedPlugin) => p.type === 'extra');
@@ -1004,6 +1026,46 @@ export class AgentsService {
     }
   }
 
+  /**
+   * ml-feature-extractor-s3: resolve the model injection payload for the current cycle.
+   *
+   * Opt-in: if ml-feature-extractor is NOT active → returns {} immediately without any KV read
+   * (AC-S3-1/12 — byte-identical to pre-s3 when the plugin is inactive).
+   *
+   * Hash-validated: compares the stored active_skill_hash against the current active skill set.
+   * Mismatch (stale model) → returns {} (identity). Hash match → returns {model_blob, feature_names}.
+   *
+   * Fail-soft: any error (KV unavailable, JSON parse, hash computation) → warn + return {}.
+   * The cycle is NEVER broken by this method.
+   */
+  private async _mlResolveModelInjection(
+    activePlugins: HydratedPlugin[],
+  ): Promise<{ model_blob?: string; feature_names?: string[] }> {
+    // Opt-in gate: no KV read unless the ML plugin is active (AC-S3-1/12)
+    if (!activePlugins.some((p) => p.id === ML_PLUGIN_ID)) {
+      return {};
+    }
+    try {
+      const raw = await this.kv?.get('ml:model:current');
+      if (!raw) return {};
+      const parsed = JSON.parse(raw) as {
+        blob_b64: string;
+        active_skill_hash: string;
+        feature_names: string[];
+      };
+      const skillIds = activePlugins.filter((p) => p.type === 'skill').map((p) => p.id);
+      const currentHash = this.mlSignalRecord!.computeActiveSkillHash(skillIds);
+      if (parsed.active_skill_hash !== currentHash) {
+        this.log.warn('[ML] stale model — active_skill_hash mismatch; using identity');
+        return {};
+      }
+      return { model_blob: parsed.blob_b64, feature_names: parsed.feature_names };
+    } catch (e) {
+      this.log.warn(`[ML] _mlResolveModelInjection failed — using identity: ${String(e)}`);
+      return {};
+    }
+  }
+
   private _mergeExtraCtx(
     base: Record<string, unknown>,
     extra: Record<string, unknown>,
@@ -1146,16 +1208,30 @@ export class AgentsService {
     disciplinePlugins: HydratedPlugin[],
     hookCtx: Record<string, unknown>,
     pendingSignals: unknown[],
+    mlInjection: { model_blob?: string; feature_names?: string[] } = {},
   ): Promise<{ vetoCtx: Record<string, unknown>; vetoSummary: VetoSummary }> {
     let vetoCtx: Record<string, unknown> = { ...hookCtx, pending_signals: pendingSignals };
     const vetoReasons: string[] = [];
 
-    for (const disc of disciplinePlugins) {
+    // D1: Stable sort — ML plugin always runs first, others keep relative order.
+    // This is structural and DB-order-independent (AC-S3-6/7).
+    const mlFirst = (a: HydratedPlugin, b: HydratedPlugin): number => {
+      if (a.id === ML_PLUGIN_ID) return -1;
+      if (b.id === ML_PLUGIN_ID) return 1;
+      return 0;
+    };
+    const sorted = [...disciplinePlugins].sort(mlFirst);
+
+    for (const disc of sorted) {
+      // D2: inject model_blob ONLY into the ML plugin's hook context (no leakage)
+      const hookCtxForDisc: Record<string, unknown> =
+        disc.id === ML_PLUGIN_ID ? { ...vetoCtx, ...mlInjection } : vetoCtx;
+
       const discResult = await this.sandbox.call({
         cmd: 'run_hook',
         plugin_id: disc.id,
         hook: 'on_cycle',
-        context: vetoCtx,
+        context: hookCtxForDisc,
       });
 
       if (discResult.ok && discResult.result) {
