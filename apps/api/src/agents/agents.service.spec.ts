@@ -5463,9 +5463,228 @@ describe('F6-S1 T10 — existing suite regression: _executeCycle reads accumulat
   });
 });
 
+// ── F6-S2 PR3 — _assembleReflectionContext [LESSONS] + [PAST EPISODES] ────────
+
+/**
+ * Build an assembler service with LTM (for PR3 reflection context tests).
+ * Extends makeAssemblerService pattern with a 12-arg constructor call.
+ */
+function makeAssemblerServicePr3(opts: {
+  auditEntries?: Array<{ event_type: string; symbol?: string | null; action?: string | null; meta?: string | null }>;
+  equityCurve?: Array<{ ts: string; equity: number }>;
+  lessons?: Array<{ id: string; ts: Date; text: string; episode_id: string | null; rationale: string | null }>;
+  episodePrefetch?: import('../long-term-memory/memory-provider.interface').EpisodeRecord[];
+  ltmThrows?: boolean;
+  noLtm?: boolean;
+  auditThrows?: boolean;
+  snapshotThrows?: boolean;
+}): AgentsService {
+  const audit = {
+    log: jest.fn().mockResolvedValue(undefined),
+    query: opts.auditThrows
+      ? jest.fn().mockRejectedValue(new Error('audit unavailable'))
+      : jest.fn().mockResolvedValue(
+          (opts.auditEntries ?? []).map((e) => ({
+            event_type: e.event_type,
+            symbol: e.symbol ?? null,
+            action: e.action ?? null,
+            meta: e.meta ?? null,
+          })),
+        ),
+  };
+
+  const snapshot: Partial<SnapshotService> | undefined = opts.snapshotThrows
+    ? { getEquityCurve: jest.fn().mockRejectedValue(new Error('snapshot unavailable')) }
+    : {
+        getEquityCurve: jest.fn().mockResolvedValue(
+          (opts.equityCurve ?? [{ ts: '2024-01-01', equity: 1000 }]).map((e) => ({
+            ts: e.ts,
+            equity: e.equity,
+          })),
+        ),
+      };
+
+  const pretest: Partial<PretestService> = {
+    compare: jest.fn().mockResolvedValue({
+      portfolios: [],
+      winner_by_return: '',
+      winner_by_risk_adj: '',
+    }),
+  };
+
+  // LTM mock
+  let ltm: ReturnType<typeof makeLtmPr3> | undefined;
+  if (!opts.noLtm) {
+    ltm = makeLtmPr3();
+    if (opts.ltmThrows) {
+      ltm.listLessons.mockRejectedValue(new Error('ltm unavailable'));
+      ltm.prefetch.mockRejectedValue(new Error('ltm unavailable'));
+    } else {
+      ltm.listLessons.mockResolvedValue(opts.lessons ?? []);
+      ltm.prefetch.mockResolvedValue(opts.episodePrefetch ?? []);
+    }
+  }
+
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+    longTermMemory: unknown,
+  ) => AgentsService)(
+    {},
+    {},
+    {
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+      getProviderTools: jest.fn().mockResolvedValue([]),
+      findActive: jest.fn().mockResolvedValue([]),
+    },
+    {},
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    snapshot,
+    undefined,
+    undefined,
+    pretest,
+    undefined,
+    ltm,
+  );
+}
+
+describe('F6-S2 PR3 — _assembleReflectionContext [LESSONS] + [PAST EPISODES]', () => {
+  it('3.7a — [LESSONS] section appears when lessons exist', async () => {
+    const service = makeAssemblerServicePr3({
+      lessons: [
+        { id: 'l1', ts: new Date(), text: 'Exit before FOMC', episode_id: null, rationale: null },
+        { id: 'l2', ts: new Date(), text: 'VIX > 30 → no new longs', episode_id: null, rationale: null },
+      ],
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+    expect(ctx).toContain('[LESSONS]');
+    expect(ctx).toContain('Exit before FOMC');
+  });
+
+  it('3.7b — [LESSONS] section is omitted when no lessons', async () => {
+    const service = makeAssemblerServicePr3({ lessons: [] });
+    const ctx = await callAssembleReflectionContext(service);
+    // No lessons → no [LESSONS] block
+    expect(ctx).not.toContain('[LESSONS]');
+  });
+
+  it('3.7c — [PAST EPISODES] section appears when prefetch has hits', async () => {
+    const episode: import('../long-term-memory/memory-provider.interface').EpisodeRecord = {
+      id: 'ep-1',
+      ts: new Date(),
+      cycle_id: 'c1',
+      symbols: '["SPY"]',
+      regime_tags: '["vix_high"]',
+      action_summary: 'EXIT SPY',
+      llm_rationale: 'High VIX',
+      narrative: 'SPY vix_high EXIT HIGH VIX',
+      outcome_pnl: 42.5,
+      outcome_equity: 10042.5,
+      promoted: false,
+      meta: null,
+    };
+    const service = makeAssemblerServicePr3({ episodePrefetch: [episode] });
+
+    const ctx = await callAssembleReflectionContext(service);
+    expect(ctx).toContain('[PAST EPISODES]');
+  });
+
+  it('3.7d — [PAST EPISODES] section is omitted when prefetch returns empty', async () => {
+    const service = makeAssemblerServicePr3({ episodePrefetch: [] });
+    const ctx = await callAssembleReflectionContext(service);
+    expect(ctx).not.toContain('[PAST EPISODES]');
+  });
+
+  it('3.7e — total length ≤ 4000 when all sections are full', async () => {
+    // Provide max-length content to stress test
+    const bigText = 'A'.repeat(600);
+    const service = makeAssemblerServicePr3({
+      lessons: [
+        { id: 'l1', ts: new Date(), text: bigText, episode_id: null, rationale: null },
+        { id: 'l2', ts: new Date(), text: bigText, episode_id: null, rationale: null },
+        { id: 'l3', ts: new Date(), text: bigText, episode_id: null, rationale: null },
+      ],
+      episodePrefetch: [
+        {
+          id: 'ep-1',
+          ts: new Date(),
+          cycle_id: 'c1',
+          symbols: '["SPY"]',
+          regime_tags: '["vix_high"]',
+          action_summary: 'EXIT SPY '.repeat(20),
+          llm_rationale: 'A'.repeat(500),
+          narrative: 'A'.repeat(1000),
+          outcome_pnl: 42.5,
+          outcome_equity: 10042.5,
+          promoted: false,
+          meta: null,
+        },
+        {
+          id: 'ep-2',
+          ts: new Date(),
+          cycle_id: 'c2',
+          symbols: '["QQQ"]',
+          regime_tags: '["vix_high"]',
+          action_summary: 'HOLD QQQ'.repeat(20),
+          llm_rationale: 'B'.repeat(500),
+          narrative: 'B'.repeat(1000),
+          outcome_pnl: null,
+          outcome_equity: null,
+          promoted: false,
+          meta: null,
+        },
+      ],
+      auditEntries: Array.from({ length: 20 }, () => ({
+        event_type: 'cycle_complete',
+        symbol: 'AAPL',
+        action: 'buy',
+      })),
+      equityCurve: Array.from({ length: 20 }, (_, i) => ({ ts: `2024-01-${String(i + 1)}`, equity: 1000 + i * 10 })),
+    });
+
+    const ctx = await callAssembleReflectionContext(service);
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+  });
+
+  it('3.7f — memory failure in listLessons is swallowed (no [LESSONS], no throw)', async () => {
+    const service = makeAssemblerServicePr3({ ltmThrows: true });
+    const ctx = await callAssembleReflectionContext(service);
+    // Should not throw and [LESSONS] should be absent (graceful omission)
+    expect(ctx).not.toContain('[LESSONS]');
+    expect(typeof ctx).toBe('string');
+  });
+
+  it('3.7g — memory failure in prefetch is swallowed (no [PAST EPISODES], no throw)', async () => {
+    const service = makeAssemblerServicePr3({ ltmThrows: true });
+    const ctx = await callAssembleReflectionContext(service);
+    expect(ctx).not.toContain('[PAST EPISODES]');
+    expect(typeof ctx).toBe('string');
+  });
+
+  it('3.7h — no LTM service → no [LESSONS], no [PAST EPISODES], no throw', async () => {
+    const service = makeAssemblerServicePr3({ noLtm: true });
+    const ctx = await callAssembleReflectionContext(service);
+    expect(ctx).not.toContain('[LESSONS]');
+    expect(ctx).not.toContain('[PAST EPISODES]');
+    expect(typeof ctx).toBe('string');
+  });
+});
+
 // ── F6-S2 PR3 — kernel__record_lesson tests ───────────────────────────────────
 
 import type { LessonRecord } from '../long-term-memory/memory-provider.interface';
+// Note: LongTermMemoryService already imported above at line 5025
 
 /** Extended LTM stub that includes promote + listLessons for PR3. */
 function makeLtmPr3(): jest.Mocked<
