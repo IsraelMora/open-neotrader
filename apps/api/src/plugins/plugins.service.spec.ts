@@ -646,7 +646,7 @@ describe('PluginsService.writeSkillGuarded', () => {
   });
 
   it('FIFO: after 6 writes, KV array is capped at 5 (oldest shifted)', async () => {
-    // Start with 5 existing snapshots
+    // Start with 5 existing snapshots in legacy string format (backward-compat read path).
     const existing = ['snap1', 'snap2', 'snap3', 'snap4', 'snap5'];
     const existingBody = 'a'.repeat(100);
 
@@ -665,11 +665,16 @@ describe('PluginsService.writeSkillGuarded', () => {
     await service.writeSkillGuarded('test-skill', 'b'.repeat(130));
 
     expect(captured).not.toBeNull();
-    const arr = JSON.parse(captured!) as string[];
-    // Should have shifted snap1 and added existingBody → ['snap2','snap3','snap4','snap5', existingBody]
+    // Entries are now SkillSnapshotEntry objects. The oldest legacy string 'snap1' was shifted;
+    // the new entry appended for existingBody is a {body, written_by, written_at} object.
+    const arr = JSON.parse(captured!) as Array<string | { body: string; written_by: string }>;
+    // Should have shifted 'snap1'; remaining 4 legacy entries + 1 new object = 5
     expect(arr).toHaveLength(5);
+    // First four entries are the remaining legacy strings
     expect(arr[0]).toBe('snap2');
-    expect(arr[4]).toBe(existingBody);
+    expect(arr[3]).toBe('snap5');
+    // Last entry is the new provenance object for the existingBody snapshot
+    expect(arr[4]).toMatchObject({ body: existingBody, written_by: 'llm' });
   });
 
   it('malformed KV JSON treated as [], no throw', async () => {
@@ -841,6 +846,133 @@ describe('PluginsService.revertSkill', () => {
 
     expect(result).toEqual({ ok: false, reason: 'not_writable' });
     expect(writeSkillContentMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── F6-s5 Provenance: writeSkillGuarded snapshot + audit provenance ───────────
+
+import type { SkillSnapshotEntry } from './plugins.service';
+
+describe('F6-s5 Provenance — writeSkillGuarded KV snapshot and audit event include written_by + written_at', () => {
+  beforeEach(() => jest.restoreAllMocks());
+
+  const writable_manifest_prov: PluginManifest = {
+    plugin: {
+      id: 'test-skill',
+      name: 'Test Skill',
+      version: '1.0.0',
+      type: 'skill',
+      llm_writable: true,
+    },
+  };
+
+  it('prov.1 — KV snapshot entry has body, written_by:"llm", and written_at (ISO string)', async () => {
+    const existingBody = 'a'.repeat(100);
+    const newBody = 'b'.repeat(130);
+
+    const { service, kv } = makeServiceWithKv({
+      manifest: writable_manifest_prov,
+      skillBody: existingBody,
+      kvValue: null,
+    });
+
+    let savedRaw: string | null = null;
+    kv.set.mockImplementation((_key: string, val: string) => {
+      savedRaw = val;
+      return Promise.resolve();
+    });
+
+    const before = new Date();
+    const result = await service.writeSkillGuarded('test-skill', newBody);
+    const after = new Date();
+
+    expect(result.ok).toBe(true);
+    expect(savedRaw).not.toBeNull();
+
+    const arr = JSON.parse(savedRaw!) as SkillSnapshotEntry[];
+    expect(arr).toHaveLength(1);
+
+    const entry = arr[0];
+    // body must be the PREVIOUS body (snapshot before write)
+    expect(entry.body).toBe(existingBody);
+    // written_by must be 'llm'
+    expect(entry.written_by).toBe('llm');
+    // written_at must be a valid ISO timestamp within the test window
+    expect(typeof entry.written_at).toBe('string');
+    const ts = new Date(entry.written_at);
+    expect(ts.getTime()).toBeGreaterThanOrEqual(before.getTime());
+    expect(ts.getTime()).toBeLessThanOrEqual(after.getTime());
+  });
+
+  it('prov.2 — audit skill_written meta includes written_by:"llm" and written_at', async () => {
+    const existingBody = 'a'.repeat(100);
+    const newBody = 'b'.repeat(130);
+
+    const { service, audit } = makeServiceWithKv({
+      manifest: writable_manifest_prov,
+      skillBody: existingBody,
+      kvValue: null,
+    });
+
+    const before = new Date();
+    await service.writeSkillGuarded('test-skill', newBody);
+    const after = new Date();
+
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'skill_written',
+        meta: expect.objectContaining({
+          written_by: 'llm',
+        }) as unknown,
+      }),
+    );
+
+    // Verify written_at is a valid ISO timestamp within the test window
+    const allCalls = audit.log.mock.calls as Array<[Record<string, unknown>]>;
+    const writtenCall = allCalls.find(([a]) => a['event_type'] === 'skill_written');
+    expect(writtenCall).toBeDefined();
+    const meta = writtenCall![0]['meta'] as Record<string, unknown>;
+    const writtenAt = meta['written_at'] as string;
+    expect(typeof writtenAt).toBe('string');
+    const ts = new Date(writtenAt);
+    expect(ts.getTime()).toBeGreaterThanOrEqual(before.getTime());
+    expect(ts.getTime()).toBeLessThanOrEqual(after.getTime());
+  });
+
+  it('prov.3 — revertSkill still works after a provenance write (reads .body from SkillSnapshotEntry)', async () => {
+    // Simulate KV containing a single SkillSnapshotEntry (the new shape from writeSkillGuarded)
+    const previousBody = 'previous skill body with sufficient length for the test';
+    const snapshotEntry: SkillSnapshotEntry = {
+      body: previousBody,
+      written_by: 'llm',
+      written_at: new Date().toISOString(),
+    };
+
+    const { service, writeSkillContentMock } = makeServiceWithKv({
+      kvValue: JSON.stringify([snapshotEntry]),
+      manifest: writable_manifest_prov,
+    });
+
+    const result = await service.revertSkill('test-skill');
+
+    expect(result).toEqual({ ok: true });
+    // writeSkillContent must be called with the body extracted from the entry
+    expect(writeSkillContentMock).toHaveBeenCalledWith('test-skill', previousBody);
+  });
+
+  it('prov.4 — revertSkill backward-compat: legacy string entries still restore correctly', async () => {
+    // Pre-provenance snapshots were stored as plain strings. Revert must handle both shapes.
+    const legacyBody = 'legacy body written before provenance feature';
+
+    const { service, writeSkillContentMock } = makeServiceWithKv({
+      kvValue: JSON.stringify([legacyBody]),
+      manifest: writable_manifest_prov,
+    });
+
+    const result = await service.revertSkill('test-skill');
+
+    expect(result).toEqual({ ok: true });
+    expect(writeSkillContentMock).toHaveBeenCalledWith('test-skill', legacyBody);
   });
 });
 
