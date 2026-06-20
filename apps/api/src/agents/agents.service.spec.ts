@@ -7,6 +7,7 @@ import type { AuditService } from '../audit/audit.service';
 import type { AlertsService } from '../alerts/alerts.service';
 import type { SnapshotService } from '../snapshot/snapshot.service';
 import type { PretestService } from '../pretest/pretest.service';
+import type { KvService } from '../common/kv.service';
 
 // ── Stubs ─────────────────────────────────────────────────────────────────────
 
@@ -118,6 +119,20 @@ function makeFullPlugins(
   };
 }
 
+/**
+ * KvService stub that returns maxTurns='1' so tests written before F6-S1 (which
+ * set up a single LLM response) remain single-iteration and their existing assertions
+ * continue to pass.  Tests that need multi-iteration behaviour use makeReActService
+ * with an explicit kv value.
+ */
+function makeKvSingleTurn(): jest.Mocked<Pick<KvService, 'get'>> {
+  return {
+    get: jest
+      .fn()
+      .mockImplementation((key: string) => Promise.resolve(key === 'react.max_turns' ? '1' : null)),
+  };
+}
+
 function makeFullAgentsService(
   llm: Partial<LlmService>,
   audit: ReturnType<typeof makeAudit>,
@@ -125,13 +140,32 @@ function makeFullAgentsService(
   sandbox: ReturnType<typeof makeSandbox>,
   memory: ReturnType<typeof makeMemory>,
 ): AgentsService {
-  return new AgentsService(
-    llm as unknown as LlmService,
-    sandbox as unknown as SandboxGateway,
-    plugins as unknown as PluginsService,
-    memory as unknown as ContextMemoryService,
-    audit as unknown as AuditService,
-    { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+  // Inject kv returning '1' so pre-F6-S1 tests stay single-iteration.
+  // F6-S1 multi-iteration tests use makeReActService with explicit kv control.
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+  ) => AgentsService)(
+    llm,
+    sandbox,
+    plugins,
+    memory,
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    makeKvSingleTurn(),
   );
 }
 
@@ -3984,5 +4018,989 @@ describe('F4-S4 Phase 3 — _dispatchKernelTool: promote_pretest', () => {
         meta: expect.objectContaining({ reason: 'unknown_kernel_tool' }) as unknown,
       }),
     );
+  });
+});
+
+// ── F6-S1 ReAct Loop Tests ────────────────────────────────────────────────────
+//
+// Tests for the in-turn ReAct loop with budget (cognitive-upgrade-s1).
+// Strict TDD: these were written RED first, then GREEN via implementation.
+
+/**
+ * Build a KvService mock that returns the given value for 'react.max_turns'.
+ */
+function makeKv(reactMaxTurns: string | null): jest.Mocked<Pick<KvService, 'get'>> {
+  return {
+    get: jest.fn().mockImplementation((key: string) => {
+      if (key === 'react.max_turns') return Promise.resolve(reactMaxTurns);
+      return Promise.resolve(null);
+    }),
+  };
+}
+
+/**
+ * Build an AgentsService with KvService injected as the 11th constructor arg.
+ * All other deps are minimal/stubbed.
+ * Prefixed with _ because the inline factory pattern is used directly in tests.
+ */
+
+function _makeReActService(opts: {
+  kv: jest.Mocked<Pick<KvService, 'get'>>;
+  llmResponses: LlmResponse[];
+  sandbox?: jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+  plugins?: ReturnType<typeof makeFullPlugins>;
+  audit?: ReturnType<typeof makeAudit>;
+  activePlugins?: import('../plugins/plugins.service').HydratedPlugin[];
+}): AgentsService {
+  const audit = opts.audit ?? makeAudit();
+  const sandbox = opts.sandbox ?? {
+    callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+  };
+  const plugins = opts.plugins ?? makeFullPlugins(null, []);
+  if (opts.activePlugins) {
+    plugins.findActive.mockResolvedValue(opts.activePlugins);
+  }
+
+  let callIdx = 0;
+  const llmComplete = jest.fn().mockImplementation(() => {
+    const resp = opts.llmResponses[callIdx] ?? opts.llmResponses[opts.llmResponses.length - 1];
+    callIdx++;
+    return Promise.resolve(resp);
+  });
+
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+  ) => AgentsService)(
+    { complete: llmComplete },
+    sandbox,
+    plugins,
+    {},
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    opts.kv,
+  );
+}
+
+/** Helper: build an LlmResponse with no tool calls (natural exit text). */
+function makeLlmText(text: string): LlmResponse {
+  return { text, tool_calls: [], backend: 'api', skills_read: [], skills_written: [] };
+}
+
+/** Helper: build an LlmResponse that embeds a provider tool call in text. */
+function makeLlmToolCall(
+  pluginId: string,
+  fn: string,
+  args: Record<string, unknown> = {},
+): LlmResponse {
+  const toolName = `${pluginId}__${fn}`;
+  const text = `<tool_calls>[{"tool":"${toolName}","args":${JSON.stringify(args)}}]</tool_calls>`;
+  return { text, tool_calls: [], backend: 'api', skills_read: [], skills_written: [] };
+}
+
+/** Helper: build an LlmResponse for a kernel tool call. */
+function makeLlmKernelToolCall(fn: string, args: Record<string, unknown> = {}): LlmResponse {
+  const text = `<tool_calls>[{"tool":"kernel__${fn}","args":${JSON.stringify(args)}}]</tool_calls>`;
+  return { text, tool_calls: [], backend: 'api', skills_read: [], skills_written: [] };
+}
+
+// ── T1: maxTurns=1 ≡ current behavior (byte-identical decision path — REGRESSION GATE) ─
+
+describe('F6-S1 T1 — maxTurns=1 byte-identical to pre-loop behavior (REGRESSION GATE)', () => {
+  it('T1.1 — kv returns "1": exactly 1 llm.complete call; context unchanged (no [OBSERVACIONES]); NO react_iteration/react_budget_exhausted audit; turns_used=1', async () => {
+    const kv = makeKv('1');
+    const audit = makeAudit();
+
+    const llmResponse = makeLlmText('decision: hold');
+    const llmComplete = jest.fn().mockResolvedValue(llmResponse);
+
+    const plugins = makeFullPlugins(null, []);
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      { callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }) },
+      plugins,
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    const inputContext = 'market context for cycle';
+    const result = await service.runGovernedTurn({
+      source: 'cycle',
+      context: inputContext,
+    });
+
+    // Exactly one LLM call
+    expect(llmComplete).toHaveBeenCalledTimes(1);
+
+    // Context passed to LLM must equal input.context — NO [OBSERVACIONES...] suffix
+    const llmCallArg = (llmComplete.mock.calls[0] as [{ context: string }])[0];
+    expect(llmCallArg.context).toBe(inputContext);
+    expect(llmCallArg.context).not.toContain('[OBSERVACIONES');
+
+    // NO react_iteration or react_budget_exhausted audit events
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const reactIterAudit = auditCalls.find(([a]) => a['event_type'] === 'react_iteration');
+    const exhaustAudit = auditCalls.find(([a]) => a['event_type'] === 'react_budget_exhausted');
+    expect(reactIterAudit).toBeUndefined();
+    expect(exhaustAudit).toBeUndefined();
+
+    // turns_used = 1
+    expect(result.turns_used).toBe(1);
+
+    // Result shape matches existing fields
+    expect(result.text).toBe('decision: hold');
+    expect(result.cycle_id).toBeDefined();
+  });
+});
+
+// ── T2: Multi-iteration accumulation ─────────────────────────────────────────
+
+describe('F6-S1 T2 — multi-iteration accumulation + observations fed forward', () => {
+  it('T2.1 — iter1 executes provider tool (emits signal), iter2 natural exit; 2 llm.complete calls, iter2 context has [OBSERVACIONES], accumulated decisions/signals, turns_used=2', async () => {
+    const kv = makeKv('4');
+    const audit = makeAudit();
+
+    const providerTool = {
+      plugin_id: 'alpaca-provider',
+      name: 'alpaca-provider__place_order',
+      description: 'Place an order',
+      input_schema: { type: 'object', properties: {} },
+    };
+    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    const capturedContexts: string[] = [];
+    let callIdx = 0;
+    const llmResponses: LlmResponse[] = [
+      makeLlmToolCall('alpaca-provider', 'place_order', { symbol: 'AAPL', action: 'buy' }),
+      makeLlmText('done, no more tools'),
+    ];
+    const llmComplete = jest.fn().mockImplementation((opts: { context: string }) => {
+      capturedContexts.push(opts.context);
+      const resp = llmResponses[callIdx] ?? llmResponses[llmResponses.length - 1];
+      callIdx++;
+      return Promise.resolve(resp);
+    });
+
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: { filled: true } }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      sandbox,
+      plugins,
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    const result = await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'trade signal context',
+      _activePlugins: [
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    // 2 LLM calls
+    expect(llmComplete).toHaveBeenCalledTimes(2);
+
+    // Iter2 context must contain [OBSERVACIONES] block
+    expect(capturedContexts[1]).toContain('[OBSERVACIONES');
+
+    // Accumulated decisions (at least one from iter1)
+    expect(result.decisions.length).toBeGreaterThanOrEqual(1);
+
+    // Accumulated signals (AAPL buy from iter1)
+    expect(result.signalsEmitted).toContainEqual({ symbol: 'AAPL', action: 'buy' });
+
+    // turns_used = 2
+    expect(result.turns_used).toBe(2);
+
+    // Final text from last iteration (iter2 natural exit)
+    expect(result.text).toBe('done, no more tools');
+  });
+});
+
+// ── T3: Natural exit on first iteration ──────────────────────────────────────
+
+describe('F6-S1 T3 — natural exit on first iteration (no tool_calls)', () => {
+  it('T3.1 — LLM emits no tool_calls on iter1 → exits immediately; 1 llm.complete; turns_used=1; no exhaustion audit', async () => {
+    const kv = makeKv('4');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+
+    const llmComplete = jest.fn().mockResolvedValue(makeLlmText('just a text response'));
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      { callPlugin: jest.fn().mockResolvedValue({ ok: true }) },
+      plugins,
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    const result = await service.runGovernedTurn({ source: 'chat', context: 'hello' });
+
+    expect(llmComplete).toHaveBeenCalledTimes(1);
+    expect(result.turns_used).toBe(1);
+    expect(result.text).toBe('just a text response');
+
+    // No exhaustion audit
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const exhaustAudit = auditCalls.find(([a]) => a['event_type'] === 'react_budget_exhausted');
+    expect(exhaustAudit).toBeUndefined();
+  });
+});
+
+// ── T4: Budget exhaustion → react_budget_exhausted + NO grace execution ───────
+
+describe('F6-S1 T4 — budget exhaustion: react_budget_exhausted emitted, NO grace exec', () => {
+  it('T4.1 — maxTurns=2, both iters emit tool_calls; exactly 2 llm.complete; react_budget_exhausted audited once; NO 3rd call; turns_used=2', async () => {
+    const kv = makeKv('2');
+    const audit = makeAudit();
+
+    const providerTool = {
+      plugin_id: 'alpaca-provider',
+      name: 'alpaca-provider__place_order',
+      description: 'Place an order',
+      input_schema: { type: 'object', properties: {} },
+    };
+    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    const toolCallResponse = makeLlmToolCall('alpaca-provider', 'place_order', {
+      symbol: 'AAPL',
+      action: 'buy',
+    });
+    const llmComplete = jest.fn().mockResolvedValue(toolCallResponse);
+
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      sandbox,
+      plugins,
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    const result = await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'context',
+      _activePlugins: [
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    // Exactly 2 LLM calls (maxTurns=2), NO 3rd grace call
+    expect(llmComplete).toHaveBeenCalledTimes(2);
+
+    // react_budget_exhausted audited exactly once
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const exhaustAudits = auditCalls.filter(([a]) => a['event_type'] === 'react_budget_exhausted');
+    expect(exhaustAudits).toHaveLength(1);
+    expect(exhaustAudits[0][0]).toMatchObject({
+      event_type: 'react_budget_exhausted',
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      meta: expect.objectContaining({ turns_used: 2 }),
+    });
+
+    // turns_used = maxTurns = 2
+    expect(result.turns_used).toBe(2);
+
+    // sandbox.callPlugin called exactly 2 times (one per iteration, no grace)
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── T5: Control re-application — kernel dropped on non-reflection 2nd iteration ─
+
+describe('F6-S1 T5 — control re-application: kernel dropped on non-reflection 2nd iteration', () => {
+  it('T5.1 — source:cycle; iter1 valid provider call, iter2 emits kernel.write_skill → dropped kernel_source_not_allowed; writeSkillGuarded NOT called', async () => {
+    const kv = makeKv('4');
+    const audit = makeAudit();
+
+    const providerTool = {
+      plugin_id: 'alpaca-provider',
+      name: 'alpaca-provider__place_order',
+      description: 'Place an order',
+      input_schema: { type: 'object', properties: {} },
+    };
+    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+    // Add writeSkillGuarded to catch any unintended dispatch
+    (plugins as unknown as { writeSkillGuarded: jest.Mock }).writeSkillGuarded = jest
+      .fn()
+      .mockResolvedValue({ ok: true });
+
+    let callIdx = 0;
+    const llmResponses: LlmResponse[] = [
+      makeLlmToolCall('alpaca-provider', 'place_order', { symbol: 'AAPL', action: 'buy' }),
+      makeLlmKernelToolCall('write_skill', { skill: 'my-skill', new_body: 'injected' }),
+      makeLlmText('done'),
+    ];
+    const llmComplete = jest.fn().mockImplementation(() => {
+      const resp = llmResponses[callIdx] ?? llmResponses[llmResponses.length - 1];
+      callIdx++;
+      return Promise.resolve(resp);
+    });
+
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      sandbox,
+      plugins,
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'cycle context',
+      _activePlugins: [
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    // iter2's kernel call must be dropped kernel_source_not_allowed
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const kernelDropped = auditCalls.find(
+      ([a]) =>
+        a['event_type'] === 'tool_call_dropped' &&
+        a['plugin_id'] === 'kernel' &&
+        (a['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
+    );
+    expect(kernelDropped).toBeDefined();
+
+    // writeSkillGuarded MUST NOT be called
+    expect(
+      (plugins as unknown as { writeSkillGuarded: jest.Mock }).writeSkillGuarded,
+    ).not.toHaveBeenCalled();
+  });
+});
+
+// ── T6: Control re-application — provider dropped in virtual_only 2nd iteration ─
+
+describe('F6-S1 T6 — control re-application: provider dropped in virtual_only 2nd iteration', () => {
+  it('T6.1 — source:pretest, virtual_only:true; iter2 emits provider tool → dropped virtual_mode_provider_blocked; sandbox.callPlugin NOT called for it', async () => {
+    const kv = makeKv('4');
+    const audit = makeAudit();
+
+    const providerTool = {
+      plugin_id: 'alpaca-provider',
+      name: 'alpaca-provider__place_order',
+      description: 'Place an order',
+      input_schema: { type: 'object', properties: {} },
+    };
+    // Use an extra-type tool for iter1 (not dropped by virtual_only) and provider tool for iter2
+    const extraTool = {
+      plugin_id: 'backtester',
+      name: 'backtester__run',
+      description: 'Run backtest',
+      input_schema: { type: 'object', properties: {} },
+    };
+    const plugins = makeFullPlugins('Use tools.', [extraTool, providerTool]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'backtester', type: 'extra', name: 'Backtester' },
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    let callIdx = 0;
+    const llmResponses: LlmResponse[] = [
+      makeLlmToolCall('backtester', 'run', {}), // extra tool — should execute (not blocked by virtual_only)
+      makeLlmToolCall('alpaca-provider', 'place_order', { symbol: 'AAPL', action: 'buy' }), // provider — DROPPED
+      makeLlmText('done'),
+    ];
+    const llmComplete = jest.fn().mockImplementation(() => {
+      const resp = llmResponses[callIdx] ?? llmResponses[llmResponses.length - 1];
+      callIdx++;
+      return Promise.resolve(resp);
+    });
+
+    const callPluginMock = jest.fn().mockResolvedValue({ ok: true, result: null });
+    const sandbox = { callPlugin: callPluginMock } as jest.Mocked<
+      Pick<SandboxGateway, 'callPlugin'>
+    >;
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      sandbox,
+      plugins,
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    await service.runGovernedTurn({
+      source: 'pretest',
+      context: 'pretest context',
+      virtual_only: true,
+      _activePlugins: [
+        { id: 'backtester', type: 'extra', name: 'Backtester' },
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    // Provider tool in iter2 must be dropped virtual_mode_provider_blocked
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const providerDropped = auditCalls.find(
+      ([a]) =>
+        a['event_type'] === 'tool_call_dropped' &&
+        a['plugin_id'] === 'alpaca-provider' &&
+        (a['meta'] as Record<string, unknown>)?.['reason'] === 'virtual_mode_provider_blocked',
+    );
+    expect(providerDropped).toBeDefined();
+
+    // sandbox.callPlugin must NOT have been called with alpaca-provider
+    const alphacaCalls = callPluginMock.mock.calls.filter(
+      (args: unknown[]) => (args as [string, ...unknown[]])[0] === 'alpaca-provider',
+    );
+    expect(alphacaCalls).toHaveLength(0);
+  });
+});
+
+// ── T7: maxTurns clamp/fail-safe ─────────────────────────────────────────────
+
+describe('F6-S1 T7 — _resolveMaxTurns clamp and fail-safe', () => {
+  async function resolveMaxTurns(kv: jest.Mocked<Pick<KvService, 'get'>>): Promise<number> {
+    const plugins = makeFullPlugins(null, []);
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      {},
+      {},
+      plugins,
+      {},
+      { log: jest.fn().mockResolvedValue(undefined) },
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    return (service as unknown as { _resolveMaxTurns: () => Promise<number> })._resolveMaxTurns();
+  }
+
+  it('T7.1 — missing key (null) → 4', async () => {
+    expect(await resolveMaxTurns(makeKv(null))).toBe(4);
+  });
+
+  it('T7.2 — "abc" (invalid) → 4', async () => {
+    expect(await resolveMaxTurns(makeKv('abc'))).toBe(4);
+  });
+
+  it('T7.3 — "0" → clamped to 1', async () => {
+    expect(await resolveMaxTurns(makeKv('0'))).toBe(1);
+  });
+
+  it('T7.4 — "999" → clamped to 10', async () => {
+    expect(await resolveMaxTurns(makeKv('999'))).toBe(10);
+  });
+
+  it('T7.5 — "2" → 2', async () => {
+    expect(await resolveMaxTurns(makeKv('2'))).toBe(2);
+  });
+
+  it('T7.6 — kv absent (null service) → 4', async () => {
+    const plugins = makeFullPlugins(null, []);
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      {},
+      {},
+      plugins,
+      {},
+      { log: jest.fn().mockResolvedValue(undefined) },
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      null, // no KvService
+    );
+
+    const result = await (
+      service as unknown as { _resolveMaxTurns: () => Promise<number> }
+    )._resolveMaxTurns();
+    expect(result).toBe(4);
+  });
+});
+
+// ── T8: Termination guarantee ─────────────────────────────────────────────────
+
+describe('F6-S1 T8 — termination: loop stops at maxTurns even with LLM always emitting tool_calls', () => {
+  it('T8.1 — maxTurns=3, all iters emit tool_calls → exactly 3 llm.complete calls, terminates', async () => {
+    const kv = makeKv('3');
+    const audit = makeAudit();
+
+    const providerTool = {
+      plugin_id: 'alpaca-provider',
+      name: 'alpaca-provider__place_order',
+      description: 'Place an order',
+      input_schema: { type: 'object', properties: {} },
+    };
+    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    const toolCallResponse = makeLlmToolCall('alpaca-provider', 'place_order', {
+      symbol: 'AAPL',
+      action: 'buy',
+    });
+    const llmComplete = jest.fn().mockResolvedValue(toolCallResponse);
+
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      sandbox,
+      plugins,
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    const result = await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'context',
+      _activePlugins: [
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    // Must stop at exactly maxTurns=3
+    expect(llmComplete).toHaveBeenCalledTimes(3);
+    expect(result.turns_used).toBe(3);
+  });
+
+  it('T8.2 — all-dropped iteration (LLM emits calls but all dropped) exits the loop (safe-direction)', async () => {
+    // LLM emits kernel.write_skill in a non-reflection source → all dropped → hadToolCalls=false → natural exit
+    const kv = makeKv('4');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+
+    const llmComplete = jest
+      .fn()
+      .mockResolvedValue(makeLlmKernelToolCall('write_skill', { skill: 'x', new_body: 'y' }));
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      { callPlugin: jest.fn().mockResolvedValue({ ok: true }) },
+      plugins,
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    const result = await service.runGovernedTurn({ source: 'cycle', context: 'ctx' });
+
+    // The all-dropped call exits naturally (hadToolCalls = validatedCalls.length > 0 = false after drop)
+    expect(result.turns_used).toBe(1);
+    expect(llmComplete).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── T9: Context cap ───────────────────────────────────────────────────────────
+
+describe('F6-S1 T9 — _composeIterationContext: context cap enforced', () => {
+  it('T9.1 — 4 iterations of long results → composed context stays within global transcript budget (~3000 chars overhead)', async () => {
+    const kv = makeKv('5');
+    const audit = makeAudit();
+
+    const providerTool = {
+      plugin_id: 'alpaca-provider',
+      name: 'alpaca-provider__place_order',
+      description: 'Place an order',
+      input_schema: { type: 'object', properties: {} },
+    };
+    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    const capturedContexts: string[] = [];
+    // 4 iterations with tool calls, then natural exit
+    let callIdx = 0;
+    const llmResponses: LlmResponse[] = [
+      makeLlmToolCall('alpaca-provider', 'place_order', {
+        symbol: 'AAPL',
+        action: 'buy',
+        extra: 'x'.repeat(800),
+      }),
+      makeLlmToolCall('alpaca-provider', 'place_order', {
+        symbol: 'TSLA',
+        action: 'sell',
+        extra: 'y'.repeat(800),
+      }),
+      makeLlmToolCall('alpaca-provider', 'place_order', {
+        symbol: 'MSFT',
+        action: 'buy',
+        extra: 'z'.repeat(800),
+      }),
+      makeLlmToolCall('alpaca-provider', 'place_order', {
+        symbol: 'GOOG',
+        action: 'buy',
+        extra: 'w'.repeat(800),
+      }),
+      makeLlmText('done'),
+    ];
+    const llmComplete = jest.fn().mockImplementation((opts: { context: string }) => {
+      capturedContexts.push(opts.context);
+      const resp = llmResponses[callIdx] ?? llmResponses[llmResponses.length - 1];
+      callIdx++;
+      return Promise.resolve(resp);
+    });
+
+    const sandbox = {
+      callPlugin: jest
+        .fn()
+        .mockResolvedValue({ ok: true, result: { status: 'filled', details: 'x'.repeat(500) } }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      sandbox,
+      plugins,
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    const baseContext = 'base context - short';
+    const result = await service.runGovernedTurn({
+      source: 'cycle',
+      context: baseContext,
+      _activePlugins: [
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    // Ran more than 1 iteration (multi-turn happened)
+    expect(result.turns_used).toBeGreaterThan(1);
+
+    // For all contexts starting from iter2, the [OBSERVACIONES] block must exist
+    // AND the total context length must be bounded (base + ~3000 char transcript budget)
+    for (let i = 1; i < capturedContexts.length; i++) {
+      const ctx = capturedContexts[i];
+      expect(ctx).toContain('[OBSERVACIONES');
+      // Context should not grow unbounded — enforce a reasonable max (base + 3500 chars overhead)
+      expect(ctx.length).toBeLessThanOrEqual(baseContext.length + 3500);
+    }
+  });
+
+  it('T9.2 — empty observations (iter1) → _composeIterationContext returns base unchanged', async () => {
+    const kv = makeKv('1');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+
+    const capturedContexts: string[] = [];
+    const llmComplete = jest.fn().mockImplementation((opts: { context: string }) => {
+      capturedContexts.push(opts.context);
+      return Promise.resolve(makeLlmText('done'));
+    });
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      { callPlugin: jest.fn().mockResolvedValue({ ok: true }) },
+      plugins,
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    const base = 'the original context text';
+    await service.runGovernedTurn({ source: 'chat', context: base });
+
+    // On iter1, context passed to LLM must be exactly base (no suffix)
+    expect(capturedContexts[0]).toBe(base);
+  });
+});
+
+// ── T10: Full existing suite regression guard ─────────────────────────────────
+
+describe('F6-S1 T10 — existing suite regression: _executeCycle reads accumulated signals/decisions', () => {
+  it('T10.1 — runCycle with maxTurns=1 (kv null→default 4, but only 1 iter needed): _executeCycle still reads signalsEmitted/decisions correctly', async () => {
+    // This is the standard _executeCycle regression guard:
+    // ensure accumulated decisions/signalsEmitted from runGovernedTurn are visible to _executeCycle.
+    const toolCallText =
+      '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"TSLA","action":"sell","qty":1}}]</tool_calls>';
+
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('Use tools.', [
+      {
+        plugin_id: 'alpaca-provider',
+        name: 'alpaca-provider__place_order',
+        description: 'Place order',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    const sandbox = makeFullSandbox();
+    const memory = makeMemory();
+
+    // Build service with kv null (default 4 turns), but LLM returns no-tool text on iter1 after executing once
+    const kv = makeKv(null); // → maxTurns=4, but natural exit after iter1 execution
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      llm,
+      sandbox,
+      plugins,
+      memory,
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    const result = await callExecuteCyclePrivate(service, 'react-cycle-001', 'run cycle');
+
+    // The cycle must have seen and processed decisions from the governed turn
+    expect(result.decisions).toBeDefined();
+    // Memory.appendObservation must have been called (uses signalsEmitted from governed turn)
+    expect(memory.appendObservation).toHaveBeenCalled();
   });
 });
