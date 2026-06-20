@@ -1677,10 +1677,17 @@ export class AgentsService {
 
   private async _assembleReflectionContext(): Promise<string> {
     const BUDGET = 4000;
-    const AUDIT_CAP = 1200;
-    const EQUITY_CAP = 400;
-    const VETO_CAP = 800;
-    const PRETEST_CAP = 1200;
+    // PR3: reduced proportionally to make room for [LESSONS] (600) + [PAST EPISODES] (800).
+    // Old caps: AUDIT=1200, EQUITY=400, VETO=800, PRETEST=1200 → total 3600.
+    // New caps: AUDIT=700, EQUITY=250, VETO=550, PRETEST=700 → total 2200.
+    // New sections: LESSONS=600, PAST_EPISODES=800 → 1400.
+    // Grand total cap budget: 2200 + 1400 = 3600 + section labels/separators fits within 4000.
+    const AUDIT_CAP = 700;
+    const EQUITY_CAP = 250;
+    const VETO_CAP = 550;
+    const PRETEST_CAP = 700;
+    const LESSONS_CAP = 600;
+    const PAST_EPISODES_CAP = 800;
 
     // Single audit query (limit 20) shared by AUDIT and VETO sections — avoids two DB calls.
     type AuditEntry = {
@@ -1756,12 +1763,63 @@ export class AgentsService {
       pretestSection = '(unavailable)';
     }
 
-    const assembled = [
+    // Section: LESSONS — top-3 curated lessons from lesson_memory
+    let lessonsSection: string | null = null;
+    if (this.longTermMemory) {
+      try {
+        const lessons = await this.longTermMemory.listLessons(3);
+        if (lessons.length > 0) {
+          lessonsSection = lessons
+            .map((l, i) => `${String(i + 1)}. ${l.text}`)
+            .join('\n')
+            .slice(0, LESSONS_CAP);
+        }
+      } catch {
+        // Memory failure → section omitted, never breaks reflection
+      }
+    }
+
+    // Section: PAST EPISODES — top-2 prefetch hits (using recent symbol query from audit)
+    let pastEpisodesSection: string | null = null;
+    if (this.longTermMemory) {
+      try {
+        // Build a query from recent cycle signal symbols in audit entries
+        const recentSymbols = auditEntries
+          .filter((e) => e.event_type === 'signal' || e.event_type === 'cycle_complete')
+          .map((e) => e.symbol)
+          .filter((s): s is string => typeof s === 'string' && s.length > 0)
+          .slice(0, 5);
+        const query = recentSymbols.join(' ') || 'market';
+        const episodes = await this.longTermMemory.prefetch(query, 2);
+        if (episodes.length > 0) {
+          pastEpisodesSection = episodes
+            .map(
+              (ep) =>
+                `[${ep.cycle_id}] ${ep.action_summary} | P&L:${ep.outcome_pnl ?? 'pending'} | ${ep.llm_rationale}`,
+            )
+            .join('\n')
+            .slice(0, PAST_EPISODES_CAP);
+        }
+      } catch {
+        // Memory failure → section omitted, never breaks reflection
+      }
+    }
+
+    const parts: string[] = [
       `[AUDIT RECENT]\n${auditSection}`,
       `[EQUITY CURVE]\n${equitySection}`,
       `[VETO SUMMARY]\n${vetoSection}`,
       `[PRETEST COMPARE]\n${pretestSection}`,
-    ].join('\n\n');
+    ];
+
+    if (lessonsSection !== null) {
+      parts.push(`[LESSONS]\n${lessonsSection}`);
+    }
+    if (pastEpisodesSection !== null) {
+      parts.push(`[PAST EPISODES]\n${pastEpisodesSection}`);
+    }
+
+    const assembled = parts.join('\n\n');
 
     // Hard global budget slice (defense in depth after per-section caps)
     return assembled.slice(0, BUDGET);
