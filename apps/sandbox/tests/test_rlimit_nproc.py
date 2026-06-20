@@ -23,13 +23,16 @@ import pytest
 SANDBOX_DIR = Path(__file__).parent.parent
 RUNNER_PATH = SANDBOX_DIR / "runner.py"
 
-# Script that loads runner.py (triggering the resource block) then prints the limit
+# Script that loads runner.py then calls _apply_resource_limits() to verify the limits
 _CHECK_NPROC_SCRIPT = """
 import importlib.util, sys, os
 runner_path = sys.argv[1]
 spec = importlib.util.spec_from_file_location("_runner", runner_path)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
+# Resource limits are applied by _apply_resource_limits() (called by main()),
+# not at import time.  Call it directly to verify enforcement.
+mod._apply_resource_limits()
 import resource
 soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
 print(f"{soft},{hard}")
@@ -47,12 +50,13 @@ if _orig is not None:
 runner_path = sys.argv[1]
 spec = importlib.util.spec_from_file_location("_runner", runner_path)
 mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
 
-# Capture stderr
+# Capture stderr produced by _apply_resource_limits()
 import io
 old_stderr = sys.stderr
 sys.stderr = io.StringIO()
-spec.loader.exec_module(mod)
+mod._apply_resource_limits()
 stderr_out = sys.stderr.getvalue()
 sys.stderr = old_stderr
 
@@ -68,6 +72,8 @@ runner_path = sys.argv[1]
 spec = importlib.util.spec_from_file_location("_runner", runner_path)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
+# Apply resource limits via the helper (same path as main())
+mod._apply_resource_limits()
 
 import multiprocessing
 import multiprocessing.pool

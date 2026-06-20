@@ -72,6 +72,10 @@ class TestIsolationWiredIntoRunner:
 
         with patch("isolation.apply", side_effect=tracking_apply):
             spec.loader.exec_module(mod)
+            # Disable in-process resource limits so the pytest process is not
+            # capped at 512 MB when main() runs. Enforcement is tested via
+            # test_rlimit_nproc.py subprocesses.
+            mod._apply_resource_limits = lambda: None
 
             request_json = json.dumps({
                 "cmd": "call_plugin",
@@ -109,6 +113,9 @@ class TestIsolationWiredIntoRunner:
         spec = ilu.spec_from_file_location("runner_strict", RUNNER_PATH)
         mod = ilu.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        # Disable in-process resource limits so the pytest process is not
+        # capped at 512 MB when main() runs.
+        mod._apply_resource_limits = lambda: None
 
         request_json = json.dumps({
             "cmd": "call_plugin",

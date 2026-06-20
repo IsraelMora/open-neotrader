@@ -19,15 +19,16 @@ def test_runner_module_exists():
 def test_runner_can_be_imported():
     """
     runner.py must be importable without side effects.
-    The module sets resource limits at import time but should not block.
+    Resource limits are NOT applied at import time — they are applied inside main()
+    so that importing runner in tests does not cap the test process.
     """
     spec = importlib.util.spec_from_file_location("runner_under_test", RUNNER_PATH)
     assert spec is not None, "Could not create module spec for runner.py"
     assert spec.loader is not None, "Module spec has no loader"
 
     module = importlib.util.module_from_spec(spec)
-    # Loading runner.py applies OS resource limits (RLIMIT_CPU, RLIMIT_AS, RLIMIT_NOFILE)
-    # and defines command handler functions — no plugins are executed.
+    # Loading runner.py defines command handler functions — no plugins are executed
+    # and no resource limits are applied (limits only apply when main() runs).
     spec.loader.exec_module(module)  # type: ignore[attr-defined]
 
     # Verify core public symbols are available
