@@ -39,6 +39,7 @@ function makeAgentsService(
       skills_written: [],
     },
     signalsEmitted: [],
+    turns_used: 1,
   };
   return {
     runGovernedTurn: jest.fn().mockResolvedValue({ ...defaultResult, ...result }),

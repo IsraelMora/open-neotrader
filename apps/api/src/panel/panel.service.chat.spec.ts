@@ -27,6 +27,7 @@ const GOVERNED_RESULT: GovernedTurnResult = {
     skills_written: [],
   },
   signalsEmitted: [],
+  turns_used: 1,
 };
 
 function makeAgents(): jest.Mocked<Pick<AgentsService, 'runGovernedTurn'>> {

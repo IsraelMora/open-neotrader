@@ -27,7 +27,9 @@ export type AuditEventType =
   | 'pretest_promoted'
   | 'pretest_promote_requested'
   | 'promotion_gate_blocked'
-  | 'plugin_content_changed';
+  | 'plugin_content_changed'
+  | 'react_iteration'
+  | 'react_budget_exhausted';
 
 export interface AuditPayload {
   cycle_id?: string;

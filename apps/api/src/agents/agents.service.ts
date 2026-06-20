@@ -17,6 +17,7 @@ import { SnapshotService } from '../snapshot/snapshot.service';
 import { NotifierBridge } from '../notifier/notifier-bridge';
 import { ConfigService } from '@nestjs/config';
 import { PretestService } from '../pretest/pretest.service';
+import { KvService } from '../common/kv.service';
 
 import type { LlmResponse } from '../llm/llm.service';
 import { parseToolCalls } from '../llm/kernel-parser';
@@ -68,6 +69,8 @@ export interface GovernedTurnResult {
   llm_response: LlmResponse;
   /** Authoritative signals emitted by _executeToolCalls (symbol+action pairs). */
   signalsEmitted: { symbol: string; action: string }[];
+  /** Number of ReAct loop iterations executed (always >= 1). */
+  turns_used: number;
 }
 
 /** Resultado completo de un ciclo del agente, incluyendo decisiones, ejecuciones en sandbox y resumen de vetos. */
@@ -121,6 +124,14 @@ export interface ReflectionTurnResult {
   cycle_id?: string;
   skills_written?: number;
 }
+
+// ── ReAct loop constants (F6-S1) ──────────────────────────────────────────────
+
+/**
+ * Default maximum number of ReAct loop iterations per runGovernedTurn call.
+ * Overridable via KV key 'react.max_turns'. Clamped 1..10 at parse time.
+ */
+const REACT_MAX_TURNS_DEFAULT = 4;
 
 // ── Kernel tool constants (Phase 3.6) ─────────────────────────────────────────
 
@@ -239,6 +250,10 @@ export class AgentsService {
     @Optional()
     @Inject(forwardRef(() => PretestService))
     private readonly pretest?: PretestService,
+    // KvService injected @Optional() so existing tests that construct AgentsService
+    // without KvService continue compiling; _resolveMaxTurns falls back to REACT_MAX_TURNS_DEFAULT.
+    @Optional()
+    private readonly kv?: KvService,
   ) {}
 
   /**
@@ -268,38 +283,110 @@ export class AgentsService {
   }
 
   /**
-   * Executes a single governed LLM turn: build system prompt (decision prompt + tool schema
-   * from a single hoisted getProviderTools call) → llm.complete → parseToolCalls (with
-   * parse_miss audit) → _validateToolCalls → _executeToolCalls → audit the turn.
-   *
-   * When source === 'chat', emits a 'chat_turn' audit entry so interactive turns are
-   * distinguishable from scheduled cycles. When source === 'cycle', skips the chat_turn
-   * audit (the caller owns cycle_start/cycle_complete).
+   * Resolves the per-call ReAct iteration ceiling from KV.
+   * Reads 'react.max_turns', parses with Number(), applies fail-safe and clamp 1..10.
+   * Absent/invalid/kv-unavailable → REACT_MAX_TURNS_DEFAULT (4).
    */
-  async runGovernedTurn(input: GovernedTurnInput): Promise<GovernedTurnResult> {
-    const cycle_id = input.cycle_id ?? randomUUID();
+  private async _resolveMaxTurns(): Promise<number> {
+    const raw = this.kv ? await this.kv.get('react.max_turns') : null;
+    const n = raw === null ? REACT_MAX_TURNS_DEFAULT : Number(raw);
+    const v = Number.isFinite(n) ? Math.trunc(n) : REACT_MAX_TURNS_DEFAULT;
+    return Math.min(10, Math.max(1, v));
+  }
 
-    // ── Hoist getProviderTools ONCE — shared between schema injection and validation ──
-    const providerTools = await this.plugins.getProviderTools();
+  /**
+   * Composes the LLM context for a given iteration.
+   * On iteration 1 (obs empty) → returns base unchanged (byte-identical path).
+   * On subsequent iterations → appends a [OBSERVACIONES DE ITERACIONES PREVIAS] block.
+   *
+   * Caps (defense in depth, mirrors _assembleReflectionContext budget pattern):
+   * - Per-observation render hard-capped at ITER_OBS_CAP chars
+   * - Keep last ITER_OBS_MAX observations
+   * - Global transcript budget ITER_TRANSCRIPT_BUDGET — sliced at the end
+   */
+  private _composeIterationContext(base: string, obs: { render: string }[]): string {
+    if (obs.length === 0) return base;
 
-    // ── Kernel tool injection gating (reflection-gated; inert in s1) ─────────────
-    // GovernedTurnInput.source union is 'chat'|'cycle'|'pretest' in s1 — 'reflection' is not
-    // reachable. The condition is written now so s2 (adding 'reflection' to the union +
-    // runReflectionTurn) requires zero changes here.
-    const kernelTools =
-      (input.source as string) === 'reflection'
-        ? [
-            KERNEL_WRITE_SKILL_TOOL,
-            KERNEL_CREATE_PRETEST_VARIANT_TOOL,
-            KERNEL_RUN_PRETEST_COMPARE_TOOL,
-            KERNEL_PROMOTE_PRETEST_TOOL,
-          ]
-        : [];
-    const effectiveTools = [...providerTools, ...kernelTools];
+    const ITER_OBS_CAP = 800;
+    const ITER_OBS_MAX = 3;
+    const ITER_TRANSCRIPT_BUDGET = 3000;
 
-    const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
+    const recent = obs.slice(-ITER_OBS_MAX);
+    const block = recent
+      .map((o) => o.render.slice(0, ITER_OBS_CAP))
+      .join('\n\n')
+      .slice(0, ITER_TRANSCRIPT_BUDGET);
 
-    let builtSystemPrompt = input.system_prompt ?? '';
+    return `${base}\n\n[OBSERVACIONES DE ITERACIONES PREVIAS]\n${block}`;
+  }
+
+  /**
+   * Renders a completed iteration's result as an observation string for context feedback.
+   * Includes the LLM text (sliced ~400), executed/dropped tool calls, and sandbox results.
+   */
+  private _toObservation(
+    iterN: number,
+    iter: {
+      text: string;
+      tool_calls: import('../llm/llm.service').ToolCallRequest[];
+      decisions: Decision[];
+      sandbox_results: SandboxResult[];
+    },
+  ): { render: string } {
+    const textSlice = (iter.text ?? '').slice(0, 400);
+    const toolLines = iter.decisions.map((d) => {
+      if (!d.allowed) {
+        return `  ${d.plugin_id}.${d.function}(…) -> dropped:${d.reason ?? 'unknown'}`;
+      }
+      const sr = iter.sandbox_results.find(
+        (r) => r.plugin_id === d.plugin_id && r.function === d.function,
+      );
+      const resultStr = sr ? JSON.stringify(sr.result).slice(0, 200) : 'null';
+      return `  ${d.plugin_id}.${d.function}(…) -> ok=${String(sr?.ok ?? false)} result=${resultStr}`;
+    });
+    const toolBlock = toolLines.length > 0 ? `\ntools=[\n${toolLines.join('\n')}\n]` : '';
+    return {
+      render: `ITER ${String(iterN)}: assistant_text=${textSlice}${toolBlock}`,
+    };
+  }
+
+  /**
+   * Executes a SINGLE ReAct iteration: build system prompt → llm.complete → parseToolCalls
+   * → _validateToolCalls → _executeToolCalls → per-source audit.
+   *
+   * This is the extracted body of the former single-shot runGovernedTurn.
+   * The ordering is preserved VERBATIM to maintain the proven validate→dispatch→audit sequence.
+   *
+   * hadToolCalls = validatedCalls.length > 0 (post-validation).
+   * An iteration whose calls were ALL dropped has hadToolCalls=false → natural exit (safe direction).
+   */
+  private async _runSingleIteration(args: {
+    cycle_id: string;
+    source: GovernedTurnInput['source'];
+    context: string;
+    system_prompt?: string;
+    effectiveTools: import('../plugins/plugins.service').ProviderTool[];
+    _activePlugins?: import('../plugins/plugins.service').HydratedPlugin[];
+    virtual_only?: boolean;
+    /** Pre-resolved decision prompt (hoisted once per governed turn — avoids N DB round-trips). */
+    decisionPrompt: string | null;
+  }): Promise<{
+    text: string;
+    tool_calls: import('../llm/llm.service').ToolCallRequest[];
+    decisions: Decision[];
+    sandbox_results: SandboxResult[];
+    signalsEmitted: { symbol: string; action: string }[];
+    llm_response: LlmResponse;
+    skills_read: string[];
+    skills_written: string[];
+    hadToolCalls: boolean;
+  }> {
+    const { cycle_id, source, effectiveTools, decisionPrompt } = args;
+
+    // ── Build system prompt with decision prompt + tool schema ────────────────
+    // decisionPrompt is resolved ONCE per governed turn in runGovernedTurn and passed
+    // here to avoid N DB round-trips (one per iteration) for a value constant per turn.
+    let builtSystemPrompt = args.system_prompt ?? '';
     if (decisionPrompt !== null) {
       const toolSchemaJson = JSON.stringify(effectiveTools);
       if (toolSchemaJson.length > 8000) {
@@ -314,7 +401,7 @@ export class AgentsService {
 
     // ── LLM call ─────────────────────────────────────────────────────────────
     const llmResponse = await this.llm.complete({
-      context: input.context,
+      context: args.context,
       system_prompt: builtSystemPrompt || undefined,
     });
 
@@ -332,23 +419,27 @@ export class AgentsService {
     const skills_written = llmResponse.skills_written ?? [];
 
     // ── Validate and dispatch ─────────────────────────────────────────────────
-    // Pass effectiveTools (providerTools + kernelTools) so _validateToolCalls can find kernel tools.
-    // Pass source so the kernel tool source gate is enforced (only 'reflection' allows kernel tools).
+    // Controls re-applied on EVERY iteration with the SAME (effectiveTools, _activePlugins,
+    // virtual_only, source) — nothing is cached from a prior iteration.
     const validatedCalls = await this._validateToolCalls(
       cycle_id,
       llmResponse.tool_calls,
       effectiveTools,
-      input._activePlugins,
-      input.virtual_only,
-      input.source,
+      args._activePlugins,
+      args.virtual_only,
+      source,
     );
     const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
       cycle_id,
       validatedCalls,
     );
 
+    // hadToolCalls is measured on post-validation calls (not raw parsed calls).
+    // An all-dropped iteration counts as no valid intent → natural exit (safe direction).
+    const hadToolCalls = validatedCalls.length > 0;
+
     // ── Audit the turn ────────────────────────────────────────────────────────
-    if (input.source === 'chat') {
+    if (source === 'chat') {
       await this.audit.log({
         cycle_id,
         event_type: 'chat_turn',
@@ -360,7 +451,7 @@ export class AgentsService {
           tools_called: validatedCalls.map((t) => `${t.plugin_id}.${t.function}`),
         },
       });
-    } else if (input.source === 'pretest') {
+    } else if (source === 'pretest') {
       // Pretest virtual evaluation — mirrors chat_turn with pretest_turn event type.
       await this.audit.log({
         cycle_id,
@@ -371,31 +462,156 @@ export class AgentsService {
         signals_count: validatedCalls.length,
         meta: {
           tools_called: validatedCalls.map((t) => `${t.plugin_id}.${t.function}`),
-          virtual_only: input.virtual_only ?? false,
+          virtual_only: args.virtual_only ?? false,
         },
       });
-    } else if (input.source === 'cycle') {
+    } else if (source === 'cycle') {
       // Cycle owns its own audit — nothing to emit here.
-    } else if (input.source === 'reflection') {
+    } else if (source === 'reflection') {
       // Reflection turn audit is owned by runReflectionTurn (emits 'reflection_turn' event).
       // runGovernedTurn intentionally emits nothing for reflection turns.
     } else {
       this.log.warn(
-        `runGovernedTurn: unknown source discriminator '${String(input.source)}' — skipping audit`,
+        `runGovernedTurn: unknown source discriminator '${String(source)}' — skipping audit`,
       );
     }
 
     return {
-      cycle_id,
       text: llmResponse.text,
       tool_calls: validatedCalls,
       decisions,
       sandbox_results,
-      backend: llmResponse.backend ?? 'api',
+      signalsEmitted,
+      llm_response: llmResponse,
       skills_read,
       skills_written,
-      llm_response: llmResponse,
-      signalsEmitted,
+      hadToolCalls,
+    };
+  }
+
+  /**
+   * Executes the bounded ReAct loop: runs _runSingleIteration up to maxTurns times,
+   * accumulating decisions/sandbox_results/signalsEmitted across iterations.
+   *
+   * Loop exits when:
+   *   (a) Natural exit: iteration had no validated tool_calls (LLM signaled completion).
+   *   (b) Budget exhausted: turn count reached maxTurns while LLM was still emitting calls.
+   *       → audit react_budget_exhausted, NO grace call.
+   *
+   * maxTurns=1 is byte-identical to the pre-F6-s1 single-shot path:
+   *   - _composeIterationContext returns base unchanged (obs empty on iter 1)
+   *   - No react_iteration/react_budget_exhausted audit on natural exit
+   *   - Only additive field is turns_used:1
+   *
+   * effectiveTools and _activePlugins are hoisted ONCE before the loop
+   * (tool SCHEMA is fixed per governed turn; only context changes between iterations).
+   * Controls (_validateToolCalls with source/virtual_only) re-applied EVERY iteration.
+   */
+  async runGovernedTurn(input: GovernedTurnInput): Promise<GovernedTurnResult> {
+    const cycle_id = input.cycle_id ?? randomUUID();
+
+    // ── Hoist ONCE — tool schema, decision prompt, and active plugins fixed per governed turn ──
+    const providerTools = await this.plugins.getProviderTools();
+    const kernelTools =
+      (input.source as string) === 'reflection'
+        ? [
+            KERNEL_WRITE_SKILL_TOOL,
+            KERNEL_CREATE_PRETEST_VARIANT_TOOL,
+            KERNEL_RUN_PRETEST_COMPARE_TOOL,
+            KERNEL_PROMOTE_PRETEST_TOOL,
+          ]
+        : [];
+    const effectiveTools = [...providerTools, ...kernelTools];
+    // Hoisted ONCE per governed turn — avoids N DB round-trips for a value that is
+    // constant for the lifetime of this turn (decision prompt does not change mid-loop).
+    const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
+    const maxTurns = await this._resolveMaxTurns();
+
+    // ── Accumulators ─────────────────────────────────────────────────────────
+    const allDecisions: Decision[] = [];
+    const allSandbox: SandboxResult[] = [];
+    const allSignals: { symbol: string; action: string }[] = [];
+    const observations: { render: string }[] = [];
+
+    let turn = 0;
+    let last: Awaited<ReturnType<typeof this._runSingleIteration>> | undefined;
+
+    // ── ReAct loop ───────────────────────────────────────────────────────────
+    while (turn < maxTurns) {
+      turn++;
+      const iterContext = this._composeIterationContext(input.context, observations);
+      last = await this._runSingleIteration({
+        cycle_id,
+        source: input.source,
+        context: iterContext,
+        system_prompt: input.system_prompt,
+        effectiveTools,
+        _activePlugins: input._activePlugins,
+        virtual_only: input.virtual_only,
+        decisionPrompt,
+      });
+
+      // Accumulate results
+      allDecisions.push(...last.decisions);
+      allSandbox.push(...last.sandbox_results);
+      allSignals.push(...last.signalsEmitted);
+
+      if (!last.hadToolCalls) {
+        // NATURAL EXIT — LLM signaled completion (no validated tool calls)
+        break;
+      }
+
+      // Feed results forward as observation for the next iteration
+      observations.push(this._toObservation(turn, last));
+
+      // Audit the completed iteration (lightweight trace event).
+      // Suppressed when maxTurns=1: single-shot path never emits react_* events,
+      // keeping it byte-identical to the pre-F6-S1 behavior.
+      if (maxTurns > 1) {
+        await this.audit.log({
+          cycle_id,
+          event_type: 'react_iteration',
+          meta: {
+            turn,
+            hadToolCalls: true,
+            tools_called: last.tool_calls.map((t) => `${t.plugin_id}.${t.function}`),
+          },
+        });
+      }
+
+      // BUDGET EXHAUSTION — LLM still has intent but ceiling reached.
+      // Suppressed when maxTurns=1 (same rationale as react_iteration above).
+      if (turn >= maxTurns) {
+        if (maxTurns > 1) {
+          await this.audit.log({
+            cycle_id,
+            event_type: 'react_budget_exhausted',
+            meta: {
+              turns_used: turn,
+              max_turns: maxTurns,
+              last_tool_calls: last.tool_calls.map((t) => `${t.plugin_id}.${t.function}`),
+            },
+          });
+        }
+        break; // SAFE DEFAULT — stop, no grace call
+      }
+    }
+
+    // last is always defined: loop runs at least once (maxTurns >= 1)
+    const finalIter = last!;
+
+    return {
+      cycle_id,
+      text: finalIter.text,
+      tool_calls: finalIter.tool_calls,
+      decisions: allDecisions,
+      sandbox_results: allSandbox,
+      backend: finalIter.llm_response.backend ?? 'api',
+      skills_read: finalIter.skills_read,
+      skills_written: finalIter.skills_written,
+      llm_response: finalIter.llm_response,
+      signalsEmitted: allSignals,
+      turns_used: turn,
     };
   }
 
@@ -433,6 +649,24 @@ export class AgentsService {
     }
 
     // ── 3. Capa de veto: discipline plugins ───────────────────────────────────
+    //
+    // VETO THREAT MODEL — _runVetoLayer is SIGNAL-ADVISORY, not a hard tool-call firewall.
+    //
+    // What it does: filters which pending_signals are surfaced to the LLM (cycle-level,
+    // once, before the ReAct loop). Signals that discipline plugins reject are removed
+    // from pending_signals before being injected into the LLM context.
+    //
+    // What it does NOT do: it does NOT inspect or block individual tool_calls the LLM
+    // emits during the ReAct loop. That hard perimeter is enforced by:
+    //   • _validateToolCalls — plugin allowlist + kernel source-gating + virtual_only check,
+    //     re-applied on EVERY ReAct iteration with the same (effectiveTools, _activePlugins,
+    //     virtual_only, source) — nothing loosens between iterations.
+    //   • Broker-side order validation — final safety net at execution time.
+    //
+    // This is INTENTIONAL per the neutral-kernel principle: the kernel does not hard-block
+    // LLM trades at the signal-advisory layer; risk policy lives in plugins, the validation
+    // gate (_validateToolCalls), and HITL review. Treating the veto as a tool-call firewall
+    // would be incorrect and would contradict the design.
     const disciplinePlugins = activePlugins.filter((p: HydratedPlugin) => p.type === 'discipline');
     const { vetoCtx, vetoSummary } = await this._runVetoLayer(
       cycle_id,

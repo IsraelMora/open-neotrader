@@ -9,6 +9,7 @@ import { AlertsModule } from '../alerts/alerts.module';
 import { SnapshotModule } from '../snapshot/snapshot.module';
 import { NotifierModule } from '../notifier/notifier.module';
 import { PretestModule } from '../pretest/pretest.module';
+import { KvService } from '../common/kv.service';
 
 @Module({
   imports: [
@@ -26,7 +27,7 @@ import { PretestModule } from '../pretest/pretest.module';
     // AgentsService injects PretestService (to create/compare pretest portfolios in reflection).
     forwardRef(() => PretestModule),
   ],
-  providers: [AgentsService],
+  providers: [AgentsService, KvService],
   exports: [AgentsService],
 })
 export class AgentsModule {}
