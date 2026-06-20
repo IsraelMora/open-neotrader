@@ -1503,14 +1503,28 @@ export class AgentsService {
     const rawRationale = tc.args['rationale'];
     const rationale = typeof rawRationale === 'string' ? rawRationale : undefined;
 
+    // Sanitize at storage time — strip LLM control tokens so recalled lessons
+    // cannot reconstruct a prompt-injection vector in a future reflection turn.
+    const sanitizedText = this._sanitizeEpisodeText(text);
+    const sanitizedRationale =
+      rationale !== undefined ? this._sanitizeEpisodeText(rationale) : undefined;
+
     // Promote the lesson (fail-soft — promote() never throws, but we guard anyway)
-    await this.longTermMemory.promote({ text, episode_id, rationale });
+    await this.longTermMemory.promote({
+      text: sanitizedText,
+      episode_id,
+      rationale: sanitizedRationale,
+    });
 
     // Audit the lesson recording
     await this.audit.log({
       cycle_id,
       event_type: 'lesson_recorded',
-      meta: { text: text.slice(0, 200), episode_id, rationale: rationale?.slice(0, 200) },
+      meta: {
+        text: sanitizedText.slice(0, 200),
+        episode_id,
+        rationale: sanitizedRationale?.slice(0, 200),
+      },
     });
 
     decisions.push({ ...tc, allowed: true });

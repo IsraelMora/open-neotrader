@@ -142,19 +142,23 @@ export class LongTermMemoryService implements MemoryProvider, OnModuleInit {
   async promote(lesson: LessonRecord): Promise<void> {
     try {
       const id = randomUUID();
-      await this.db.$executeRaw`
-        INSERT INTO lesson_memory (id, text, episode_id, rationale)
-        VALUES (${id}, ${lesson.text}, ${lesson.episode_id ?? null}, ${lesson.rationale ?? null})
-      `;
-      // FIFO prune: delete oldest rows when count exceeds 30
-      await this.db.$executeRaw`
-        DELETE FROM lesson_memory
-        WHERE id IN (
-          SELECT id FROM lesson_memory
-          ORDER BY ts ASC
-          LIMIT MAX(0, (SELECT COUNT(*) FROM lesson_memory) - 30)
-        )
-      `;
+      // INSERT + FIFO prune in a single transaction: a prune failure after a committed
+      // insert would leak a row (count → 31). Both succeed or neither does.
+      await this.db.$transaction(async (tx) => {
+        await tx.$executeRaw`
+          INSERT INTO lesson_memory (id, text, episode_id, rationale)
+          VALUES (${id}, ${lesson.text}, ${lesson.episode_id ?? null}, ${lesson.rationale ?? null})
+        `;
+        // FIFO prune: delete oldest rows when count exceeds 30
+        await tx.$executeRaw`
+          DELETE FROM lesson_memory
+          WHERE id IN (
+            SELECT id FROM lesson_memory
+            ORDER BY ts ASC
+            LIMIT MAX(0, (SELECT COUNT(*) FROM lesson_memory) - 30)
+          )
+        `;
+      });
     } catch (e) {
       this.log.warn(`promote failed: ${e}`);
     }
