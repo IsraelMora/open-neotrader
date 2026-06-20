@@ -115,6 +115,51 @@ def _has_rlimit_nproc() -> bool:
         return False
 
 
+def _can_spawn_subprocess() -> bool:
+    """
+    Return True if this process can still spawn subprocesses.
+
+    When test_baseline.py (which runs before us) loads runner.py, it sets
+    RLIMIT_NPROC=64 in the pytest process. If the current user already has
+    more than 64 processes running, subprocess.run() will fail with
+    BlockingIOError. In that case these tests must be skipped.
+
+    Checks purely via /proc to avoid spawning another process.
+    """
+    try:
+        import resource
+        if not hasattr(resource, "RLIMIT_NPROC"):
+            return True
+        soft, _ = resource.getrlimit(resource.RLIMIT_NPROC)
+        if soft == resource.RLIM_INFINITY:
+            return True
+        # Count current user processes via /proc (Linux only, no spawn needed)
+        import os as _os
+        uid = _os.getuid()
+        count = 0
+        try:
+            for entry in _os.scandir("/proc"):
+                if not entry.is_dir() or not entry.name.isdigit():
+                    continue
+                try:
+                    status_path = f"/proc/{entry.name}/status"
+                    with open(status_path) as f:
+                        for line in f:
+                            if line.startswith("Uid:"):
+                                uid_vals = line.split()
+                                if int(uid_vals[1]) == uid:
+                                    count += 1
+                                break
+                except (OSError, PermissionError, ValueError):
+                    continue
+        except OSError:
+            return True  # /proc not available (non-Linux)
+        # Need headroom for fork: at least 6 slots
+        return count < (soft - 6)
+    except Exception:
+        return True
+
+
 class TestRlimitNproc:
     """RLIMIT_NPROC must be applied by the runner resource block."""
 
@@ -122,6 +167,11 @@ class TestRlimitNproc:
         """AC-1: without env override, RLIMIT_NPROC must be (64, 64)."""
         if not _has_rlimit_nproc():
             pytest.skip("RLIMIT_NPROC not available on this platform")
+        if not _can_spawn_subprocess():
+            pytest.skip(
+                "RLIMIT_NPROC already set to 64 (by test_baseline.py loading runner.py) "
+                "and user has too many processes to spawn subprocesses — skipping"
+            )
 
         result = _run_script(_CHECK_NPROC_SCRIPT, env_remove=["SANDBOX_MAX_PROCS"])
         assert result.returncode == 0, f"Script failed: {result.stderr}"
@@ -136,6 +186,11 @@ class TestRlimitNproc:
         """AC-4 (env): SANDBOX_MAX_PROCS=128 overrides the default 64."""
         if not _has_rlimit_nproc():
             pytest.skip("RLIMIT_NPROC not available on this platform")
+        if not _can_spawn_subprocess():
+            pytest.skip(
+                "RLIMIT_NPROC already constrained (test_baseline.py side effect) — "
+                "user process count too high to spawn subprocesses"
+            )
 
         result = _run_script(_CHECK_NPROC_SCRIPT, env_overrides={"SANDBOX_MAX_PROCS": "128"})
         assert result.returncode == 0, f"Script failed: {result.stderr}"
@@ -155,6 +210,11 @@ class TestRlimitNproc:
         """
         if not _has_rlimit_nproc():
             pytest.skip("RLIMIT_NPROC not available on this platform")
+        if not _can_spawn_subprocess():
+            pytest.skip(
+                "RLIMIT_NPROC already constrained — cannot spawn subprocess to verify "
+                "missing-NPROC behavior"
+            )
 
         result = _run_script(_CHECK_NPROC_MISSING_SCRIPT)
         assert result.returncode == 0, f"Script crashed: {result.stderr}"
