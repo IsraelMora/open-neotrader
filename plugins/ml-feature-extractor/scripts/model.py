@@ -229,9 +229,13 @@ def train(training_data: Any, config: dict[str, Any]) -> dict[str, Any]:
         joblib.dump({"model": clf, "feature_names": feature_names}, buf)
         blob = base64.b64encode(buf.getvalue()).decode()
 
-        # Hash uses only real plugin_ids (exclude reserved __*__ names)
-        real_ids = [n for n in feature_names if not (n.startswith("__") and n.endswith("__"))]
-        active_skill_hash = compute_active_skill_hash(real_ids)
+        # Hash: use the most-recent row's TS-captured active_skill_hash verbatim.
+        # rows are ordered ts DESC (getTrainingData contract), so rows[0] is newest.
+        # Single source of truth = s1-TS-captured hash (over ALL active skill ids,
+        # including skills that were signal-silent). Re-deriving from feature_names
+        # would exclude signal-silent skills and produce a different hash than TS,
+        # making the model always appear stale (_mlResolveModelInjection mismatch).
+        active_skill_hash = rows[0].get("active_skill_hash") or None
 
         return {
             "ok": True,

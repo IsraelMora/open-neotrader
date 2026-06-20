@@ -766,14 +766,14 @@ export class AgentsService {
     );
 
     // ml-feature-extractor-s3 D6: audit when a model was actually applied (blob injected).
+    // Fix4: n_signals = what the ML hook operated on (pendingSignals before the aggregator
+    // runs), NOT post-veto count. pendingSignals is the array passed into _runVetoLayer;
+    // since ML runs first (mlFirst sort), it sees the full pre-aggregator signal set.
     if (mlInjection.model_blob) {
-      const postVetoSignals: unknown[] = Array.isArray(vetoCtx['pending_signals'])
-        ? (vetoCtx['pending_signals'] as unknown[])
-        : [];
       await this.audit.log({
         cycle_id,
         event_type: 'ml_signals_adjusted',
-        meta: { n_signals: postVetoSignals.length, hash_match: true },
+        meta: { n_signals: pendingSignals.length, hash_match: true },
       });
     }
 
@@ -1053,8 +1053,11 @@ export class AgentsService {
         active_skill_hash: string;
         feature_names: string[];
       };
+      // Fix3: explicit guard before non-null assertion — mlSignalRecord is an
+      // optional constructor dep; if absent, identity (no model injection) is correct.
+      if (!this.mlSignalRecord) return {};
       const skillIds = activePlugins.filter((p) => p.type === 'skill').map((p) => p.id);
-      const currentHash = this.mlSignalRecord!.computeActiveSkillHash(skillIds);
+      const currentHash = this.mlSignalRecord.computeActiveSkillHash(skillIds);
       if (parsed.active_skill_hash !== currentHash) {
         this.log.warn('[ML] stale model — active_skill_hash mismatch; using identity');
         return {};
@@ -1236,7 +1239,18 @@ export class AgentsService {
 
       if (discResult.ok && discResult.result) {
         const updated = discResult.result as Record<string, unknown>;
-        vetoCtx = updated;
+        // D2/Fix2: strip model_blob + feature_names from the ML plugin's echoed ctx
+        // before propagating to vetoCtx. The real Python hook returns the full ctx
+        // (including injected fields), so we must remove them here to prevent leakage
+        // to downstream plugins (aggregator etc.).
+        if (disc.id === ML_PLUGIN_ID) {
+          const stripped = { ...updated };
+          delete stripped['model_blob'];
+          delete stripped['feature_names'];
+          vetoCtx = stripped;
+        } else {
+          vetoCtx = updated;
+        }
         const reasons = (updated['veto_reasons'] as string[] | undefined) ?? [];
         vetoReasons.push(...reasons.map((r) => `[${disc.name}] ${r}`));
         await this._persistPluginAlerts(updated, cycle_id);
