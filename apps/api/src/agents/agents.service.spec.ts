@@ -4182,6 +4182,85 @@ describe('F6-S1 T1 — maxTurns=1 byte-identical to pre-loop behavior (REGRESSIO
     expect(result.text).toBe('decision: hold');
     expect(result.cycle_id).toBeDefined();
   });
+
+  it('T1.2 — maxTurns=1 + LLM emits a valid provider tool_call: tool executes (1 llm.complete, decision present), turns_used=1, NEITHER react_iteration NOR react_budget_exhausted is audited', async () => {
+    const providerTool = {
+      plugin_id: 'alpaca-provider',
+      name: 'alpaca-provider__place_order',
+      description: 'Place an order',
+      input_schema: { type: 'object', properties: {} },
+    };
+    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    const kv = makeKv('1');
+    const audit = makeAudit();
+
+    const llmResponse = makeLlmToolCall('alpaca-provider', 'place_order', {
+      symbol: 'AAPL',
+      action: 'buy',
+    });
+    const llmComplete = jest.fn().mockResolvedValue(llmResponse);
+
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: { filled: true } }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      sandbox,
+      plugins,
+      {},
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+    );
+
+    const result = await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'market context',
+      _activePlugins: [{ id: 'alpaca-provider', type: 'provider', name: 'Alpaca' }] as never,
+    });
+
+    // Exactly one LLM call (single-shot — maxTurns=1)
+    expect(llmComplete).toHaveBeenCalledTimes(1);
+
+    // Tool executed: decision is present
+    expect(result.decisions).toHaveLength(1);
+    expect(result.decisions[0]).toMatchObject({
+      plugin_id: 'alpaca-provider',
+      function: 'place_order',
+      allowed: true,
+    });
+
+    // turns_used = 1
+    expect(result.turns_used).toBe(1);
+
+    // NEITHER react_iteration NOR react_budget_exhausted must be audited
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const reactIterAudit = auditCalls.find(([a]) => a['event_type'] === 'react_iteration');
+    const exhaustAudit = auditCalls.find(([a]) => a['event_type'] === 'react_budget_exhausted');
+    expect(reactIterAudit).toBeUndefined();
+    expect(exhaustAudit).toBeUndefined();
+  });
 });
 
 // ── T2: Multi-iteration accumulation ─────────────────────────────────────────

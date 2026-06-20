@@ -368,6 +368,8 @@ export class AgentsService {
     effectiveTools: import('../plugins/plugins.service').ProviderTool[];
     _activePlugins?: import('../plugins/plugins.service').HydratedPlugin[];
     virtual_only?: boolean;
+    /** Pre-resolved decision prompt (hoisted once per governed turn — avoids N DB round-trips). */
+    decisionPrompt: string | null;
   }): Promise<{
     text: string;
     tool_calls: import('../llm/llm.service').ToolCallRequest[];
@@ -379,10 +381,11 @@ export class AgentsService {
     skills_written: string[];
     hadToolCalls: boolean;
   }> {
-    const { cycle_id, source, effectiveTools } = args;
+    const { cycle_id, source, effectiveTools, decisionPrompt } = args;
 
     // ── Build system prompt with decision prompt + tool schema ────────────────
-    const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
+    // decisionPrompt is resolved ONCE per governed turn in runGovernedTurn and passed
+    // here to avoid N DB round-trips (one per iteration) for a value constant per turn.
     let builtSystemPrompt = args.system_prompt ?? '';
     if (decisionPrompt !== null) {
       const toolSchemaJson = JSON.stringify(effectiveTools);
@@ -507,7 +510,7 @@ export class AgentsService {
   async runGovernedTurn(input: GovernedTurnInput): Promise<GovernedTurnResult> {
     const cycle_id = input.cycle_id ?? randomUUID();
 
-    // ── Hoist ONCE — tool schema + active plugins fixed for this governed turn ──
+    // ── Hoist ONCE — tool schema, decision prompt, and active plugins fixed per governed turn ──
     const providerTools = await this.plugins.getProviderTools();
     const kernelTools =
       (input.source as string) === 'reflection'
@@ -519,6 +522,9 @@ export class AgentsService {
           ]
         : [];
     const effectiveTools = [...providerTools, ...kernelTools];
+    // Hoisted ONCE per governed turn — avoids N DB round-trips for a value that is
+    // constant for the lifetime of this turn (decision prompt does not change mid-loop).
+    const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
     const maxTurns = await this._resolveMaxTurns();
 
     // ── Accumulators ─────────────────────────────────────────────────────────
@@ -542,6 +548,7 @@ export class AgentsService {
         effectiveTools,
         _activePlugins: input._activePlugins,
         virtual_only: input.virtual_only,
+        decisionPrompt,
       });
 
       // Accumulate results
@@ -557,28 +564,35 @@ export class AgentsService {
       // Feed results forward as observation for the next iteration
       observations.push(this._toObservation(turn, last));
 
-      // Audit the completed iteration (lightweight trace event)
-      await this.audit.log({
-        cycle_id,
-        event_type: 'react_iteration',
-        meta: {
-          turn,
-          hadToolCalls: true,
-          tools_called: last.tool_calls.map((t) => `${t.plugin_id}.${t.function}`),
-        },
-      });
-
-      // BUDGET EXHAUSTION — LLM still has intent but ceiling reached
-      if (turn >= maxTurns) {
+      // Audit the completed iteration (lightweight trace event).
+      // Suppressed when maxTurns=1: single-shot path never emits react_* events,
+      // keeping it byte-identical to the pre-F6-S1 behavior.
+      if (maxTurns > 1) {
         await this.audit.log({
           cycle_id,
-          event_type: 'react_budget_exhausted',
+          event_type: 'react_iteration',
           meta: {
-            turns_used: turn,
-            max_turns: maxTurns,
-            last_tool_calls: last.tool_calls.map((t) => `${t.plugin_id}.${t.function}`),
+            turn,
+            hadToolCalls: true,
+            tools_called: last.tool_calls.map((t) => `${t.plugin_id}.${t.function}`),
           },
         });
+      }
+
+      // BUDGET EXHAUSTION — LLM still has intent but ceiling reached.
+      // Suppressed when maxTurns=1 (same rationale as react_iteration above).
+      if (turn >= maxTurns) {
+        if (maxTurns > 1) {
+          await this.audit.log({
+            cycle_id,
+            event_type: 'react_budget_exhausted',
+            meta: {
+              turns_used: turn,
+              max_turns: maxTurns,
+              last_tool_calls: last.tool_calls.map((t) => `${t.plugin_id}.${t.function}`),
+            },
+          });
+        }
         break; // SAFE DEFAULT — stop, no grace call
       }
     }
@@ -635,6 +649,24 @@ export class AgentsService {
     }
 
     // ── 3. Capa de veto: discipline plugins ───────────────────────────────────
+    //
+    // VETO THREAT MODEL — _runVetoLayer is SIGNAL-ADVISORY, not a hard tool-call firewall.
+    //
+    // What it does: filters which pending_signals are surfaced to the LLM (cycle-level,
+    // once, before the ReAct loop). Signals that discipline plugins reject are removed
+    // from pending_signals before being injected into the LLM context.
+    //
+    // What it does NOT do: it does NOT inspect or block individual tool_calls the LLM
+    // emits during the ReAct loop. That hard perimeter is enforced by:
+    //   • _validateToolCalls — plugin allowlist + kernel source-gating + virtual_only check,
+    //     re-applied on EVERY ReAct iteration with the same (effectiveTools, _activePlugins,
+    //     virtual_only, source) — nothing loosens between iterations.
+    //   • Broker-side order validation — final safety net at execution time.
+    //
+    // This is INTENTIONAL per the neutral-kernel principle: the kernel does not hard-block
+    // LLM trades at the signal-advisory layer; risk policy lives in plugins, the validation
+    // gate (_validateToolCalls), and HITL review. Treating the veto as a tool-call firewall
+    // would be incorrect and would contradict the design.
     const disciplinePlugins = activePlugins.filter((p: HydratedPlugin) => p.type === 'discipline');
     const { vetoCtx, vetoSummary } = await this._runVetoLayer(
       cycle_id,
