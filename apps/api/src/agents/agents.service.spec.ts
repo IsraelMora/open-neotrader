@@ -6047,3 +6047,853 @@ describe('F6-S2 PR3 — kernel__record_lesson dispatch', () => {
     expect(lesson.rationale).toBe(cleanRationale);
   });
 });
+
+// ── F6-S3 PR-B — Debate intercept (B1-B5) ─────────────────────────────────────
+
+import type { DebateService } from './debate.service';
+import type { DebateStance, DebateConsensus } from './debate.types';
+import type { ProviderGatewayService } from '../providers/provider-gateway.service';
+
+// ── Stubs ─────────────────────────────────────────────────────────────────────
+
+/** Minimal DebateService stub. */
+function makeDebateStub(opts: {
+  runPanelResult?: DebateConsensus;
+  runPanelThrows?: boolean;
+  runPanelError?: Error;
+}): jest.Mocked<Pick<DebateService, 'runPanel' | 'synthesizeConsensus' | 'parseStance'>> {
+  const stub = {
+    runPanel: opts.runPanelThrows
+      ? jest.fn().mockRejectedValue(opts.runPanelError ?? new Error('panel timeout'))
+      : jest.fn().mockResolvedValue(
+          opts.runPanelResult ?? {
+            recommendation: 'approve',
+            auditor_blocked: false,
+            stances: [],
+          },
+        ),
+    synthesizeConsensus: jest.fn(),
+    parseStance: jest.fn(),
+  };
+  return stub;
+}
+
+/** Minimal ProviderGatewayService stub for isHighImpact tests. */
+function makeGatewayStub(opts: {
+  quoteLast?: number;
+  quoteThrows?: boolean;
+  portfolioEquity?: number;
+  portfolioThrows?: boolean;
+}): jest.Mocked<Pick<ProviderGatewayService, 'getQuote' | 'getPortfolio'>> {
+  return {
+    getQuote: opts.quoteThrows
+      ? jest.fn().mockRejectedValue(new Error('quote unavailable'))
+      : jest.fn().mockResolvedValue({
+          symbol: 'AAPL',
+          bid: 99,
+          ask: 101,
+          last: opts.quoteLast ?? 100,
+          ts: '',
+        }),
+    getPortfolio: opts.portfolioThrows
+      ? jest.fn().mockRejectedValue(new Error('portfolio unavailable'))
+      : jest.fn().mockResolvedValue({
+          provider_id: 'test',
+          equity: opts.portfolioEquity ?? 50_000,
+          cash: 10_000,
+          buying_power: 20_000,
+          positions: [],
+          total_market_value: 40_000,
+          total_pnl: 0,
+          ts: '',
+        }),
+  };
+}
+
+/**
+ * Build an AgentsService with 14 constructor args (adds debate + providerGateway as 13th/14th).
+ * KV defaults are injected via makeKvDebate — returns '1' for react.max_turns and
+ * configurable debate.* values.
+ */
+function makeDebateAgentsService(opts: {
+  llm?: Partial<LlmService>;
+  audit?: ReturnType<typeof makeAudit>;
+  plugins?: ReturnType<typeof makeFullPlugins>;
+  sandbox?: ReturnType<typeof makeSandbox> | ReturnType<typeof makeFullSandbox>;
+  memory?: ReturnType<typeof makeMemory>;
+  debate?: ReturnType<typeof makeDebateStub> | null;
+  gateway?: ReturnType<typeof makeGatewayStub> | null;
+  kv?: jest.Mocked<Pick<KvService, 'get'>>;
+}): AgentsService {
+  const llm = opts.llm ?? makeLlm('');
+  const audit = opts.audit ?? makeAudit();
+  const plugins = opts.plugins ?? makeFullPlugins();
+  const sandbox = opts.sandbox ?? makeSandbox();
+  const memory = opts.memory ?? makeMemory();
+  const kv = opts.kv ?? makeKvSingleTurn();
+
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+    longTermMemory: unknown,
+    debate: unknown,
+    providerGateway: unknown,
+  ) => AgentsService)(
+    llm,
+    sandbox,
+    plugins,
+    memory,
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    kv,
+    undefined,
+    opts.debate ?? undefined,
+    opts.gateway ?? undefined,
+  );
+}
+
+/** Call _readDebateConfig directly via private cast. */
+async function callReadDebateConfig(service: AgentsService): Promise<{
+  enabled: boolean;
+  minPct: number;
+  maxRoles: number;
+  failMode: 'allow' | 'block';
+}> {
+  return (
+    service as unknown as {
+      _readDebateConfig: () => Promise<{
+        enabled: boolean;
+        minPct: number;
+        maxRoles: number;
+        failMode: 'allow' | 'block';
+      }>;
+    }
+  )._readDebateConfig();
+}
+
+/** Call _isHighImpact directly via private cast. */
+async function callIsHighImpact(
+  service: AgentsService,
+  tc: import('../llm/llm.service').ToolCallRequest,
+  pct: number,
+): Promise<boolean> {
+  return (
+    service as unknown as {
+      _isHighImpact: (
+        tc: import('../llm/llm.service').ToolCallRequest,
+        pct: number,
+      ) => Promise<boolean>;
+    }
+  )._isHighImpact(tc, pct);
+}
+
+/** KvService stub returning configurable debate.* values + '1' for react.max_turns. */
+function makeKvDebate(kvMap: Record<string, string>): jest.Mocked<Pick<KvService, 'get'>> {
+  return {
+    get: jest.fn().mockImplementation((key: string) => {
+      if (key === 'react.max_turns') return Promise.resolve('1');
+      return Promise.resolve(kvMap[key] ?? null);
+    }),
+  };
+}
+
+// ── B1: _readDebateConfig tests ───────────────────────────────────────────────
+
+describe('F6-S3 PR-B B1 — _readDebateConfig (KV fail-safe reader)', () => {
+  it('B1.1 — absent KV → all safe defaults (enabled=false, minPct=0.1, maxRoles=3, failMode=allow)', async () => {
+    const service = makeDebateAgentsService({ kv: makeKvDebate({}) });
+    const cfg = await callReadDebateConfig(service);
+    expect(cfg.enabled).toBe(false);
+    // eslint-disable-next-line sonarjs/no-floating-point-equality
+    expect(cfg.minPct).toBe(0.1);
+    expect(cfg.maxRoles).toBe(3);
+    expect(cfg.failMode).toBe('allow');
+  });
+
+  it("B1.2 — debate.enabled = 'true' → enabled=true", async () => {
+    const service = makeDebateAgentsService({ kv: makeKvDebate({ 'debate.enabled': 'true' }) });
+    const cfg = await callReadDebateConfig(service);
+    expect(cfg.enabled).toBe(true);
+  });
+
+  it("B1.3 — debate.enabled = 'True' (wrong case) → enabled=false", async () => {
+    const service = makeDebateAgentsService({ kv: makeKvDebate({ 'debate.enabled': 'True' }) });
+    const cfg = await callReadDebateConfig(service);
+    expect(cfg.enabled).toBe(false);
+  });
+
+  it("B1.4 — debate.enabled = '1' → enabled=false (strict === 'true')", async () => {
+    const service = makeDebateAgentsService({ kv: makeKvDebate({ 'debate.enabled': '1' }) });
+    const cfg = await callReadDebateConfig(service);
+    expect(cfg.enabled).toBe(false);
+  });
+
+  it('B1.5 — debate.min_notional_pct non-finite value → default 0.1', async () => {
+    const service = makeDebateAgentsService({
+      kv: makeKvDebate({ 'debate.min_notional_pct': 'not-a-number' }),
+    });
+    const cfg = await callReadDebateConfig(service);
+    // eslint-disable-next-line sonarjs/no-floating-point-equality
+    expect(cfg.minPct).toBe(0.1);
+  });
+
+  it('B1.6 — debate.min_notional_pct negative → default 0.1', async () => {
+    const service = makeDebateAgentsService({
+      kv: makeKvDebate({ 'debate.min_notional_pct': '-0.05' }),
+    });
+    const cfg = await callReadDebateConfig(service);
+    // eslint-disable-next-line sonarjs/no-floating-point-equality
+    expect(cfg.minPct).toBe(0.1);
+  });
+
+  it('B1.7 — debate.min_notional_pct = 0.05 → 0.05', async () => {
+    const service = makeDebateAgentsService({
+      kv: makeKvDebate({ 'debate.min_notional_pct': '0.05' }),
+    });
+    const cfg = await callReadDebateConfig(service);
+    // eslint-disable-next-line sonarjs/no-floating-point-equality
+    expect(cfg.minPct).toBe(0.05);
+  });
+
+  it('B1.8 — debate.max_roles = 0 → clamp to 1', async () => {
+    const service = makeDebateAgentsService({ kv: makeKvDebate({ 'debate.max_roles': '0' }) });
+    const cfg = await callReadDebateConfig(service);
+    expect(cfg.maxRoles).toBe(1);
+  });
+
+  it('B1.9 — debate.max_roles = 6 → clamp to 5', async () => {
+    const service = makeDebateAgentsService({ kv: makeKvDebate({ 'debate.max_roles': '6' }) });
+    const cfg = await callReadDebateConfig(service);
+    expect(cfg.maxRoles).toBe(5);
+  });
+
+  it('B1.10 — debate.max_roles = 2.7 → trunc to 2', async () => {
+    const service = makeDebateAgentsService({ kv: makeKvDebate({ 'debate.max_roles': '2.7' }) });
+    const cfg = await callReadDebateConfig(service);
+    expect(cfg.maxRoles).toBe(2);
+  });
+
+  it("B1.11 — debate.fail_mode = 'block' → 'block'", async () => {
+    const service = makeDebateAgentsService({ kv: makeKvDebate({ 'debate.fail_mode': 'block' }) });
+    const cfg = await callReadDebateConfig(service);
+    expect(cfg.failMode).toBe('block');
+  });
+
+  it("B1.12 — debate.fail_mode = 'Block' → 'allow' (strict match)", async () => {
+    const service = makeDebateAgentsService({ kv: makeKvDebate({ 'debate.fail_mode': 'Block' }) });
+    const cfg = await callReadDebateConfig(service);
+    expect(cfg.failMode).toBe('allow');
+  });
+
+  it('B1.13 — kv.get throws → safe defaults (feature stays inert)', async () => {
+    const kvThrows: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockRejectedValue(new Error('db unavailable')),
+    };
+    const service = makeDebateAgentsService({ kv: kvThrows });
+    const cfg = await callReadDebateConfig(service);
+    expect(cfg.enabled).toBe(false);
+    // eslint-disable-next-line sonarjs/no-floating-point-equality
+    expect(cfg.minPct).toBe(0.1);
+    expect(cfg.maxRoles).toBe(3);
+    expect(cfg.failMode).toBe('allow');
+  });
+});
+
+// ── B2: _isHighImpact tests ───────────────────────────────────────────────────
+
+describe('F6-S3 PR-B B2 — _isHighImpact (fail-soft notional check)', () => {
+  const kernelPromoteTc: import('../llm/llm.service').ToolCallRequest = {
+    plugin_id: 'kernel',
+    function: 'promote_pretest',
+    args: { pretest_id: 'pt-1' },
+  };
+
+  const providerTc = (
+    symbol: string,
+    qty: number,
+  ): import('../llm/llm.service').ToolCallRequest => ({
+    plugin_id: 'alpaca',
+    function: 'place_order',
+    args: { symbol, qty },
+  });
+
+  it('B2.1 — promote_pretest → always true (zero I/O)', async () => {
+    const gateway = makeGatewayStub({});
+    const service = makeDebateAgentsService({ gateway });
+    const result = await callIsHighImpact(service, kernelPromoteTc, 0.05);
+    expect(result).toBe(true);
+    expect(gateway.getQuote).not.toHaveBeenCalled();
+    expect(gateway.getPortfolio).not.toHaveBeenCalled();
+  });
+
+  it('B2.2 — notional >= pct*equity → true', async () => {
+    // qty=50, last=100 → notional=5000; equity=50000; pct=0.05 → threshold=2500 → 5000>=2500 true
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({ gateway });
+    const result = await callIsHighImpact(service, providerTc('AAPL', 50), 0.05);
+    expect(result).toBe(true);
+  });
+
+  it('B2.3 — notional < pct*equity → false', async () => {
+    // qty=10, last=100 → notional=1000; equity=50000; pct=0.05 → threshold=2500 → 1000<2500 false
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({ gateway });
+    const result = await callIsHighImpact(service, providerTc('AAPL', 10), 0.05);
+    expect(result).toBe(false);
+  });
+
+  it('B2.4 — quote.last = 0 → false (fail-soft, never divide by zero)', async () => {
+    const gateway = makeGatewayStub({ quoteLast: 0, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({ gateway });
+    const result = await callIsHighImpact(service, providerTc('AAPL', 50), 0.05);
+    expect(result).toBe(false);
+  });
+
+  it('B2.5 — equity <= 0 → false', async () => {
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 0 });
+    const service = makeDebateAgentsService({ gateway });
+    const result = await callIsHighImpact(service, providerTc('AAPL', 50), 0.05);
+    expect(result).toBe(false);
+  });
+
+  it('B2.6 — gateway.getQuote throws → false (fail-soft, never blocks trade)', async () => {
+    const gateway = makeGatewayStub({ quoteThrows: true });
+    const service = makeDebateAgentsService({ gateway });
+    const result = await callIsHighImpact(service, providerTc('AAPL', 50), 0.05);
+    expect(result).toBe(false);
+  });
+
+  it('B2.7 — gateway.getPortfolio throws → false', async () => {
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioThrows: true });
+    const service = makeDebateAgentsService({ gateway });
+    const result = await callIsHighImpact(service, providerTc('AAPL', 50), 0.05);
+    expect(result).toBe(false);
+  });
+
+  it('B2.8 — qty missing from args → false', async () => {
+    const gateway = makeGatewayStub({});
+    const service = makeDebateAgentsService({ gateway });
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'alpaca',
+      function: 'place_order',
+      args: { symbol: 'AAPL' }, // no qty
+    };
+    const result = await callIsHighImpact(service, tc, 0.05);
+    expect(result).toBe(false);
+  });
+
+  it('B2.9 — symbol missing from args → false', async () => {
+    const gateway = makeGatewayStub({});
+    const service = makeDebateAgentsService({ gateway });
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'alpaca',
+      function: 'place_order',
+      args: { qty: 50 }, // no symbol
+    };
+    const result = await callIsHighImpact(service, tc, 0.05);
+    expect(result).toBe(false);
+  });
+
+  it('B2.10 — providerGateway absent (@Optional undefined) → false', async () => {
+    const service = makeDebateAgentsService({ gateway: null });
+    const result = await callIsHighImpact(service, providerTc('AAPL', 50), 0.05);
+    expect(result).toBe(false);
+  });
+});
+
+// ── B3: DI boot test ─────────────────────────────────────────────────────────
+
+describe('F6-S3 PR-B B3 — DI boot: AgentsModule compiles with DebateService + ProvidersModule', () => {
+  it('B3.1 — AgentsModule.compile() succeeds: DebateService resolved, no circular-dependency error', async () => {
+    const { Test } = await import('@nestjs/testing');
+    const { AgentsModule } = await import('./agents.module');
+    const { PretestModule } = await import('../pretest/pretest.module');
+    const { ProvidersModule } = await import('../providers/providers.module');
+    const { PrismaService } = await import('../prisma/prisma.service');
+    const { SandboxGateway } = await import('../sandbox/sandbox.gateway');
+    const { LlmService } = await import('../llm/llm.service');
+    const { PluginsService } = await import('../plugins/plugins.service');
+    const { PluginEventsService } = await import('../plugins/plugin-events.service');
+    const { LifecycleService } = await import('../plugins/lifecycle.service');
+    const { PluginWatcherService } = await import('../plugins/plugin-watcher.service');
+    const { ContextMemoryService } = await import('../context-memory/context-memory.service');
+    const { AuditService } = await import('../audit/audit.service');
+    const { AlertsService } = await import('../alerts/alerts.service');
+    const { SnapshotService } = await import('../snapshot/snapshot.service');
+    const { NotifierBridge } = await import('../notifier/notifier-bridge');
+    const { TelegramService } = await import('../notifier/telegram.service');
+    const { ProviderGatewayService } = await import('../providers/provider-gateway.service');
+    const { OhlcvCacheService } = await import('../providers/ohlcv-cache.service');
+    const { KvService } = await import('../common/kv.service');
+    const { MigrationRunnerService } = await import('../prisma/migration-runner.service');
+    const { AgentsService: AgentsSvc } = await import('./agents.service');
+    const { DebateService } = await import('./debate.service');
+    const { ConfigModule } = await import('@nestjs/config');
+    const { TotpRequiredGuard } = await import('../auth/guards/totp-required.guard');
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        ConfigModule.forRoot({ isGlobal: true }),
+        AgentsModule,
+        PretestModule,
+        ProvidersModule,
+      ],
+    })
+      .overrideProvider(PrismaService)
+      .useValue({ $connect: jest.fn(), $disconnect: jest.fn() })
+      .overrideProvider(MigrationRunnerService)
+      .useValue({})
+      .overrideProvider(SandboxGateway)
+      .useValue({
+        runCycle: jest.fn(),
+        callPlugin: jest.fn(),
+        call: jest.fn(),
+        runExtraCycleHook: jest.fn(),
+        getPluginStage: jest.fn(),
+      })
+      .overrideProvider(LlmService)
+      .useValue({ complete: jest.fn() })
+      .overrideProvider(PluginsService)
+      .useValue({
+        findActive: jest.fn(),
+        getProviderTools: jest.fn(),
+        getSkillsMetadata: jest.fn(),
+        getActiveDecisionPrompt: jest.fn(),
+        getActiveReflectionPrompt: jest.fn(),
+        getActiveDebateRoles: jest.fn(),
+        writeSkillGuarded: jest.fn(),
+      })
+      .overrideProvider(PluginEventsService)
+      .useValue({})
+      .overrideProvider(LifecycleService)
+      .useValue({})
+      .overrideProvider(PluginWatcherService)
+      .useValue({})
+      .overrideProvider(ContextMemoryService)
+      .useValue({
+        toContextString: jest.fn(),
+        appendObservation: jest.fn(),
+        trackSignal: jest.fn(),
+      })
+      .overrideProvider(AuditService)
+      .useValue({ log: jest.fn(), query: jest.fn() })
+      .overrideProvider(AlertsService)
+      .useValue({ createBulk: jest.fn() })
+      .overrideProvider(SnapshotService)
+      .useValue({ getEquityCurve: jest.fn() })
+      .overrideProvider(NotifierBridge)
+      .useValue({ send: jest.fn() })
+      .overrideProvider(TelegramService)
+      .useValue({ sendMessage: jest.fn() })
+      .overrideProvider(ProviderGatewayService)
+      .useValue({ getQuote: jest.fn(), getPortfolio: jest.fn() })
+      .overrideProvider(OhlcvCacheService)
+      .useValue({ get: jest.fn(), set: jest.fn() })
+      .overrideProvider(KvService)
+      .useValue({ get: jest.fn(), set: jest.fn(), del: jest.fn() })
+      .overrideProvider(TotpRequiredGuard)
+      .useValue({ canActivate: jest.fn().mockReturnValue(true) })
+      .compile();
+
+    // compile() not throwing proves no circular-dep. All services resolve.
+    const agentsService = moduleRef.get(AgentsSvc);
+    const debateService = moduleRef.get(DebateService);
+
+    expect(agentsService).toBeDefined();
+    expect(debateService).toBeDefined();
+
+    // debate must be wired into AgentsService
+    const debate = (agentsService as unknown as Record<string, unknown>)['debate'];
+    expect(debate).toBeDefined();
+    expect(debate).toBe(debateService);
+
+    await moduleRef.close();
+  }, 15000);
+});
+
+// ── B4: _executeToolCalls intercept tests ────────────────────────────────────
+
+describe('F6-S3 PR-B B4 — _executeToolCalls debate intercept', () => {
+  const CYCLE_ID = 'debate-intercept-001';
+
+  /** A provider tool call that simulates a high-impact trade. */
+  function makeProviderTc(symbol = 'AAPL', qty = 50): import('../llm/llm.service').ToolCallRequest {
+    return {
+      plugin_id: 'alpaca',
+      function: 'place_order',
+      args: { symbol, qty, action: 'buy' },
+    };
+  }
+
+  /** A promote_pretest kernel call — always high-impact. */
+  const promotePreTestTc: import('../llm/llm.service').ToolCallRequest = {
+    plugin_id: 'kernel',
+    function: 'promote_pretest',
+    args: { pretest_id: 'pt-1' },
+  };
+
+  /**
+   * Plugins stub that returns active debate roles for the intercept tests.
+   * Also declares the provider tool so _validateToolCalls allows it.
+   */
+  function makePluginsWithDebate(
+    roles: import('./debate.types').DebateRole[] | null = [
+      { name: 'bull', prompt: 'be bullish' },
+      { name: 'bear', prompt: 'be bearish' },
+      { name: 'risk-auditor', prompt: 'audit risk', block: true },
+    ],
+  ): jest.Mocked<
+    Pick<
+      PluginsService,
+      | 'findActive'
+      | 'getProviderTools'
+      | 'getSkillsMetadata'
+      | 'getActiveDecisionPrompt'
+      | 'getActiveDebateRoles'
+    >
+  > {
+    return {
+      findActive: jest.fn().mockResolvedValue([{ id: 'alpaca', type: 'provider' }]),
+      getProviderTools: jest.fn().mockResolvedValue([
+        {
+          plugin_id: 'alpaca',
+          name: 'alpaca__place_order',
+          description: '',
+          input_schema: { type: 'object', properties: {} },
+        },
+      ]),
+      getSkillsMetadata: jest.fn().mockResolvedValue([]),
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+      getActiveDebateRoles: jest.fn().mockResolvedValue(roles),
+    };
+  }
+
+  // T1: LOAD-BEARING REGRESSION GATE — debate NOT provided → byte-identical dispatch
+  it('T1 — debate NOT provided → runPanel 0 calls + dispatch byte-identical (load-bearing regression gate)', async () => {
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    // No debate, no gateway
+    const service = makeDebateAgentsService({
+      sandbox,
+      audit,
+      plugins: makePluginsWithDebate(),
+      kv: makeKvDebate({ 'debate.enabled': 'true' }),
+      debate: null,
+      gateway: null,
+    });
+
+    const tc = makeProviderTc('AAPL', 50);
+    const { decisions, sandbox_results } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
+
+    // sandbox.callPlugin must be called once (normal dispatch)
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+    // Decision allowed (no debate gate intercepted)
+    expect(decisions[0]?.allowed).toBe(true);
+    expect(sandbox_results).toHaveLength(1);
+    // Audit events must NOT contain any debate event
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const debateAudits = auditCalls.filter(([a]) =>
+      ['debate_started', 'debate_stance', 'debate_consensus', 'debate_skipped'].includes(
+        String(a['event_type']),
+      ),
+    );
+    expect(debateAudits).toHaveLength(0);
+  });
+
+  // T2: debate provided but enabled=false → byte-identical dispatch, runPanel 0 calls
+  it('T2 — debate provided + enabled=false → runPanel 0 calls + normal dispatch (byte-identical)', async () => {
+    const debateStub = makeDebateStub({
+      runPanelResult: { recommendation: 'approve', auditor_blocked: false, stances: [] },
+    });
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const service = makeDebateAgentsService({
+      sandbox,
+      audit,
+      plugins: makePluginsWithDebate(),
+      kv: makeKvDebate({ 'debate.enabled': 'false' }), // explicitly disabled
+      debate: debateStub,
+      gateway: makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 }),
+    });
+
+    const tc = makeProviderTc('AAPL', 50);
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
+
+    expect(debateStub.runPanel).not.toHaveBeenCalled();
+    expect(decisions[0]?.allowed).toBe(true);
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+  });
+
+  // T3: enabled + roles + high-impact + approve → dispatched + debate_consensus audited
+  it('T3 — enabled + roles + high-impact + approve → dispatched + debate_consensus audited', async () => {
+    const stances: DebateStance[] = [
+      { role: 'bull', stance: 'approve', confidence: 0.8, rationale: 'bullish' },
+      { role: 'bear', stance: 'approve', confidence: 0.6, rationale: 'trend ok' },
+    ];
+    const consensus: DebateConsensus = {
+      recommendation: 'approve',
+      auditor_blocked: false,
+      stances,
+    };
+    const debateStub = makeDebateStub({ runPanelResult: consensus });
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    // High-impact: qty=50, last=100 → notional=5000; equity=50000; pct=0.05 → thr=2500 → above
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({
+      sandbox,
+      audit,
+      plugins: makePluginsWithDebate(),
+      kv: makeKvDebate({ 'debate.enabled': 'true', 'debate.min_notional_pct': '0.05' }),
+      debate: debateStub,
+      gateway,
+    });
+
+    const tc = makeProviderTc('AAPL', 50);
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
+
+    // runPanel called once
+    expect(debateStub.runPanel).toHaveBeenCalledTimes(1);
+    // tc dispatched (not dropped)
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+    expect(decisions[0]?.allowed).toBe(true);
+    // audit events: debate_started, debate_stance ×2, debate_consensus
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const started = auditCalls.find(([a]) => a['event_type'] === 'debate_started');
+    const consensusEvent = auditCalls.find(([a]) => a['event_type'] === 'debate_consensus');
+    expect(started).toBeDefined();
+    expect(consensusEvent).toBeDefined();
+    const stanceEvents = auditCalls.filter(([a]) => a['event_type'] === 'debate_stance');
+    expect(stanceEvents).toHaveLength(2);
+  });
+
+  // T4: enabled + high-impact + reject → NOT dispatched + Decision reason 'debate_rejected' + audited
+  it('T4 — enabled + high-impact + reject → NOT dispatched + allowed:false reason:debate_rejected + debate_consensus audited', async () => {
+    const stances: DebateStance[] = [
+      { role: 'bull', stance: 'reject', confidence: 0.9, rationale: 'bad trade' },
+    ];
+    const consensus: DebateConsensus = {
+      recommendation: 'reject',
+      auditor_blocked: false,
+      stances,
+    };
+    const debateStub = makeDebateStub({ runPanelResult: consensus });
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({
+      sandbox,
+      audit,
+      plugins: makePluginsWithDebate(),
+      kv: makeKvDebate({ 'debate.enabled': 'true', 'debate.min_notional_pct': '0.05' }),
+      debate: debateStub,
+      gateway,
+    });
+
+    const tc = makeProviderTc('AAPL', 50);
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
+
+    // sandbox NOT called
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+    // decision dropped with debate_rejected
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.allowed).toBe(false);
+    expect(decisions[0]?.reason).toBe('debate_rejected');
+    // audit debate_consensus emitted
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const consensusAudit = auditCalls.find(([a]) => a['event_type'] === 'debate_consensus');
+    expect(consensusAudit).toBeDefined();
+  });
+
+  // T5: promote_pretest + reject → _kernelPromotePretest/promote NEVER called
+  it('T5 — promote_pretest + debate rejects → _kernelPromotePretest NOT called (no pretest.promote)', async () => {
+    const consensus: DebateConsensus = {
+      recommendation: 'reject',
+      auditor_blocked: true,
+      stances: [
+        {
+          role: 'risk-auditor',
+          stance: 'reject',
+          confidence: 1,
+          rationale: 'too risky',
+          block: true,
+        },
+      ],
+    };
+    const debateStub = makeDebateStub({ runPanelResult: consensus });
+    const audit = makeAudit();
+    const gateway = makeGatewayStub({});
+    const pretestMock = {
+      promote: jest.fn(),
+      findAll: jest.fn().mockResolvedValue([]),
+      compare: jest.fn(),
+    };
+
+    // Build a service with pretest to detect if promote is called
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+      longTermMemory: unknown,
+      debate: unknown,
+      providerGateway: unknown,
+    ) => AgentsService)(
+      makeLlm(''),
+      makeSandbox(),
+      makePluginsWithDebate(),
+      makeMemory(),
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      pretestMock,
+      makeKvDebate({ 'debate.enabled': 'true' }),
+      undefined,
+      debateStub,
+      gateway,
+    );
+
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [promotePreTestTc]);
+
+    // promote_pretest debate-rejected → pretest.promote NOT called
+    expect(pretestMock.promote).not.toHaveBeenCalled();
+    expect(decisions[0]?.allowed).toBe(false);
+    expect(decisions[0]?.reason).toBe('debate_rejected');
+  });
+
+  // T6: not-high-impact → runPanel 0 calls + normal dispatch
+  it('T6 — not-high-impact (low notional) → runPanel 0 calls + normal dispatch', async () => {
+    const debateStub = makeDebateStub({
+      runPanelResult: { recommendation: 'reject', auditor_blocked: false, stances: [] },
+    });
+    const sandbox = makeSandbox();
+    // low notional: qty=1, last=100 → notional=100; equity=50000; pct=0.05 → thr=2500 → below
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({
+      sandbox,
+      plugins: makePluginsWithDebate(),
+      kv: makeKvDebate({ 'debate.enabled': 'true', 'debate.min_notional_pct': '0.05' }),
+      debate: debateStub,
+      gateway,
+    });
+
+    const tc = makeProviderTc('AAPL', 1);
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
+
+    expect(debateStub.runPanel).not.toHaveBeenCalled();
+    expect(decisions[0]?.allowed).toBe(true);
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+  });
+
+  // T7: getActiveDebateRoles returns null → no panel
+  it('T7 — getActiveDebateRoles null → no panel + normal dispatch', async () => {
+    const debateStub = makeDebateStub({});
+    const sandbox = makeSandbox();
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({
+      sandbox,
+      plugins: makePluginsWithDebate(null), // null = no active debate plugin
+      kv: makeKvDebate({ 'debate.enabled': 'true', 'debate.min_notional_pct': '0.05' }),
+      debate: debateStub,
+      gateway,
+    });
+
+    const tc = makeProviderTc('AAPL', 50);
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
+
+    expect(debateStub.runPanel).not.toHaveBeenCalled();
+    expect(decisions[0]?.allowed).toBe(true);
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+  });
+
+  // T8: runPanel throws + fail_mode allow → debate_skipped + dispatched
+  it('T8 — runPanel throws + fail_mode=allow → debate_skipped emitted + tc dispatched', async () => {
+    const debateStub = makeDebateStub({
+      runPanelThrows: true,
+      runPanelError: new Error('panel timeout'),
+    });
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({
+      sandbox,
+      audit,
+      plugins: makePluginsWithDebate(),
+      kv: makeKvDebate({
+        'debate.enabled': 'true',
+        'debate.min_notional_pct': '0.05',
+        'debate.fail_mode': 'allow',
+      }),
+      debate: debateStub,
+      gateway,
+    });
+
+    const tc = makeProviderTc('AAPL', 50);
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
+
+    // debate_skipped must be audited
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const skipped = auditCalls.find(([a]) => a['event_type'] === 'debate_skipped');
+    expect(skipped).toBeDefined();
+    // tc dispatched (fail-soft allow)
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+    expect(decisions[0]?.allowed).toBe(true);
+  });
+
+  // T9: runPanel throws + fail_mode block → debate_skipped + NOT dispatched (reason 'debate_failed')
+  it('T9 — runPanel throws + fail_mode=block → debate_skipped emitted + tc NOT dispatched (reason debate_failed)', async () => {
+    const debateStub = makeDebateStub({
+      runPanelThrows: true,
+      runPanelError: new Error('llm error'),
+    });
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({
+      sandbox,
+      audit,
+      plugins: makePluginsWithDebate(),
+      kv: makeKvDebate({
+        'debate.enabled': 'true',
+        'debate.min_notional_pct': '0.05',
+        'debate.fail_mode': 'block',
+      }),
+      debate: debateStub,
+      gateway,
+    });
+
+    const tc = makeProviderTc('AAPL', 50);
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
+
+    // debate_skipped must be audited
+    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+    const skipped = auditCalls.find(([a]) => a['event_type'] === 'debate_skipped');
+    expect(skipped).toBeDefined();
+    // tc NOT dispatched
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+    expect(decisions[0]?.allowed).toBe(false);
+    expect(decisions[0]?.reason).toBe('debate_failed');
+  });
+});
