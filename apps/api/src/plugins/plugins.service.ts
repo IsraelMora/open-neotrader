@@ -614,7 +614,11 @@ export class PluginsService implements OnApplicationBootstrap {
       const active = await this.findActive();
       const debatePlugins = active.filter((p) => {
         const manifest = this.getManifest(p.installed_path);
-        return manifest?.debate && Array.isArray(manifest.debate.roles) && manifest.debate.roles.length > 0;
+        return (
+          manifest?.debate &&
+          Array.isArray(manifest.debate.roles) &&
+          manifest.debate.roles.length > 0
+        );
       });
 
       if (debatePlugins.length === 0) return null;

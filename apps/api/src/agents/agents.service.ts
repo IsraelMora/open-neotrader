@@ -1482,8 +1482,7 @@ export class AgentsService {
     // Sanitize at storage time — strip LLM control tokens so recalled lessons
     // cannot reconstruct a prompt-injection vector in a future reflection turn.
     const sanitizedText = sanitizeText(text);
-    const sanitizedRationale =
-      rationale !== undefined ? sanitizeText(rationale) : undefined;
+    const sanitizedRationale = rationale !== undefined ? sanitizeText(rationale) : undefined;
 
     // Promote the lesson (fail-soft — promote() never throws, but we guard anyway)
     await this.longTermMemory.promote({

@@ -49,9 +49,8 @@ export class DebateService {
         return abstainFor(roleName);
       }
 
-      // Strategy 1: fenced ```json block
-      const fencedMatch = /```json\s*([\s\S]*?)\s*```/.exec(text);
-      const rawJson = fencedMatch ? fencedMatch[1] : this._extractBareObject(text);
+      // Strategy 1: fenced ```json block (non-backtracking: find markers, slice between them)
+      const rawJson = this._extractFencedJson(text) ?? this._extractBareObject(text);
 
       if (!rawJson) return abstainFor(roleName);
 
@@ -110,7 +109,9 @@ export class DebateService {
     // Step 2: confidence-weighted majority
     let score = 0;
     for (const s of stances) {
-      const value = s.stance === 'approve' ? 1 : s.stance === 'reject' ? -1 : 0;
+      let value = 0;
+      if (s.stance === 'approve') value = 1;
+      else if (s.stance === 'reject') value = -1;
       score += s.confidence * value;
     }
 
@@ -127,11 +128,7 @@ export class DebateService {
    * Whole-panel timeout → AbortController aborts and the panel Promise rejects.
    * The CALLER is responsible for catching that rejection and applying fail_mode.
    */
-  async runPanel(
-    summary: string,
-    roles: DebateRole[],
-    _cycleId: string,
-  ): Promise<DebateConsensus> {
+  async runPanel(summary: string, roles: DebateRole[], _cycleId: string): Promise<DebateConsensus> {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), this.panelTimeoutMs);
 
@@ -160,6 +157,20 @@ export class DebateService {
   }
 
   // ── Private helpers ───────────────────────────────────────────────────────────
+
+  /**
+   * Extracts raw JSON content from a fenced ```json block (non-backtracking).
+   * Returns null if none found.
+   */
+  private _extractFencedJson(text: string): string | null {
+    const open = text.indexOf('```json');
+    if (open === -1) return null;
+    const contentStart = text.indexOf('\n', open);
+    if (contentStart === -1) return null;
+    const close = text.indexOf('\n```', contentStart);
+    if (close === -1) return null;
+    return text.slice(contentStart + 1, close).trim();
+  }
 
   /**
    * Extracts the first bare {...} JSON object from text by tracking brace depth.

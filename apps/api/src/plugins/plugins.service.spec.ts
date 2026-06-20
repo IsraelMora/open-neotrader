@@ -1542,39 +1542,8 @@ describe('F3-s4 — KV weight override in getTrustReport (AC-6)', () => {
 
 import type { DebateRole } from '../agents/debate.types';
 
-/** Build a PluginsService instance configured for getActiveDebateRoles tests. */
-function makeDebateService(
-  activePlugins: { id: string; installed_path: string | null }[],
-  manifestMap: Record<string, PluginManifest | null>,
-): PluginsService {
-  const db = {
-    plugin: {
-      findMany: jest.fn().mockImplementation(({ where }: { where?: { active?: boolean } }) => {
-        if (where?.active === true) return Promise.resolve(activePlugins);
-        return Promise.resolve([]);
-      }),
-      findUnique: jest.fn(),
-      findFirst: jest.fn(),
-      create: jest.fn(),
-      update: jest.fn(),
-      delete: jest.fn(),
-    },
-  } as unknown as import('../prisma/prisma.service').PrismaService;
-
-  const events = { emit: jest.fn() } as unknown as import('./plugin-events.service').PluginEventsService;
-  const cfg = {
-    get: jest.fn().mockReturnValue('/var/plugins'),
-  } as unknown as import('@nestjs/config').ConfigService;
-
-  const service = new PluginsService(db, events, cfg);
-
-  service.getManifest = jest.fn().mockImplementation((installedPath: string | null) => {
-    if (!installedPath) return null;
-    return manifestMap[installedPath] ?? null;
-  });
-
-  return service;
-}
+// Reuse makeReflectionService factory — identical shape, no duplication.
+const makeDebateService = makeReflectionService;
 
 const THREE_DEBATE_ROLES: PluginManifest['debate'] = {
   roles: [
@@ -1659,7 +1628,9 @@ describe('PluginsService.getActiveDebateRoles', () => {
         '/plugins/inline-wins': {
           plugin: { id: 'inline-wins', name: 'Inline Wins', version: '1.0.0', type: 'extra' },
           debate: {
-            roles: [{ name: 'bull', prompt: 'Inline prompt!', prompt_file: 'BULL.md', block: false }],
+            roles: [
+              { name: 'bull', prompt: 'Inline prompt!', prompt_file: 'BULL.md', block: false },
+            ],
           },
         },
       },
@@ -1672,8 +1643,8 @@ describe('PluginsService.getActiveDebateRoles', () => {
     expect(result).not.toBeNull();
     expect(result![0].prompt).toBe('Inline prompt!');
     // readFileSync should NOT be called for BULL.md when prompt is present
-    const bullCalls = (readFileSyncSpy.mock.calls as unknown[][]).filter(
-      (args) => typeof args[0] === 'string' && (args[0] as string).includes('BULL'),
+    const bullCalls = readFileSyncSpy.mock.calls.filter(
+      (args: unknown[]) => typeof args[0] === 'string' && args[0].includes('BULL'),
     );
     expect(bullCalls).toHaveLength(0);
   });
@@ -1696,8 +1667,8 @@ describe('PluginsService.getActiveDebateRoles', () => {
     await service.getActiveDebateRoles();
 
     // Must have used path.join('/plugins/traversal-test', 'passwd') — basename only
-    const traversalCalls = (readFileSyncSpy.mock.calls as unknown[][]).filter(
-      (args) => typeof args[0] === 'string' && (args[0] as string).includes('etc/passwd'),
+    const traversalCalls = readFileSyncSpy.mock.calls.filter(
+      (args: unknown[]) => typeof args[0] === 'string' && args[0].includes('etc/passwd'),
     );
     expect(traversalCalls).toHaveLength(0);
 

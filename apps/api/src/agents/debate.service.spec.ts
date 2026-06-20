@@ -16,7 +16,11 @@ function makeService(llm: jest.Mocked<Pick<LlmService, 'complete'>>): DebateServ
 
 const BULL_ROLE: DebateRole = { name: 'bull', prompt: 'You are a bull.', block: false };
 const BEAR_ROLE: DebateRole = { name: 'bear', prompt: 'You are a bear.', block: false };
-const AUDITOR_ROLE: DebateRole = { name: 'risk-auditor', prompt: 'You are the auditor.', block: true };
+const AUDITOR_ROLE: DebateRole = {
+  name: 'risk-auditor',
+  prompt: 'You are the auditor.',
+  block: true,
+};
 
 // ── Suite 1: parseStance ─────────────────────────────────────────────────────
 
@@ -103,7 +107,13 @@ describe('DebateService.parseStance', () => {
   });
 
   it('never throws on any input', () => {
-    const badInputs = [null as unknown as string, undefined as unknown as string, 123 as unknown as string, '{}', '[]'];
+    const badInputs = [
+      null as unknown as string,
+      undefined as unknown as string,
+      123 as unknown as string,
+      '{}',
+      '[]',
+    ];
     for (const input of badInputs) {
       expect(() => service.parseStance(input, 'bull')).not.toThrow();
     }
@@ -255,9 +265,15 @@ describe('DebateService.runPanel', () => {
     const llm: jest.Mocked<Pick<LlmService, 'complete'>> = {
       complete: jest
         .fn()
-        .mockResolvedValueOnce({ text: '{"stance":"approve","confidence":0.85,"rationale":"strong"}' })
-        .mockResolvedValueOnce({ text: '{"stance":"approve","confidence":0.7,"rationale":"trend up"}' })
-        .mockResolvedValueOnce({ text: '{"stance":"abstain","confidence":0.5,"rationale":"neutral"}' }),
+        .mockResolvedValueOnce({
+          text: '{"stance":"approve","confidence":0.85,"rationale":"strong"}',
+        })
+        .mockResolvedValueOnce({
+          text: '{"stance":"approve","confidence":0.7,"rationale":"trend up"}',
+        })
+        .mockResolvedValueOnce({
+          text: '{"stance":"abstain","confidence":0.5,"rationale":"neutral"}',
+        }),
     };
     const service = makeService(llm);
 
