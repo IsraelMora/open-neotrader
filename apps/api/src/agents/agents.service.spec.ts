@@ -7736,12 +7736,15 @@ describe('F6-s5 Elevated-still-obeys-policy — (d) promote() hard-checks gate +
 
 // ── ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch ─────────────
 
-import type { MlSignalRecordService, MlSignalRow } from '../ml-signal-record/ml-signal-record.service';
+import type {
+  MlSignalRecordService,
+  MlSignalRow,
+} from '../ml-signal-record/ml-signal-record.service';
 
 /** Minimal MlSignalRecordService stub. */
-function makeMlSignalRecord(rows: MlSignalRow[]): jest.Mocked<
-  Pick<MlSignalRecordService, 'getTrainingData'>
-> {
+function makeMlSignalRecord(
+  rows: MlSignalRow[],
+): jest.Mocked<Pick<MlSignalRecordService, 'getTrainingData'>> {
   return {
     getTrainingData: jest.fn().mockResolvedValue(rows),
   };
@@ -7803,8 +7806,11 @@ function makeMlTrainAgentsService(
   );
 }
 
-/** Call _dispatchKernelTool directly (PR2 variant). */
-async function callDispatchKernelToolPr2(
+/**
+ * Call _dispatchKernelTool directly for PR2 (ml-feature-extractor) tests.
+ * Delegates to callDispatchKernelToolPr3 (same private cast, shared helper).
+ */
+function callDispatchKernelToolPr2(
   service: AgentsService,
   cycleId: string,
   tc: import('../llm/llm.service').ToolCallRequest,
@@ -7812,19 +7818,7 @@ async function callDispatchKernelToolPr2(
   decisions: import('./agents.service').Decision[];
   sandbox_results: import('./agents.service').SandboxResult[];
 }> {
-  const decisions: import('./agents.service').Decision[] = [];
-  const sandbox_results: import('./agents.service').SandboxResult[] = [];
-  await (
-    service as unknown as {
-      _dispatchKernelTool: (
-        c: string,
-        tc: import('../llm/llm.service').ToolCallRequest,
-        d: import('./agents.service').Decision[],
-        s: import('./agents.service').SandboxResult[],
-      ) => Promise<void>;
-    }
-  )._dispatchKernelTool(cycleId, tc, decisions, sandbox_results);
-  return { decisions, sandbox_results };
+  return callDispatchKernelToolPr3(service, cycleId, tc);
 }
 
 /** Build 60 synthetic MlSignalRows (labeled, sufficient for training). */
@@ -7865,34 +7859,25 @@ describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () =
     expect(valid[0]?.function).toBe('train_ml_model');
   });
 
-  it('6.2 — source:reflection → kernel__train_ml_model IS in kernelTools (visible in tool schema)', async () => {
-    const audit = makeAudit();
-    const sandbox = makeSandbox();
+  it('6.2 — source:reflection → kernel__train_ml_model IS in injected [TOOL SCHEMA]', async () => {
+    // Use the same pattern as 4.1 tests: capture system_prompt and look for the tool name in
+    // the serialized [TOOL SCHEMA] block (tools are JSON-serialized into system_prompt).
+    const captured: { tools: string }[] = [];
     const mlSignalRecord = makeMlSignalRecord([]);
-    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord);
-    const captured: { tools: string[] }[] = [];
 
-    (
-      service as unknown as {
-        _buildToolSchema: (tools: import('../plugins/plugins.service').ProviderTool[]) => string;
-      }
-    );
-
-    // We check via runGovernedTurn injection: kernel__train_ml_model must appear in the
-    // tools array passed to llm.complete when source==='reflection'.
-    const fakeLlm = {
-      complete: jest.fn().mockImplementation(
-        (opts: { system: string; context: string; tools: { name: string }[] }) => {
-          captured.push({ tools: opts.tools.map((t) => t.name) });
-          return Promise.resolve({
-            text: 'done',
-            tool_calls: [],
-            backend: 'api' as const,
-            skills_read: [],
-            skills_written: [],
-          });
-        },
-      ),
+    const fakeLlm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+        const sp = opts.system_prompt ?? '';
+        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+        captured.push({ tools: match ? match[1] : '' });
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api' as const,
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
     };
 
     const svcWithLlm = new (AgentsService as unknown as new (
@@ -7913,15 +7898,11 @@ describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () =
       mlSignalRecord: unknown,
     ) => AgentsService)(
       fakeLlm,
-      sandbox,
-      {
-        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
-        getProviderTools: jest.fn().mockResolvedValue([]),
-        findActive: jest.fn().mockResolvedValue([]),
-        getSkillsMetadata: jest.fn().mockResolvedValue([]),
-      },
-      { toContextString: jest.fn().mockResolvedValue(''), appendObservation: jest.fn(), trackSignal: jest.fn() },
-      audit,
+      makeSandbox(),
+      // Give it a decision prompt so [TOOL SCHEMA] is injected
+      makeFullPlugins('Use tools via JSON.', []),
+      makeMemory(),
+      { log: jest.fn().mockResolvedValue(undefined) },
       { createBulk: jest.fn().mockResolvedValue([]) },
       undefined,
       undefined,
@@ -8026,11 +8007,9 @@ describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () =
     expect(mlSignalRecord.getTrainingData).toHaveBeenCalledWith(1000);
 
     // callPlugin('ml-feature-extractor', 'train', { training_data: rows })
-    expect(sandbox.callPlugin).toHaveBeenCalledWith(
-      'ml-feature-extractor',
-      'train',
-      { training_data: rows },
-    );
+    expect(sandbox.callPlugin).toHaveBeenCalledWith('ml-feature-extractor', 'train', {
+      training_data: rows,
+    });
 
     // kv.set('ml:model:current', ...) with the blob and metadata
     expect(kv.set).toHaveBeenCalledTimes(1);
@@ -8196,7 +8175,8 @@ describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () =
     // kv already has a stored model
     (kv.get as jest.Mock).mockImplementation((key: string) => {
       if (key === 'react.max_turns') return Promise.resolve('1');
-      if (key === 'ml:model:current') return Promise.resolve(JSON.stringify({ blob_b64: 'existingblob==' }));
+      if (key === 'ml:model:current')
+        return Promise.resolve(JSON.stringify({ blob_b64: 'existingblob==' }));
       return Promise.resolve(null);
     });
 

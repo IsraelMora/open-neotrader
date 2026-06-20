@@ -240,6 +240,27 @@ const KERNEL_RECORD_LESSON_TOOL: import('../plugins/plugins.service').ProviderTo
 };
 
 /**
+ * Schema definition for the kernel__train_ml_model tool.
+ * Injected into the LLM tool schema ONLY when source === 'reflection'.
+ * Trains the on-device sklearn model from captured signal history and persists
+ * the base64 blob in KV key 'ml:model:current'. Inert to live cycle decisions (s2).
+ */
+const KERNEL_TRAIN_ML_MODEL_TOOL: import('../plugins/plugins.service').ProviderTool = {
+  plugin_id: 'kernel',
+  name: 'kernel__train_ml_model',
+  description:
+    'Trains the on-device ML model from captured signal history and persists it. Reflection turns only.',
+  input_schema: { type: 'object', properties: {}, required: [] },
+};
+
+/**
+ * Cold-start threshold: minimum number of labeled rows required to attempt training.
+ * Mirrors manifest [config].min_samples = 50 in plugins/ml-feature-extractor/manifest.toml.
+ * Below this, the handler audits cold_start and returns without writing KV.
+ */
+const MIN_ML_SAMPLES = 50;
+
+/**
  * Maximum number of active pretest portfolios allowed. Enforced at dispatch time by
  * counting all portfolios via PretestService.findAll() before calling create().
  * Bounds parallel simulation cost and prevents LLM-driven portfolio explosion.
@@ -257,6 +278,7 @@ const KERNEL_TOOL_REGISTRY: Set<string> = new Set([
   'run_pretest_compare',
   'promote_pretest',
   'record_lesson',
+  'train_ml_model',
 ]);
 
 /** Orquesta el ciclo completo del agente: memoria, hooks de plugins, capa de veto, LLM y ejecución de tool calls. */
@@ -571,6 +593,7 @@ export class AgentsService {
             KERNEL_RUN_PRETEST_COMPARE_TOOL,
             KERNEL_PROMOTE_PRETEST_TOOL,
             KERNEL_RECORD_LESSON_TOOL,
+            KERNEL_TRAIN_ML_MODEL_TOOL,
           ]
         : [];
     const effectiveTools = [...providerTools, ...kernelTools];
@@ -1308,6 +1331,8 @@ export class AgentsService {
       await this._kernelPromotePretest(cycle_id, tc, decisions, sandbox_results);
     } else if (tc.function === 'record_lesson') {
       await this._kernelRecordLesson(cycle_id, tc, decisions, sandbox_results);
+    } else if (tc.function === 'train_ml_model') {
+      await this._kernelTrainMlModel(cycle_id, tc, decisions, sandbox_results);
     } else {
       this.log.warn(`_dispatchKernelTool: unknown kernel function '${tc.function}' — dropped`);
       decisions.push({ ...tc, allowed: false, reason: 'unknown_kernel_tool' });
@@ -1605,6 +1630,119 @@ export class AgentsService {
       ok: true,
       result: { text, episode_id, rationale },
     });
+  }
+
+  /**
+   * Handles kernel__train_ml_model dispatch.
+   * Reflection-gated (injection side guarantees source==='reflection'; this handler
+   * trusts the gate). Reads labeled signal history from MlSignalRecordService,
+   * trains via sandbox.callPlugin('ml-feature-extractor','train',...), and stores
+   * the resulting base64 blob in KV key 'ml:model:current'.
+   *
+   * Fail-soft: NEVER throws into the reflection turn. Any error → audit + allowed:false.
+   * No-clobber: cold_start / error paths do NOT write KV (existing blob preserved).
+   * Inert: does NOT modify _executeCycle or pending_signals (s3 wires predict).
+   */
+  private async _kernelTrainMlModel(
+    cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+  ): Promise<void> {
+    // Guard: MlSignalRecordService must be injected (@Optional — may be absent in tests).
+    // sandbox is always present; guard only mlSignalRecord.
+    if (!this.mlSignalRecord) {
+      decisions.push({ ...tc, allowed: false, reason: 'ml_unavailable' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'ml_unavailable',
+      });
+      return;
+    }
+
+    try {
+      // Fetch the most recent 1000 labeled rows (outcome_pnl IS NOT NULL).
+      const rows = await this.mlSignalRecord.getTrainingData(1000);
+
+      // Cold-start gate: below MIN_ML_SAMPLES we cannot fit a meaningful model.
+      // Audit and return without calling the plugin or writing KV.
+      if (rows.length < MIN_ML_SAMPLES) {
+        await this.audit.log({
+          cycle_id,
+          event_type: 'ml_model_trained',
+          meta: { status: 'cold_start', n_samples: rows.length },
+        });
+        decisions.push({ ...tc, allowed: true });
+        sandbox_results.push({
+          plugin_id: 'kernel',
+          function: tc.function,
+          ok: true,
+          result: { status: 'cold_start', n_samples: rows.length },
+        });
+        return;
+      }
+
+      // Invoke the plugin's train() function via the sandbox (no ML in the kernel).
+      const res = await this.sandbox.callPlugin('ml-feature-extractor', 'train', {
+        training_data: rows,
+      });
+      const r = (res.result ?? {}) as Record<string, unknown>;
+
+      if (res.ok && r['status'] === 'trained' && typeof r['model_blob'] === 'string') {
+        // Store the serialized model in KV. s3 reads this key to inject into predict().
+        await this.kv?.set(
+          'ml:model:current',
+          JSON.stringify({
+            blob_b64: r['model_blob'],
+            active_skill_hash: r['active_skill_hash'],
+            feature_names: r['feature_names'],
+            n_samples: r['n_samples'],
+            trained_at: new Date().toISOString(),
+          }),
+        );
+        await this.audit.log({
+          cycle_id,
+          event_type: 'ml_model_trained',
+          meta: { status: 'trained', n_samples: r['n_samples'] },
+        });
+      } else {
+        // Plugin returned cold_start (single-class, no data) or an unexpected status.
+        // Do NOT overwrite an existing good model blob.
+        await this.audit.log({
+          cycle_id,
+          event_type: 'ml_model_trained',
+          meta: {
+            status: typeof r['status'] === 'string' ? r['status'] : 'cold_start',
+            n_samples: rows.length,
+          },
+        });
+      }
+
+      decisions.push({ ...tc, allowed: true });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: true,
+        result: { status: typeof r['status'] === 'string' ? r['status'] : 'cold_start' },
+      });
+    } catch (e: unknown) {
+      // FAIL-SOFT: any error must not break the reflection turn.
+      this.log.warn(`[ML] train_ml_model failed: ${String(e)}`);
+      await this.audit.log({
+        cycle_id,
+        event_type: 'ml_model_trained',
+        meta: { status: 'error', error: String(e) },
+      });
+      decisions.push({ ...tc, allowed: false, reason: 'ml_train_failed' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: String(e),
+      });
+    }
   }
 
   /**
