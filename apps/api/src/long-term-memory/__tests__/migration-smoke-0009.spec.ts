@@ -7,11 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-const MIGRATION_DIR = path.resolve(
-  __dirname,
-  '../../..',
-  'prisma/migrations/0009_lesson_memory',
-);
+const MIGRATION_DIR = path.resolve(__dirname, '../../..', 'prisma/migrations/0009_lesson_memory');
 const MIGRATION_FILE = path.join(MIGRATION_DIR, 'migration.sql');
 
 describe('Migration 0009_lesson_memory (F6-s2 PR3)', () => {

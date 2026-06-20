@@ -394,7 +394,9 @@ describe('LongTermMemoryService promote + listLessons (integration)', () => {
     // Insert the 31st
     await service.promote({ text: 'NEWEST LESSON' });
 
-    const rows = db.prepare('SELECT text FROM lesson_memory ORDER BY ts ASC').all() as { text: string }[];
+    const rows = db.prepare('SELECT text FROM lesson_memory ORDER BY ts ASC').all() as {
+      text: string;
+    }[];
     const texts = rows.map((r) => r.text);
     // Oldest ('OLDEST LESSON') should be gone
     expect(texts).not.toContain('OLDEST LESSON');
@@ -408,7 +410,7 @@ describe('LongTermMemoryService promote + listLessons (integration)', () => {
     await service.promote({ text: 'Third lesson' });
 
     const lessons = await service.listLessons(2);
-    expect(lessons.length).toBe(2);
+    expect(lessons).toHaveLength(2);
     // Most recent first
     expect(lessons[0]?.text).toBe('Third lesson');
     expect(lessons[1]?.text).toBe('Second lesson');

@@ -5470,9 +5470,20 @@ describe('F6-S1 T10 — existing suite regression: _executeCycle reads accumulat
  * Extends makeAssemblerService pattern with a 12-arg constructor call.
  */
 function makeAssemblerServicePr3(opts: {
-  auditEntries?: Array<{ event_type: string; symbol?: string | null; action?: string | null; meta?: string | null }>;
+  auditEntries?: Array<{
+    event_type: string;
+    symbol?: string | null;
+    action?: string | null;
+    meta?: string | null;
+  }>;
   equityCurve?: Array<{ ts: string; equity: number }>;
-  lessons?: Array<{ id: string; ts: Date; text: string; episode_id: string | null; rationale: string | null }>;
+  lessons?: Array<{
+    id: string;
+    ts: Date;
+    text: string;
+    episode_id: string | null;
+    rationale: string | null;
+  }>;
   episodePrefetch?: import('../long-term-memory/memory-provider.interface').EpisodeRecord[];
   ltmThrows?: boolean;
   noLtm?: boolean;
@@ -5563,7 +5574,13 @@ describe('F6-S2 PR3 — _assembleReflectionContext [LESSONS] + [PAST EPISODES]',
     const service = makeAssemblerServicePr3({
       lessons: [
         { id: 'l1', ts: new Date(), text: 'Exit before FOMC', episode_id: null, rationale: null },
-        { id: 'l2', ts: new Date(), text: 'VIX > 30 → no new longs', episode_id: null, rationale: null },
+        {
+          id: 'l2',
+          ts: new Date(),
+          text: 'VIX > 30 → no new longs',
+          episode_id: null,
+          rationale: null,
+        },
       ],
     });
 
@@ -5650,7 +5667,10 @@ describe('F6-S2 PR3 — _assembleReflectionContext [LESSONS] + [PAST EPISODES]',
         symbol: 'AAPL',
         action: 'buy',
       })),
-      equityCurve: Array.from({ length: 20 }, (_, i) => ({ ts: `2024-01-${String(i + 1)}`, equity: 1000 + i * 10 })),
+      equityCurve: Array.from({ length: 20 }, (_, i) => ({
+        ts: `2024-01-${String(i + 1)}`,
+        equity: 1000 + i * 10,
+      })),
     });
 
     const ctx = await callAssembleReflectionContext(service);
@@ -5744,7 +5764,10 @@ async function callDispatchKernelToolPr3(
   service: AgentsService,
   cycleId: string,
   tc: import('../llm/llm.service').ToolCallRequest,
-): Promise<{ decisions: import('./agents.service').Decision[]; sandbox_results: import('./agents.service').SandboxResult[] }> {
+): Promise<{
+  decisions: import('./agents.service').Decision[];
+  sandbox_results: import('./agents.service').SandboxResult[];
+}> {
   const decisions: import('./agents.service').Decision[] = [];
   const sandbox_results: import('./agents.service').SandboxResult[] = [];
   await (
@@ -5832,7 +5855,7 @@ describe('F6-S2 PR3 — kernel__record_lesson dispatch', () => {
 
     // promote() must have been called with the lesson record
     expect(ltm.promote).toHaveBeenCalledTimes(1);
-    const lesson = (ltm.promote as jest.Mock).mock.calls[0][0] as LessonRecord;
+    const lesson = ((ltm.promote as jest.Mock).mock.calls as Array<[LessonRecord]>)[0][0];
     expect(lesson.text).toBe('Always exit before FOMC');
     expect(lesson.episode_id).toBe('ep-1');
     expect(lesson.rationale).toBe('FOMC volatility');
