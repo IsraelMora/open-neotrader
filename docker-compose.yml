@@ -13,7 +13,8 @@ services:
       dockerfile: apps/api/Dockerfile
     environment:
       NODE_ENV: production
-      DB_PATH: /data/neurotrader.db
+      # El código lee DATABASE_URL (no DB_PATH). Apunta al volumen persistente.
+      DATABASE_URL: file:/data/neurotrader.db
       # Sandbox Python
       SANDBOX_RUNNER_PATH: /sandbox/runner.py
       SANDBOX_TIMEOUT_MS: ${SANDBOX_TIMEOUT_MS:-60000}
@@ -33,13 +34,13 @@ services:
       # CORS — separar por comas si hay múltiples origins
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
     ports:
-      - "${API_PORT:-127.0.0.1:3000}:3000"
+      # Bind a 0.0.0.0 (default) para que el proxy de Dokploy pueda enrutar.
+      - "${API_PORT:-3000}:3000"
     volumes:
+      # plugins/ y el sandbox ahora van horneados en la imagen (ver Dockerfile).
       - api-data:/data
-      - plugins-vol:/plugins
-      - ./apps/sandbox/runner.py:/sandbox/runner.py:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q '\"status\"' || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health | grep -q '\"status\"' || exit 1"]
       interval: 20s
       timeout: 8s
       retries: 5
@@ -59,27 +60,13 @@ services:
       context: ./apps/web
       dockerfile: Dockerfile
     ports:
-      - "${WEB_PORT:-127.0.0.1:8080}:80"
+      - "${WEB_PORT:-8080}:80"
     depends_on:
       api:
         condition: service_healthy
     networks:
       - internal
     restart: unless-stopped
-
-  # ── Inicialización de plugins (ejecutar una vez al instalar) ───────────────
-  # Uso: docker compose --profile init run --rm sandbox-init
-  sandbox-init:
-    build:
-      context: ./apps/sandbox
-      dockerfile: Dockerfile
-    command: ["python3", "-c", "import tomllib; print('sandbox OK')"]
-    volumes:
-      - plugins-vol:/plugins
-    profiles:
-      - init
-    networks:
-      - internal
 
 networks:
   # Red interna — el API no tiene acceso a internet desde Docker
@@ -90,4 +77,3 @@ networks:
 
 volumes:
   api-data:     # Base de datos SQLite + config persistente
-  plugins-vol:  # Plugins instalados (compartido entre API y sandbox-init)

@@ -35,6 +35,13 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 
+# Sandbox runner + sibling modules (runner.py lazy-imports isolation.py / analyzer.py)
+COPY apps/sandbox/*.py /sandbox/
+# Strategy + backtester plugins baked into the image (PLUGINS_DIR=/plugins).
+# chown so runtime plugin installs (POST /api/plugins/install) can still write.
+COPY plugins/ /plugins/
+RUN chown -R node:node /plugins
+
 ENV NODE_ENV=production
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
