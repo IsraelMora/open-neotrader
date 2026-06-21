@@ -34,8 +34,11 @@ services:
       # CORS — separar por comas si hay múltiples origins
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
     ports:
-      # Bind a 0.0.0.0 (default) para que el proxy de Dokploy pueda enrutar.
-      - "${API_PORT:-3000}:3000"
+      # Loopback por defecto (no exponer en crudo). El proxy de Dokploy llega al
+      # contenedor por la red interna de Docker al puerto 3000 + dominio configurado
+      # en la UI; NO necesita el puerto publicado en el host. El bind local sirve
+      # solo para debug. Para acceso externo, configurar el dominio en Dokploy.
+      - "${API_PORT:-127.0.0.1:3000}:3000"
     volumes:
       # plugins/ y el sandbox ahora van horneados en la imagen (ver Dockerfile).
       - api-data:/data
@@ -60,7 +63,8 @@ services:
       context: ./apps/web
       dockerfile: Dockerfile
     ports:
-      - "${WEB_PORT:-8080}:80"
+      # Loopback por defecto; el dominio del panel se enruta vía proxy de Dokploy.
+      - "${WEB_PORT:-127.0.0.1:8080}:80"
     depends_on:
       api:
         condition: service_healthy
