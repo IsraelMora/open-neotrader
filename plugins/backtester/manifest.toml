@@ -22,3 +22,6 @@ risk_per_trade    = { type = "number",  default = 0.01,   description = "Riesgo 
 max_positions     = { type = "integer", default = 5,      description = "Máximo de posiciones simultáneas" }
 benchmark         = { type = "string",  default = "SPY",  description = "Símbolo benchmark para comparar rendimiento" }
 output_equity_curve = { type = "boolean", default = true, description = "Incluir curva de equity en resultado" }
+
+[skills]
+keys = ["backtester.run"]
