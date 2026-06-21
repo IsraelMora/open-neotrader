@@ -4,7 +4,7 @@ name        = "Ensemble Signal Voting + Vol-Targeting"
 version     = "1.0.0"
 type        = "skill"
 description = "Ensemble de 12 variantes: EMA × 4 lookbacks + Donchian Channel × 4 + Time-Series Momentum × 4. Voto por mayoría. Vol-targeting: escala la posición inversamente a la volatilidad realizada para mantener un riesgo constante del 10% anual."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["ensemble", "momentum", "trend", "vol-targeting", "diversification"]
 
 [scheduler]

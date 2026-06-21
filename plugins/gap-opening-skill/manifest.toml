@@ -4,7 +4,7 @@ name        = "Gap Opening Strategy"
 version     = "1.0.0"
 type        = "skill"
 description = "Estrategia de gaps de apertura. Detecta gaps significativos entre el cierre anterior y la apertura del día. Gaps grandes (>2%) tienden a rellenarse en intraday. Gaps pequeños (0.5-2%) en tendencia tienden a continuar. Win rate: ~58-65%."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["skill", "gap", "intraday", "opening", "mean-reversion", "momentum"]
 
 [scheduler]

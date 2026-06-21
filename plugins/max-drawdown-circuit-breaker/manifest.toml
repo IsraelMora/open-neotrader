@@ -4,7 +4,7 @@ name        = "Max Drawdown Circuit Breaker"
 version     = "1.0.0"
 type        = "discipline"
 description = "Discipline de seguridad crítica. Monitorea el drawdown del portfolio en tiempo real y activa un circuit breaker si supera los umbrales configurados. Reduce tamaño de posición gradualmente o detiene el trading por completo. Basado en gestión de riesgo institucional."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

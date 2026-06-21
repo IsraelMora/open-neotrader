@@ -4,7 +4,7 @@ name        = "EMA Crossover 9/21"
 version     = "1.0.0"
 type        = "skill"
 description = "Estrategia de cruce de medias exponenciales 9/21 periodos. Señal de entrada cuando EMA rápida (9) cruza por encima de EMA lenta (21). Clásico sistema de seguimiento de tendencia con Sharpe histórico ~0.6-0.8 en mercados con tendencia."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

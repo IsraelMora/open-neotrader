@@ -4,7 +4,7 @@ name        = "Macro Calendar Guard"
 version     = "1.0.0"
 type        = "discipline"
 description = "Disciplina de seguridad: suprime o reduce señales en ventanas de alta incertidumbre macro (Fed, CPI, NFP, ECB, earnings season peaks). Evita el slippage y reversiones bruscas post-evento."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["discipline", "macro", "risk", "calendar", "events"]
 
 [scheduler]

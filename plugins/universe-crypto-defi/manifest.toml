@@ -4,7 +4,7 @@ name        = "Crypto DeFi Top 20"
 version     = "1.0.0"
 type        = "universe"
 description = "Universo de los 20 principales tokens DeFi (Finanzas Descentralizadas), excluyendo BTC y ETH. Incluye protocolos de lending, DEX, derivados y yield. Alta volatilidad y correlación con el ciclo cripto."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

@@ -4,7 +4,7 @@ name        = "Volatility Regime Detection"
 version     = "1.0.0"
 type        = "skill"
 description = "Detecta el régimen de volatilidad del mercado (baja/media/alta/crisis) usando VIX, ATR histórico y percentil de volatilidad realizada. Cambia automáticamente el comportamiento del agente: momentum en baja volatilidad, mean reversion en alta volatilidad. Matemáticamente probado por Ang et al. (2006)."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

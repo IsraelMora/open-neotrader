@@ -4,7 +4,7 @@ name        = "Volatility Rank (HV Percentile)"
 version     = "1.0.0"
 type        = "skill"
 description = "Calcula el rango de volatilidad histórica (HV Percentile) como proxy de IV Rank. Identifica cuándo la volatilidad está alta (>80% = premium selling) o baja (<20% = premium buying). Técnica de traders profesionales de opciones."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["skill", "volatility", "options", "iv-rank", "hv-percentile"]
 
 [scheduler]

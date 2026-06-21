@@ -4,7 +4,7 @@ name        = "Forex Majors Universe"
 version     = "1.0.0"
 type        = "universe"
 description = "Universo de los 7 pares de divisas principales (Forex majors). Mercado más líquido del mundo con $6.6 billones de volumen diario. Abierto 24h/5d. Ideal para estrategias de mean reversion, momentum y análisis macro."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

@@ -4,7 +4,7 @@ name        = "Alpaca Provider"
 version     = "1.0.0"
 type        = "provider"
 description = "Proveedor de datos de mercado y broker de ejecución via Alpaca Markets API. Datos históricos OHLCV, cotizaciones y órdenes (paper y live)."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 # ── Credenciales ──────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@ name        = "Position Sizing Pyramid"
 version     = "1.0.0"
 type        = "discipline"
 description = "Pirámide de posicionamiento: entra en tranches y añade capital a posiciones ganadoras. Reduce el coste medio en ganadores sin aumentar el riesgo inicial. Base matemática: Van Tharp (1999), Ed Seykota."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [[tools]]

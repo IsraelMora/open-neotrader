@@ -4,7 +4,7 @@ name        = "Tiingo Provider"
 version     = "1.0.0"
 type        = "provider"
 description = "Proveedor de datos históricos OHLCV y fundamentales via Tiingo API. Alternativa a Alpaca para datos — sin capacidad de ejecución de órdenes. API gratuita disponible con token."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 # ── Credenciales ──────────────────────────────────────────────────────────────

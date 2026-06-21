@@ -4,7 +4,7 @@ name        = "Stack: Trend Following"
 version     = "1.0.0"
 type        = "stack"
 description = "Stack de seguimiento de tendencia: combina MACD Signal + EMA Crossover + Ichimoku Cloud + Momentum Factor + Volatility Regime Detection. Señal de consenso de 3/5 skills para reducir falsos positivos."
-author      = "NeuroTrader"
+author      = "OpenNeoTrader"
 tags        = ["stack", "trend-following", "momentum", "consensus"]
 
 [config]

@@ -4,7 +4,7 @@ name        = "Yahoo Finance Provider"
 version     = "1.0.0"
 type        = "provider"
 description = "Datos OHLCV gratuitos via Yahoo Finance (API no oficial). Sin API key necesaria. Limitado a datos históricos diarios y datos en tiempo diferido (~15 min). Ideal como fallback cuando no hay otros providers."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["provider", "yahoo", "free", "fallback", "equities"]
 
 [scheduler]

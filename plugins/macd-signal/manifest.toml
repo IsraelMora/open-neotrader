@@ -4,7 +4,7 @@ name        = "MACD Signal"
 version     = "1.0.0"
 type        = "skill"
 description = "MACD clásico (Gerald Appel, 1979): línea MACD, señal EMA, histograma y detección de divergencias. Win rate ~54% en tendencias, ~48% sin filtro de tendencia."
-author      = "NeuroTrader"
+author      = "OpenNeoTrader"
 tags        = ["momentum", "trend", "macd", "ema"]
 
 [config]

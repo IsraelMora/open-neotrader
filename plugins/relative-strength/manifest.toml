@@ -4,7 +4,7 @@ name        = "Relative Strength vs Index"
 version     = "1.0.0"
 type        = "skill"
 description = "Relative Strength de Levy (1968) y O'Neil (CANSLIM): compara retorno del activo vs benchmark en N periodos. Activos con RS > 1.0 tienden a outperform. Win rate ~62% sobre S&P500."
-author      = "NeuroTrader"
+author      = "OpenNeoTrader"
 tags        = ["momentum", "relative-strength", "canslim", "ranking"]
 
 [config]

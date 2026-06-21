@@ -4,7 +4,7 @@ name        = "Ichimoku Cloud"
 version     = "1.0.0"
 type        = "skill"
 description = "Sistema Ichimoku Kinko Hyo (Goichi Hosoda, 1969): nube futura, líneas Tenkan/Kijun/Chikou. Win rate ~58% con confirmación de nube + chikou. Excelente para criptos y forex."
-author      = "NeuroTrader"
+author      = "OpenNeoTrader"
 tags        = ["trend", "ichimoku", "support-resistance", "crypto", "forex"]
 
 [config]

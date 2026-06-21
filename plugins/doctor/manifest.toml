@@ -4,7 +4,7 @@ name        = "Doctor — Diagnóstico del Sistema"
 version     = "1.0.0"
 type        = "extra"
 description = "Chequeo de integridad al inicio de cada ciclo: valida plugins activos, credenciales requeridas, conexiones a providers y estado de la base de datos. Reporta advertencias al LLM y al log de auditoría."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["diagnostics", "health", "monitoring", "safety"]
 
 [scheduler]

@@ -4,7 +4,7 @@ name = "Example Decision Plugin"
 version = "0.1.0"
 type = "extra"
 description = "Demonstrates the [decision] capability. Teaches the LLM the mechanical tool_call format using only the provided tool schema. INACTIVE by default — activate explicitly to enable."
-author = "NeuroTrader"
+author = "OpenNeoTrader"
 
 [decision]
 prompt = """

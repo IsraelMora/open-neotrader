@@ -4,7 +4,7 @@ name        = "Opening Range Breakout (ORB)"
 version     = "1.0.0"
 type        = "skill"
 description = "Estrategia intradiaria. El rango de los primeros N minutos de trading define el rango del día. La ruptura del máximo/mínimo inicial con volumen genera señal de entrada. Win rate ~55%, payoff ratio ~1.8 histórico. Requiere datos intradiarios (5m o 15m)."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

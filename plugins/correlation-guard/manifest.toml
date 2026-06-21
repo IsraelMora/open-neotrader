@@ -4,7 +4,7 @@ name        = "Correlation Guard"
 version     = "1.0.0"
 type        = "discipline"
 description = "Discipline de riesgo. Cancela señales de entrada en activos altamente correlacionados con posiciones ya abiertas (correlación > umbral). Evita la falsa diversificación — tener 5 posiciones con correlación 0.9 es como tener 1 posición con 5× el riesgo."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

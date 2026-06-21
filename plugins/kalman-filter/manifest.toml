@@ -4,7 +4,7 @@ name        = "Kalman Filter Trend Following"
 version     = "1.0.0"
 type        = "skill"
 description = "Trend following usando el Filtro de Kalman discreto para estimar el estado oculto (tendencia) del precio. Supera al EMA porque adapta su ganancia dinámicamente según la relación ruido/señal. Las señales se generan cuando el precio cruza el estado estimado por el filtro. Welch & Bishop (1995), Zacks (2009) 'Optimal Control'."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["trend", "kalman", "adaptive", "signal-processing", "state-space"]
 
 [scheduler]

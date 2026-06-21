@@ -4,7 +4,7 @@ name        = "Signal Aggregator"
 version     = "1.0.0"
 type        = "discipline"
 description = "Agrega señales de múltiples skills usando votación ponderada por confianza. Genera una señal final consenso, filtra ruido, y produce decisiones de trading más robustas que cualquier skill individual. Reduce la dependencia del LLM para agregación simple."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [[tools]]

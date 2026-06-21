@@ -4,7 +4,7 @@ name        = "Momentum Factor 12-1"
 version     = "1.0.0"
 type        = "skill"
 description = "Estrategia de momentum cross-sectional basada en retorno de 12 meses excluyendo el último mes (12-1). Probada académicamente por Jegadeesh & Titman (1993) con Sharpe ~0.5-0.7 anualizado en mercados desarrollados."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

@@ -4,7 +4,7 @@ name        = "Carry Trade"
 version     = "1.0.0"
 type        = "skill"
 description = "Estrategia basada en diferenciales de tasas de interés: comprar la divisa de mayor rendimiento y vender la de menor rendimiento. Rentabilidad media histórica ~5-8% anual en pares AUD/JPY, NZD/JPY. Base: Uncovered Interest Rate Parity (UIP) theory."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [[tools]]

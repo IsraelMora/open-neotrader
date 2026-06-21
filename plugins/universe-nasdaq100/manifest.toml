@@ -4,7 +4,7 @@ name        = "Nasdaq-100 Universe"
 version     = "1.0.0"
 type        = "universe"
 description = "Universo de los 100 principales activos del índice Nasdaq-100 (QQQ). Dominado por tecnología y growth. Ideal para estrategias momentum, EMA crossover y mean reversion en activos de alta capitalización."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

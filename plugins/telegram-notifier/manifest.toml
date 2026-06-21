@@ -4,7 +4,7 @@ name        = "Telegram Notifier"
 version     = "1.0.0"
 type        = "extra"
 description = "Envía alertas en tiempo real a Telegram. Notifica señales de trading, inicio/fin de ciclos, estado del circuit breaker, y cualquier evento crítico. Esencial para el modelo de ingresos pasivos — te mantienes informado sin mirar la pantalla."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [credentials]

@@ -4,7 +4,7 @@ name        = "Kelly Criterion Position Sizer"
 version     = "1.0.0"
 type        = "discipline"
 description = "Calcula el tamaño óptimo de posición usando el Criterio de Kelly. Maximiza el crecimiento geométrico del capital a largo plazo. Matemáticamente óptimo cuando se conocen win rate y payoff ratio."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [[tools]]

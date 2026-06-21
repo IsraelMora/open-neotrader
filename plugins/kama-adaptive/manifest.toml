@@ -4,7 +4,7 @@ name        = "KAMA — Kaufman Adaptive Moving Average"
 version     = "1.0.0"
 type        = "skill"
 description = "Kaufman (1995) Adaptive Moving Average que ajusta su velocidad según la Efficiency Ratio (ER). En mercados tendenciales el KAMA es rápido (EMA corta); en mercados caóticos/laterales es lento (EMA larga). Elimina whipsaws de EMAs fijas y supera al triple EMA en mercados reales. Emite señales de cruce KAMA vs precio y detección de régimen."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["adaptive", "moving-average", "kama", "trend-following", "noise-filter", "kaufman"]
 
 [scheduler]

@@ -4,7 +4,7 @@ name        = "ATR Dynamic Stop Loss"
 version     = "1.0.0"
 type        = "discipline"
 description = "Discipline plugin que calcula stops dinámicos basados en ATR (Average True Range). Adapta el stop a la volatilidad actual del activo, evitando stops demasiado ajustados en alta volatilidad y demasiado amplios en baja volatilidad. Compatible con cualquier señal de entrada."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

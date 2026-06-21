@@ -4,7 +4,7 @@ name        = "Ornstein-Uhlenbeck Mean Reversion"
 version     = "1.0.0"
 type        = "skill"
 description = "Mean reversion basada en el proceso estocástico de Ornstein-Uhlenbeck (OU). Estima parámetros θ (velocidad de reversión), μ (media de largo plazo) y σ (volatilidad) por Máxima Verosimilitud. Señal cuando el precio se desvía N sigmas del equilibrio estimado. Superior al Z-score simple al capturar la dinámica temporal de la reversión. Vasicek (1977), Schwartz (1997)."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["mean-reversion", "statistical", "stochastic", "OU", "Vasicek", "quantitative"]
 
 [scheduler]

@@ -4,7 +4,7 @@ name = "Cognitive Upgrade — Multi-Agent Debate Panel"
 version = "0.1.0"
 type = "extra"
 description = "Provides a three-role debate panel (bull / bear / risk-auditor) for high-impact trade gating. INACTIVE by default — activate explicitly to enable. Requires debate.enabled KV key set to 'true'."
-author = "NeuroTrader"
+author = "OpenNeoTrader"
 
 [debate]
 [[debate.roles]]

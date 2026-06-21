@@ -4,7 +4,7 @@ name        = "Pairs Trading (Statistical Arbitrage)"
 version     = "1.0.0"
 type        = "skill"
 description = "Arbitraje estadístico entre pares cointegrados. Cuando el spread supera 2σ, compra el rezagado y vende el adelantado. Market-neutral: beneficio independiente de la dirección del mercado. Base: Engle-Granger (1987), Vidyamurthy (2004)."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [[tools]]

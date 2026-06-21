@@ -4,7 +4,7 @@ name        = "ML Feature Extractor"
 version     = "0.1.0"
 type        = "discipline"
 description = "On-device sklearn model: learns which of the agent's own skill signals made money and adjusts per-signal confidence multiplicatively in [0.5x, 1.5x]. INFORMS, never a barrier. Cold-start/error → identity."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 license     = "MIT"
 active      = false
 

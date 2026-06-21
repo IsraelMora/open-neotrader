@@ -4,7 +4,7 @@ name        = "S&P 500 Universe"
 version     = "1.0.0"
 type        = "universe"
 description = "Universo de los 500 activos del índice S&P 500. Filtra automáticamente por liquidez (volumen mínimo) y excluye empresas en proceso de quiebra o delisting. Actualización mensual de componentes."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

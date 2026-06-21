@@ -4,7 +4,7 @@ name        = "Earnings Drift (PEAD)"
 version     = "1.0.0"
 type        = "skill"
 description = "Post-Earnings Announcement Drift: tendencia de las acciones a continuar moviéndose en la dirección de la sorpresa de earnings durante 30-60 días. Una de las anomalías más persistentes y documentadas en finanzas (Ball & Brown 1968, Bernard & Thomas 1989)."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [[tools]]

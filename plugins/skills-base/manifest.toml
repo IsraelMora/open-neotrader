@@ -4,7 +4,7 @@ name = "Skills Base"
 version = "0.1.0"
 type = "skill"
 description = "Skills fundamentales de análisis: diversificación, momentum, anti-martingala"
-author = "NeuroTrader"
+author = "OpenNeoTrader"
 
 [skills]
 keys = [

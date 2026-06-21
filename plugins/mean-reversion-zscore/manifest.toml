@@ -4,7 +4,7 @@ name        = "Mean Reversion Z-Score"
 version     = "1.0.0"
 type        = "skill"
 description = "Detecta activos con precio estadísticamente alejado de su media histórica. Z-Score > 2.0 σ indica sobreventa/sobrecompra con alta probabilidad de reversión. Sólida base estadística (Jegadeesh 1990, Lo&MacKinlay 1988)."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [[tools]]

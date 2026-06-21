@@ -4,7 +4,7 @@ name        = "Portfolio Risk Manager"
 version     = "1.0.0"
 type        = "discipline"
 description = "Gestión de riesgo a nivel de cartera completa. Controla exposición total, concentración por sector/activo, número máximo de posiciones y ratio de liquidez. Complementa el Circuit Breaker (que actúa por drawdown) y Kelly (que dimensiona individualmente)."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [[tools]]

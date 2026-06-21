@@ -4,7 +4,7 @@ name        = "Funding Rate Arbitrage (Crypto)"
 version     = "1.0.0"
 type        = "skill"
 description = "Estrategia de ingresos pasivos en crypto: detecta oportunidades de arbitraje entre tasas de financiamiento (funding rates) de futuros perpetuos y spot. Long spot + Short perp = capturar funding rate sin riesgo de precio. Rendimiento objetivo: 15-40% APR en tasas altas. Basado en la mecánica de funding de Bitmex/Binance Futures."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["crypto", "arbitrage", "funding-rate", "neutral", "passive-income", "perp-futures"]
 
 [scheduler]

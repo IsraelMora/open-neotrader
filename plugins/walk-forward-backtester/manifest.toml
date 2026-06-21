@@ -4,7 +4,7 @@ name        = "Walk-Forward Backtester"
 version     = "1.0.0"
 type        = "extra"
 description = "Validación walk-forward out-of-sample para evitar overfitting. Divide la historia en ventanas solapadas de in-sample (optimización) + out-of-sample (validación), ejecuta el backtest en cada ventana y compara métricas IS vs OOS."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["backtesting", "walk-forward", "overfitting", "validation", "analysis"]
 
 [scheduler]

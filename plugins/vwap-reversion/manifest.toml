@@ -4,7 +4,7 @@ name        = "VWAP Reversion"
 version     = "1.0.0"
 type        = "skill"
 description = "Estrategia de mean reversion intradiaria. El VWAP (Volume Weighted Average Price) actúa como imán de precio durante el día. Las desviaciones de 2σ del VWAP revierten con alta probabilidad. Win rate ~62%, payoff ratio ~1.4. Requiere datos intradiarios con volumen."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

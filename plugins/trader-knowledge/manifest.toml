@@ -4,7 +4,7 @@ name        = "Professional Trader Knowledge Base"
 version     = "1.0.0"
 type        = "skill"
 description = "Base de conocimiento de un trader profesional con 20+ años de experiencia. Cubre psicología, gestión de riesgo, lectura de mercado, patrones de precio, macro, y lecciones aprendidas de crisis reales. Usar como contexto base para todos los ciclos de análisis."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [permissions]

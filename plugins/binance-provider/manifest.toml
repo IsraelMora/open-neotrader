@@ -4,7 +4,7 @@ name        = "Binance Provider"
 version     = "1.0.0"
 type        = "provider"
 description = "Proveedor de datos y ejecución para crypto via Binance API. Datos históricos OHLCV, libro de órdenes, trades en tiempo real. Soporta testnet y mainnet. El exchange de mayor volumen de crypto del mundo."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [credentials]

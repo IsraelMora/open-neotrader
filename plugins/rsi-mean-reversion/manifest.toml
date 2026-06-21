@@ -4,7 +4,7 @@ name        = "RSI Mean Reversion"
 version     = "1.0.0"
 type        = "skill"
 description = "Detecta zonas de sobrecompra/sobreventa usando RSI de Wilder y genera señales de reversión a la media. Matemáticamente sólido: win rate ~58% en backtests S&P500 2000-2023."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

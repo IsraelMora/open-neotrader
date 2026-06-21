@@ -4,7 +4,7 @@ name        = "Crypto Top 50"
 version     = "1.0.0"
 type        = "universe"
 description = "Universo de las 50 criptomonedas con mayor capitalización de mercado. Excluye stablecoins (USDT, USDC, DAI, etc.). Rebalanceo semanal de componentes. Diseñado para uso con provider de Binance/CCXT."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

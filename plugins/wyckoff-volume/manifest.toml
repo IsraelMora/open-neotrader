@@ -4,7 +4,7 @@ name        = "Wyckoff — Análisis de Precio/Volumen Institucional"
 version     = "1.0.0"
 type        = "skill"
 description = "Método Wyckoff (1910-1934): detecta fases de acumulación y distribución institucional mediante análisis precio/volumen. Identifica: Springs (false breakdowns con bajo volumen), Upthrusts (false breakouts con alto volumen), Climax de venta/compra (capitulación), y Tests secundarios. Win rate ~65-70% en activos con suficiente volumen institucional."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["wyckoff", "volume-analysis", "institutional", "accumulation", "distribution", "price-volume"]
 
 [scheduler]

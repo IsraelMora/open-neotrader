@@ -4,7 +4,7 @@ name        = "Dollar Cost Averaging (DCA)"
 version     = "1.0.0"
 type        = "discipline"
 description = "Disciplina DCA: compras periódicas de importe fijo independientes del precio. Reduce el coste medio en mercados volátiles. Matemáticamente óptimo para activos con tendencia alcista a largo plazo (Vanguard 2012). Compatible con señales de cualquier skill."
-author      = "NeuroTrader"
+author      = "OpenNeoTrader"
 tags        = ["dca", "discipline", "long-term", "cost-averaging"]
 
 [config]

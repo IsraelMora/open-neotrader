@@ -4,7 +4,7 @@ name        = "Market Breadth — Salud del Mercado Amplio"
 version     = "1.0.0"
 type        = "skill"
 description = "Calcula indicadores de amplitud del mercado para evaluar la salud general del mercado. Incluye: Advance/Decline Ratio, % activos sobre MA200, McClellan Oscillator, New Highs/New Lows, y Breadth Thrust (Zweig). Detecta divergencias entre índice y breadth (warning de techo/suelo). Inyecta market_breadth_score y market_regime en el contexto del ciclo."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["market-breadth", "macro", "advance-decline", "mcclellan", "zweig", "regime"]
 
 [scheduler]

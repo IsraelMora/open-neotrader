@@ -4,7 +4,7 @@ name        = "Sentiment Analysis"
 version     = "1.0.0"
 type        = "skill"
 description = "Analiza el sentimiento de noticias financieras usando el LLM. El LLM lee titulares y resúmenes y devuelve un score de sentimiento por símbolo. Las noticias se obtienen via ProviderGatewayService desde NewsAPI (requiere clave gratuita)."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["skill", "sentiment", "nlp", "news", "llm"]
 
 [scheduler]

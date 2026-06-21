@@ -4,7 +4,7 @@ name        = "Paper Trading"
 version     = "1.0.0"
 type        = "discipline"
 description = "Simula ejecución de órdenes en modo paper (sin dinero real). Intercepta señales y las ejecuta en un portafolio virtual con precios reales. Calcula PnL diario, acumulado y métricas de rendimiento. Permite validar estrategias en live sin riesgo."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["discipline", "paper", "simulation", "testing", "risk-free"]
 
 [scheduler]

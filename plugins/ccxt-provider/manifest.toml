@@ -4,7 +4,7 @@ name        = "CCXT Universal Provider"
 version     = "1.0.0"
 type        = "provider"
 description = "Acceso a 200+ exchanges via CCXT. Soporta spot, futuros y perpetuos en modo uniforme."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["provider", "crypto", "ccxt", "multi-exchange"]
 
 [scheduler]

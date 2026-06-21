@@ -4,7 +4,7 @@ name        = "Sector Rotation"
 version     = "1.0.0"
 type        = "skill"
 description = "Estrategia de rotación entre sectores del S&P 500 basada en momentum relativo y filtro de tendencia. Meb Faber (2007): comprar los sectores con mejor momentum y filtro MA de 10 meses reduce drawdown un 50% vs buy-and-hold. Rebalanceo mensual."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]

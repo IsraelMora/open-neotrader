@@ -4,7 +4,7 @@ name        = "Risk Envelope (AI-First)"
 version     = "1.0.0"
 type        = "discipline"
 description = "Veto duro matemático sobre propuestas de la IA. Aplica frenos de riesgo inviolables antes de cualquier ejecución: límite por activo, exposición total máxima, cortos prohibidos, reescalado proporcional. Sin exceptions."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["risk", "discipline", "ai-first", "veto", "safety"]
 
 [scheduler]

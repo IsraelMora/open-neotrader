@@ -4,7 +4,7 @@ name        = "Data Quality — Validación de Datos de Mercado"
 version     = "1.0.0"
 type        = "discipline"
 description = "Valida la calidad de los datos de precio antes de permitir señales. Detecta: precios obsoletos (>24h), gaps en series históricas, outliers estadísticos (>4σ), precios negativos/cero, y discrepancias entre providers. Vetoes señales de símbolos con datos sospechosos y emite alertas."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["data-quality", "validation", "risk", "outlier-detection", "discipline"]
 
 [scheduler]

@@ -4,7 +4,7 @@ name        = "Universe — ETF Temáticos"
 version     = "1.0.0"
 type        = "universe"
 description = "Universo de ETFs temáticos de alto crecimiento: ARK Innovation, semiconductores, ciberseguridad, clean energy, inteligencia artificial, biotecnología y cloud computing."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["universe", "etf", "thematic", "growth", "tech"]
 
 [scheduler]

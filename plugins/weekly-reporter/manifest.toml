@@ -4,7 +4,7 @@ name        = "Weekly/Monthly Reporter"
 version     = "1.0.0"
 type        = "extra"
 description = "Genera resúmenes periódicos de rendimiento: P&L, Sharpe ratio, max drawdown, win rate y top señales. Envía el reporte vía Telegram. Configurable para reportes semanales y/o mensuales."
-author      = "neurotrader"
+author      = "OpenNeoTrader"
 tags        = ["reporting", "telegram", "pnl", "performance", "monitoring"]
 
 [scheduler]

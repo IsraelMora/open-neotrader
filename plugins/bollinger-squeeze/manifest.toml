@@ -4,7 +4,7 @@ name        = "Bollinger Band Squeeze"
 version     = "1.0.0"
 type        = "skill"
 description = "Detecta compresión de volatilidad (squeeze) en Bandas de Bollinger y genera señales de ruptura direccional. Alta precisión cuando el squeeze dura ≥5 barras. Basado en método TTM Squeeze (Carter 2002) con mejoras estadísticas."
-author      = "neurotrader-community"
+author      = "OpenNeoTrader"
 license     = "MIT"
 
 [config]
