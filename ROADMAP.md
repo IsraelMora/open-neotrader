@@ -196,14 +196,14 @@ Revisión de `trading-test/` revela funcionalidades pendientes de migrar al sist
 - **IV Rank skill** — Implied Volatility Rank/Percentile para opciones; identifica cuándo la IV está cara/barata (requiere datos de opciones)
 - **Earnings Call NLP** — analizar transcripciones de earnings calls con el LLM; señales sobre guidance, tono del CEO
 - **Options Greeks Monitor** — delta, gamma, theta, vega por posición; calcular exposición real delta-equivalente
-- **ML Feature Extractor** — scikit-learn on-device; entrena modelo con señales históricas para mejorar el signal aggregator
+- [x] **ML Feature Extractor** — plugin `ml-feature-extractor` tipo discipline; scikit-learn on-device (LogisticRegression); captura señal-por-skill→outcome (tabla ml_signal_record), entrena en la reflexión (`kernel__train_ml_model`, blob base64 en KV), ajusta confidences de señales vivas ×[0.5,1.5] antes del aggregator; opt-in, never-flip, hash-validado, fail-soft
 - **Paper trading automático** — simula ejecución en tiempo real con reporte diario vía Telegram
 - **Federación de señales** — compartir consenso de señales entre instancias con privacidad (solo señales, no datos ni credenciales)
 - [x] **Walk-Forward Backtester** — plugin `walk-forward-backtester` tipo extra; Pardo (2008) walk-forward anchored; robustness ratio = Sharpe_OOS/Sharpe_IS; veredicto ROBUSTO/SOBREAJUSTADO/INSUFICIENTE_DATOS
 - [x] **KAMA Adaptive Moving Average** — plugin `kama-adaptive` tipo skill; Kaufman (1995); ER (Efficiency Ratio) adapta velocidad al régimen; solo señales en tendencia (ER>0.6); elimina whipsaws vs EMA fija; históricamente supera buy-and-hold en 15 de 20 años
 - [x] **Wyckoff Volume Analysis** — plugin `wyckoff-volume` tipo skill; detecta acumulación/distribución institucional; Spring/Upthrust/SOS/SOW; win rate ~65-70%
 - [x] **Market Breadth** — plugin `market-breadth` tipo skill; A/D Ratio, % sobre MA200, McClellan Oscillator, NH/NL Ratio, Breadth Thrust Zweig (1986); score 0-100 + régimen; detecta divergencias precio/breadth; inyecta `market_breadth_regime` en contexto para que discipline plugins escalen posiciones; detecta acumulación/distribución institucional; Spring (falsa ruptura soporte, vol bajo → bullish) y Upthrust (falsa ruptura resistencia, vol alto → bearish); SOS/SOW; win rate ~65-70% en Springs confirmados
-- **Adaptive parameters** — el LLM ajusta parámetros de skills según el régimen de volatilidad actual
+- [x] **Adaptive parameters** — `kernel__tune_plugin_param` (reflection-gated); el LLM ajusta parámetros de skills según el régimen de volatilidad, gobernado por param-discipline (lock/budget/journal persistente en KV), skill-only, acotado por config schema, auditado, reversible; contexto de reflexión expone [TUNABLE PARAMS]/[PARAM LOCK STATUS]/[CURRENT REGIME]
 - **WebSocket bidireccional** — migrar de SSE a WS para chat en tiempo real con el agente
 - **Prisma migrations** — gestión de schema versionado para producción
 
