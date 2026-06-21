@@ -90,6 +90,31 @@ def run_backtest(
     for symbol, bars in prices.items():
         price_index[symbol] = {b["date"]: b for b in bars}
 
+    # Orden de fechas por símbolo. Ejecución realista: una señal generada con el
+    # cierre de la barra i se ejecuta en la APERTURA de la barra i+1 (nunca al
+    # cierre de la misma barra, que sería información imposible de conocer).
+    date_order: dict[str, list[str]] = {sym: sorted(idx.keys()) for sym, idx in price_index.items()}
+    date_pos: dict[str, dict[str, int]] = {
+        sym: {d: i for i, d in enumerate(dates)} for sym, dates in date_order.items()
+    }
+
+    def _next_fill(symbol: str, sig_date: str) -> dict | None:
+        """Barra de ejecución = primera barra POSTERIOR a la fecha de la señal."""
+        dates = date_order.get(symbol, [])
+        pos = date_pos.get(symbol, {}).get(sig_date)
+        if pos is None or pos + 1 >= len(dates):
+            return None
+        return price_index[symbol][dates[pos + 1]]
+
+    # Span de calendario (para CAGR y exposición), en días.
+    from datetime import date as _date
+
+    _all_dates = sorted({d for idx in price_index.values() for d in idx})
+    if len(_all_dates) >= 2:
+        span_days = max((_date.fromisoformat(_all_dates[-1]) - _date.fromisoformat(_all_dates[0])).days, 1)
+    else:
+        span_days = 1
+
     # Ordenar señales por fecha
     signals_sorted = sorted(signals, key=lambda s: s.get("date", ""))
 
@@ -111,16 +136,13 @@ def run_backtest(
         if not symbol or not sig_date:
             continue
 
-        bars = price_index.get(symbol, {})
-        bar = bars.get(sig_date)
-        if not bar:
-            # Usar precio de la señal si está disponible
-            price = sig.get("price") or sig.get("entry_price")
-            if not price:
-                continue
-            bar = {"close": price, "open": price}
-
-        price = bar["close"]
+        fill_bar = _next_fill(symbol, sig_date)
+        if not fill_bar:
+            # Sin barra siguiente no hay ejecución posible (no usar el cierre actual,
+            # que sería lookahead). Señales en la última barra quedan sin ejecutar.
+            continue
+        price = fill_bar["open"]
+        exec_date = fill_bar["date"]
 
         # Abrir posición
         if action in ("long", "short") and symbol not in open_positions:
@@ -140,7 +162,7 @@ def run_backtest(
             equity -= cost
             open_positions[symbol] = {
                 "direction": action,
-                "entry_date": sig_date,
+                "entry_date": exec_date,
                 "entry_price": price,
                 "shares": shares,
                 "cost": cost,
@@ -161,10 +183,8 @@ def run_backtest(
 
             # Calcular duración en días aproximado
             try:
-                from datetime import date
-
-                d1 = date.fromisoformat(pos["entry_date"])
-                d2 = date.fromisoformat(sig_date)
+                d1 = _date.fromisoformat(pos["entry_date"])
+                d2 = _date.fromisoformat(exec_date)
                 duration = (d2 - d1).days
             except Exception:
                 duration = 0
@@ -193,7 +213,7 @@ def run_backtest(
             daily_returns.append(daily_return)
             prev_equity = equity
 
-            equity_curve.append({"date": sig_date, "equity": round(equity, 2)})
+            equity_curve.append({"date": exec_date, "equity": round(equity, 2)})
 
     # Cerrar posiciones abiertas al precio del último bar disponible
     for symbol, pos in list(open_positions.items()):
@@ -232,9 +252,10 @@ def run_backtest(
 
     total_return = (equity - capital) / capital * 100
 
-    # Calcular CAGR
-    n_years = max(len(completed_trades) / 252, 0.01)
-    cagr = ((equity / capital) ** (1 / n_years) - 1) * 100 if capital > 0 else 0
+    # Calcular CAGR — anualizado sobre el span de calendario real de los datos,
+    # no sobre el número de trades.
+    n_years = max(span_days / 365.25, 0.01)
+    cagr = ((equity / capital) ** (1 / n_years) - 1) * 100 if capital > 0 and equity > 0 else 0
 
     # Max drawdown
     peak = capital
@@ -288,8 +309,10 @@ def run_backtest(
         statistics.mean([t.duration_days for t in completed_trades]) if completed_trades else 0
     )
 
-    # Time in market (aproximado)
-    time_in_mkt = len(daily_returns) / max(len(signals_sorted), 1) * 100
+    # Time in market — fracción del calendario con exposición real:
+    # suma de las duraciones de los trades sobre el span total (acotado a 100%).
+    position_days = sum(t.duration_days for t in completed_trades)
+    time_in_mkt = min(100.0, position_days / span_days * 100)
 
     include_curve = cfg.get("output_equity_curve", True)
 
@@ -309,7 +332,7 @@ def run_backtest(
         largest_win_pct=round(largest_win, 2),
         largest_loss_pct=round(largest_loss, 2),
         time_in_market_pct=round(time_in_mkt, 1),
-        avg_positions=round(max_positions / 2, 1),
+        avg_positions=round(position_days / span_days, 2),
         equity_curve=equity_curve if include_curve else [],
         trades=[
             {

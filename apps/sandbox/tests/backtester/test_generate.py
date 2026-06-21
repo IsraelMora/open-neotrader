@@ -286,3 +286,29 @@ class TestGenerateSignalsRsi:
     def test_empty_bars_returns_empty(self, gen):
         result = gen.generate_signals(self.STRATEGY, [], {"symbol": "AAPL"})
         assert result == []
+
+    def test_divergence_bull_maps_to_long(self, gen, monkeypatch):
+        """A bullish divergence (which preempts oversold in the strategy) must map to long."""
+
+        class _Stub:
+            @staticmethod
+            def analyze(**_kw):
+                return {"signal": "divergence_bull", "last_rsi": 25.0, "rsi": [], "bars_in_zone": 1}
+
+        monkeypatch.setattr(gen, "_load_strategy_module", lambda *_a, **_k: _Stub)
+        result = gen.generate_signals(self.STRATEGY, make_bars_mild(30), {"symbol": "X"})
+        assert len(result) > 0
+        assert all(s["action"] == "long" for s in result)
+
+    def test_divergence_bear_maps_to_exit(self, gen, monkeypatch):
+        """A bearish divergence (which preempts overbought) must map to exit."""
+
+        class _Stub:
+            @staticmethod
+            def analyze(**_kw):
+                return {"signal": "divergence_bear", "last_rsi": 75.0, "rsi": [], "bars_in_zone": 1}
+
+        monkeypatch.setattr(gen, "_load_strategy_module", lambda *_a, **_k: _Stub)
+        result = gen.generate_signals(self.STRATEGY, make_bars_mild(30), {"symbol": "X"})
+        assert len(result) > 0
+        assert all(s["action"] == "exit" for s in result)

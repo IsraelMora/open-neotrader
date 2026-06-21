@@ -77,11 +77,9 @@ def normalize_bars(raw: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Strategy adapter registry
 # ---------------------------------------------------------------------------
-
-# Minimum bars required before we can call each strategy's analyze().
-# Below this threshold the strategy returns a neutral result; we skip early.
-_EMA_MIN_BARS = 48   # slow_period(21) * 2 + confirmation_bars(1) + 5
-_RSI_MIN_BARS = 17   # period(14) + 1 delta + confirmation_bars(2)
+# Each adapter computes its own minimum-bars threshold from the runtime config
+# (see min_bars inside each adapter) so the strategy's analyze() never receives
+# a window shorter than it needs.
 
 
 def _ema_adapter(bars: list[dict], config: dict, symbol: str) -> list[dict]:
@@ -141,9 +139,14 @@ def _rsi_adapter(bars: list[dict], config: dict, symbol: str) -> list[dict]:
     Signal mapping (RSIResult is a TypedDict — access via key notation):
       "oversold"        → action "long"  (RSI below oversold threshold, confirmed)
       "overbought"      → action "exit"  (RSI above overbought threshold, confirmed)
+      "divergence_bull" → action "long"  (bullish reversal — strategy preempts oversold)
+      "divergence_bear" → action "exit"  (bearish reversal — strategy preempts overbought)
       "neutral"         → skip
-      "divergence_bull" → skip (out of scope for this change)
-      "divergence_bear" → skip (out of scope for this change)
+
+    NOTE: calcular_rsi.analyze() checks divergence BEFORE the oversold/overbought
+    zones, so a bullish/bearish divergence REPLACES the zone signal. Mapping the
+    divergence outputs (instead of dropping them) avoids silently discarding the
+    bullish/bearish entries the strategy actually intends.
     """
     mod = _load_strategy_module("rsi-mean-reversion", "calcular_rsi.py")
 
@@ -172,11 +175,11 @@ def _rsi_adapter(bars: list[dict], config: dict, symbol: str) -> list[dict]:
             confirmation_bars=confirmation_bars,
         )
 
-        if result["signal"] == "oversold":
+        if result["signal"] in ("oversold", "divergence_bull"):
             signals.append({"symbol": symbol, "action": "long", "date": bars[i]["date"]})
-        elif result["signal"] == "overbought":
+        elif result["signal"] in ("overbought", "divergence_bear"):
             signals.append({"symbol": symbol, "action": "exit", "date": bars[i]["date"]})
-        # neutral / divergence_* → skip
+        # neutral → skip
 
     return signals
 
