@@ -29,6 +29,7 @@ import { SnapshotModule } from './snapshot/snapshot.module';
 import { AlertsModule } from './alerts/alerts.module';
 import { PretestModule } from './pretest/pretest.module';
 import { DashboardModule } from './dashboard/dashboard.module';
+import { BacktestModule } from './backtest/backtest.module';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard';
 import { CorrelationMiddleware } from './common/correlation.middleware';
 
@@ -69,6 +70,7 @@ import { CorrelationMiddleware } from './common/correlation.middleware';
     AlertsModule,
     PretestModule,
     DashboardModule,
+    BacktestModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: JwtAuthGuard },

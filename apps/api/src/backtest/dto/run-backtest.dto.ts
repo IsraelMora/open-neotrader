@@ -1,0 +1,81 @@
+import {
+  IsString,
+  IsNotEmpty,
+  IsArray,
+  ArrayNotEmpty,
+  IsEnum,
+  IsOptional,
+  IsNumber,
+  IsInt,
+  Min,
+  Max,
+  ValidateIf,
+} from 'class-validator';
+import { Type } from 'class-transformer';
+
+const SUPPORTED_STRATEGIES = ['ema-crossover-9-21', 'rsi-mean-reversion'] as const;
+type SupportedStrategy = (typeof SUPPORTED_STRATEGIES)[number];
+
+export class RunBacktestDto {
+  @IsEnum(SUPPORTED_STRATEGIES)
+  strategy!: SupportedStrategy;
+
+  @IsArray()
+  @ArrayNotEmpty()
+  @IsString({ each: true })
+  @IsNotEmpty({ each: true })
+  symbols!: string[];
+
+  @IsOptional()
+  @IsString()
+  timeframe?: string = '1d';
+
+  @IsOptional()
+  @IsInt()
+  @Min(10)
+  @Max(2000)
+  @Type(() => Number)
+  limit?: number = 500;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(100)
+  @Type(() => Number)
+  capital?: number = 10000;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Type(() => Number)
+  commission_pct?: number = 0.001;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Type(() => Number)
+  slippage_pct?: number = 0.0005;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0.0001)
+  @Max(1)
+  @Type(() => Number)
+  risk_per_trade?: number = 0.01;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(50)
+  @Type(() => Number)
+  max_positions?: number = 5;
+
+  /**
+   * Optional provider ID. When null, BacktestService uses the default active provider.
+   * IsNullable does not exist in class-validator — use ValidateIf to skip string
+   * validation when the value is explicitly null.
+   */
+  @IsOptional()
+  @ValidateIf((o: RunBacktestDto) => o.provider_id !== null && o.provider_id !== undefined)
+  @IsString()
+  provider_id?: string | null = null;
+}
