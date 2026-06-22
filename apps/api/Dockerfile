@@ -8,6 +8,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY apps/api/package.json apps/api/package-lock.json ./
 RUN npm ci
+# Generate the Prisma client INTO node_modules here in deps: both the builder
+# (tsc needs the client types) and the runner (runtime needs the client) copy
+# node_modules from this stage, so generating once here covers both.
+COPY apps/api/prisma ./prisma
+RUN npx prisma generate
 
 # ── Build TypeScript ────────────────────────────────────────────────────────
 FROM node:22-slim AS builder
@@ -34,6 +39,9 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
+# Prisma schema + migrations needed at runtime (MigrationRunnerService reads
+# ../../../prisma/migrations relative to dist/src/prisma → /app/prisma/migrations).
+COPY apps/api/prisma ./prisma
 
 # Sandbox runner + sibling modules (runner.py lazy-imports isolation.py / analyzer.py)
 COPY apps/sandbox/*.py /sandbox/
@@ -48,4 +56,5 @@ ENV PYTHONUNBUFFERED=1
 
 USER node
 EXPOSE 3000
-CMD ["node", "dist/main"]
+# nest build preserves src/, so the entrypoint is dist/src/main.js (not dist/main.js)
+CMD ["node", "dist/src/main"]
