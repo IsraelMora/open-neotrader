@@ -27,7 +27,7 @@ WORKDIR /app
 
 # Python 3 + pip for sandbox; curl for healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip curl \
+    python3 python3-pip curl gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Plugin SDK + sandbox deps
@@ -50,11 +50,18 @@ COPY apps/sandbox/*.py /sandbox/
 COPY plugins/ /plugins/
 RUN chown -R node:node /plugins
 
+# Entrypoint fixes the SQLite data-volume ownership at runtime, then drops to the
+# unprivileged `node` user via gosu (see docker-entrypoint.sh). We deliberately do
+# NOT set `USER node` here: the container starts as root so the entrypoint can
+# chown /data (named volumes mount as root), then runs the app as `node`.
+COPY apps/api/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
 ENV NODE_ENV=production
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-USER node
 EXPOSE 3000
+ENTRYPOINT ["docker-entrypoint.sh"]
 # nest build preserves src/, so the entrypoint is dist/src/main.js (not dist/main.js)
 CMD ["node", "dist/src/main"]
