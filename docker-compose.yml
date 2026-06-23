@@ -33,12 +33,13 @@ services:
       LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-6}
       # CORS — separar por comas si hay múltiples origins
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
-    ports:
-      # Loopback por defecto (no exponer en crudo). El proxy de Dokploy llega al
-      # contenedor por la red interna de Docker al puerto 3000 + dominio configurado
-      # en la UI; NO necesita el puerto publicado en el host. El bind local sirve
-      # solo para debug. Para acceso externo, configurar el dominio en Dokploy.
-      - "${API_PORT:-127.0.0.1:3000}:3000"
+    expose:
+      # NO publicamos el puerto al host: en Dokploy/Traefik el proxy llega al
+      # contenedor por la red interna de Docker (dominio configurado en la UI →
+      # servicio web:80, que a su vez proxya /api → api:3000). Publicar el host
+      # 3000 choca con el propio Dokploy (que ya escucha en :3000). Para debug
+      # local, levantar la app nativa (pnpm dev) o un compose.override con ports.
+      - "3000"
     volumes:
       # plugins/ y el sandbox ahora van horneados en la imagen (ver Dockerfile).
       - api-data:/data
@@ -62,9 +63,10 @@ services:
     build:
       context: ./apps/web
       dockerfile: Dockerfile
-    ports:
-      # Loopback por defecto; el dominio del panel se enruta vía proxy de Dokploy.
-      - "${WEB_PORT:-127.0.0.1:8080}:80"
+    expose:
+      # El dominio del panel se enruta vía Traefik a este servicio (web:80) por la
+      # red interna; no publicamos el puerto al host (evita choques y es innecesario).
+      - "80"
     depends_on:
       api:
         condition: service_healthy
