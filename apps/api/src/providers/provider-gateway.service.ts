@@ -119,11 +119,32 @@ const TF_BINANCE: Record<string, string> = {
   '5Min': '5m',
 };
 
+// Yahoo Finance (format "generic"). Valid intervals per Yahoo's chart API:
+// 1m,2m,5m,15m,30m,60m,90m,1h,4h,1d,5d,1wk,1mo,3mo. Without this map the gateway
+// fell back to TF_ALPACA and sent "1Day", which Yahoo rejects with HTTP 400.
+const TF_GENERIC: Record<string, string> = {
+  '1m': '1m',
+  '2m': '2m',
+  '5m': '5m',
+  '15m': '15m',
+  '30m': '30m',
+  '1h': '1h',
+  '4h': '4h',
+  '1d': '1d',
+  '5d': '5d',
+  '1w': '1wk',
+  '1mo': '1mo',
+  '3mo': '3mo',
+  '1Day': '1d',
+  '1Min': '1m',
+};
+
 const TIMEFRAME_MAPS: Record<string, Record<string, string>> = {
   alpaca: TF_ALPACA,
   tiingo: TF_TIINGO,
   ccxt: TF_CCXT,
   binance: TF_BINANCE,
+  generic: TF_GENERIC,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -242,6 +263,9 @@ export class ProviderGatewayService implements OnModuleInit {
       tf,
       limit,
       start_date: startDate,
+      // Yahoo (generic) takes a discrete `range`, not a bar count. Harmless for
+      // other providers whose URL templates don't reference {range}.
+      range: this.yahooRange(limit),
     });
 
     const bars = this.normalizeBars(raw, fmt);
@@ -790,6 +814,29 @@ export class ProviderGatewayService implements OnModuleInit {
     const d = new Date();
     d.setDate(d.getDate() - days);
     return d.toISOString().split('T')[0];
+  }
+
+  /**
+   * Yahoo Finance accepts only a discrete `range` token (not a bar count). Pick
+   * the smallest bucket that covers `limit` bars (approximated as trading days,
+   * which is correct for daily data and a safe over-fetch for intraday — the
+   * adapter slices the window it needs). Falls back to "max".
+   */
+  private yahooRange(limit: number): string {
+    const buckets: Array<[string, number]> = [
+      ['5d', 5],
+      ['1mo', 21],
+      ['3mo', 63],
+      ['6mo', 126],
+      ['1y', 252],
+      ['2y', 504],
+      ['5y', 1260],
+      ['10y', 2520],
+    ];
+    for (const [range, bars] of buckets) {
+      if (limit <= bars) return range;
+    }
+    return 'max';
   }
 
   // ── TOML parser mínimo ────────────────────────────────────────────────────
