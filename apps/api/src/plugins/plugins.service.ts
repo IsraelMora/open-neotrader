@@ -24,9 +24,13 @@ import {
 import type { DebateRole } from '../agents/debate.types';
 import { scanLocalManifests } from './local-sync';
 import type { Plugin } from '@prisma/client';
-import type { KvService } from '../common/kv.service';
-import type { AuditService } from '../audit/audit.service';
-import type { SandboxGateway } from '../sandbox/sandbox.gateway';
+// NOTE: these MUST be value imports (not `import type`). They are injected via the
+// constructor and NestJS relies on emitDecoratorMetadata to record the parameter
+// types at runtime. `import type` is erased at compile time, so the metadata would
+// degrade to `Function` and DI resolution fails (UnknownDependenciesException).
+import { KvService } from '../common/kv.service';
+import { AuditService } from '../audit/audit.service';
+import { SandboxGateway } from '../sandbox/sandbox.gateway';
 
 export type { Plugin };
 export type PluginVerification = 'unverified' | 'pending' | 'verified' | 'rejected';
