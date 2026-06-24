@@ -225,14 +225,15 @@ export class TradeIntentService {
   // ── approve ───────────────────────────────────────────────────────────────────
 
   /**
-   * Approves a pending TradeIntent and executes it in PAPER mode (human path).
+   * Approves a pending TradeIntent and executes it (human/HITL path).
    *
-   * Hard guards (throw before any portfolio mutation):
-   *   - mode != "paper"  → Error("real-money execution is disabled")
-   *   - status != "pending" → Error("TradeIntent ti_xxx is not pending …")
+   * Execution mode is decided by _effectiveMode(policy): PAPER by default; REAL only
+   * under the triple condition (execution.real=true AND a broker_plugin_id is set).
+   * So a human approving while real mode is configured WILL place a real order
+   * (gated by the same risk checks + notional ceiling inside _executeReal).
    *
-   * Fail-soft: if getQuote fails, sets status=failed with reason in result_json.
-   * Never throws to the caller beyond the two hard-guard cases above.
+   * Hard guard: status != "pending" → throws.
+   * Fail-soft: if getQuote/placeOrder fails, sets status=failed with reason in result_json.
    *
    * Paper execution:
    *   - "long"  → buy floor(cash * SIZING_PCT / fill_price) shares
