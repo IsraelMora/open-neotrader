@@ -1,0 +1,62 @@
+[
+  {
+    "name": "calculate_position_size",
+    "description": "Compute optimal position size. Mode 'kelly': sizes from trade history win-rate/payoff. Mode 'fixed': uses fixed_pct. Call BEFORE opening any position.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "capital":         { "type": "number", "description": "Total available capital in USD" },
+        "price":           { "type": "number", "description": "Current asset price" },
+        "stop_loss_pct":   { "type": "number", "description": "% loss if stop is hit (e.g. 2.0 = 2%)" },
+        "take_profit_pct": { "type": "number", "description": "% gain if target is hit (e.g. 3.0 = 3%)" }
+      },
+      "required": ["capital", "price", "stop_loss_pct", "take_profit_pct"]
+    }
+  },
+  {
+    "name": "get_kelly_stats",
+    "description": "Return Kelly statistics from accumulated trade history: win_rate, payoff_ratio, kelly_full, kelly_half, is_reliable, n_trades. Use before sizing to understand historical edge.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "calculate_tranches",
+    "description": "Compute the pyramid tranche plan for a new entry signal. Returns entry tranche size and trigger levels for subsequent adds.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "symbol":         { "type": "string", "description": "Asset ticker" },
+        "entry_price":    { "type": "number" },
+        "stop_loss":      { "type": "number" },
+        "target_price":   { "type": "number" },
+        "total_size_pct": { "type": "number", "description": "% of capital for the full position" },
+        "entry_pct":      { "type": "number", "description": "% of total for the first tranche" },
+        "add_pct":        { "type": "number" },
+        "max_tranches":   { "type": "integer" },
+        "add_trigger_r":  { "type": "number" }
+      },
+      "required": ["symbol", "entry_price", "stop_loss"]
+    }
+  },
+  {
+    "name": "evaluate_add",
+    "description": "Evaluate whether an open position has reached the trigger level to add the next pyramid tranche.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "symbol":             { "type": "string" },
+        "current_price":      { "type": "number" },
+        "entry_price":        { "type": "number" },
+        "stop_loss":          { "type": "number" },
+        "tranches_executed":  { "type": "integer" },
+        "max_tranches":       { "type": "integer" },
+        "add_trigger_r":      { "type": "number" },
+        "add_pct":            { "type": "number" },
+        "total_size_pct":     { "type": "number" }
+      },
+      "required": ["symbol", "current_price", "entry_price", "stop_loss"]
+    }
+  }
+]

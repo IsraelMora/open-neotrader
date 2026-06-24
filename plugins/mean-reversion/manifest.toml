@@ -1,0 +1,99 @@
+[plugin]
+id          = "mean-reversion"
+type        = "skill"
+version     = "1.0.0"
+name        = "Mean Reversion"
+description = "Statistically-validated mean-reversion strategy combining OU half-life (stationarity gate), z-score entry/exit thresholds, and optional Wilder RSI confirmation. Consolidates ornstein-uhlenbeck, mean-reversion-zscore, and rsi-mean-reversion plugins."
+author      = "OpenNeoTrader"
+tags        = ["mean-reversion", "statistical", "OU", "z-score", "RSI", "quantitative"]
+
+[config]
+[config.lookback]
+type        = "number"
+default     = 20
+min         = 10
+max         = 120
+label       = "Lookback period (bars)"
+description = "Number of bars for rolling mean/std. 20 = one month of daily data."
+
+[config.entry_z]
+type        = "number"
+default     = 2.0
+min         = 1.5
+max         = 3.5
+label       = "Entry z-score threshold"
+description = "Generate entry signal when |z| >= this value. 2.0 = ~95% confidence band."
+
+[config.exit_z]
+type        = "number"
+default     = 0.5
+min         = 0.0
+max         = 1.5
+label       = "Exit z-score threshold"
+description = "Exit the position when |z| <= this value (price has reverted to mean)."
+
+[config.rsi_period]
+type        = "number"
+default     = 14
+min         = 2
+max         = 50
+label       = "RSI period (Wilder)"
+description = "Period for Wilder's RSI. Ignored when use_rsi_confirm = false."
+
+[config.rsi_oversold]
+type        = "number"
+default     = 30
+min         = 10
+max         = 45
+label       = "RSI oversold threshold"
+description = "RSI must be below this value to confirm a long entry."
+
+[config.rsi_overbought]
+type        = "number"
+default     = 70
+min         = 55
+max         = 90
+label       = "RSI overbought threshold"
+description = "RSI must be above this value to confirm a short entry."
+
+[config.require_stationarity]
+type        = "boolean"
+default     = true
+label       = "Require stationarity (OU gate)"
+description = "When true, the OU half-life must be finite and <= max_half_life. Prevents signals on trending (non-stationary) series."
+
+[config.max_half_life]
+type        = "number"
+default     = 60
+min         = 5
+max         = 252
+label       = "Maximum OU half-life (bars)"
+description = "Reversion half-life ceiling. Series with half-life above this are considered non-reverting."
+
+[config.timeframe]
+type        = "string"
+enum        = ["1m", "5m", "15m", "1h", "4h", "1d"]
+default     = "1d"
+label       = "Timeframe"
+description = "OHLCV bar timeframe."
+
+[config.use_rsi_confirm]
+type        = "boolean"
+default     = true
+label       = "Use RSI confirmation"
+description = "When true, entry signals also require RSI in oversold/overbought zone."
+
+[skills]
+tools = ["mean-reversion.analyze"]
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

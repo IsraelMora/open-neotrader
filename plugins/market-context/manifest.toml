@@ -1,0 +1,73 @@
+[plugin]
+id          = "market-context"
+name        = "Market Context — Breadth & Volatility Regime"
+version     = "1.0.0"
+type        = "skill"
+description = "Consolidated market context plugin that merges market-breadth and volatility-regime into a single on_cycle hook. Injects breadth indicators (A/D Ratio, McClellan Oscillator, % above MA200, NH/NL, Breadth Thrust) into ctx and emits a volatility_regime signal. Preserves the full output contract of both source plugins."
+author      = "OpenNeoTrader"
+tags        = ["market-breadth", "volatility-regime", "macro", "regime", "advance-decline", "mcclellan", "zweig", "vix"]
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+# ── Breadth config (from market-breadth) ─────────────────────────────────────
+[config]
+breadth_bullish_threshold  = 70     # score >70 → healthy market
+breadth_bearish_threshold  = 30     # score <30 → weak market
+ma_period                  = 200    # MA period for % above MA200
+mcclellan_fast             = 19     # Fast EMA period (McClellan Ratio Adjusted)
+mcclellan_slow             = 39     # Slow EMA period (McClellan)
+thrust_period              = 10     # Days for Zweig Breadth Thrust
+emit_context_injection     = true   # inject score and regime into cycle ctx
+
+# ── Volatility regime config (from volatility-regime) ────────────────────────
+index_symbol               = "SPY"
+vix_symbol                 = "^VIX"
+
+[config.vix_low_threshold]
+type        = "number"
+default     = 15
+min         = 5
+max         = 25
+label       = "VIX low threshold (quiet regime)"
+description = "VIX below this value = quiet market; momentum strategies perform well."
+
+[config.vix_high_threshold]
+type        = "number"
+default     = 25
+min         = 15
+max         = 40
+label       = "VIX high threshold (elevated volatility)"
+description = "VIX above this value = elevated volatility; prefer mean reversion or reduce exposure."
+
+[config.vix_crisis_threshold]
+type        = "number"
+default     = 40
+min         = 30
+max         = 80
+label       = "VIX crisis threshold"
+description = "VIX above this value = crisis. Maximum caution signal."
+
+[config.vol_lookback_days]
+type        = "number"
+default     = 252
+min         = 60
+max         = 504
+label       = "Volatility percentile lookback days"
+description = "Number of days for computing historical realized volatility percentile."
+
+# ── LLM-callable skills (union of both sources) ───────────────────────────────
+[skills]
+get_market_breadth      = "scripts/market_breadth.py"
+check_breadth_divergence = "scripts/market_breadth.py"
+get_volatility_regime   = "scripts/regime.py"
+detect_regime           = "scripts/regime.py"

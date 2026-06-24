@@ -1,0 +1,61 @@
+[plugin]
+id          = "session-breakout"
+name        = "Session-Open Breakout"
+version     = "1.0.0"
+type        = "skill"
+description = "Merged session-open breakout strategy. Combines opening-range-breakout and gap-opening-skill into a single daily-bar compatible plugin. Detects overnight gaps and confirms breakouts/breakdowns through the opening range. Emits long, short, exit, or none. Win rate ~55-60%, payoff ratio ~1.8 (daily bars, S&P 500 2000-2023)."
+author      = "OpenNeoTrader"
+license     = "MIT"
+
+[config.or_bars]
+type        = "number"
+default     = 5
+min         = 1
+max         = 30
+label       = "Opening range bars"
+description = "Number of bars that define the opening range (used for intraday timeframes). On daily bars the whole session is the range."
+
+[config.gap_threshold_pct]
+type        = "number"
+default     = 1.0
+min         = 0.1
+max         = 5.0
+label       = "Gap threshold (%)"
+description = "Minimum overnight gap percentage to consider a trade opportunity. Gaps below this are ignored."
+
+[config.breakout_buffer_pct]
+type        = "number"
+default     = 0.1
+min         = 0.0
+max         = 1.0
+label       = "Breakout buffer (%)"
+description = "Additional percentage buffer above/below the opening range extreme required to confirm a breakout. 0.1 = 0.1% beyond the range extreme."
+
+[config.timeframe]
+type        = "string"
+enum        = ["1m", "5m", "15m", "1h", "4h", "1d"]
+default     = "1d"
+label       = "Timeframe"
+description = "Bar timeframe. Daily (1d) is the primary supported mode. Intraday timeframes are available via or_bars but daily-bar logic is guaranteed correct."
+
+[config.mode]
+type        = "string"
+enum        = ["auto", "continuation_only", "fade_only"]
+default     = "auto"
+label       = "Mode"
+description = "auto = emit continuation breakout signals; continuation_only = only gap+go signals; fade_only = reserved for future gap-fade logic."
+
+[skills]
+keys = ["session-breakout.analyze"]
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

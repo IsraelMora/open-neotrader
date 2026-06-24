@@ -21,14 +21,14 @@ describe('parseToolCalls', () => {
 
   it('parses a <tool_calls> XML-style tag block', () => {
     const text =
-      '<tool_calls>[{"tool":"kelly-criterion__calculate_position_size","args":{}}]</tool_calls>';
+      '<tool_calls>[{"tool":"position-sizing__size","args":{}}]</tool_calls>';
 
     const result = parseToolCalls(text);
 
     expect(result).toHaveLength(1);
     expect(result[0]).toEqual({
-      plugin_id: 'kelly-criterion',
-      function: 'calculate_position_size',
+      plugin_id: 'position-sizing',
+      function: 'size',
       args: {},
     });
   });

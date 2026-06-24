@@ -1,0 +1,35 @@
+[
+  {
+    "name": "emit_trade_intent",
+    "description": "Registra UNA decisión de trading tras razonar sobre el contexto textual y las señales de los plugins. NO recibe precios ni ejecuta órdenes — captura la intención para auditoría/memoria. Usá una sola llamada por decisión.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "description": "Ticker del activo, ej. AAPL"
+        },
+        "action": {
+          "type": "string",
+          "enum": ["long", "short", "exit", "hold"],
+          "description": "Dirección de la decisión"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Confianza en la decisión, 0 a 1"
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Justificación basada en el contexto y las señales (qué la motiva)"
+        },
+        "timeframe": {
+          "type": "string",
+          "description": "Horizonte de la decisión, ej. 1d, 1h (default 1d)"
+        }
+      },
+      "required": ["symbol", "action", "confidence", "rationale"]
+    }
+  }
+]

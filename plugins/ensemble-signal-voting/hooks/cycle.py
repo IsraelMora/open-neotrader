@@ -4,7 +4,7 @@ Ejecutado al inicio de cada ciclo del agente.
 
 Lee los precios de los símbolos activos desde el contexto,
 calcula señales ensemble para cada símbolo y escribe los resultados
-en el contexto para que el agente y el risk-envelope los procesen.
+en el contexto para que el agente y el risk-manager los procesen.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def run(ctx: dict) -> dict:
 
     ctx["ensemble_signals"] = ensemble_signals
 
-    # Inyectar señales como pending_signals para que el risk-envelope las procese
+    # Inyectar señales como pending_signals para que el risk-manager las procese
     pending: list[dict] = ctx.get("pending_signals", [])
     for symbol, sig in ensemble_signals.items():
         if sig.get("signal", 0) != 0:

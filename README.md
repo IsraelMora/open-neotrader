@@ -67,7 +67,7 @@ Los plugins viven en `plugins/<id>/`:
 
 ```
 plugins/
-  skills-base/
+  mi-plugin/
     manifest.toml    ← declaración: id, tipo, skills expuestos
     plugin.py        ← implementación de las funciones
 ```
@@ -97,13 +97,13 @@ NestJS llama a `python3 runner.py` como subprocess. Protocolo stdin→stdout:
 
 ```json
 // Listar plugins
-{"cmd": "list_plugins", "active_ids": ["skills-base"]}
+{"cmd": "list_plugins", "active_ids": ["mi-plugin"]}
 
 // Llamar una función de plugin (solo funciones declaradas en manifest.skills)
-{"cmd": "call_plugin", "plugin_id": "skills-base", "function": "analizar", "args": {"symbol": "BTC"}}
+{"cmd": "call_plugin", "plugin_id": "mi-plugin", "function": "analizar", "args": {"symbol": "BTC"}}
 
 // Ciclo completo del agente
-{"cmd": "run_cycle", "active_ids": ["skills-base", "universe-crypto"], "context": {}}
+{"cmd": "run_cycle", "active_ids": ["mi-plugin", "universe-crypto-defi"], "context": {}}
 ```
 
 Respuesta siempre: `{"ok": true, "result": ...}` o `{"ok": false, "error": "..."}`.

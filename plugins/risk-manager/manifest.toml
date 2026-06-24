@@ -1,0 +1,181 @@
+[plugin]
+id          = "risk-manager"
+name        = "Risk Manager"
+version     = "1.0.0"
+type        = "discipline"
+description = "Unified layered risk discipline. Consolidates risk-envelope, portfolio-risk-manager, correlation-guard, and max-drawdown-circuit-breaker into one ordered pipeline. Each of the four layers can be independently toggled via config flags."
+author      = "OpenNeoTrader"
+license     = "MIT"
+tags        = ["risk", "discipline", "exposure", "concentration", "correlation", "drawdown", "safety"]
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000
+
+# ── Layer toggles ─────────────────────────────────────────────────────────────
+
+[config.enable_exposure]
+type        = "boolean"
+default     = true
+label       = "Enable exposure layer"
+description = "Apply hard veto and qty rescale for per-trade, per-asset, and total exposure limits."
+
+[config.enable_concentration]
+type        = "boolean"
+default     = true
+label       = "Enable concentration layer"
+description = "Block new entries that would exceed sector concentration or max-positions limits."
+
+[config.enable_correlation]
+type        = "boolean"
+default     = true
+label       = "Enable correlation layer"
+description = "Cancel long entries whose Pearson correlation with open positions exceeds threshold."
+
+[config.enable_drawdown_breaker]
+type        = "boolean"
+default     = true
+label       = "Enable drawdown circuit breaker"
+description = "Halt or scale down trading when portfolio drawdown exceeds configured thresholds."
+
+# ── Layer 1: Exposure thresholds (from risk-envelope) ─────────────────────────
+
+[config.max_total_exposure]
+type        = "number"
+default     = 0.80
+min         = 0.10
+max         = 1.0
+label       = "Max total exposure (fraction)"
+description = "Maximum fraction of portfolio_value that can be invested. Default 0.80 = 80%."
+
+[config.max_position_pct]
+type        = "number"
+default     = 0.40
+min         = 0.02
+max         = 1.0
+label       = "Max per-asset exposure (fraction)"
+description = "Maximum fraction of portfolio_value in a single asset. Default 0.40 = 40%."
+
+[config.max_single_trade_pct]
+type        = "number"
+default     = 0.10
+min         = 0.01
+max         = 1.0
+label       = "Max per-trade notional (fraction)"
+description = "Maximum notional of any single trade as fraction of portfolio_value. Default 0.10 = 10%."
+
+[config.max_open_positions]
+type        = "number"
+default     = 10
+min         = 1
+max         = 100
+label       = "Max open positions"
+description = "Maximum number of simultaneously open positions."
+
+[config.allow_shorts]
+type        = "boolean"
+default     = false
+label       = "Allow short selling"
+description = "If false, any short/sell_short signal is hard-vetoed."
+
+# ── Layer 2: Concentration thresholds (from portfolio-risk-manager) ───────────
+
+[config.max_sector_concentration_pct]
+type        = "number"
+default     = 30.0
+min         = 5.0
+max         = 100.0
+label       = "Max sector concentration (%)"
+description = "Maximum % of portfolio (by size_pct) in any single sector. Default 30%."
+
+[config.max_positions]
+type        = "number"
+default     = 10
+min         = 1
+max         = 100
+label       = "Max positions (concentration layer)"
+description = "Max simultaneous positions tracked at the portfolio (size_pct) level."
+
+[config.min_cash_pct]
+type        = "number"
+default     = 20.0
+min         = 0.0
+max         = 80.0
+label       = "Min cash reserve (%)"
+description = "Minimum cash percentage that must remain uninvested. Default 20%."
+
+# ── Layer 3: Correlation thresholds (from correlation-guard) ──────────────────
+
+[config.max_correlation]
+type        = "number"
+default     = 0.70
+min         = 0.30
+max         = 0.99
+label       = "Max allowed Pearson correlation"
+description = "Long entries correlated > this value with any open position are cancelled."
+
+[config.lookback_days]
+type        = "number"
+default     = 60
+min         = 20
+max         = 252
+label       = "Correlation lookback (days)"
+description = "Number of daily bars used to compute log-return Pearson correlation."
+
+# ── Layer 4: Drawdown thresholds (from max-drawdown-circuit-breaker) ──────────
+
+[config.warning_drawdown_pct]
+type        = "number"
+default     = 5.0
+min         = 1.0
+max         = 20.0
+label       = "Warning drawdown (%)"
+description = "Drawdown from equity peak that triggers WARNING state: size reduced to 50%."
+
+[config.danger_drawdown_pct]
+type        = "number"
+default     = 10.0
+min         = 5.0
+max         = 30.0
+label       = "Danger drawdown (%)"
+description = "Drawdown from equity peak that triggers DANGER state: size reduced to 25%."
+
+[config.circuit_breaker_pct]
+type        = "number"
+default     = 15.0
+min         = 10.0
+max         = 50.0
+label       = "Circuit breaker drawdown (%)"
+description = "Drawdown from equity peak that triggers BREAKER state: all new entries halted."
+
+[config.recovery_threshold_pct]
+type        = "number"
+default     = 3.0
+min         = 1.0
+max         = 10.0
+label       = "Recovery threshold for BREAKER reset (%)"
+description = "Drawdown must recover by this % from worst point before exiting BREAKER state."
+
+[config.daily_loss_limit_pct]
+type        = "number"
+default     = 3.0
+min         = 0.5
+max         = 10.0
+label       = "Daily loss limit (%)"
+description = "If the portfolio loses this % intraday, all new entries are halted until next session."
+
+# ── LLM-callable skills (tools exposed to the AI orchestrator) ────────────────
+
+[skills]
+keys = [
+  "risk-manager.apply_risk_envelope",
+  "risk-manager.check_portfolio_health",
+]

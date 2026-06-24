@@ -1,0 +1,35 @@
+[plugin]
+id          = "trend-following"
+name        = "Trend Following"
+version     = "1.0.0"
+type        = "skill"
+description = "Multi-confirmation trend strategy that consolidates EMA crossover, MACD, and Ichimoku Cloud into a single consensus signal. Emits 'long'/'short'/'exit' only when min_consensus indicators agree — reduces false signals vs single-indicator approaches."
+author      = "OpenNeoTrader"
+tags        = ["trend", "ema", "macd", "ichimoku", "multi-confirmation"]
+
+[config]
+fast_period  = 9
+slow_period  = 21
+timeframe    = "1d"
+min_consensus = 2
+macd_fast    = 12
+macd_slow    = 26
+macd_signal  = 9
+tenkan       = 9
+kijun        = 26
+senkou_b     = 52
+
+[skills]
+keys = ["trend-following.analyze"]
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = true
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

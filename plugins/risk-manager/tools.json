@@ -1,0 +1,71 @@
+[
+  {
+    "name": "apply_risk_envelope",
+    "description": "Apply the unified risk-manager exposure layer to a list of trade proposals. Enforces per-trade notional cap, per-asset position cap, max open positions, and total exposure cap. Returns which signals were approved, rescaled, or hard-vetoed, with reasons. This is the AI-facing skill for pre-execution risk gate.",
+    "script": "scripts/risk_manager_core.py",
+    "function": "apply_exposure_layer",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "signals": {
+          "type": "array",
+          "description": "List of pending trade signals to evaluate",
+          "items": {
+            "type": "object",
+            "properties": {
+              "symbol":  { "type": "string" },
+              "action":  { "type": "string", "enum": ["long", "short", "exit", "buy", "sell", "close", "cover"] },
+              "qty":     { "type": "number" },
+              "price":   { "type": "number" }
+            },
+            "required": ["symbol", "action", "qty", "price"]
+          }
+        },
+        "portfolio_value": {
+          "type": "number",
+          "description": "Total portfolio value in USD"
+        },
+        "positions": {
+          "type": "array",
+          "description": "Current open positions",
+          "items": {
+            "type": "object",
+            "properties": {
+              "symbol":       { "type": "string" },
+              "market_value": { "type": "number" },
+              "qty":          { "type": "number" },
+              "current_price":{ "type": "number" }
+            }
+          }
+        },
+        "config": {
+          "type": "object",
+          "description": "Optional config overrides (max_total_exposure, max_position_pct, etc.)"
+        }
+      },
+      "required": ["signals", "portfolio_value"]
+    }
+  },
+  {
+    "name": "check_portfolio_health",
+    "description": "Diagnose the current portfolio against risk-manager limits. Returns violations (hard breaches), warnings (near-limit), sector exposure breakdown, and an overall healthy flag. Useful for the AI to report portfolio health before proposing trades.",
+    "script": "scripts/risk_manager_core.py",
+    "function": "check_portfolio_health",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "portfolio_value": { "type": "number" },
+        "positions": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "portfolio": {
+          "type": "object",
+          "description": "Portfolio map { symbol: { size_pct, sector } } for sector-level checks"
+        },
+        "config": { "type": "object" }
+      },
+      "required": ["portfolio_value"]
+    }
+  }
+]

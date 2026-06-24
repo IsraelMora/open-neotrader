@@ -1,0 +1,121 @@
+[plugin]
+id          = "position-sizing"
+name        = "Position Sizing (Unified)"
+version     = "1.0.0"
+type        = "discipline"
+description = "Unified position-sizing discipline with selectable modes: Kelly Criterion (optimal fraction from trade history), Van Tharp Pyramiding (tranches + add to winners), and Fixed Fractional. Consolidates kelly-criterion and position-sizing-pyramid plugins."
+author      = "OpenNeoTrader"
+license     = "MIT"
+
+[[tools]]
+name        = "calculate_position_size"
+description = "Compute optimal position size. In kelly mode: uses win-rate/payoff from trade history. In fixed mode: uses fixed_pct. Returns shares, position_usd, position_pct, risk_usd, reward_usd."
+
+[[tools]]
+name        = "calculate_tranches"
+description = "Compute pyramid tranche plan for a new entry signal. Returns the entry tranche size and remaining trigger levels."
+
+[[tools]]
+name        = "get_kelly_stats"
+description = "Return Kelly statistics from trade history: win_rate, payoff_ratio, kelly_full, kelly_half, is_reliable, n_trades."
+
+[[tools]]
+name        = "evaluate_add"
+description = "Given an open position's state, determine whether the next pyramid tranche should be added now."
+
+[config]
+[config.mode]
+type        = "string"
+default     = "kelly"
+label       = "Sizing mode"
+description = "Which sizing algorithm to use: 'kelly' (optimal fraction from trade history), 'pyramid' (Van Tharp tranches), 'fixed' (fixed % of capital)."
+
+[config.kelly_fraction_cap]
+type        = "number"
+default     = 0.5
+min         = 0.1
+max         = 1.0
+label       = "Kelly fraction cap"
+description = "Fraction of full Kelly to use. 0.5 = Half-Kelly (recommended). Applies only in kelly mode."
+
+[config.max_position_pct]
+type        = "number"
+default     = 10
+min         = 1
+max         = 25
+label       = "Max position (%)"
+description = "Upper limit on position size as % of total capital. Applies to kelly and fixed modes."
+
+[config.min_trades_required]
+type        = "number"
+default     = 30
+min         = 10
+max         = 200
+label       = "Min trades required (Kelly)"
+description = "Minimum historical trades to compute reliable Kelly stats. Below this threshold, uses safety_size_pct."
+
+[config.safety_size_pct]
+type        = "number"
+default     = 2
+min         = 0.5
+max         = 5
+label       = "Safety size (%)"
+description = "Fixed position size used when Kelly stats are unreliable (insufficient history). Applies in kelly mode."
+
+[config.fixed_pct]
+type        = "number"
+default     = 5
+min         = 0.5
+max         = 25
+label       = "Fixed position (%)"
+description = "Position size as % of capital. Used only in fixed mode."
+
+[config.entry_pct]
+type        = "number"
+default     = 40
+min         = 20
+max         = 60
+label       = "Initial entry (%)"
+description = "Percentage of total target size for the first tranche. Used only in pyramid mode."
+
+[config.add_pct]
+type        = "number"
+default     = 30
+min         = 10
+max         = 40
+label       = "Add-on tranche (%)"
+description = "Percentage of total target size for each subsequent tranche. Used only in pyramid mode."
+
+[config.max_tranches]
+type        = "number"
+default     = 3
+min         = 2
+max         = 5
+label       = "Max tranches"
+description = "Maximum number of pyramid tranches. Used only in pyramid mode."
+
+[config.add_trigger_r]
+type        = "number"
+default     = 1.0
+min         = 0.5
+max         = 3.0
+label       = "Add trigger (R multiples)"
+description = "Price must advance this many R (ATR) from entry to trigger the next tranche. Used only in pyramid mode."
+
+[config.trail_stop_after_add]
+type        = "boolean"
+default     = true
+label       = "Trail stop on add"
+description = "Move stop loss to breakeven after adding the second tranche. Used only in pyramid mode."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000

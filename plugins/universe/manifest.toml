@@ -1,0 +1,35 @@
+[plugin]
+id          = "universe"
+name        = "Universe — Multi-Market"
+version     = "1.0.0"
+type        = "universe"
+description = "Universo configurable multi-mercado. Consolida Nasdaq-100, Crypto DeFi Top 20, ETFs Temáticos y Forex Majors en un único proveedor seleccionable por configuración."
+author      = "OpenNeoTrader"
+license     = "MIT"
+tags        = ["universe", "nasdaq100", "crypto", "defi", "etf", "forex", "multi-market"]
+
+[config]
+markets = { type = "text", default = "nasdaq100", label = "Mercados activos", description = "Lista separada por comas de mercados a incluir. Opciones: nasdaq100, crypto-defi, etf-thematic, forex-majors." }
+
+# --- ETF Thematic category toggles (only relevant when etf-thematic is in markets) ---
+include_ark     = { type = "boolean", default = true,  description = "Incluir ETFs ARK (ARKK, ARKW, ARKG, ARKF, ARKX)" }
+include_semis   = { type = "boolean", default = true,  description = "Incluir ETFs de semiconductores (SOXX, SMH, SOXQ)" }
+include_cyber   = { type = "boolean", default = true,  description = "Incluir ETFs de ciberseguridad (HACK, CIBR, BUG)" }
+include_energy  = { type = "boolean", default = true,  description = "Incluir ETFs de energía limpia (ICLN, QCLN, TAN, FAN)" }
+include_ai      = { type = "boolean", default = true,  description = "Incluir ETFs de IA (BOTZ, ROBO, AIQ, QTUM)" }
+include_biotech = { type = "boolean", default = false, description = "Incluir ETFs de biotecnología (XBI, IBB, LABU — alta volatilidad)" }
+include_cloud   = { type = "boolean", default = true,  description = "Incluir ETFs de cloud (WCLD, SKYY)" }
+include_fintech = { type = "boolean", default = false, description = "Incluir ETFs de fintech (FINX, ARKF)" }
+
+# --- Forex options (only relevant when forex-majors is in markets) ---
+include_crosses = { type = "boolean", default = false, description = "Incluir cruces de divisas (EUR/GBP, EUR/JPY, GBP/JPY y otros 14 cruces)." }
+
+[hooks]
+on_activate = "hooks/on_activate.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode = "none"

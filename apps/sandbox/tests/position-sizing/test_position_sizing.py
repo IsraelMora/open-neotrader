@@ -1,0 +1,555 @@
+"""
+Tests for the unified position-sizing plugin.
+
+Strict TDD: written BEFORE implementation. All tests must fail with ImportError
+until plugins/position-sizing/ exists with scripts/ and hooks/.
+
+Modes tested:
+  (a) mode="kelly"   — sizes from win-rate/payoff from trade history
+  (b) mode="pyramid" — tranche plan for new signals, adds for open positions
+  (c) mode="fixed"   — uses fixed_pct regardless of history
+  (d) kelly_fraction_cap limits the computed Kelly fraction
+  (e) edge cases: no trade history degrades safely (fallback safety size)
+"""
+
+from __future__ import annotations
+
+import sys
+import os
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Path wiring — let tests import from plugins/position-sizing/scripts directly
+# ---------------------------------------------------------------------------
+
+_PLUGIN_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "plugins", "position-sizing")
+)
+_SCRIPTS = os.path.join(_PLUGIN_ROOT, "scripts")
+_HOOKS = os.path.join(_PLUGIN_ROOT, "hooks")
+
+sys.path.insert(0, _SCRIPTS)
+sys.path.insert(0, _HOOKS)
+
+from sizing import compute_kelly, stats_from_trades, position_size  # noqa: E402
+from pyramid import calculate_tranches, evaluate_add                 # noqa: E402
+import cycle                                                          # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Helpers — synthetic trade history
+# ---------------------------------------------------------------------------
+
+def _trades(n_wins: int, n_losses: int, avg_win_pct: float = 3.0, avg_loss_pct: float = 1.5) -> list[dict]:
+    """Build a deterministic trade history with the given win/loss profile."""
+    trades = []
+    for _ in range(n_wins):
+        trades.append({"pnl_pct": avg_win_pct})
+    for _ in range(n_losses):
+        trades.append({"pnl_pct": -avg_loss_pct})
+    return trades
+
+
+def _long_signal(symbol: str = "AAPL", price: float = 150.0) -> dict:
+    return {
+        "action": "long",
+        "symbol": symbol,
+        "price": price,
+        "entry_price": price,
+        "stop_loss": price * 0.98,  # 2% stop
+        "stop_loss_pct": 2.0,
+        "take_profit_pct": 3.0,
+        "target_price": price * 1.05,
+        "size_pct": 10.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# (a) mode="kelly" — sizes from win-rate / payoff
+# ---------------------------------------------------------------------------
+
+class TestKellyMode:
+
+    def _ctx(self, trades: list[dict], config_override: dict | None = None) -> dict:
+        config = {
+            "mode": "kelly",
+            "kelly_fraction_cap": 0.5,
+            "max_position_pct": 15.0,
+            "min_trades_required": 10,
+            "safety_size_pct": 2.0,
+            # pyramid params (ignored in kelly mode but must be present)
+            "max_tranches": 3,
+            "entry_pct": 40.0,
+            "add_pct": 30.0,
+            "add_trigger_r": 1.0,
+            "trail_stop_after_add": True,
+            # fixed param (ignored)
+            "fixed_pct": 5.0,
+        }
+        if config_override:
+            config.update(config_override)
+        return {
+            "pending_signals": [_long_signal()],
+            "portfolio_value": 10_000.0,
+            "portfolio": {},
+            "trade_history": trades,
+            "config": config,
+        }
+
+    def test_a_kelly_mode_sizes_signal_from_trade_history(self) -> None:
+        """With 30+ trades and a decent win rate, on_cycle enriches the signal with kelly key."""
+        trades = _trades(n_wins=20, n_losses=10, avg_win_pct=3.0, avg_loss_pct=1.5)
+        ctx = self._ctx(trades)
+        result = cycle.on_cycle(ctx)
+
+        signals = result["signals"]
+        assert len(signals) == 1
+        sig = signals[0]
+        assert "kelly" in sig, f"Expected 'kelly' key in signal, got keys: {list(sig.keys())}"
+        k = sig["kelly"]
+        assert k["shares"] > 0, "Kelly sizing must produce at least 1 share"
+        assert k["position_pct"] > 0, "position_pct must be positive"
+        assert k["position_pct"] <= 15.0, "position_pct must respect max_position_pct"
+
+    def test_a_kelly_mode_result_has_logs(self) -> None:
+        trades = _trades(20, 10)
+        ctx = self._ctx(trades)
+        result = cycle.on_cycle(ctx)
+        assert "logs" in result
+        assert len(result["logs"]) > 0
+
+    def test_a_kelly_non_long_signals_pass_through_unchanged(self) -> None:
+        """Exit signals must not be touched by Kelly sizing."""
+        trades = _trades(20, 10)
+        ctx = self._ctx(trades)
+        ctx["pending_signals"] = [{"action": "exit", "symbol": "AAPL"}]
+        result = cycle.on_cycle(ctx)
+        assert len(result["signals"]) == 1
+        assert "kelly" not in result["signals"][0]
+        assert result["signals"][0]["action"] == "exit"
+
+
+# ---------------------------------------------------------------------------
+# (b) mode="pyramid" — tranche plan for new signals, adds for open positions
+# ---------------------------------------------------------------------------
+
+class TestPyramidMode:
+
+    def _ctx(self, config_override: dict | None = None) -> dict:
+        config = {
+            "mode": "pyramid",
+            "kelly_fraction_cap": 0.5,
+            "max_position_pct": 15.0,
+            "min_trades_required": 10,
+            "safety_size_pct": 2.0,
+            "max_tranches": 3,
+            "entry_pct": 40.0,
+            "add_pct": 30.0,
+            "add_trigger_r": 1.0,
+            "trail_stop_after_add": True,
+            "fixed_pct": 5.0,
+        }
+        if config_override:
+            config.update(config_override)
+        return {
+            "pending_signals": [_long_signal()],
+            "portfolio_value": 10_000.0,
+            "portfolio": {},
+            "trade_history": [],
+            "config": config,
+        }
+
+    def test_b_pyramid_mode_attaches_plan_to_new_signal(self) -> None:
+        """New long signal gets size_pct set to first tranche and pyramid_plan attached."""
+        ctx = self._ctx()
+        result = cycle.on_cycle(ctx)
+        signals = result["signals"]
+        assert len(signals) == 1
+        sig = signals[0]
+        assert "pyramid_plan" in sig, f"Expected 'pyramid_plan' key, got: {list(sig.keys())}"
+        plan = sig["pyramid_plan"]
+        assert plan["total_tranches"] >= 1
+        assert "remaining_tranches" in plan
+        # size_pct should be the first tranche only (< total)
+        assert sig["size_pct"] < 10.0, (
+            f"First tranche size_pct ({sig['size_pct']}) should be < total (10.0)"
+        )
+
+    def test_b_pyramid_adds_to_winner_open_position(self) -> None:
+        """
+        An open position that has advanced >= 1 ATR triggers a pyramid_add signal.
+        """
+        ctx = self._ctx()
+        ctx["pending_signals"] = []  # no new signals
+        entry = 100.0
+        stop = 98.0   # ATR = 2.0
+        # current price at entry + 1 ATR → trigger reached
+        current = entry + (entry - stop) * 1.0 + 0.01
+
+        ctx["portfolio"] = {
+            "TSLA": {
+                "current_price": current,
+                "entry_price": entry,
+                "stop_loss": stop,
+                "target_size_pct": 10.0,
+                "meta": {
+                    "pyramid_plan": {
+                        "total_tranches": 3,
+                        "executed_tranches": 1,
+                        "remaining_tranches": [
+                            {"number": 2, "size_pct": 3.0, "trigger_price": current - 0.1}
+                        ],
+                    }
+                },
+            }
+        }
+        result = cycle.on_cycle(ctx)
+        add_signals = [s for s in result["signals"] if s.get("type") == "pyramid_add"]
+        assert len(add_signals) == 1, (
+            f"Expected 1 pyramid_add signal, got {len(add_signals)}. signals={result['signals']}"
+        )
+        add = add_signals[0]
+        assert add["symbol"] == "TSLA"
+        assert add["action"] == "long"
+        assert add["size_pct"] > 0
+
+    def test_b_pyramid_no_add_when_price_not_reached(self) -> None:
+        """Open position that has NOT reached the add trigger emits no add signal."""
+        ctx = self._ctx()
+        ctx["pending_signals"] = []
+        entry = 100.0
+        stop = 98.0
+        ctx["portfolio"] = {
+            "TSLA": {
+                "current_price": 100.5,  # barely moved, well short of trigger
+                "entry_price": entry,
+                "stop_loss": stop,
+                "target_size_pct": 10.0,
+                "meta": {
+                    "pyramid_plan": {
+                        "total_tranches": 3,
+                        "executed_tranches": 1,
+                        "remaining_tranches": [],
+                    }
+                },
+            }
+        }
+        result = cycle.on_cycle(ctx)
+        add_signals = [s for s in result["signals"] if s.get("type") == "pyramid_add"]
+        assert len(add_signals) == 0
+
+
+# ---------------------------------------------------------------------------
+# (c) mode="fixed" — uses fixed_pct regardless of history
+# ---------------------------------------------------------------------------
+
+class TestFixedMode:
+
+    def _ctx(self, fixed_pct: float = 5.0) -> dict:
+        return {
+            "pending_signals": [_long_signal()],
+            "portfolio_value": 10_000.0,
+            "portfolio": {},
+            "trade_history": [],  # no history — fixed mode must not need it
+            "config": {
+                "mode": "fixed",
+                "kelly_fraction_cap": 0.5,
+                "max_position_pct": 15.0,
+                "min_trades_required": 10,
+                "safety_size_pct": 2.0,
+                "max_tranches": 3,
+                "entry_pct": 40.0,
+                "add_pct": 30.0,
+                "add_trigger_r": 1.0,
+                "trail_stop_after_add": True,
+                "fixed_pct": fixed_pct,
+            },
+        }
+
+    def test_c_fixed_mode_uses_fixed_pct(self) -> None:
+        """mode=fixed: signal is enriched with a 'fixed' key using fixed_pct."""
+        ctx = self._ctx(fixed_pct=5.0)
+        result = cycle.on_cycle(ctx)
+        signals = result["signals"]
+        assert len(signals) == 1
+        sig = signals[0]
+        assert "fixed" in sig, f"Expected 'fixed' key in signal, got keys: {list(sig.keys())}"
+        f = sig["fixed"]
+        assert f["position_pct"] == pytest.approx(5.0, abs=0.5), (
+            f"Expected ~5% position, got {f['position_pct']}"
+        )
+        assert f["shares"] > 0
+
+    def test_c_fixed_mode_ignores_trade_history(self) -> None:
+        """Fixed mode produces the same result whether or not there is trade history."""
+        ctx_no_hist = self._ctx(5.0)
+        ctx_with_hist = self._ctx(5.0)
+        ctx_with_hist["trade_history"] = _trades(20, 10)
+
+        r1 = cycle.on_cycle(ctx_no_hist)
+        r2 = cycle.on_cycle(ctx_with_hist)
+
+        pct1 = r1["signals"][0]["fixed"]["position_pct"]
+        pct2 = r2["signals"][0]["fixed"]["position_pct"]
+        assert abs(pct1 - pct2) < 0.01, (
+            f"Fixed mode must not depend on trade history: {pct1} vs {pct2}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# (d) kelly_fraction_cap limits computed Kelly fraction
+# ---------------------------------------------------------------------------
+
+class TestKellyFractionCap:
+
+    def test_d_kelly_fraction_is_capped(self) -> None:
+        """
+        With a very favorable win rate / payoff, uncapped Kelly would be large.
+        kelly_fraction_cap must clamp it so position_pct <= max_position_pct.
+        """
+        # 80% win rate, 4:1 payoff → raw Kelly ≈ 0.75 (very aggressive)
+        trades = _trades(n_wins=80, n_losses=20, avg_win_pct=4.0, avg_loss_pct=1.0)
+
+        # Compute uncapped stats first
+        stats = stats_from_trades(trades, min_required=10)
+        kelly_full = stats.kelly_full
+
+        # Apply cap of 0.25 (much lower than the full Kelly)
+        cap = 0.25
+        capped = compute_kelly(stats.win_rate, stats.payoff_ratio, fraction=cap)
+        assert capped <= kelly_full, "Capped Kelly must be <= full Kelly"
+
+        # Now via on_cycle
+        ctx = {
+            "pending_signals": [_long_signal(price=100.0)],
+            "portfolio_value": 10_000.0,
+            "portfolio": {},
+            "trade_history": trades,
+            "config": {
+                "mode": "kelly",
+                "kelly_fraction_cap": cap,
+                "max_position_pct": 15.0,
+                "min_trades_required": 10,
+                "safety_size_pct": 2.0,
+                "max_tranches": 3,
+                "entry_pct": 40.0,
+                "add_pct": 30.0,
+                "add_trigger_r": 1.0,
+                "trail_stop_after_add": True,
+                "fixed_pct": 5.0,
+            },
+        }
+        result = cycle.on_cycle(ctx)
+        sig = result["signals"][0]
+        assert "kelly" in sig
+        # position_pct is computed from capped Kelly / stop_loss_pct
+        # With cap=0.25, stop=2%, position_pct = 0.25/0.02 = 12.5% clamped to max 15%
+        assert sig["kelly"]["position_pct"] <= 15.0, (
+            f"position_pct {sig['kelly']['position_pct']} exceeds max_position_pct=15"
+        )
+
+    def test_d_pure_kelly_math_cap(self) -> None:
+        """compute_kelly with fraction=0.5 returns exactly half the full Kelly."""
+        win_rate = 0.6
+        payoff = 2.0
+        # f* = (0.6*2 - 0.4) / 2 = 0.8/2 = 0.4
+        full = compute_kelly(win_rate, payoff, fraction=1.0)
+        half = compute_kelly(win_rate, payoff, fraction=0.5)
+        assert full == pytest.approx(0.4, abs=1e-9)
+        assert half == pytest.approx(0.2, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# (e) Edge case: no trade history → safe degradation
+# ---------------------------------------------------------------------------
+
+class TestEdgeCases:
+
+    def test_e_no_trade_history_kelly_mode_uses_safety_size(self) -> None:
+        """
+        With 0 trades, kelly mode must not crash.
+        It must fall back to safety_size_pct and add a warning/log.
+        """
+        ctx = {
+            "pending_signals": [_long_signal()],
+            "portfolio_value": 10_000.0,
+            "portfolio": {},
+            "trade_history": [],
+            "config": {
+                "mode": "kelly",
+                "kelly_fraction_cap": 0.5,
+                "max_position_pct": 15.0,
+                "min_trades_required": 10,
+                "safety_size_pct": 2.0,
+                "max_tranches": 3,
+                "entry_pct": 40.0,
+                "add_pct": 30.0,
+                "add_trigger_r": 1.0,
+                "trail_stop_after_add": True,
+                "fixed_pct": 5.0,
+            },
+        }
+        result = cycle.on_cycle(ctx)
+        assert "signals" in result
+        assert len(result["signals"]) == 1
+        sig = result["signals"][0]
+        assert "kelly" in sig, "Even safety-mode must attach the 'kelly' key"
+        assert sig["kelly"]["shares"] >= 0, "shares must be non-negative"
+        # Safety size = 2%, position = 2%/2% stop = 100%... capped to max_position_pct
+        # Actually: safety_size_pct=2 → position = capital * 0.02 → valid
+        assert sig["kelly"]["position_pct"] <= 15.0
+
+        # At least one log must mention safety / insufficient history
+        logs = result["logs"]
+        safety_logs = [l for l in logs if "seguro" in l["msg"].lower() or "safety" in l["msg"].lower()
+                       or "mínimo" in l["msg"].lower() or "minimum" in l["msg"].lower()
+                       or "insuficiente" in l["msg"].lower() or "insufficient" in l["msg"].lower()]
+        assert len(safety_logs) > 0, f"Expected a safety/warning log. Got: {[l['msg'] for l in logs]}"
+
+    def test_e_no_trade_history_fixed_mode_works(self) -> None:
+        """Fixed mode must work with 0 trade history — no crash, correct sizing."""
+        ctx = {
+            "pending_signals": [_long_signal()],
+            "portfolio_value": 10_000.0,
+            "portfolio": {},
+            "trade_history": [],
+            "config": {
+                "mode": "fixed",
+                "kelly_fraction_cap": 0.5,
+                "max_position_pct": 15.0,
+                "min_trades_required": 10,
+                "safety_size_pct": 2.0,
+                "max_tranches": 3,
+                "entry_pct": 40.0,
+                "add_pct": 30.0,
+                "add_trigger_r": 1.0,
+                "trail_stop_after_add": True,
+                "fixed_pct": 3.0,
+            },
+        }
+        result = cycle.on_cycle(ctx)
+        sig = result["signals"][0]
+        assert "fixed" in sig
+        assert sig["fixed"]["shares"] >= 0
+
+    def test_e_zero_price_signal_is_skipped(self) -> None:
+        """A signal with price=0 must be dropped or pass through without crash."""
+        ctx = {
+            "pending_signals": [{"action": "long", "symbol": "BAD", "price": 0.0}],
+            "portfolio_value": 10_000.0,
+            "portfolio": {},
+            "trade_history": _trades(20, 10),
+            "config": {
+                "mode": "kelly",
+                "kelly_fraction_cap": 0.5,
+                "max_position_pct": 15.0,
+                "min_trades_required": 10,
+                "safety_size_pct": 2.0,
+                "max_tranches": 3,
+                "entry_pct": 40.0,
+                "add_pct": 30.0,
+                "add_trigger_r": 1.0,
+                "trail_stop_after_add": True,
+                "fixed_pct": 5.0,
+            },
+        }
+        # Must not raise
+        result = cycle.on_cycle(ctx)
+        assert "signals" in result
+
+    def test_e_unknown_mode_raises_value_error(self) -> None:
+        """An unrecognised mode must raise ValueError immediately."""
+        ctx = {
+            "pending_signals": [_long_signal()],
+            "portfolio_value": 10_000.0,
+            "portfolio": {},
+            "trade_history": [],
+            "config": {"mode": "turbo_laser_sizing"},
+        }
+        with pytest.raises(ValueError, match="mode"):
+            cycle.on_cycle(ctx)
+
+    def test_e_empty_pending_signals_returns_empty_list(self) -> None:
+        """on_cycle with no pending signals and no open positions returns empty signals."""
+        ctx = {
+            "pending_signals": [],
+            "portfolio_value": 10_000.0,
+            "portfolio": {},
+            "trade_history": [],
+            "config": {"mode": "fixed", "fixed_pct": 5.0},
+        }
+        result = cycle.on_cycle(ctx)
+        assert result["signals"] == []
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for pure math functions
+# ---------------------------------------------------------------------------
+
+class TestPureMath:
+
+    def test_stats_from_trades_empty(self) -> None:
+        stats = stats_from_trades([], min_required=10)
+        assert stats.is_reliable is False
+        assert stats.win_rate == 0.0
+        assert stats.payoff_ratio == 0.0
+
+    def test_stats_from_trades_below_minimum(self) -> None:
+        trades = _trades(5, 5)
+        stats = stats_from_trades(trades, min_required=30)
+        assert stats.is_reliable is False
+        assert stats.n_trades == 10
+
+    def test_stats_from_trades_reliable(self) -> None:
+        trades = _trades(20, 10)
+        stats = stats_from_trades(trades, min_required=10)
+        assert stats.is_reliable is True
+        assert stats.win_rate == pytest.approx(2 / 3, abs=1e-4)
+        assert stats.payoff_ratio == pytest.approx(3.0 / 1.5, abs=1e-4)  # 2.0
+
+    def test_compute_kelly_negative_ev(self) -> None:
+        """Negative expected value → kelly should return 0."""
+        # win_rate=0.3, payoff=1.0 → f* = (0.3*1 - 0.7)/1 = -0.4 → clamp to 0
+        k = compute_kelly(0.3, 1.0, fraction=1.0)
+        assert k == pytest.approx(0.0, abs=1e-9)
+
+    def test_compute_kelly_invalid_inputs(self) -> None:
+        assert compute_kelly(0.0, 2.0) == 0.0
+        assert compute_kelly(1.0, 2.0) == 0.0
+        assert compute_kelly(0.6, 0.0) == 0.0
+
+    def test_position_size_safety_fallback(self) -> None:
+        result = position_size(
+            capital=10_000,
+            price=100.0,
+            stop_loss_pct=2.0,
+            take_profit_pct=3.0,
+            kelly_fraction=0.0,
+            max_position_pct=15.0,
+            safety_size_pct=2.0,
+            use_safety=True,
+        )
+        # 2% of 10000 = 200, shares = floor(200/100) = 2
+        assert result.shares == 2
+        assert result.warning is not None
+
+    def test_calculate_tranches_plan_structure(self) -> None:
+        plan = calculate_tranches(
+            symbol="AAPL",
+            entry_price=150.0,
+            stop_loss=147.0,
+            target_price=160.0,
+            total_size_pct=9.0,
+            entry_pct=40.0,
+            add_pct=30.0,
+            max_tranches=3,
+            add_trigger_r=1.0,
+        )
+        assert len(plan.tranches) == 3
+        assert plan.tranches[0].number == 1
+        # First tranche = 40% of 9% = 3.6%
+        assert plan.tranches[0].size_pct == pytest.approx(3.6, abs=0.01)
+        # Trigger for tranche 2 = entry + 1 ATR
+        atr = abs(150.0 - 147.0)
+        assert plan.tranches[1].trigger_price == pytest.approx(150.0 + atr, abs=0.001)

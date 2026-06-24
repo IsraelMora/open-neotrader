@@ -1,0 +1,12 @@
+[plugin]
+id          = "decision"
+name        = "Decision (trade intent)"
+version     = "1.0.0"
+type        = "skill"
+description = "Tool de acción del LLM: tras razonar sobre el contexto y las señales de los plugins, el orquestador registra UNA decisión de trading (symbol, action, confidence, rationale). No recibe precios ni ejecuta órdenes — registra la intención, que pasa por el pipeline de auditoría/memoria del kernel."
+author      = "OpenNeoTrader"
+license     = "MIT"
+
+# Whitelist del sandbox: runner.cmd_call_plugin solo despacha funciones declaradas aquí.
+[skills]
+keys = ["decision.emit_trade_intent"]
