@@ -345,6 +345,34 @@ export class TradeIntentService {
     return { autonomous, max_position_pct, max_open_positions, max_drawdown_halt_pct, real, broker_plugin_id, max_order_notional };
   }
 
+  /** Current execution policy (operator-facing). */
+  async getPolicy(): Promise<ExecutionPolicy> {
+    return this._readExecutionPolicy();
+  }
+
+  /**
+   * Updates execution policy KV keys (operator config — "configure once").
+   * Only provided fields are written. Returns the resulting (clamped) policy.
+   * Safety stays enforced downstream by _effectiveMode (triple condition) and the
+   * automated risk gates — this only persists the knobs.
+   */
+  async setPolicy(patch: Partial<ExecutionPolicy>): Promise<ExecutionPolicy> {
+    if (patch.autonomous !== undefined)
+      await this.kv.set('execution.autonomous', String(patch.autonomous));
+    if (patch.real !== undefined) await this.kv.set('execution.real', String(patch.real));
+    if (patch.broker_plugin_id !== undefined)
+      await this.kv.set('execution.broker_plugin_id', patch.broker_plugin_id);
+    if (patch.max_position_pct !== undefined)
+      await this.kv.set('execution.max_position_pct', String(patch.max_position_pct));
+    if (patch.max_open_positions !== undefined)
+      await this.kv.set('execution.max_open_positions', String(patch.max_open_positions));
+    if (patch.max_drawdown_halt_pct !== undefined)
+      await this.kv.set('execution.max_drawdown_halt_pct', String(patch.max_drawdown_halt_pct));
+    if (patch.max_order_notional !== undefined)
+      await this.kv.set('execution.max_order_notional', String(patch.max_order_notional));
+    return this._readExecutionPolicy();
+  }
+
   // ── _effectiveMode ────────────────────────────────────────────────────────────
 
   /**

@@ -48,10 +48,10 @@ function makeGateway(): MockGateway {
   return { getQuote: jest.fn(), placeOrder: jest.fn() };
 }
 
-type MockKv = { get: jest.Mock };
+type MockKv = { get: jest.Mock; set: jest.Mock };
 
 function makeKv(): MockKv {
-  return { get: jest.fn() };
+  return { get: jest.fn(), set: jest.fn().mockResolvedValue(undefined) };
 }
 
 function makeService(prisma: MockPrisma, gateway: MockGateway, kv: MockKv): TradeIntentService {
@@ -855,5 +855,53 @@ describe('TradeIntentService', () => {
       expect(result.status).toBe('executed');
       expect(result.quantity).toBe(0);
     });
+  });
+});
+
+// ── Execution policy (operator config) ─────────────────────────────────────────
+describe('TradeIntentService policy config', () => {
+  it('setPolicy writes only the provided KV keys and returns the resulting policy', async () => {
+    const prisma = makePrisma();
+    const gateway = makeGateway();
+    const kv = makeKv();
+    // After writes, getPolicy re-reads: make get return the "new" values.
+    kv.get.mockImplementation((k: string) =>
+      Promise.resolve(
+        {
+          'execution.real': 'true',
+          'execution.broker_plugin_id': 'alpaca-provider',
+          'execution.max_order_notional': '500',
+        }[k] ?? null,
+      ),
+    );
+    const service = makeService(prisma, gateway, kv);
+
+    const policy = await service.setPolicy({
+      real: true,
+      broker_plugin_id: 'alpaca-provider',
+      max_order_notional: 500,
+    });
+
+    expect(kv.set).toHaveBeenCalledWith('execution.real', 'true');
+    expect(kv.set).toHaveBeenCalledWith('execution.broker_plugin_id', 'alpaca-provider');
+    expect(kv.set).toHaveBeenCalledWith('execution.max_order_notional', '500');
+    // untouched key not written
+    expect(kv.set).not.toHaveBeenCalledWith('execution.autonomous', expect.anything());
+    expect(policy.real).toBe(true);
+    expect(policy.broker_plugin_id).toBe('alpaca-provider');
+    expect(policy.max_order_notional).toBe(500);
+  });
+
+  it('getPolicy returns defaults when no KV keys are set (autonomous paper)', async () => {
+    const prisma = makePrisma();
+    const gateway = makeGateway();
+    const kv = makeKv();
+    kv.get.mockResolvedValue(null);
+    const service = makeService(prisma, gateway, kv);
+
+    const policy = await service.getPolicy();
+    expect(policy.autonomous).toBe(true);
+    expect(policy.real).toBe(false);
+    expect(policy.broker_plugin_id).toBe('');
   });
 });

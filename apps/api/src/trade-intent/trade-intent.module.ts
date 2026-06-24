@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TradeIntentService } from './trade-intent.service';
 import { TradeIntentController } from './trade-intent.controller';
+import { ExecutionController } from './execution.controller';
 import { PrismaModule } from '../prisma/prisma.module';
 import { ProvidersModule } from '../providers/providers.module';
 import { AuthModule } from '../auth/auth.module';
@@ -14,7 +15,7 @@ import { KvService } from '../common/kv.service';
     AuthModule,
   ],
   providers: [TradeIntentService, KvService],
-  controllers: [TradeIntentController],
+  controllers: [TradeIntentController, ExecutionController],
   exports: [TradeIntentService],
 })
 export class TradeIntentModule {}
