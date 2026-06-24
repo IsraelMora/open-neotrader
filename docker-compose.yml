@@ -15,6 +15,9 @@ services:
       NODE_ENV: production
       # El código lee DATABASE_URL (no DB_PATH). Apunta al volumen persistente.
       DATABASE_URL: file:/data/neurotrader.db
+      # Credenciales de providers (set vía API /credentials) persisten en el volumen:
+      # CredentialsService escribe acá y ConfigModule lo lee en cada boot.
+      DOTENV_PATH: /data/.env
       # Sandbox Python
       SANDBOX_RUNNER_PATH: /sandbox/runner.py
       SANDBOX_TIMEOUT_MS: ${SANDBOX_TIMEOUT_MS:-60000}

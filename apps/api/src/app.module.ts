@@ -36,7 +36,9 @@ import { CorrelationMiddleware } from './common/correlation.middleware';
 
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true }),
+    // envFilePath = DOTENV_PATH (volumen persistente en prod) → las credenciales de
+    // providers escritas vía /credentials sobreviven a los redeploys.
+    ConfigModule.forRoot({ isGlobal: true, envFilePath: process.env['DOTENV_PATH'] ?? '.env' }),
     EventEmitterModule.forRoot({ wildcard: false, maxListeners: 50 }),
 
     // Rate limiting: 120 req/min por IP en rutas normales, 10/min en rutas de auth
