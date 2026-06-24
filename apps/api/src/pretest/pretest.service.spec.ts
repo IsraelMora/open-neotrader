@@ -2760,6 +2760,7 @@ function makePromoteService(opts: {
       max_dd: 5,
       n_trades: 30,
       loss_trades: 12,
+      alpha_pct: null,
     },
   });
 
@@ -3340,6 +3341,7 @@ describe('PretestService.computePluginReputation (F3-s3 Phase 2)', () => {
       max_dd: 10,
       n_trades: 20,
       loss_trades: 6,
+      alpha_pct: null,
     });
 
     const result = await svc.computePluginReputation('plugin-formula');
@@ -3373,6 +3375,7 @@ describe('PretestService.computePluginReputation (F3-s3 Phase 2)', () => {
       max_dd: 60, // → nRisk=clamp(1-60/50,0,1)=0
       n_trades: 20,
       loss_trades: 6,
+      alpha_pct: null,
     });
 
     const result = await svc.computePluginReputation('plugin-clamp');
@@ -3615,5 +3618,164 @@ describe('PretestService.gate() — F3-s3 reputation trigger', () => {
     expect(result.ready).toBe(true);
     expect(result).toHaveProperty('reasons');
     expect(result).toHaveProperty('metrics');
+  });
+});
+
+// ── Alpha gate: a strategy must beat (or match) buy & hold to be promotable ───
+// Encodes the empirical finding that EMA/RSI defaults posted POSITIVE returns yet
+// NEGATIVE alpha vs buy&hold — i.e. they destroyed value and must NOT reach live.
+describe('PretestService — alpha gate (beats buy & hold)', () => {
+  // KV overrides that neutralize the other gate checks so each test isolates alpha.
+  const ONLY_ALPHA = {
+    'pretest.gate.min_trades': '1',
+    'pretest.gate.min_sharpe': '0',
+    'pretest.gate.min_loss_trades': '0',
+  };
+
+  function mkState(equity: number, benchmark_return_pct?: number): PretestState {
+    return {
+      equity,
+      cash: equity,
+      positions: [],
+      trades: [
+        {
+          ts: new Date().toISOString(),
+          symbol: 'T',
+          action: 'sell',
+          price: 100,
+          quantity: 1,
+          pnl: 50,
+          entry_price: 100,
+        },
+        {
+          ts: new Date().toISOString(),
+          symbol: 'T',
+          action: 'sell',
+          price: 100,
+          quantity: 1,
+          pnl: -10,
+          entry_price: 100,
+        },
+      ],
+      max_equity: equity,
+      max_drawdown_pct: 5,
+      realized_pnl: 0,
+      win_trades: 1,
+      loss_trades: 1,
+      ...(benchmark_return_pct !== undefined && { benchmark_return_pct }),
+    };
+  }
+
+  function mkRow(stateObj: PretestState, initial_capital = 10000) {
+    return {
+      id: 'alpha-test',
+      name: 'Alpha Test',
+      description: null,
+      initial_capital,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(stateObj),
+      run_count: stateObj.trades.length,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+  }
+
+  function svcFor(row: ReturnType<typeof mkRow>, kvOverrides: Record<string, string>) {
+    const db = {
+      pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
+    } as unknown as PrismaService;
+    return new PretestService(
+      db,
+      {} as unknown as SandboxGateway,
+      {} as unknown as PluginsService,
+      {} as unknown as LlmService,
+      {} as unknown as ContextMemoryService,
+      DEFAULT_GATEWAY,
+      makeStubAgents(),
+      makeStubKv(kvOverrides),
+      makeStubAudit(),
+    );
+  }
+
+  it('computeSignificance: alpha_pct = portfolio return − benchmark return', () => {
+    // equity 12000 on 10000 capital → +20% return; benchmark +8% → alpha +12.
+    const svc = makeService(DEFAULT_GATEWAY);
+    const metrics = svc.computeSignificance(mkState(12000, 8), 10000);
+    expect(metrics.alpha_pct).toBeCloseTo(12, 5);
+  });
+
+  it('computeSignificance: alpha_pct is null when no benchmark is tracked', () => {
+    const svc = makeService(DEFAULT_GATEWAY);
+    const metrics = svc.computeSignificance(mkState(12000), 10000);
+    expect(metrics.alpha_pct).toBeNull();
+  });
+
+  it('gate BLOCKS a strategy that underperforms buy & hold (positive return, negative alpha)', async () => {
+    // +5% return but benchmark +30% → alpha −25 < default min_alpha 0 → NOT READY.
+    const svc = svcFor(mkRow(mkState(10500, 30)), ONLY_ALPHA);
+    const result = await svc.gate('alpha-test');
+    expect(result.ready).toBe(false);
+    expect(result.reasons.some((r: string) => r.includes('alpha'))).toBe(true);
+  });
+
+  it('gate PASSES a strategy with positive alpha', async () => {
+    // +20% return, benchmark +8% → alpha +12 ≥ 0 → READY.
+    const svc = svcFor(mkRow(mkState(12000, 8)), ONLY_ALPHA);
+    const result = await svc.gate('alpha-test');
+    expect(result.ready).toBe(true);
+  });
+
+  it('gate is fail-soft: no benchmark tracked → alpha check is skipped, never blocks', async () => {
+    // +5% return, NO benchmark → alpha null → alpha check skipped → READY (others neutralized).
+    const svc = svcFor(mkRow(mkState(10500)), ONLY_ALPHA);
+    const result = await svc.gate('alpha-test');
+    expect(result.ready).toBe(true);
+    expect(result.reasons.some((r: string) => r.includes('alpha'))).toBe(false);
+  });
+
+  it('gate honors a configurable min_alpha threshold', async () => {
+    // +12% return, benchmark +10% → alpha +2 < min_alpha 5 → NOT READY.
+    const svc = svcFor(mkRow(mkState(11200, 10)), { ...ONLY_ALPHA, 'pretest.gate.min_alpha': '5' });
+    const result = await svc.gate('alpha-test');
+    expect(result.ready).toBe(false);
+    expect(result.reasons.some((r: string) => r.includes('alpha'))).toBe(true);
+  });
+});
+
+// ── Benchmark tracking in MTM feeds the alpha gate (default symbol SPY) ────────
+describe('PretestService._updateEquityMetrics — benchmark tracking', () => {
+  it('sets benchmark_start_price and 0% return on the first MTM', async () => {
+    const gw = makeGateway((_p, symbol) =>
+      Promise.resolve(makeQuote(symbol, symbol === 'SPY' ? 400 : 100)),
+    );
+    const svc = makeService(gw);
+    const state = makeState({ positions: [{ symbol: 'AAPL', quantity: 1, avg_price: 100 }] });
+    await svc._updateEquityMetrics(state);
+    expect(state.benchmark_start_price).toBeCloseTo(400, 5);
+    expect(state.benchmark_return_pct).toBeCloseTo(0, 5);
+  });
+
+  it('computes benchmark_return_pct from a previously stored start price', async () => {
+    const gw = makeGateway((_p, symbol) =>
+      Promise.resolve(makeQuote(symbol, symbol === 'SPY' ? 500 : 100)),
+    );
+    const svc = makeService(gw);
+    const state = makeState({
+      positions: [{ symbol: 'AAPL', quantity: 1, avg_price: 100 }],
+      benchmark_start_price: 400, // SPY 400 → 500 = +25%
+    });
+    await svc._updateEquityMetrics(state);
+    expect(state.benchmark_return_pct).toBeCloseTo(25, 5);
+  });
+
+  it('is fail-soft: benchmark quote failure leaves benchmark fields untouched, no throw', async () => {
+    const svc = makeService(makeRejectingGateway('feed down'));
+    const state = makeState({ positions: [{ symbol: 'AAPL', quantity: 1, avg_price: 100 }] });
+    await expect(svc._updateEquityMetrics(state)).resolves.toBeUndefined();
+    expect(state.benchmark_return_pct).toBeUndefined();
+    expect(state.benchmark_start_price).toBeUndefined();
   });
 });

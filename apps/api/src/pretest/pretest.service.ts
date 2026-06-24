@@ -44,6 +44,9 @@ const POLICY_DEFAULTS: PretestPolicy = {
   commission_pct: 0,
 };
 
+/** Buy & hold benchmark for the alpha gate. SPY = broad US-equity index proxy. */
+const BENCHMARK_SYMBOL = 'SPY';
+
 export interface PretestTrade {
   ts: string;
   symbol: string;
@@ -73,6 +76,12 @@ export interface PretestState {
   realized_pnl: number;
   win_trades: number;
   loss_trades: number;
+  /** Buy & hold benchmark return (%) over the portfolio's active span, tracked
+   * by _updateEquityMetrics. Undefined until the first benchmark quote resolves;
+   * absence makes the alpha gate fail-soft (skipped, never blocks). */
+  benchmark_return_pct?: number;
+  /** Benchmark price at portfolio inception (first MTM). Internal baseline. */
+  benchmark_start_price?: number;
 }
 
 export interface PretestPortfolio {
@@ -103,6 +112,9 @@ export interface SignificanceMetrics {
   n_trades: number;
   /** Count of closing trades with pnl < 0. Used by gate min_loss_trades check. */
   loss_trades: number;
+  /** Portfolio return − buy&hold benchmark return (%). null when no benchmark is
+   * tracked or initial_capital is unknown → the alpha gate check is then skipped. */
+  alpha_pct: number | null;
 }
 
 /** Result of the significance gate evaluation. */
@@ -412,7 +424,7 @@ export class PretestService {
       const return_pct = (p.state.equity - p.initial_capital) / p.initial_capital;
       const risk_adj =
         p.state.max_drawdown_pct > 0 ? return_pct / p.state.max_drawdown_pct : return_pct;
-      const metrics = this.computeSignificance(p.state);
+      const metrics = this.computeSignificance(p.state, p.initial_capital);
       // Use computeSignificance win_rate (closing trades only) for consistency —
       // avoids the deflation bug where total_trades included buy records.
       const reasons = this._evaluateGate(metrics, thresholds);
@@ -464,7 +476,14 @@ export class PretestService {
    * loss_trades: count(pnl<0).
    * max_dd: state.max_drawdown_pct.
    */
-  computeSignificance(state: PretestState): SignificanceMetrics {
+  computeSignificance(state: PretestState, initialCapital?: number): SignificanceMetrics {
+    // Alpha = portfolio return − buy&hold benchmark return. Requires both a tracked
+    // benchmark and a known initial_capital; otherwise null (gate skips the check).
+    const alpha_pct =
+      state.benchmark_return_pct !== undefined && initialCapital !== undefined && initialCapital > 0
+        ? ((state.equity - initialCapital) / initialCapital) * 100 - state.benchmark_return_pct
+        : null;
+
     // Only closing trades with a pnl field are included in significance computation
     const closingTrades = state.trades.filter(
       (t) => (t.action === 'sell' || t.action === 'close') && t.pnl !== undefined,
@@ -479,6 +498,7 @@ export class PretestService {
         max_dd: state.max_drawdown_pct,
         n_trades: 0,
         loss_trades: 0,
+        alpha_pct,
       };
     }
 
@@ -530,6 +550,7 @@ export class PretestService {
       max_dd: state.max_drawdown_pct,
       n_trades: n,
       loss_trades: losses,
+      alpha_pct,
     };
   }
 
@@ -544,7 +565,7 @@ export class PretestService {
    */
   async gate(id: string): Promise<GateResult> {
     const portfolio = await this.findOne(id);
-    const metrics = this.computeSignificance(portfolio.state);
+    const metrics = this.computeSignificance(portfolio.state, portfolio.initial_capital);
     const thresholds = await this._readGateThresholds();
     const reasons = this._evaluateGate(metrics, thresholds);
     const ready = reasons.length === 0;
@@ -588,7 +609,7 @@ export class PretestService {
 
     // Step 4: Filter to gate-READY portfolios using in-memory evaluation
     const ready = containing.filter((p) => {
-      const metrics = this.computeSignificance(p.state);
+      const metrics = this.computeSignificance(p.state, p.initial_capital);
       const reasons = this._evaluateGate(metrics, thresholds);
       return reasons.length === 0;
     });
@@ -603,7 +624,7 @@ export class PretestService {
     let worstDdPct = 0;
 
     for (const p of ready) {
-      const metrics = this.computeSignificance(p.state);
+      const metrics = this.computeSignificance(p.state, p.initial_capital);
       sumSharpe += metrics.sharpe;
       const returnPct = ((p.state.equity - p.initial_capital) / p.initial_capital) * 100;
       sumReturnPct += returnPct;
@@ -670,23 +691,30 @@ export class PretestService {
     min_sharpe: number;
     max_dd_pct: number;
     min_loss_trades: number;
+    min_alpha: number;
   }> {
     const parseNum = (raw: string | null, fallback: number): number => {
       if (raw === null) return fallback;
       const n = Number(raw);
       return isFinite(n) ? n : fallback;
     };
-    const [rawMinTrades, rawMinSharpe, rawMaxDd, rawMinLossTrades] = await Promise.all([
-      this.kv.get('pretest.gate.min_trades'),
-      this.kv.get('pretest.gate.min_sharpe'),
-      this.kv.get('pretest.gate.max_dd_pct'),
-      this.kv.get('pretest.gate.min_loss_trades'),
-    ]);
+    const [rawMinTrades, rawMinSharpe, rawMaxDd, rawMinLossTrades, rawMinAlpha] = await Promise.all(
+      [
+        this.kv.get('pretest.gate.min_trades'),
+        this.kv.get('pretest.gate.min_sharpe'),
+        this.kv.get('pretest.gate.max_dd_pct'),
+        this.kv.get('pretest.gate.min_loss_trades'),
+        this.kv.get('pretest.gate.min_alpha'),
+      ],
+    );
 
     const min_trades_raw = parseNum(rawMinTrades, 20);
     const min_sharpe_raw = parseNum(rawMinSharpe, 1.0);
     const max_dd_pct_raw = parseNum(rawMaxDd, 20);
     const min_loss_trades_raw = parseNum(rawMinLossTrades, 3);
+    // Default 0: a promotable strategy must at least MATCH buy & hold. A negative
+    // threshold (operator opt-in) tolerates mild underperformance; no upper clamp.
+    const min_alpha = parseNum(rawMinAlpha, 0);
 
     // Clamp: max_dd_pct must be in [1, 100] — anything below 1 almost certainly indicates
     // a fraction was stored (e.g. 0.20 meaning 20%) rather than a percentage; coerce to default 20.
@@ -698,7 +726,7 @@ export class PretestService {
     // Clamp: min_loss_trades must be >= 0
     const min_loss_trades = min_loss_trades_raw >= 0 ? min_loss_trades_raw : 0;
 
-    return { min_trades, min_sharpe, max_dd_pct, min_loss_trades };
+    return { min_trades, min_sharpe, max_dd_pct, min_loss_trades, min_alpha };
   }
 
   /** Evaluates metrics against thresholds and returns a list of failure reasons. */
@@ -709,6 +737,7 @@ export class PretestService {
       min_sharpe: number;
       max_dd_pct: number;
       min_loss_trades: number;
+      min_alpha: number;
     },
   ): string[] {
     const reasons: string[] = [];
@@ -726,6 +755,14 @@ export class PretestService {
     if (metrics.loss_trades < thresholds.min_loss_trades) {
       reasons.push(
         `insufficient loss trades: ${metrics.loss_trades} < ${thresholds.min_loss_trades} (cannot validate risk on a strategy that never lost)`,
+      );
+    }
+    // Alpha gate: a strategy that does not beat buy & hold destroys value and must
+    // not reach live. Fail-soft: skipped entirely when no benchmark is tracked
+    // (alpha_pct === null), so existing portfolios are never retroactively blocked.
+    if (metrics.alpha_pct !== null && metrics.alpha_pct < thresholds.min_alpha) {
+      reasons.push(
+        `negative alpha vs buy&hold: ${metrics.alpha_pct.toFixed(2)}% < ${thresholds.min_alpha}% (strategy underperforms simply holding)`,
       );
     }
     return reasons;
@@ -1066,6 +1103,23 @@ export class PretestService {
       0,
     );
     state.equity = state.cash + posValue;
+
+    // Benchmark tracking for the alpha gate: buy & hold of BENCHMARK_SYMBOL over the
+    // portfolio's span. Baseline is captured on the first MTM; later cycles compute
+    // the return vs that baseline. Fail-soft: any failure leaves the benchmark fields
+    // untouched so the alpha gate simply skips (never blocks) this cycle.
+    try {
+      const bench = await this.gateway.getQuote(null, BENCHMARK_SYMBOL);
+      if (isFinite(bench.last) && bench.last > 0) {
+        if (state.benchmark_start_price === undefined) {
+          state.benchmark_start_price = bench.last;
+        }
+        state.benchmark_return_pct =
+          ((bench.last - state.benchmark_start_price) / state.benchmark_start_price) * 100;
+      }
+    } catch (err) {
+      this.log.warn(`Benchmark MTM skipped (${BENCHMARK_SYMBOL}): ${String(err)}`);
+    }
 
     if (state.equity > state.max_equity) {
       state.max_equity = state.equity;
