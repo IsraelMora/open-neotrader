@@ -4,6 +4,7 @@ import { TradeIntentController } from './trade-intent.controller';
 import { PrismaModule } from '../prisma/prisma.module';
 import { ProvidersModule } from '../providers/providers.module';
 import { AuthModule } from '../auth/auth.module';
+import { KvService } from '../common/kv.service';
 
 @Module({
   imports: [
@@ -12,7 +13,7 @@ import { AuthModule } from '../auth/auth.module';
     // AuthModule exports TotpRequiredGuard used in TradeIntentController
     AuthModule,
   ],
-  providers: [TradeIntentService],
+  providers: [TradeIntentService, KvService],
   controllers: [TradeIntentController],
   exports: [TradeIntentService],
 })

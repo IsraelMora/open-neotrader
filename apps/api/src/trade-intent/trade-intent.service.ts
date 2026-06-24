@@ -1,12 +1,14 @@
 /**
- * TradeIntentService — HITL paper trade-execution layer.
+ * TradeIntentService — paper trade-execution layer.
  *
  * The LLM emits a decision (plugin decision.emit_trade_intent). This service:
  *   1. Persists it as a TradeIntent (status=pending).
- *   2. Waits for human approval or rejection.
- *   3. On approval, executes in PAPER mode against a virtual portfolio stored
+ *   2. If autonomous mode is enabled (KV execution.autonomous != 'false'), immediately
+ *      runs through risk gates and executes autonomously.
+ *   3. Otherwise waits for human approval or rejection (HITL path).
+ *   4. On execution, runs in PAPER mode against a virtual portfolio stored
  *      in the Portfolio table under name="paper".
- *   4. Records fill_price, quantity, realized_pnl, and result_json.
+ *   5. Records fill_price, quantity, realized_pnl, and result_json.
  *
  * REAL-MONEY EXECUTION IS HARD-DISABLED.
  * Any intent with mode != "paper" will throw before touching the portfolio.
@@ -18,6 +20,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
+import { KvService } from '../common/kv.service';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -34,13 +37,21 @@ export interface PaperState {
   equity: number;
   cash: number;
   positions: PaperPosition[];
+  max_drawdown_pct?: number;
+}
+
+export interface ExecutionPolicy {
+  autonomous: boolean;
+  max_position_pct: number;
+  max_open_positions: number;
+  max_drawdown_halt_pct: number;
 }
 
 /** Default capital for the shared paper portfolio if it doesn't exist yet. */
 const PAPER_PORTFOLIO_INITIAL_CAPITAL = 10_000;
 const PAPER_PORTFOLIO_NAME = 'paper';
 
-/** Fraction of available cash used per long entry. */
+/** Fraction of available cash used per long entry (human-approved path). */
 const SIZING_PCT = 0.05;
 
 // ── Service ───────────────────────────────────────────────────────────────────
@@ -52,6 +63,7 @@ export class TradeIntentService {
   constructor(
     private readonly db: PrismaService,
     private readonly gateway: ProviderGatewayService,
+    private readonly kv: KvService,
   ) {}
 
   // ── recordIntent ─────────────────────────────────────────────────────────────
@@ -59,7 +71,8 @@ export class TradeIntentService {
   /**
    * Persists a new TradeIntent in status=pending.
    * Validates action (must be long|short|exit|hold) and confidence ([0,1]).
-   * Never touches the portfolio — that happens only on approve().
+   * If execution policy has autonomous=true, immediately calls autoProcess().
+   * Otherwise returns the pending intent as-is (HITL path).
    */
   async recordIntent(dto: {
     cycle_id?: string;
@@ -80,7 +93,7 @@ export class TradeIntentService {
       );
     }
 
-    return this.db.tradeIntent.create({
+    const created = await this.db.tradeIntent.create({
       data: {
         cycle_id: dto.cycle_id ?? null,
         symbol: dto.symbol,
@@ -92,6 +105,14 @@ export class TradeIntentService {
         status: 'pending',
       },
     });
+
+    const policy = await this._readExecutionPolicy();
+
+    if (policy.autonomous) {
+      return this.autoProcess(created.id);
+    }
+
+    return created;
   }
 
   // ── list / listPending ────────────────────────────────────────────────────────
@@ -109,10 +130,97 @@ export class TradeIntentService {
     return this.list('pending');
   }
 
+  // ── autoProcess ───────────────────────────────────────────────────────────────
+
+  /**
+   * Autonomous execution path — governed by risk gates from ExecutionPolicy.
+   *
+   * Hard guards (throw before any portfolio mutation):
+   *   - mode != "paper"  → Error("real-money execution is disabled...")
+   *   - status != "pending" → Error("TradeIntent ti_xxx is not pending …")
+   *
+   * Risk gates for opening trades (long/short):
+   *   - drawdown >= max_drawdown_halt_pct → circuit breaker, reject
+   *   - positions.length >= max_open_positions → max positions reached, reject
+   *
+   * "exit" always passes risk gates (closing reduces risk).
+   * "hold" marks as executed with quantity=0, no quote fetch, no portfolio mutation.
+   *
+   * Fail-soft on getQuote failure: sets status=failed, no throw.
+   */
+  async autoProcess(id: string) {
+    const intent = await this.db.tradeIntent.findUnique({ where: { id } });
+    if (!intent) throw new Error(`TradeIntent ${id} not found`);
+
+    // HARD GUARD: real-money execution is intentionally not wired.
+    if (intent.mode !== 'paper') {
+      throw new Error(
+        `real-money execution is disabled. Only mode="paper" is supported. ` +
+          `Received mode="${intent.mode}" for intent ${id}.`,
+      );
+    }
+
+    if (intent.status !== 'pending') {
+      throw new Error(
+        `TradeIntent ${id} is not pending (current status: ${intent.status}). ` +
+          `Only pending intents can be processed.`,
+      );
+    }
+
+    const policy = await this._readExecutionPolicy();
+
+    // Load the shared paper portfolio (create with defaults if missing).
+    const portfolioRow = await this.db.portfolio.findUnique({
+      where: { name: PAPER_PORTFOLIO_NAME },
+    });
+    const paperState: PaperState = portfolioRow
+      ? (JSON.parse(portfolioRow.data) as PaperState)
+      : {
+          equity: PAPER_PORTFOLIO_INITIAL_CAPITAL,
+          cash: PAPER_PORTFOLIO_INITIAL_CAPITAL,
+          positions: [],
+        };
+
+    const action = intent.action as TradeAction;
+
+    // "hold" → executed immediately as no-op, no quote fetch, no portfolio mutation.
+    if (action === 'hold') {
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'executed',
+          quantity: 0,
+          decided_at: new Date(),
+          decided_by: 'autonomous',
+          result_json: JSON.stringify({ quantity: 0, reason: 'hold — no position change' }),
+        },
+      });
+    }
+
+    // Risk gate — only for opening trades.
+    if (action === 'long' || action === 'short') {
+      const { pass, reason } = this._passesAutoRisk(paperState, policy);
+      if (!pass) {
+        return this.db.tradeIntent.update({
+          where: { id },
+          data: {
+            status: 'rejected',
+            decided_at: new Date(),
+            decided_by: 'autonomous',
+            reject_reason: reason,
+          },
+        });
+      }
+    }
+    // "exit" always passes — closing a position reduces risk.
+
+    return this._runPaperExecution(id, intent.symbol, action, paperState, 'autonomous', policy.max_position_pct);
+  }
+
   // ── approve ───────────────────────────────────────────────────────────────────
 
   /**
-   * Approves a pending TradeIntent and executes it in PAPER mode.
+   * Approves a pending TradeIntent and executes it in PAPER mode (human path).
    *
    * Hard guards (throw before any portfolio mutation):
    *   - mode != "paper"  → Error("real-money execution is disabled")
@@ -158,79 +266,7 @@ export class TradeIntentService {
           positions: [],
         };
 
-    // Fetch live quote (fail-soft on error).
-    let fillPrice: number;
-    try {
-      const quote = await this.gateway.getQuote(null, intent.symbol);
-      fillPrice = quote.last;
-    } catch (err) {
-      this.log.warn(`approve ${id}: getQuote failed for ${intent.symbol} — ${String(err)}`);
-      const updated = await this.db.tradeIntent.update({
-        where: { id },
-        data: {
-          status: 'failed',
-          decided_at: new Date(),
-          decided_by,
-          result_json: JSON.stringify({ error: String(err) }),
-        },
-      });
-      return updated;
-    }
-
-    if (!isFinite(fillPrice) || fillPrice <= 0) {
-      const updated = await this.db.tradeIntent.update({
-        where: { id },
-        data: {
-          status: 'failed',
-          decided_at: new Date(),
-          decided_by,
-          result_json: JSON.stringify({ error: `Invalid fill price: ${fillPrice}` }),
-        },
-      });
-      return updated;
-    }
-
-    // Execute the trade in-memory.
-    const { quantity, realized_pnl, newState } = this._executePaper(
-      intent.action as TradeAction,
-      intent.symbol,
-      fillPrice,
-      state,
-    );
-
-    // Persist updated portfolio state.
-    await this.db.portfolio.upsert({
-      where: { name: PAPER_PORTFOLIO_NAME },
-      create: {
-        name: PAPER_PORTFOLIO_NAME,
-        data: JSON.stringify(newState),
-      },
-      update: {
-        data: JSON.stringify(newState),
-      },
-    });
-
-    // Persist result on the TradeIntent row.
-    const updated = await this.db.tradeIntent.update({
-      where: { id },
-      data: {
-        status: 'executed',
-        fill_price: fillPrice,
-        quantity,
-        realized_pnl: realized_pnl ?? null,
-        decided_at: new Date(),
-        decided_by,
-        result_json: JSON.stringify({
-          fill_price: fillPrice,
-          quantity,
-          realized_pnl,
-          portfolio_equity: newState.equity,
-          portfolio_cash: newState.cash,
-        }),
-      },
-    });
-
-    return updated;
+    return this._runPaperExecution(id, intent.symbol, intent.action as TradeAction, state, decided_by, SIZING_PCT);
   }
 
   // ── reject ─────────────────────────────────────────────────────────────────────
@@ -261,13 +297,153 @@ export class TradeIntentService {
     });
   }
 
+  // ── _readExecutionPolicy ──────────────────────────────────────────────────────
+
+  private async _readExecutionPolicy(): Promise<ExecutionPolicy> {
+    const parseNum = (raw: string | null, fallback: number): number => {
+      if (raw === null) return fallback;
+      const n = Number(raw);
+      return isFinite(n) ? n : fallback;
+    };
+
+    const [rawAutonomous, rawMaxPosPct, rawMaxOpenPos, rawMaxDrawdown] = await Promise.all([
+      this.kv.get('execution.autonomous'),
+      this.kv.get('execution.max_position_pct'),
+      this.kv.get('execution.max_open_positions'),
+      this.kv.get('execution.max_drawdown_halt_pct'),
+    ]);
+
+    const autonomous = rawAutonomous !== 'false';
+
+    let max_position_pct = parseNum(rawMaxPosPct, 0.1);
+    if (max_position_pct <= 0 || max_position_pct > 1) max_position_pct = 0.1;
+
+    let max_open_positions = Math.round(parseNum(rawMaxOpenPos, 10));
+    if (max_open_positions < 1) max_open_positions = 1;
+
+    let max_drawdown_halt_pct = parseNum(rawMaxDrawdown, 25);
+    if (max_drawdown_halt_pct <= 0 || max_drawdown_halt_pct > 100) max_drawdown_halt_pct = 25;
+
+    return { autonomous, max_position_pct, max_open_positions, max_drawdown_halt_pct };
+  }
+
+  // ── _passesAutoRisk ───────────────────────────────────────────────────────────
+
+  private _passesAutoRisk(
+    state: PaperState,
+    policy: ExecutionPolicy,
+  ): { pass: boolean; reason?: string } {
+    const drawdown = state.max_drawdown_pct ?? 0;
+    if (drawdown >= policy.max_drawdown_halt_pct) {
+      return {
+        pass: false,
+        reason: `circuit breaker: drawdown ${drawdown}% >= ${policy.max_drawdown_halt_pct}%`,
+      };
+    }
+
+    if (state.positions.length >= policy.max_open_positions) {
+      return {
+        pass: false,
+        reason: `max open positions reached (${state.positions.length}/${policy.max_open_positions})`,
+      };
+    }
+
+    return { pass: true };
+  }
+
+  // ── _runPaperExecution ────────────────────────────────────────────────────────
+
+  /**
+   * Shared paper execution logic used by both approve() and autoProcess().
+   * Fetches quote (fail-soft), computes trade, upserts portfolio, updates intent.
+   */
+  private async _runPaperExecution(
+    id: string,
+    symbol: string,
+    action: TradeAction,
+    state: PaperState,
+    decided_by: string,
+    sizingPct: number,
+  ) {
+    // Fetch live quote (fail-soft on error).
+    let fillPrice: number;
+    try {
+      const quote = await this.gateway.getQuote(null, symbol);
+      fillPrice = quote.last;
+    } catch (err) {
+      this.log.warn(`autoProcess/approve ${id}: getQuote failed for ${symbol} — ${String(err)}`);
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({ error: String(err) }),
+        },
+      });
+    }
+
+    if (!isFinite(fillPrice) || fillPrice <= 0) {
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({ error: `Invalid fill price: ${fillPrice}` }),
+        },
+      });
+    }
+
+    // Execute the trade in-memory.
+    const { quantity, realized_pnl, newState } = this._executePaper(
+      action,
+      symbol,
+      fillPrice,
+      state,
+      sizingPct,
+    );
+
+    // Persist updated portfolio state.
+    await this.db.portfolio.upsert({
+      where: { name: PAPER_PORTFOLIO_NAME },
+      create: {
+        name: PAPER_PORTFOLIO_NAME,
+        data: JSON.stringify(newState),
+      },
+      update: {
+        data: JSON.stringify(newState),
+      },
+    });
+
+    // Persist result on the TradeIntent row.
+    return this.db.tradeIntent.update({
+      where: { id },
+      data: {
+        status: 'executed',
+        fill_price: fillPrice,
+        quantity,
+        realized_pnl: realized_pnl ?? null,
+        decided_at: new Date(),
+        decided_by,
+        result_json: JSON.stringify({
+          fill_price: fillPrice,
+          quantity,
+          realized_pnl,
+          portfolio_equity: newState.equity,
+          portfolio_cash: newState.cash,
+        }),
+      },
+    });
+  }
+
   // ── Paper execution logic ─────────────────────────────────────────────────────
 
   /**
    * Applies a paper trade to the virtual portfolio state (pure function except for state mutation).
    * Returns the executed quantity, any realized_pnl (for exit), and the updated state.
    *
-   * "long"  → buy floor(cash * SIZING_PCT / fill_price) shares; avg_price cost-basis.
+   * "long"  → buy floor(cash * sizingPct / fill_price) shares; avg_price cost-basis.
    * "exit"  → close entire existing position; realized_pnl = (fill - avg) * qty.
    * "short" → not really executable in simple paper mode; records qty=0, no state change.
    * "hold"  → no trade; qty=0.
@@ -277,6 +453,7 @@ export class TradeIntentService {
     symbol: string,
     fillPrice: number,
     state: PaperState,
+    sizingPct = SIZING_PCT,
   ): { quantity: number; realized_pnl: number | null; newState: PaperState } {
     // Deep-copy positions so we don't mutate the original.
     const newState: PaperState = {
@@ -286,7 +463,7 @@ export class TradeIntentService {
     };
 
     if (action === 'long') {
-      const budget = newState.cash * SIZING_PCT;
+      const budget = newState.cash * sizingPct;
       const quantity = Math.floor(budget / fillPrice);
       if (quantity <= 0) {
         return { quantity: 0, realized_pnl: null, newState };
