@@ -10,9 +10,11 @@
  *      in the Portfolio table under name="paper".
  *   5. Records fill_price, quantity, realized_pnl, and result_json.
  *
- * REAL-MONEY EXECUTION IS HARD-DISABLED.
- * Any intent with mode != "paper" will throw before touching the portfolio.
- * This is intentional and must not be removed without a security review.
+ * REAL-MONEY EXECUTION IS OFF BY DEFAULT.
+ * Effective mode is derived from ExecutionPolicy, not the stored intent.mode.
+ * Real execution requires: execution.real=true AND execution.broker_plugin_id non-empty.
+ * All real orders pass through the same risk gates and a per-order notional ceiling.
+ * Every real order attempt is logged at WARN level.
  *
  * Paper portfolio storage: Portfolio model, name="paper", data=JSON PaperState.
  * This reuses the existing Portfolio table (keyed by name) and avoids a new table.
@@ -45,6 +47,12 @@ export interface ExecutionPolicy {
   max_position_pct: number;
   max_open_positions: number;
   max_drawdown_halt_pct: number;
+  /** Only literal 'true' (string) enables real execution. Default false. */
+  real: boolean;
+  /** Which provider plugin executes real orders. Empty string → paper fallback. */
+  broker_plugin_id: string;
+  /** Hard ceiling per real order in notional value (qty * price). Default 1000. */
+  max_order_notional: number;
 }
 
 /** Default capital for the shared paper portfolio if it doesn't exist yet. */
@@ -152,14 +160,6 @@ export class TradeIntentService {
     const intent = await this.db.tradeIntent.findUnique({ where: { id } });
     if (!intent) throw new Error(`TradeIntent ${id} not found`);
 
-    // HARD GUARD: real-money execution is intentionally not wired.
-    if (intent.mode !== 'paper') {
-      throw new Error(
-        `real-money execution is disabled. Only mode="paper" is supported. ` +
-          `Received mode="${intent.mode}" for intent ${id}.`,
-      );
-    }
-
     if (intent.status !== 'pending') {
       throw new Error(
         `TradeIntent ${id} is not pending (current status: ${intent.status}). ` +
@@ -168,8 +168,10 @@ export class TradeIntentService {
     }
 
     const policy = await this._readExecutionPolicy();
+    const effectiveMode = this._effectiveMode(policy);
 
     // Load the shared paper portfolio (create with defaults if missing).
+    // Also needed in real mode for exit qty lookup and risk gate state.
     const portfolioRow = await this.db.portfolio.findUnique({
       where: { name: PAPER_PORTFOLIO_NAME },
     });
@@ -214,6 +216,9 @@ export class TradeIntentService {
     }
     // "exit" always passes — closing a position reduces risk.
 
+    if (effectiveMode === 'real') {
+      return this._executeReal(id, intent, policy, paperState, 'autonomous', policy.max_position_pct);
+    }
     return this._runPaperExecution(id, intent.symbol, action, paperState, 'autonomous', policy.max_position_pct);
   }
 
@@ -239,14 +244,6 @@ export class TradeIntentService {
     const intent = await this.db.tradeIntent.findUnique({ where: { id } });
     if (!intent) throw new Error(`TradeIntent ${id} not found`);
 
-    // HARD GUARD: real-money execution is intentionally not wired.
-    if (intent.mode !== 'paper') {
-      throw new Error(
-        `real-money execution is disabled. Only mode="paper" is supported. ` +
-          `Received mode="${intent.mode}" for intent ${id}.`,
-      );
-    }
-
     if (intent.status !== 'pending') {
       throw new Error(
         `TradeIntent ${id} is not pending (current status: ${intent.status}). ` +
@@ -254,7 +251,11 @@ export class TradeIntentService {
       );
     }
 
+    const policy = await this._readExecutionPolicy();
+    const effectiveMode = this._effectiveMode(policy);
+
     // Load the shared paper portfolio (create with defaults if missing).
+    // Also needed in real mode for exit qty lookup.
     const portfolioRow = await this.db.portfolio.findUnique({
       where: { name: PAPER_PORTFOLIO_NAME },
     });
@@ -266,6 +267,9 @@ export class TradeIntentService {
           positions: [],
         };
 
+    if (effectiveMode === 'real') {
+      return this._executeReal(id, intent, policy, state, decided_by, SIZING_PCT);
+    }
     return this._runPaperExecution(id, intent.symbol, intent.action as TradeAction, state, decided_by, SIZING_PCT);
   }
 
@@ -306,11 +310,14 @@ export class TradeIntentService {
       return isFinite(n) ? n : fallback;
     };
 
-    const [rawAutonomous, rawMaxPosPct, rawMaxOpenPos, rawMaxDrawdown] = await Promise.all([
+    const [rawAutonomous, rawMaxPosPct, rawMaxOpenPos, rawMaxDrawdown, rawReal, rawBrokerId, rawMaxNotional] = await Promise.all([
       this.kv.get('execution.autonomous'),
       this.kv.get('execution.max_position_pct'),
       this.kv.get('execution.max_open_positions'),
       this.kv.get('execution.max_drawdown_halt_pct'),
+      this.kv.get('execution.real'),
+      this.kv.get('execution.broker_plugin_id'),
+      this.kv.get('execution.max_order_notional'),
     ]);
 
     const autonomous = rawAutonomous !== 'false';
@@ -324,7 +331,230 @@ export class TradeIntentService {
     let max_drawdown_halt_pct = parseNum(rawMaxDrawdown, 25);
     if (max_drawdown_halt_pct <= 0 || max_drawdown_halt_pct > 100) max_drawdown_halt_pct = 25;
 
-    return { autonomous, max_position_pct, max_open_positions, max_drawdown_halt_pct };
+    // real: only the literal string 'true' enables it — everything else is false.
+    const real = rawReal === 'true';
+
+    // broker_plugin_id: empty string is treated as "not set" → paper fallback.
+    const broker_plugin_id = (rawBrokerId ?? '').trim();
+
+    // max_order_notional: hard ceiling per order in notional value. Default 1000.
+    let max_order_notional = parseNum(rawMaxNotional, 1_000);
+    if (max_order_notional <= 0) max_order_notional = 1_000;
+
+    return { autonomous, max_position_pct, max_open_positions, max_drawdown_halt_pct, real, broker_plugin_id, max_order_notional };
+  }
+
+  // ── _effectiveMode ────────────────────────────────────────────────────────────
+
+  /**
+   * Derives the execution mode from policy.
+   * Returns 'real' ONLY when BOTH conditions hold:
+   *   1. policy.real === true  (operator explicitly set execution.real=true)
+   *   2. policy.broker_plugin_id is non-empty  (a broker is configured)
+   *
+   * Any other combination → 'paper'. This is the SINGLE source of truth.
+   * intent.mode (stored in DB) is irrelevant at execution time.
+   */
+  private _effectiveMode(policy: ExecutionPolicy): 'paper' | 'real' {
+    if (policy.real === true && policy.broker_plugin_id.length > 0) {
+      return 'real';
+    }
+    return 'paper';
+  }
+
+  // ── _executeReal ──────────────────────────────────────────────────────────────
+
+  /**
+   * Real-money execution path.
+   *
+   * Pre-checks (any failure → status=failed, NEVER place order):
+   *   - broker_plugin_id must be set (defensive; _effectiveMode already guards this)
+   *   - qty computed from fresh getQuote; must be > 0
+   *   - notional (qty * price) must be <= policy.max_order_notional
+   *
+   * Side mapping:
+   *   long  → 'buy'
+   *   exit  → 'sell' (qty = held position qty from paper portfolio)
+   *   short → 'sell'
+   *   hold  → no-op (executed, qty=0) — caller should have short-circuited before here
+   *
+   * On broker success: status=executed, fill_price/quantity/result_json from response.
+   * On broker throw: status=failed, reason logged, NO retry, NO throw to caller.
+   * Paper portfolio is NEVER mutated in real mode.
+   *
+   * Every real order attempt emits a WARN-level audit log line.
+   */
+  private async _executeReal(
+    id: string,
+    intent: { symbol: string; action: string },
+    policy: ExecutionPolicy,
+    paperState: PaperState,
+    decided_by: string,
+    sizingPct: number,
+  ) {
+    const symbol = intent.symbol;
+    const action = intent.action as TradeAction;
+
+    // Defensive: broker must be set (belt-and-suspenders beyond _effectiveMode).
+    if (!policy.broker_plugin_id) {
+      this.log.warn(`REAL ORDER REJECTED [${id}]: broker_plugin_id is empty — safety guard`);
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({ error: 'broker_plugin_id not configured' }),
+        },
+      });
+    }
+
+    // Fetch live quote for sizing.
+    let price: number;
+    try {
+      const quote = await this.gateway.getQuote(null, symbol);
+      price = quote.last;
+    } catch (err) {
+      this.log.warn(`REAL ORDER FAILED [${id}]: getQuote error for ${symbol} — ${String(err)}`);
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({ error: String(err) }),
+        },
+      });
+    }
+
+    if (!isFinite(price) || price <= 0) {
+      this.log.warn(`REAL ORDER FAILED [${id}]: invalid quote price ${price} for ${symbol}`);
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({ error: `Invalid quote price: ${price}` }),
+        },
+      });
+    }
+
+    // Compute side and qty.
+    let side: 'buy' | 'sell';
+    let qty: number;
+
+    if (action === 'long') {
+      side = 'buy';
+      qty = Math.floor((paperState.equity * sizingPct) / price);
+    } else if (action === 'exit') {
+      side = 'sell';
+      // Use held position quantity from paper portfolio as the authoritative qty.
+      const pos = paperState.positions.find((p) => p.symbol === symbol);
+      qty = pos ? pos.quantity : 0;
+    } else if (action === 'short') {
+      side = 'sell';
+      qty = Math.floor((paperState.equity * sizingPct) / price);
+    } else {
+      // 'hold' — should have been short-circuited before reaching here; defensive no-op.
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'executed',
+          quantity: 0,
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({ quantity: 0, reason: 'hold — no position change' }),
+        },
+      });
+    }
+
+    // Qty safety check.
+    if (qty <= 0) {
+      this.log.warn(`REAL ORDER REJECTED [${id}]: computed qty=${qty} for ${symbol} — not placing`);
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({ error: `Computed qty=${qty} — not enough equity or no position to exit` }),
+        },
+      });
+    }
+
+    // Notional ceiling check.
+    const notional = qty * price;
+    if (notional > policy.max_order_notional) {
+      this.log.warn(
+        `REAL ORDER REJECTED [${id}]: notional=${notional} exceeds max_order_notional=${policy.max_order_notional} for ${symbol}`,
+      );
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({
+            error: `Order notional ${notional} exceeds max_order_notional ${policy.max_order_notional}`,
+            qty,
+            price,
+            notional,
+            max_order_notional: policy.max_order_notional,
+          }),
+        },
+      });
+    }
+
+    // LOUD audit log before every real order attempt.
+    this.log.warn(
+      `REAL ORDER ATTEMPT [${id}]: ${side.toUpperCase()} ${qty} ${symbol} @ ~${price} ` +
+        `(notional=${notional}) via broker=${policy.broker_plugin_id} decided_by=${decided_by}`,
+    );
+
+    // Place the real order — fail-soft on broker error.
+    let orderResponse: Record<string, unknown>;
+    try {
+      orderResponse = await this.gateway.placeOrder(policy.broker_plugin_id, {
+        symbol,
+        qty,
+        side,
+        type: 'market',
+      });
+    } catch (err) {
+      this.log.warn(`REAL ORDER FAILED [${id}]: broker threw — ${String(err)}`);
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({ error: String(err), qty, side, symbol }),
+        },
+      });
+    }
+
+    this.log.warn(
+      `REAL ORDER EXECUTED [${id}]: ${side.toUpperCase()} ${qty} ${symbol} — broker response: ${JSON.stringify(orderResponse)}`,
+    );
+
+    return this.db.tradeIntent.update({
+      where: { id },
+      data: {
+        status: 'executed',
+        fill_price: price,
+        quantity: qty,
+        decided_at: new Date(),
+        decided_by,
+        result_json: JSON.stringify({
+          fill_price: price,
+          quantity: qty,
+          side,
+          broker: policy.broker_plugin_id,
+          order: orderResponse,
+        }),
+      },
+    });
   }
 
   // ── _passesAutoRisk ───────────────────────────────────────────────────────────
