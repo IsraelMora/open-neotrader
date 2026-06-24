@@ -181,6 +181,34 @@ model MlSignalRecord {
   @@map("ml_signal_record")
 }
 
+// HITL paper trade-execution layer.
+// Records LLM trade decisions (TradeIntent) for human review before paper execution.
+// Real-money execution is intentionally NOT wired — only mode="paper" is supported.
+model TradeIntent {
+  id            String    @id @default(cuid())
+  cycle_id      String?
+  symbol        String
+  action        String                      // "long" | "short" | "exit" | "hold"
+  confidence    Float
+  rationale     String
+  timeframe     String    @default("1d")
+  mode          String    @default("paper") // always "paper"; real-money is hard-disabled
+  status        String    @default("pending") // "pending" | "approved" | "rejected" | "executed" | "failed"
+  created_at    DateTime  @default(now())
+  decided_at    DateTime?
+  decided_by    String?
+  reject_reason String?
+  fill_price    Float?
+  quantity      Float?
+  realized_pnl  Float?
+  result_json   String?   // JSON: execution details
+
+  @@index([status])
+  @@index([created_at])
+  @@index([cycle_id])
+  @@map("trade_intents")
+}
+
 // Cartera virtual de pretest — permite probar configuraciones distintas antes de usar dinero real
 // Cada pretest es independiente: tiene sus propios plugins activos, config y estado de cartera virtual
 model PretestPortfolio {

@@ -25,6 +25,7 @@ import {
   MlSignalRecordService,
   SkillContribution,
 } from '../ml-signal-record/ml-signal-record.service';
+import { TradeIntentService } from '../trade-intent/trade-intent.service';
 
 import type { LlmResponse } from '../llm/llm.service';
 import type { DebateConsensus } from './debate.types';
@@ -353,6 +354,11 @@ export class AgentsService {
     // Absent → _mlCaptureSignals short-circuits; cycle is byte-identical to pre-s1.
     @Optional()
     private readonly mlSignalRecord?: MlSignalRecordService,
+    // TradeIntentService injected @Optional() — when present, an LLM decision is
+    // persisted as a pending TradeIntent for HITL approval (paper-only). Absent →
+    // cycle behaves exactly as before (decisions only recorded in audit/memory).
+    @Optional()
+    private readonly tradeIntent?: TradeIntentService,
   ) {}
 
   /**
@@ -2315,6 +2321,32 @@ export class AgentsService {
             action,
             sandbox_ok: res.ok,
           });
+
+          // HITL: a successful `decision.emit_trade_intent` becomes a persisted
+          // pending TradeIntent (paper-only) awaiting human approval. Fail-soft —
+          // recording must NEVER break the cycle, and is a no-op when the service
+          // is not injected.
+          if (
+            this.tradeIntent &&
+            res.ok &&
+            tc.plugin_id === 'decision' &&
+            tc.function === 'emit_trade_intent'
+          ) {
+            try {
+              await this.tradeIntent.recordIntent({
+                cycle_id,
+                symbol,
+                action,
+                confidence: Number(args['confidence']) || 0,
+                rationale: typeof args['rationale'] === 'string' ? args['rationale'] : '',
+                timeframe: typeof args['timeframe'] === 'string' ? args['timeframe'] : undefined,
+              });
+            } catch (e: unknown) {
+              this.log.warn(
+                `recordIntent falló (no bloquea el ciclo): ${e instanceof Error ? e.message : String(e)}`,
+              );
+            }
+          }
         }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);

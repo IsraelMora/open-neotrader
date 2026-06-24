@@ -738,6 +738,62 @@ describe('AgentsService.runGovernedTurn — signalsEmitted in result', () => {
   });
 });
 
+// ── HITL wiring: a successful decision tool-call persists a pending TradeIntent ──
+
+describe('AgentsService.runGovernedTurn — decision → TradeIntent (HITL)', () => {
+  it('records a pending TradeIntent when the LLM emits decision.emit_trade_intent', async () => {
+    const toolCallText =
+      '<tool_calls>[{"tool":"decision__emit_trade_intent","args":{"symbol":"AAPL","action":"long","confidence":0.8,"rationale":"breadth bullish"}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const tools = [
+      {
+        plugin_id: 'decision',
+        name: 'decision__emit_trade_intent',
+        description: 'Emit a trade decision',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ];
+    const plugins = makeFullPlugins('Emit a decision.', tools);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'skill' }] as never);
+    const sandbox = makeSandbox();
+    sandbox.callPlugin.mockResolvedValue({ ok: true, result: { ok: true } });
+    const memory = makeMemory();
+    const tradeIntent = { recordIntent: jest.fn().mockResolvedValue({ id: 'ti-1' }) };
+
+    const service = new (AgentsService as unknown as new (...a: unknown[]) => AgentsService)(
+      llm,
+      sandbox,
+      plugins,
+      memory,
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) }, // alerts
+      undefined, // snapshot
+      undefined, // cfg
+      undefined, // notifier
+      undefined, // pretest
+      makeKvSingleTurn(), // kv
+      undefined, // longTermMemory
+      undefined, // debate
+      undefined, // providerGateway
+      undefined, // mlSignalRecord
+      tradeIntent, // tradeIntent (the @Optional() dep under test)
+    );
+
+    await service.runGovernedTurn({ source: 'chat', context: 'Decide on AAPL' });
+
+    expect(tradeIntent.recordIntent).toHaveBeenCalledTimes(1);
+    expect(tradeIntent.recordIntent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        symbol: 'AAPL',
+        action: 'long',
+        confidence: 0.8,
+        rationale: 'breadth bullish',
+      }),
+    );
+  });
+});
+
 // ── Shared helper for _executeCycle tests below ───────────────────────────────
 
 function callExecuteCyclePrivate(

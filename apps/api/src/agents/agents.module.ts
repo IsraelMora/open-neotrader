@@ -15,6 +15,7 @@ import { LongTermMemoryModule } from '../long-term-memory/long-term-memory.modul
 import { ProvidersModule } from '../providers/providers.module';
 import { MlSignalRecordModule } from '../ml-signal-record/ml-signal-record.module';
 import { MlSignalRecordService } from '../ml-signal-record/ml-signal-record.service';
+import { TradeIntentModule } from '../trade-intent/trade-intent.module';
 
 @Module({
   imports: [
@@ -38,6 +39,9 @@ import { MlSignalRecordService } from '../ml-signal-record/ml-signal-record.serv
     ProvidersModule,
     // MlSignalRecordModule is a leaf (PrismaModule only) — no circular dep risk.
     MlSignalRecordModule,
+    // TradeIntentModule exports TradeIntentService → AgentsService persists a
+    // pending TradeIntent (HITL, paper-only) when the LLM emits a decision.
+    TradeIntentModule,
   ],
   providers: [AgentsService, KvService, DebateService, MlSignalRecordService],
   exports: [AgentsService],
