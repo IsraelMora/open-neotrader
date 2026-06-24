@@ -23,5 +23,10 @@ max_positions     = { type = "integer", default = 5,      description = "Máximo
 benchmark         = { type = "string",  default = "SPY",  description = "Símbolo benchmark para comparar rendimiento" }
 output_equity_curve = { type = "boolean", default = true, description = "Incluir curva de equity en resultado" }
 
+# Walk-forward params (used by backtester.run_walk_forward)
+in_sample_pct   = { type = "number",  default = 0.7,  description = "Fracción IS por ventana (default 70%)" }
+n_windows       = { type = "integer", default = 5,    description = "Número de ventanas walk-forward" }
+min_trades      = { type = "integer", default = 10,   description = "Mínimo de trades OOS para ventana válida" }
+
 [skills]
-keys = ["backtester.run"]
+keys = ["backtester.run", "backtester.run_walk_forward"]

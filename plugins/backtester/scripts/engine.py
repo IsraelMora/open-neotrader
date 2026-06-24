@@ -40,6 +40,12 @@ class BacktestResult:
     max_drawdown_pct: float
     calmar_ratio: float
 
+    # Benchmark: comprar y aguantar (equal-weight sobre los símbolos del universo)
+    # y alpha = retorno de la estrategia − retorno del benchmark. Responde la
+    # pregunta clave: ¿la estrategia AGREGA valor o conviene solo indexar?
+    buy_hold_return_pct: float
+    alpha_pct: float
+
     # Estadísticas de trades
     total_trades: int
     win_rate_pct: float
@@ -156,6 +162,11 @@ def run_backtest(
             if cost > equity:
                 shares = equity / (price * (1 + commission + slippage))
                 cost = equity
+
+            # Sin capital disponible no se abre la posición: un cost/shares de 0
+            # produciría una división por cero al calcular pnl_pct al cerrar.
+            if cost <= 0 or shares <= 0:
+                continue
 
             equity -= cost
             open_positions[symbol] = {
@@ -323,6 +334,21 @@ def run_backtest(
 
     calmar = cagr / max_dd if max_dd > 0 else 0
 
+    # Benchmark buy & hold: por símbolo, comprar a la APERTURA de la primera barra
+    # y aguantar hasta el CIERRE de la última. El benchmark del universo es el
+    # promedio equal-weight de esos retornos. Alpha = estrategia − benchmark.
+    bh_returns: list[float] = []
+    for symbol, bars in prices.items():
+        if len(bars) < 1:
+            continue
+        ordered = sorted(bars, key=lambda b: b["date"])
+        first_open = ordered[0]["open"]
+        last_close = ordered[-1]["close"]
+        if first_open > 0:
+            bh_returns.append((last_close / first_open - 1) * 100)
+    buy_hold_return = statistics.mean(bh_returns) if bh_returns else 0.0
+    alpha = total_return - buy_hold_return
+
     # Estadísticas de trades
     wins = [t for t in completed_trades if t.pnl > 0]
     losses = [t for t in completed_trades if t.pnl <= 0]
@@ -357,6 +383,8 @@ def run_backtest(
         sortino_ratio=round(sortino, 2),
         max_drawdown_pct=round(max_dd, 2),
         calmar_ratio=round(calmar, 2),
+        buy_hold_return_pct=round(buy_hold_return, 2),
+        alpha_pct=round(alpha, 2),
         total_trades=len(completed_trades),
         win_rate_pct=round(win_rate, 2),
         profit_factor=round(profit_factor, 2) if math.isfinite(profit_factor) else 999,
@@ -399,6 +427,10 @@ Performance:
   Sortino Ratio:   {result.sortino_ratio:.2f}
   Max Drawdown:    -{result.max_drawdown_pct:.2f}%
   Calmar Ratio:    {result.calmar_ratio:.2f}
+
+Benchmark:
+  Buy & Hold:      {result.buy_hold_return_pct:+.2f}%
+  Alpha:           {result.alpha_pct:+.2f}%
 
 Trade Stats:
   Total Trades:    {result.total_trades}

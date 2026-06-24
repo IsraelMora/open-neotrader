@@ -31,15 +31,12 @@ def _make_ctx() -> MagicMock:
 
 def _make_bars_uptrend(n: int, start_price: float = 100.0) -> list[dict]:
     """
-    Flat-then-rise bars: flat for 60 bars then +1/bar.
-    Guarantees an EMA golden cross signal when n >= 100.
+    Accelerating (quadratic) rise → EMA, MACD and Ichimoku all turn bullish,
+    so trend-following emits a confirmed long. Needs n >= 78 (senkou_b+kijun).
     """
     bars = []
     for i in range(n):
-        if i < 60:
-            close = start_price
-        else:
-            close = start_price + (i - 60) * 1.0
+        close = start_price + 0.5 * i + 0.02 * i * i
         date = (datetime.date(2023, 1, 1) + datetime.timedelta(days=i)).isoformat()
         bars.append({
             "date": date,
@@ -77,7 +74,7 @@ class TestRunHappyPath:
     def test_returns_dict_with_ok_true(self, plugin):
         prices = {"AAPL": _make_bars_uptrend(150)}
         result = plugin.run(
-            strategy_id="ema-crossover-9-21",
+            strategy_id="trend-following",
             prices=prices,
             config={"initial_capital": 10000},
             _context=_make_ctx(),
@@ -88,7 +85,7 @@ class TestRunHappyPath:
     def test_result_has_metrics(self, plugin):
         prices = {"AAPL": _make_bars_uptrend(150)}
         result = plugin.run(
-            strategy_id="ema-crossover-9-21",
+            strategy_id="trend-following",
             prices=prices,
             config={"initial_capital": 10000},
             _context=_make_ctx(),
@@ -100,7 +97,7 @@ class TestRunHappyPath:
     def test_result_has_equity_curve(self, plugin):
         prices = {"AAPL": _make_bars_uptrend(150)}
         result = plugin.run(
-            strategy_id="ema-crossover-9-21",
+            strategy_id="trend-following",
             prices=prices,
             config={"initial_capital": 10000},
             _context=_make_ctx(),
@@ -111,7 +108,7 @@ class TestRunHappyPath:
     def test_result_has_trades(self, plugin):
         prices = {"AAPL": _make_bars_uptrend(150)}
         result = plugin.run(
-            strategy_id="ema-crossover-9-21",
+            strategy_id="trend-following",
             prices=prices,
             config={"initial_capital": 10000},
             _context=_make_ctx(),
@@ -135,7 +132,7 @@ class TestRunHappyPath:
             })
         prices = {"TEST": bars}
         result = plugin.run(
-            strategy_id="rsi-mean-reversion",
+            strategy_id="mean-reversion",
             prices=prices,
             config={"initial_capital": 5000, "oversold": 35.0, "confirmation_bars": 1},
             _context=_make_ctx(),
@@ -149,7 +146,7 @@ class TestRunHappyPath:
 class TestRunEdgeCases:
     def test_empty_prices_returns_error(self, plugin):
         result = plugin.run(
-            strategy_id="ema-crossover-9-21",
+            strategy_id="trend-following",
             prices={},
             config={},
             _context=_make_ctx(),
@@ -159,7 +156,7 @@ class TestRunEdgeCases:
 
     def test_empty_bars_for_symbol_returns_error(self, plugin):
         result = plugin.run(
-            strategy_id="ema-crossover-9-21",
+            strategy_id="trend-following",
             prices={"AAPL": []},
             config={},
             _context=_make_ctx(),
@@ -168,9 +165,9 @@ class TestRunEdgeCases:
 
     def test_all_neutral_signals_returns_ok_with_zero_trades(self, plugin):
         """Too few bars → no signals → zero trades → still ok=True with valid metrics."""
-        prices = {"AAPL": _make_bars_mild(20)}  # 20 bars < 48 minimum for EMA
+        prices = {"AAPL": _make_bars_mild(20)}  # 20 bars < 78 minimum for trend-following
         result = plugin.run(
-            strategy_id="ema-crossover-9-21",
+            strategy_id="trend-following",
             prices=prices,
             config={"initial_capital": 10000},
             _context=_make_ctx(),
@@ -196,7 +193,7 @@ class TestRunEdgeCases:
             "MSFT": _make_bars_uptrend(150, start_price=300.0),
         }
         result = plugin.run(
-            strategy_id="ema-crossover-9-21",
+            strategy_id="trend-following",
             prices=prices,
             config={"initial_capital": 10000},
             _context=_make_ctx(),

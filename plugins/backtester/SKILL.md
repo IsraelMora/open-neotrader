@@ -65,7 +65,48 @@ Sharpe 2.1, Win Rate 55%, Max DD 8%:
 4. **Sin dividendos** — no ajusta precios por dividendos (importante para backtests > 3 años)
 5. **Sin market impact** — posiciones grandes moverían el precio en realidad
 
-Para backtests avanzados (walk-forward, Monte Carlo), considera vectorbt o backtrader.
+Para backtests avanzados (Monte Carlo), considera vectorbt o backtrader.
+
+## Walk-Forward Mode (`run_walk_forward`)
+
+Validates a strategy out-of-sample using Pardo (2008) anchored walk-forward. Drives the same `generate → engine` pipeline as `run`, so no separate backtest logic exists.
+
+### When to use
+
+Use after a plain backtest returns promising metrics to check whether those metrics hold on unseen data (detect overfitting before going live).
+
+### How it works
+
+1. IS always starts at bar 0 and grows (anchored, not rolling).
+2. The OOS window slides forward by `oos_total / n_windows` bars per fold.
+3. A full backtest runs on each (IS prices, OOS prices) pair independently.
+4. Robustness ratio per window = `Sharpe_OOS / Sharpe_IS` (0 when `|IS Sharpe| ≤ 0.01`).
+
+### Verdict thresholds
+
+| Verdict              | Condition |
+|----------------------|-----------|
+| `ROBUSTO`            | ≥ 50% of valid windows have `robustness_ratio ≥ 0.5` |
+| `SOBREAJUSTADO`      | < 50% of valid windows are robust |
+| `INSUFICIENTE_DATOS` | < 2 valid windows (windows where `oos_trades ≥ min_trades`) OR < 60 total bars |
+
+### Example usage
+
+```
+→ run_walk_forward(
+    strategy_id = "trend-following",
+    prices      = {"AAPL": [...500 bars...]},
+    config      = {"n_windows": 5, "in_sample_pct": 0.7, "min_trades": 10}
+  )
+```
+
+### Key config params
+
+| Param          | Default | Description |
+|----------------|---------|-------------|
+| `n_windows`    | 5       | Number of IS/OOS folds |
+| `in_sample_pct`| 0.7     | Fraction of history used as IS |
+| `min_trades`   | 10      | Min OOS trades for a window to count |
 
 ## Notas aprendidas
 

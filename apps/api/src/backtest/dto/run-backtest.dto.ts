@@ -13,7 +13,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 
-const SUPPORTED_STRATEGIES = ['ema-crossover-9-21', 'rsi-mean-reversion'] as const;
+const SUPPORTED_STRATEGIES = ['trend-following', 'mean-reversion', 'session-breakout'] as const;
 type SupportedStrategy = (typeof SUPPORTED_STRATEGIES)[number];
 
 export class RunBacktestDto {

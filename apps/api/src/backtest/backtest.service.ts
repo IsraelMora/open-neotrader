@@ -10,6 +10,8 @@ export interface BacktestMetrics {
   sortino_ratio: number;
   max_drawdown_pct: number;
   calmar_ratio: number;
+  buy_hold_return_pct: number;
+  alpha_pct: number;
   total_trades: number;
   win_rate_pct: number;
   profit_factor: number;

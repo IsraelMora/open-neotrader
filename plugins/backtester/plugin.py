@@ -16,6 +16,7 @@ if _SCRIPTS_STR not in sys.path:
 
 from engine import run_backtest
 from generate import generate_signals
+from walk_forward import run_walk_forward as _run_walk_forward
 
 
 def run(
@@ -28,7 +29,7 @@ def run(
     Execute a backtest for a given strategy and set of price histories.
 
     Args:
-        strategy_id: e.g. "ema-crossover-9-21" or "rsi-mean-reversion"
+        strategy_id: e.g. "trend-following", "mean-reversion" or "session-breakout"
         prices:      {symbol: [normalized bars with date/open/high/low/close/volume]}
         config:      backtest config dict (initial_capital, commission_pct, etc.)
         _context:    SDK context (unused but required by runner.py call convention)
@@ -65,6 +66,8 @@ def run(
                 "sortino_ratio": result.sortino_ratio,
                 "max_drawdown_pct": result.max_drawdown_pct,
                 "calmar_ratio": result.calmar_ratio,
+                "buy_hold_return_pct": result.buy_hold_return_pct,
+                "alpha_pct": result.alpha_pct,
                 "total_trades": result.total_trades,
                 "win_rate_pct": result.win_rate_pct,
                 "profit_factor": result.profit_factor,
@@ -83,3 +86,58 @@ def run(
         return {"ok": False, "error": str(exc)}
     except Exception as exc:
         return {"ok": False, "error": f"Backtest failed: {exc}"}
+
+
+def run_walk_forward(
+    strategy_id: str,
+    prices: dict,
+    config: dict,
+    _context=None,
+) -> dict:
+    """
+    Execute anchored walk-forward validation for a strategy (Pardo 2008).
+
+    Splits the price history into N rolling in-sample / out-of-sample windows
+    and runs a full backtest (generate → engine) on each. Computes the
+    robustness ratio (Sharpe_OOS / Sharpe_IS) per window and returns a verdict:
+      - ROBUSTO           : >= 50% of valid windows have robustness_ratio >= 0.5
+      - SOBREAJUSTADO     : < 50% of valid windows are robust
+      - INSUFICIENTE_DATOS: fewer than 2 valid OOS windows
+
+    Args:
+        strategy_id: e.g. "trend-following", "mean-reversion", "session-breakout"
+        prices:      {symbol: [normalized bars with date/open/high/low/close/volume]}
+        config:      walk-forward config dict:
+                       n_windows (int, default 5)
+                       in_sample_pct (float, default 0.7)
+                       min_trades (int, default 10)
+                       commission_pct, slippage_pct, initial_capital, ...
+        _context:    SDK context (unused but required by runner.py call convention)
+
+    Returns:
+        {
+          "ok": True,
+          "verdict": "ROBUSTO" | "SOBREAJUSTADO" | "INSUFICIENTE_DATOS",
+          "n_windows": int,
+          "avg_oos_sharpe": float,
+          "avg_robustness_ratio": float,
+          "robust_windows": int,
+          "total_windows": int,
+          "windows": [{window_idx, is_sharpe, oos_sharpe, robustness_ratio, ...}, ...],
+          "summary": {...}
+        }
+        or {"ok": False, "error": "<message>"}
+    """
+    if not prices:
+        return {"ok": False, "error": "No price data provided"}
+
+    for symbol, bars in prices.items():
+        if not bars:
+            return {"ok": False, "error": f"Empty bar list for symbol '{symbol}'"}
+
+    try:
+        return _run_walk_forward(strategy_id, prices, config)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": f"Walk-forward failed: {exc}"}

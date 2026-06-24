@@ -87,5 +87,48 @@
       },
       "required": ["strategy_names"]
     }
+  },
+  {
+    "name": "run_walk_forward",
+    "description": "Ejecuta validación walk-forward out-of-sample (Pardo 2008) usando el pipeline real de generación de señales + motor de backtesting. Divide el historial en N ventanas anchored IS/OOS, ejecuta el backtest en cada una, calcula el ratio de robustez (Sharpe_OOS / Sharpe_IS) y devuelve veredicto ROBUSTO | SOBREAJUSTADO | INSUFICIENTE_DATOS. Detecta overfitting cuando el Sharpe OOS cae por debajo del 50% del IS.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "strategy_id": {
+          "type": "string",
+          "description": "ID de la estrategia: 'trend-following', 'mean-reversion' o 'session-breakout'"
+        },
+        "prices": {
+          "type": "object",
+          "description": "Precios OHLCV por símbolo: {SYMBOL: [{date, open, high, low, close, volume}]}",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "date":   { "type": "string" },
+                "open":   { "type": "number" },
+                "high":   { "type": "number" },
+                "low":    { "type": "number" },
+                "close":  { "type": "number" },
+                "volume": { "type": "number" }
+              },
+              "required": ["date", "close"]
+            }
+          }
+        },
+        "config": {
+          "type": "object",
+          "properties": {
+            "n_windows":      { "type": "integer", "description": "Número de ventanas walk-forward (default 5)" },
+            "in_sample_pct":  { "type": "number",  "description": "Fracción IS por ventana (default 0.7)" },
+            "min_trades":     { "type": "integer", "description": "Mínimo de trades OOS para ventana válida (default 10)" },
+            "commission_pct": { "type": "number",  "description": "Comisión por operación (default 0.001)" },
+            "slippage_pct":   { "type": "number",  "description": "Slippage estimado (default 0.0005)" }
+          }
+        }
+      },
+      "required": ["strategy_id", "prices"]
+    }
   }
 ]

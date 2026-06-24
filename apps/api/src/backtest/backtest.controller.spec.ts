@@ -16,7 +16,7 @@ import { RunBacktestDto } from './dto/run-backtest.dto';
 describe('RunBacktestDto — validation', () => {
   function dto(overrides: Record<string, unknown> = {}): RunBacktestDto {
     return plainToInstance(RunBacktestDto, {
-      strategy: 'ema-crossover-9-21',
+      strategy: 'trend-following',
       symbols: ['AAPL'],
       ...overrides,
     });
@@ -100,6 +100,8 @@ const MOCK_RESPONSE: BacktestResponse = {
     sortino_ratio: 1.8,
     max_drawdown_pct: 4.2,
     calmar_ratio: 4.0,
+    buy_hold_return_pct: 12.0,
+    alpha_pct: 13.0,
     total_trades: 6,
     win_rate_pct: 66.7,
     profit_factor: 2.5,
@@ -136,7 +138,7 @@ describe('BacktestController', () => {
 
   it('POST /backtest delegates to BacktestService.runBacktest', async () => {
     const dto = plainToInstance(RunBacktestDto, {
-      strategy: 'ema-crossover-9-21',
+      strategy: 'trend-following',
       symbols: ['AAPL'],
     });
 
@@ -149,7 +151,7 @@ describe('BacktestController', () => {
 
   it('returns the service result directly', async () => {
     const dto = plainToInstance(RunBacktestDto, {
-      strategy: 'rsi-mean-reversion',
+      strategy: 'mean-reversion',
       symbols: ['SPY'],
     });
 

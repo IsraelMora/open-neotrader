@@ -38,7 +38,7 @@ function makeBars(n: number): OhlcvBar[] {
 
 function makeDto(overrides: Partial<RunBacktestDto> = {}): RunBacktestDto {
   return plainToInstance(RunBacktestDto, {
-    strategy: 'ema-crossover-9-21',
+    strategy: 'trend-following',
     symbols: ['AAPL'],
     timeframe: '1d',
     limit: 100,
@@ -58,6 +58,8 @@ const SANDBOX_SUCCESS: Record<string, unknown> = {
       sortino_ratio: 1.5,
       max_drawdown_pct: 3.0,
       calmar_ratio: 3.5,
+      buy_hold_return_pct: 8.0,
+      alpha_pct: 2.4,
       total_trades: 4,
       win_rate_pct: 75.0,
       profit_factor: 2.1,
@@ -189,10 +191,10 @@ describe('BacktestService — runBacktest', () => {
     const { gateway } = makeGateway();
     const { sandbox, callPlugin } = makeSandbox();
     const svc = makeService(gateway, sandbox);
-    await svc.runBacktest(makeDto({ strategy: 'rsi-mean-reversion' }));
+    await svc.runBacktest(makeDto({ strategy: 'mean-reversion' }));
 
     const callArgs = callPlugin.mock.calls[0] as [string, string, { strategy_id: string }];
     expect(callArgs[1]).toBe('run');
-    expect(callArgs[2].strategy_id).toBe('rsi-mean-reversion');
+    expect(callArgs[2].strategy_id).toBe('mean-reversion');
   });
 });

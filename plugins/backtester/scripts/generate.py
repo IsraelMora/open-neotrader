@@ -77,117 +77,70 @@ def normalize_bars(raw: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Strategy adapter registry
 # ---------------------------------------------------------------------------
-# Each adapter computes its own minimum-bars threshold from the runtime config
-# (see min_bars inside each adapter) so the strategy's analyze() never receives
-# a window shorter than it needs.
+# Every curated strategy plugin exposes the SAME pure contract:
+#
+#     analyze(bars: list[dict], config: dict) -> dict
+#         bars  = the window [0..now] of OHLCV dicts (STRICTLY no future bars)
+#         return at least {"signal": "long"|"short"|"exit"|"none", ...}
+#
+# so a single sliding-window adapter works for all of them. Each registry entry
+# supplies the plugin id, its script module, and a min_bars(config) function that
+# guarantees analyze() never receives a window shorter than it needs.
 
 
-def _ema_adapter(bars: list[dict], config: dict, symbol: str) -> list[dict]:
+def _slide_adapter(plugin_id: str, script_name: str, min_bars_fn):
+    """Build an adapter that slides over bars and calls the plugin's analyze().
+
+    Mapping: result["signal"] in {long, short, exit} → engine action of the same
+    name; anything else (none/missing) is skipped. Strict no-lookahead: at step i
+    the strategy only ever sees bars[: i + 1].
     """
-    Slide over bars bar-by-bar; call analyze(bars[:i+1]) for each bar.
-    Strictly NO lookahead: strategy sees only closes[0..i] at step i.
 
-    Returns engine-compatible signal dicts.
-    """
-    mod = _load_strategy_module("ema-crossover-9-21", "ema_crossover.py")
+    def adapter(bars: list[dict], config: dict, symbol: str) -> list[dict]:
+        mod = _load_strategy_module(plugin_id, script_name)
+        min_bars = max(1, int(min_bars_fn(config)))
+        signals: list[dict] = []
+        for i in range(len(bars)):
+            if i + 1 < min_bars:
+                continue  # not enough history yet
+            window = bars[: i + 1]  # STRICTLY no future bars
+            result = mod.analyze(window, config)
+            signal = result.get("signal", "none")
+            if signal in ("long", "short", "exit"):
+                signals.append({"symbol": symbol, "action": signal, "date": bars[i]["date"]})
+        return signals
 
-    fast_period: int = config.get("fast_period", 9)
-    slow_period: int = config.get("slow_period", 21)
-    confirmation_bars: int = config.get("confirmation_bars", 1)
-    atr_stop_multiplier: float = config.get("atr_stop_multiplier", 2.0)
-    min_bars: int = slow_period * 2 + confirmation_bars + 5
-
-    signals: list[dict] = []
-
-    for i in range(len(bars)):
-        if i + 1 < min_bars:
-            continue  # not enough history yet
-
-        window = bars[: i + 1]  # STRICTLY no future bars
-        closes = [b["close"] for b in window]
-        highs = [b["high"] for b in window]
-        lows = [b["low"] for b in window]
-
-        # EmaResult is a dataclass — access via attribute notation
-        result = mod.analyze(
-            symbol=symbol,
-            closes=closes,
-            highs=highs,
-            lows=lows,
-            fast_period=fast_period,
-            slow_period=slow_period,
-            confirmation_bars=confirmation_bars,
-            atr_stop_multiplier=atr_stop_multiplier,
-        )
-
-        if not result.confirmed:
-            continue
-
-        if result.signal == "long":
-            signals.append({"symbol": symbol, "action": "long", "date": bars[i]["date"]})
-        elif result.signal == "exit_long":
-            signals.append({"symbol": symbol, "action": "exit", "date": bars[i]["date"]})
-        # "none" / "short" / "exit_short" → skip (not in scope for this adapter)
-
-    return signals
+    return adapter
 
 
-def _rsi_adapter(bars: list[dict], config: dict, symbol: str) -> list[dict]:
-    """
-    RSI mean-reversion adapter.
-
-    Signal mapping (RSIResult is a TypedDict — access via key notation):
-      "oversold"        → action "long"  (RSI below oversold threshold, confirmed)
-      "overbought"      → action "exit"  (RSI above overbought threshold, confirmed)
-      "divergence_bull" → action "long"  (bullish reversal — strategy preempts oversold)
-      "divergence_bear" → action "exit"  (bearish reversal — strategy preempts overbought)
-      "neutral"         → skip
-
-    NOTE: calcular_rsi.analyze() checks divergence BEFORE the oversold/overbought
-    zones, so a bullish/bearish divergence REPLACES the zone signal. Mapping the
-    divergence outputs (instead of dropping them) avoids silently discarding the
-    bullish/bearish entries the strategy actually intends.
-    """
-    mod = _load_strategy_module("rsi-mean-reversion", "calcular_rsi.py")
-
-    period: int = config.get("rsi_period", 14)
-    oversold: float = config.get("oversold", 30.0)
-    overbought: float = config.get("overbought", 70.0)
-    confirmation_bars: int = config.get("confirmation_bars", 2)
-    # Need at least period+1 closes (for 1 delta) + confirmation_bars bars in zone
-    min_bars: int = period + 1 + confirmation_bars
-
-    signals: list[dict] = []
-
-    for i in range(len(bars)):
-        if i + 1 < min_bars:
-            continue  # not enough history yet
-
-        window = bars[: i + 1]  # STRICTLY no future bars
-        closes = [b["close"] for b in window]
-
-        # RSIResult is a TypedDict — access via key notation
-        result = mod.analyze(
-            closes=closes,
-            period=period,
-            oversold=oversold,
-            overbought=overbought,
-            confirmation_bars=confirmation_bars,
-        )
-
-        if result["signal"] in ("oversold", "divergence_bull"):
-            signals.append({"symbol": symbol, "action": "long", "date": bars[i]["date"]})
-        elif result["signal"] in ("overbought", "divergence_bear"):
-            signals.append({"symbol": symbol, "action": "exit", "date": bars[i]["date"]})
-        # neutral → skip
-
-    return signals
+def _trend_following_min_bars(config: dict) -> int:
+    # Ichimoku needs senkou_b + kijun bars before the cloud is defined.
+    return config.get("senkou_b", 52) + config.get("kijun", 26)
 
 
-# Registry: strategy_id → adapter function
+def _mean_reversion_min_bars(config: dict) -> int:
+    lookback = config.get("lookback", 20)
+    rsi_period = config.get("rsi_period", 14)
+    # OU half-life estimation wants a healthy sample; RSI wants period+1 deltas.
+    return max(lookback * 3 + 20, lookback + rsi_period + 10)
+
+
+def _session_breakout_min_bars(config: dict) -> int:
+    # Needs the previous close to measure the overnight gap.
+    return max(3, config.get("or_bars", 5))
+
+
+# Registry: strategy_id → sliding-window adapter over the plugin's analyze()
 _ADAPTERS: dict[str, Any] = {
-    "ema-crossover-9-21": _ema_adapter,
-    "rsi-mean-reversion": _rsi_adapter,
+    "trend-following": _slide_adapter(
+        "trend-following", "trend_following.py", _trend_following_min_bars
+    ),
+    "mean-reversion": _slide_adapter(
+        "mean-reversion", "mean_reversion.py", _mean_reversion_min_bars
+    ),
+    "session-breakout": _slide_adapter(
+        "session-breakout", "session_breakout.py", _session_breakout_min_bars
+    ),
 }
 
 
@@ -196,7 +149,8 @@ def generate_signals(strategy_id: str, bars: list[dict], config: dict) -> list[d
     Generate engine-compatible signals for a single symbol.
 
     Args:
-        strategy_id: one of "ema-crossover-9-21", "rsi-mean-reversion"
+        strategy_id: one of the curated strategies in _ADAPTERS
+                     ("trend-following", "mean-reversion", "session-breakout")
         bars:        normalized bars (each has date, open, high, low, close, volume)
         config:      dict with strategy params + optional "symbol" key
 

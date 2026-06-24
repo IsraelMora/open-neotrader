@@ -167,3 +167,66 @@ class TestMarkToMarketEquity:
         result = engine.run_backtest(signals, {"AAA": bars}, {"initial_capital": 10000})
         # 12 bars → at least ~one equity point per bar (old engine produced ~2-3).
         assert len(result.equity_curve) >= 10
+
+
+# ---------------------------------------------------------------------------
+# 4b. Capital exhaustion must not crash (no division by zero)
+# ---------------------------------------------------------------------------
+class TestCapitalExhaustion:
+    def test_second_symbol_when_capital_exhausted_does_not_crash(self, engine):
+        """If the first long consumes all capital, a second concurrent long has
+        zero funds. The engine must skip it gracefully — never open a zero-cost
+        position (which would later divide by zero in pnl_pct)."""
+        a = [_bar("2024-01-01", 100.0, 100.0), _bar("2024-01-02", 100.0, 100.0),
+             _bar("2024-01-03", 110.0, 110.0), _bar("2024-01-04", 110.0, 110.0)]
+        b = [_bar("2024-01-01", 50.0, 50.0), _bar("2024-01-02", 50.0, 50.0),
+             _bar("2024-01-03", 55.0, 55.0), _bar("2024-01-04", 55.0, 55.0)]
+        signals = [
+            {"symbol": "A", "action": "long", "date": "2024-01-01"},
+            {"symbol": "B", "action": "long", "date": "2024-01-01"},
+            {"symbol": "A", "action": "exit", "date": "2024-01-03"},
+            {"symbol": "B", "action": "exit", "date": "2024-01-03"},
+        ]
+        # initial_capital fully absorbed by A → B cannot be funded.
+        result = engine.run_backtest(signals, {"A": a, "B": b}, {"initial_capital": 100})
+        # No exception, and the unfunded symbol simply produced no trade.
+        assert result.total_trades == 1
+
+
+# ---------------------------------------------------------------------------
+# 5. Buy & hold benchmark + alpha (does the strategy beat just holding?)
+# ---------------------------------------------------------------------------
+class TestBuyAndHoldBenchmark:
+    def test_single_symbol_buy_hold_return(self, engine):
+        """B&H = buy at the first bar's open, hold to the last bar's close.
+        First open 100 → last close 150 ⇒ +50%, regardless of strategy trades."""
+        bars = [
+            _bar("2024-01-01", 100.0, 100.0),
+            _bar("2024-01-02", 120.0, 120.0),
+            _bar("2024-01-03", 140.0, 150.0),
+        ]
+        # No trades at all; benchmark must still be computed from prices.
+        result = engine.run_backtest([], {"AAA": bars}, {"initial_capital": 10000})
+        assert result.buy_hold_return_pct == pytest.approx(50.0, abs=0.01)
+
+    def test_alpha_is_strategy_minus_buy_hold(self, engine):
+        """Alpha = strategy total return − buy & hold return. A strategy that sits
+        out a rising market has NEGATIVE alpha even if it never loses money."""
+        bars = [
+            _bar("2024-01-01", 100.0, 100.0),
+            _bar("2024-01-02", 150.0, 200.0),  # market doubles
+            _bar("2024-01-03", 200.0, 200.0),
+        ]
+        result = engine.run_backtest([], {"AAA": bars}, {"initial_capital": 10000})
+        # Flat strategy (0%) in a +100% market ⇒ alpha ≈ -100%.
+        assert result.buy_hold_return_pct == pytest.approx(100.0, abs=0.01)
+        assert result.alpha_pct == pytest.approx(result.total_return_pct - result.buy_hold_return_pct, abs=0.01)
+        assert result.alpha_pct < 0.0
+
+    def test_multi_symbol_buy_hold_is_equal_weight(self, engine):
+        """A basket B&H is the equal-weight average of per-symbol returns:
+        one symbol +50%, one −10% ⇒ +20%."""
+        up = [_bar("2024-01-01", 100.0, 100.0), _bar("2024-01-02", 150.0, 150.0)]
+        down = [_bar("2024-01-01", 100.0, 100.0), _bar("2024-01-02", 90.0, 90.0)]
+        result = engine.run_backtest([], {"UP": up, "DOWN": down}, {"initial_capital": 10000})
+        assert result.buy_hold_return_pct == pytest.approx(20.0, abs=0.01)
