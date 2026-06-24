@@ -127,3 +127,43 @@ class TestTimeInMarket:
         assert result.total_trades == 1
         assert result.time_in_market_pct < 25.0
         assert result.time_in_market_pct > 0.0
+
+
+# ---------------------------------------------------------------------------
+# 4. Mark-to-market equity (bar-by-bar), not sampled only at trade closes
+# ---------------------------------------------------------------------------
+class TestMarkToMarketEquity:
+    def test_drawdown_captures_intratrade_dip(self, engine):
+        """Equity must be marked to market every bar: a deep dip WHILE holding a
+        position counts toward max drawdown even if price recovers before exit.
+        Sampling equity only at trade close (the old behaviour) reports ~0%."""
+        bars = [
+            _bar("2024-01-01", 100.0, 100.0),  # long signal here → fill next open
+            _bar("2024-01-02", 100.0, 100.0),  # entry fill at open=100 (≈all equity)
+            _bar("2024-01-03", 100.0, 100.0),
+            _bar("2024-01-04", 70.0, 70.0),    # ~30% dip while still holding
+            _bar("2024-01-05", 75.0, 75.0),
+            _bar("2024-01-06", 105.0, 105.0),  # recovers
+            _bar("2024-01-07", 106.0, 106.0),  # exit signal → fill next open
+            _bar("2024-01-08", 106.0, 106.0),  # exit fill
+        ]
+        signals = [
+            {"symbol": "AAA", "action": "long", "date": "2024-01-01"},
+            {"symbol": "AAA", "action": "exit", "date": "2024-01-07"},
+        ]
+        result = engine.run_backtest(signals, {"AAA": bars}, {"initial_capital": 10000})
+        assert result.total_trades == 1
+        # Position is ~100% of equity; a 30% intra-hold dip → ~30% drawdown.
+        assert result.max_drawdown_pct > 20.0
+
+    def test_equity_curve_has_a_point_per_bar(self, engine):
+        """The equity curve is daily (one mark-to-market point per bar of the
+        backtest span), not just entry/exit snapshots."""
+        bars = _series(datetime.date(2024, 1, 1), 12, lambda i: 100.0, lambda i: 100.0 + i)
+        signals = [
+            {"symbol": "AAA", "action": "long", "date": bars[0]["date"]},
+            {"symbol": "AAA", "action": "exit", "date": bars[10]["date"]},
+        ]
+        result = engine.run_backtest(signals, {"AAA": bars}, {"initial_capital": 10000})
+        # 12 bars → at least ~one equity point per bar (old engine produced ~2-3).
+        assert len(result.equity_curve) >= 10

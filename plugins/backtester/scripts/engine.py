@@ -119,14 +119,12 @@ def run_backtest(
     signals_sorted = sorted(signals, key=lambda s: s.get("date", ""))
 
     equity = capital
-    equity_curve = [
-        {"date": signals_sorted[0]["date"] if signals_sorted else "start", "equity": equity}
-    ]
     open_positions: dict[str, dict] = {}  # symbol → position info
     completed_trades: list[Trade] = []
-    daily_returns: list[float] = []
-
-    prev_equity = equity
+    # Trade legs for the mark-to-market reconstruction below. Each records the
+    # actual fill dates so the equity can be valued bar-by-bar (open positions at
+    # close, closed positions as realized PnL) instead of only at trade closes.
+    legs: list[dict] = []
 
     for sig in signals_sorted:
         symbol = sig.get("symbol", "")
@@ -208,12 +206,15 @@ def run_backtest(
                 )
             )
 
-            # Registrar retorno diario
-            daily_return = (equity - prev_equity) / prev_equity if prev_equity > 0 else 0
-            daily_returns.append(daily_return)
-            prev_equity = equity
-
-            equity_curve.append({"date": exec_date, "equity": round(equity, 2)})
+            legs.append({
+                "symbol": symbol,
+                "direction": pos["direction"],
+                "shares": pos["shares"],
+                "entry_price": pos["entry_price"],
+                "entry_date": pos["entry_date"],  # entry fill date
+                "exit_date": exec_date,  # exit fill date
+                "pnl": pnl,
+            })
 
     # Cerrar posiciones abiertas al precio del último bar disponible
     for symbol, pos in list(open_positions.items()):
@@ -246,7 +247,40 @@ def run_backtest(
                     duration_days=0,
                 )
             )
-            equity_curve.append({"date": last_date, "equity": round(equity, 2)})
+            legs.append({
+                "symbol": symbol,
+                "direction": pos["direction"],
+                "shares": pos["shares"],
+                "entry_price": pos["entry_price"],
+                "entry_date": pos["entry_date"],
+                "exit_date": last_date,
+                "pnl": pnl,
+            })
+
+    # ── Curva de equity marcada a mercado (barra a barra) ─────────────────────
+    # En CADA barra del span valuamos: posiciones abiertas a precio de cierre
+    # (PnL no realizado) y trades ya cerrados como PnL realizado. Esto produce
+    # una serie de retornos DIARIOS real (uno por barra, no uno por trade) y un
+    # drawdown que ve las caídas intra-posición, no solo el estado al cerrar.
+    mtm_curve: list[dict] = []
+    daily_returns: list[float] = []
+    prev_eq = capital
+    for d in _all_dates:
+        eq = capital
+        for leg in legs:
+            if d >= leg["exit_date"]:
+                eq += leg["pnl"]  # realizado
+            elif d >= leg["entry_date"]:
+                bar = price_index.get(leg["symbol"], {}).get(d)
+                if bar is not None:
+                    sign = 1.0 if leg["direction"] == "long" else -1.0
+                    eq += (bar["close"] - leg["entry_price"]) * leg["shares"] * sign
+        mtm_curve.append({"date": d, "equity": round(eq, 2)})
+        if prev_eq > 0:
+            daily_returns.append((eq - prev_eq) / prev_eq)
+        prev_eq = eq
+
+    equity_curve = mtm_curve if mtm_curve else [{"date": "start", "equity": round(capital, 2)}]
 
     # ── Calcular métricas ────────────────────────────────────────────────────
 
