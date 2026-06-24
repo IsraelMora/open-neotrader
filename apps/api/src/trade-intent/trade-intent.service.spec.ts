@@ -42,10 +42,10 @@ function makePrisma(): MockPrisma {
   };
 }
 
-type MockGateway = { getQuote: jest.Mock };
+type MockGateway = { getQuote: jest.Mock; placeOrder: jest.Mock };
 
 function makeGateway(): MockGateway {
-  return { getQuote: jest.fn() };
+  return { getQuote: jest.fn(), placeOrder: jest.fn() };
 }
 
 type MockKv = { get: jest.Mock };
@@ -244,15 +244,20 @@ describe('TradeIntentService', () => {
   // ── approve ────────────────────────────────────────────────────────────────
 
   describe('approve', () => {
-    it('throws when mode != "paper" (real-money execution disabled)', async () => {
-      const intent = pendingIntent({ mode: 'live' });
+    it('default policy (real unset) → paper mode in approve even if intent.mode is "live"', async () => {
+      // Effective mode comes from policy, not intent.mode. Default policy → paper.
+      kv.get.mockResolvedValue(null);
+      const intent = pendingIntent({ mode: 'live', action: 'long' });
       prisma.tradeIntent.findUnique.mockResolvedValue(intent);
+      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: EMPTY_PORTFOLIO_DATA, updatedAt: new Date() });
+      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
+      prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}', updatedAt: new Date() });
+      const updated = pendingIntent({ status: 'executed', fill_price: 150, decided_by: 'alice', decided_at: new Date() });
+      prisma.tradeIntent.update.mockResolvedValue(updated);
 
-      await expect(service.approve('ti_001', 'alice')).rejects.toThrow(
-        /real-money execution is disabled/i,
-      );
-      // Must NOT execute any trade or update status
-      expect(prisma.tradeIntent.update).not.toHaveBeenCalled();
+      const result = await service.approve('ti_001', 'alice');
+      expect(result.status).toBe('executed');
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
     });
 
     it('throws when intent is not in pending status', async () => {
@@ -614,11 +619,18 @@ describe('TradeIntentService', () => {
       expect(prisma.tradeIntent.findUnique).not.toHaveBeenCalled();
     });
 
-    it('mode!="paper" in autoProcess → throws', async () => {
-      kv.get.mockResolvedValue(null);
-      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ mode: 'live' }));
+    it('default policy (real unset) → paper mode even if intent.mode is "live"', async () => {
+      // real execution is disabled by default; effective mode is always paper
+      kv.get.mockResolvedValue(null); // all keys null → real=false, broker_plugin_id=''
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ mode: 'live', action: 'hold' }));
 
-      await expect(service.autoProcess('ti_001')).rejects.toThrow(/real-money execution is disabled/i);
+      const executed = pendingIntent({ status: 'executed', quantity: 0, decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      // Must NOT throw. Routes to paper (hold → no-op).
+      const result = await service.autoProcess('ti_001');
+      expect(result.status).toBe('executed');
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
     });
 
     it('getQuote failure during autoProcess → status=failed, no throw', async () => {
@@ -644,6 +656,204 @@ describe('TradeIntentService', () => {
         }),
       );
       expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── real execution ──────────────────────────────────────────────────────────
+
+  describe('real execution', () => {
+    // Helper: configure KV for real execution with a broker
+    function enableReal(kvMock: MockKv, brokerPluginId = 'alpaca-provider', maxOrderNotional = 1000) {
+      kvMock.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve(brokerPluginId);
+        if (key === 'execution.max_order_notional') return Promise.resolve(String(maxOrderNotional));
+        return Promise.resolve(null); // all other keys → defaults (autonomous=true, etc.)
+      });
+    }
+
+    it('default policy (real unset) → effective mode=paper, placeOrder NEVER called', async () => {
+      // All KV keys return null → real=false → paper path
+      kv.get.mockResolvedValue(null);
+
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
+      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: EMPTY_PORTFOLIO_DATA, updatedAt: new Date() });
+      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
+      prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}', updatedAt: new Date() });
+      const executed = pendingIntent({ status: 'executed', fill_price: 150, decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(prisma.portfolio.upsert).toHaveBeenCalled(); // paper portfolio updated
+    });
+
+    it('real=true but broker_plugin_id empty → effective mode=paper, placeOrder NOT called', async () => {
+      // Safety: real without broker must NEVER fire
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve(''); // empty!
+        return Promise.resolve(null);
+      });
+
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
+      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: EMPTY_PORTFOLIO_DATA, updatedAt: new Date() });
+      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
+      prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}', updatedAt: new Date() });
+      const executed = pendingIntent({ status: 'executed', fill_price: 150, decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(prisma.portfolio.upsert).toHaveBeenCalled(); // still paper
+    });
+
+    it('real=true + broker set → autoProcess long calls placeOrder with side=buy, type=market, qty>0, status=executed', async () => {
+      enableReal(kv); // real=true, broker='alpaca-provider', max_order_notional=1000
+      // qty = floor(10000 * 0.1 / 150) = floor(6.66) = 6; notional = 6*150 = 900 <= 1000 ✓
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long', symbol: 'AAPL' }));
+      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
+      gateway.placeOrder.mockResolvedValue({ id: 'order_123', status: 'accepted', filled_qty: '6' });
+      const executed = pendingIntent({ status: 'executed', fill_price: 150, quantity: 6, decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).toHaveBeenCalledWith(
+        'alpaca-provider',
+        expect.objectContaining({
+          symbol: 'AAPL',
+          qty: expect.any(Number),
+          side: 'buy',
+          type: 'market',
+        }),
+      );
+      // qty must be > 0
+      const callArgs = gateway.placeOrder.mock.calls[0][1] as { qty: number };
+      expect(callArgs.qty).toBeGreaterThan(0);
+      expect(result.status).toBe('executed');
+      // Paper portfolio must NOT be upserted in real mode
+      expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
+    });
+
+    it('real order notional exceeds max_order_notional → status=failed, placeOrder NOT called', async () => {
+      // max_order_notional=100; qty=floor(10000*0.1/150)=6; notional=6*150=900 > 100 → fail
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        if (key === 'execution.max_order_notional') return Promise.resolve('100'); // tiny ceiling
+        return Promise.resolve(null);
+      });
+
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long', symbol: 'AAPL' }));
+      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
+      const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(failed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('failed');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: 'failed',
+            result_json: expect.stringContaining('max_order_notional'),
+          }),
+        }),
+      );
+    });
+
+    it('placeOrder throws → status=failed, no throw to caller', async () => {
+      enableReal(kv);
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long', symbol: 'AAPL' }));
+      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
+      gateway.placeOrder.mockRejectedValue(new Error('Broker connection refused'));
+      const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(failed);
+
+      // Must NOT throw
+      const result = await service.autoProcess('ti_001');
+
+      expect(result.status).toBe('failed');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: 'failed',
+            result_json: expect.stringContaining('Broker connection refused'),
+          }),
+        }),
+      );
+    });
+
+    it('real exit → side=sell with the held position qty from portfolio', async () => {
+      // Portfolio holds 10 AAPL at avg 140; exit → sell 10 shares
+      enableReal(kv, 'alpaca-provider', 5000); // ceiling high enough
+      const portfolioWithPosition = JSON.stringify({
+        equity: 11_400,
+        cash: 10_000,
+        positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 140 }],
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'exit', symbol: 'AAPL' }));
+      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
+      // For exit in real mode, we look up held qty from the paper portfolio to know how many to sell
+      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: portfolioWithPosition, updatedAt: new Date() });
+      gateway.placeOrder.mockResolvedValue({ id: 'order_456', status: 'accepted', filled_qty: '10' });
+      const executed = pendingIntent({ status: 'executed', fill_price: 150, quantity: 10, decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).toHaveBeenCalledWith(
+        'alpaca-provider',
+        expect.objectContaining({
+          symbol: 'AAPL',
+          side: 'sell',
+          qty: 10,
+          type: 'market',
+        }),
+      );
+    });
+
+    it('risk gate still applies in real mode — drawdown halt prevents real order', async () => {
+      enableReal(kv);
+      const portfolioWithDrawdown = JSON.stringify({
+        equity: 7_000,
+        cash: 7_000,
+        positions: [],
+        max_drawdown_pct: 30, // >= 25 halt
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
+      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: portfolioWithDrawdown, updatedAt: new Date() });
+      const rejected = pendingIntent({ status: 'rejected', decided_by: 'autonomous', reject_reason: 'circuit breaker: drawdown 30% >= 25%' });
+      prisma.tradeIntent.update.mockResolvedValue(rejected);
+
+      await service.autoProcess('ti_001');
+
+      // Real mode: risk gate fires BEFORE any quote fetch or order
+      expect(gateway.getQuote).not.toHaveBeenCalled();
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'rejected' }),
+        }),
+      );
+    });
+
+    it('hold in real mode → no order placed, status=executed, quantity=0', async () => {
+      enableReal(kv);
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'hold' }));
+      const executed = pendingIntent({ status: 'executed', quantity: 0, decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.getQuote).not.toHaveBeenCalled();
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('executed');
+      expect(result.quantity).toBe(0);
     });
   });
 });
