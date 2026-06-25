@@ -8,8 +8,6 @@
  */
 
 import { TradeIntentService } from './trade-intent.service';
-import type { PrismaService } from '../prisma/prisma.service';
-import type { ProviderGatewayService } from '../providers/provider-gateway.service';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -249,10 +247,29 @@ describe('TradeIntentService', () => {
       kv.get.mockResolvedValue(null);
       const intent = pendingIntent({ mode: 'live', action: 'long' });
       prisma.tradeIntent.findUnique.mockResolvedValue(intent);
-      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: EMPTY_PORTFOLIO_DATA, updatedAt: new Date() });
-      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
-      prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}', updatedAt: new Date() });
-      const updated = pendingIntent({ status: 'executed', fill_price: 150, decided_by: 'alice', decided_at: new Date() });
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: EMPTY_PORTFOLIO_DATA,
+        updatedAt: new Date(),
+      });
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'AAPL',
+        bid: 149,
+        ask: 151,
+        last: 150,
+        ts: new Date().toISOString(),
+      });
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      const updated = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        decided_by: 'alice',
+        decided_at: new Date(),
+      });
       prisma.tradeIntent.update.mockResolvedValue(updated);
 
       const result = await service.approve('ti_001', 'alice');
@@ -323,7 +340,10 @@ describe('TradeIntentService', () => {
       });
       gateway.getQuote.mockRejectedValue(new Error('Network timeout'));
 
-      const failed = pendingIntent({ status: 'failed', result_json: '{"error":"Network timeout"}' });
+      const failed = pendingIntent({
+        status: 'failed',
+        result_json: '{"error":"Network timeout"}',
+      });
       prisma.tradeIntent.update.mockResolvedValue(failed);
 
       // Must NOT throw
@@ -446,7 +466,13 @@ describe('TradeIntentService', () => {
         data: EMPTY_PORTFOLIO_DATA,
         updatedAt: new Date(),
       });
-      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'AAPL',
+        bid: 149,
+        ask: 151,
+        last: 150,
+        ts: new Date().toISOString(),
+      });
       prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}' });
       const executedIntent = pendingIntent({ status: 'executed', decided_by: 'autonomous' });
       prisma.tradeIntent.update.mockResolvedValue(executedIntent);
@@ -482,7 +508,11 @@ describe('TradeIntentService', () => {
         data: portfolioWithDrawdown,
         updatedAt: new Date(),
       });
-      const rejected = pendingIntent({ status: 'rejected', decided_by: 'autonomous', reject_reason: 'circuit breaker: drawdown 30% >= 25%' });
+      const rejected = pendingIntent({
+        status: 'rejected',
+        decided_by: 'autonomous',
+        reject_reason: 'circuit breaker: drawdown 30% >= 25%',
+      });
       prisma.tradeIntent.update.mockResolvedValue(rejected);
 
       await service.autoProcess('ti_001');
@@ -511,8 +541,16 @@ describe('TradeIntentService', () => {
       const portfolioFull = JSON.stringify({ equity: 10_000, cash: 5_000, positions });
 
       prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
-      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: portfolioFull, updatedAt: new Date() });
-      const rejected = pendingIntent({ status: 'rejected', decided_by: 'autonomous', reject_reason: 'max open positions reached' });
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioFull,
+        updatedAt: new Date(),
+      });
+      const rejected = pendingIntent({
+        status: 'rejected',
+        decided_by: 'autonomous',
+        reject_reason: 'max open positions reached',
+      });
       prisma.tradeIntent.update.mockResolvedValue(rejected);
 
       await service.autoProcess('ti_001');
@@ -536,15 +574,27 @@ describe('TradeIntentService', () => {
         return Promise.resolve(null); // autonomous=true for others
       });
 
-      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long', symbol: 'AAPL' }));
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
       prisma.portfolio.findUnique.mockResolvedValue({
         name: 'paper',
         data: EMPTY_PORTFOLIO_DATA, // equity=10000, cash=10000, positions=[]
         updatedAt: new Date(),
       });
-      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 99, ask: 101, last: 100, ts: new Date().toISOString() });
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'AAPL',
+        bid: 99,
+        ask: 101,
+        last: 100,
+        ts: new Date().toISOString(),
+      });
       prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}' });
-      const executedIntent = pendingIntent({ status: 'executed', quantity: 5, decided_by: 'autonomous' });
+      const executedIntent = pendingIntent({
+        status: 'executed',
+        quantity: 5,
+        decided_by: 'autonomous',
+      });
       prisma.tradeIntent.update.mockResolvedValue(executedIntent);
 
       await service.autoProcess('ti_001');
@@ -566,11 +616,28 @@ describe('TradeIntentService', () => {
         avg_price: 100,
       }));
       // drawdown=30% (>= 25 halt) AND 10 positions (>= 10 max)
-      const portfolioFull = JSON.stringify({ equity: 7_000, cash: 6_000, positions, max_drawdown_pct: 30 });
+      const portfolioFull = JSON.stringify({
+        equity: 7_000,
+        cash: 6_000,
+        positions,
+        max_drawdown_pct: 30,
+      });
 
-      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'exit', symbol: 'AAPL' }));
-      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: portfolioFull, updatedAt: new Date() });
-      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', last: 110, bid: 109, ask: 111, ts: new Date().toISOString() });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioFull,
+        updatedAt: new Date(),
+      });
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'AAPL',
+        last: 110,
+        bid: 109,
+        ask: 111,
+        ts: new Date().toISOString(),
+      });
       prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}' });
       const executedIntent = pendingIntent({ status: 'executed', decided_by: 'autonomous' });
       prisma.tradeIntent.update.mockResolvedValue(executedIntent);
@@ -590,7 +657,11 @@ describe('TradeIntentService', () => {
         data: EMPTY_PORTFOLIO_DATA,
         updatedAt: new Date(),
       });
-      const executedIntent = pendingIntent({ status: 'executed', quantity: 0, decided_by: 'autonomous' });
+      const executedIntent = pendingIntent({
+        status: 'executed',
+        quantity: 0,
+        decided_by: 'autonomous',
+      });
       prisma.tradeIntent.update.mockResolvedValue(executedIntent);
 
       const result = await service.autoProcess('ti_001');
@@ -622,7 +693,9 @@ describe('TradeIntentService', () => {
     it('default policy (real unset) → paper mode even if intent.mode is "live"', async () => {
       // real execution is disabled by default; effective mode is always paper
       kv.get.mockResolvedValue(null); // all keys null → real=false, broker_plugin_id=''
-      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ mode: 'live', action: 'hold' }));
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ mode: 'live', action: 'hold' }),
+      );
 
       const executed = pendingIntent({ status: 'executed', quantity: 0, decided_by: 'autonomous' });
       prisma.tradeIntent.update.mockResolvedValue(executed);
@@ -663,11 +736,16 @@ describe('TradeIntentService', () => {
 
   describe('real execution', () => {
     // Helper: configure KV for real execution with a broker
-    function enableReal(kvMock: MockKv, brokerPluginId = 'alpaca-provider', maxOrderNotional = 1000) {
+    function enableReal(
+      kvMock: MockKv,
+      brokerPluginId = 'alpaca-provider',
+      maxOrderNotional = 1000,
+    ) {
       kvMock.get.mockImplementation((key: string) => {
         if (key === 'execution.real') return Promise.resolve('true');
         if (key === 'execution.broker_plugin_id') return Promise.resolve(brokerPluginId);
-        if (key === 'execution.max_order_notional') return Promise.resolve(String(maxOrderNotional));
+        if (key === 'execution.max_order_notional')
+          return Promise.resolve(String(maxOrderNotional));
         return Promise.resolve(null); // all other keys → defaults (autonomous=true, etc.)
       });
     }
@@ -677,10 +755,28 @@ describe('TradeIntentService', () => {
       kv.get.mockResolvedValue(null);
 
       prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
-      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: EMPTY_PORTFOLIO_DATA, updatedAt: new Date() });
-      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
-      prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}', updatedAt: new Date() });
-      const executed = pendingIntent({ status: 'executed', fill_price: 150, decided_by: 'autonomous' });
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: EMPTY_PORTFOLIO_DATA,
+        updatedAt: new Date(),
+      });
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'AAPL',
+        bid: 149,
+        ask: 151,
+        last: 150,
+        ts: new Date().toISOString(),
+      });
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      const executed = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        decided_by: 'autonomous',
+      });
       prisma.tradeIntent.update.mockResolvedValue(executed);
 
       await service.autoProcess('ti_001');
@@ -698,10 +794,28 @@ describe('TradeIntentService', () => {
       });
 
       prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
-      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: EMPTY_PORTFOLIO_DATA, updatedAt: new Date() });
-      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
-      prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}', updatedAt: new Date() });
-      const executed = pendingIntent({ status: 'executed', fill_price: 150, decided_by: 'autonomous' });
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: EMPTY_PORTFOLIO_DATA,
+        updatedAt: new Date(),
+      });
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'AAPL',
+        bid: 149,
+        ask: 151,
+        last: 150,
+        ts: new Date().toISOString(),
+      });
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      const executed = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        decided_by: 'autonomous',
+      });
       prisma.tradeIntent.update.mockResolvedValue(executed);
 
       await service.autoProcess('ti_001');
@@ -713,10 +827,27 @@ describe('TradeIntentService', () => {
     it('real=true + broker set → autoProcess long calls placeOrder with side=buy, type=market, qty>0, status=executed', async () => {
       enableReal(kv); // real=true, broker='alpaca-provider', max_order_notional=1000
       // qty = floor(10000 * 0.1 / 150) = floor(6.66) = 6; notional = 6*150 = 900 <= 1000 ✓
-      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long', symbol: 'AAPL' }));
-      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
-      gateway.placeOrder.mockResolvedValue({ id: 'order_123', status: 'accepted', filled_qty: '6' });
-      const executed = pendingIntent({ status: 'executed', fill_price: 150, quantity: 6, decided_by: 'autonomous' });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'AAPL',
+        bid: 149,
+        ask: 151,
+        last: 150,
+        ts: new Date().toISOString(),
+      });
+      gateway.placeOrder.mockResolvedValue({
+        id: 'order_123',
+        status: 'accepted',
+        filled_qty: '6',
+      });
+      const executed = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        quantity: 6,
+        decided_by: 'autonomous',
+      });
       prisma.tradeIntent.update.mockResolvedValue(executed);
 
       const result = await service.autoProcess('ti_001');
@@ -747,8 +878,16 @@ describe('TradeIntentService', () => {
         return Promise.resolve(null);
       });
 
-      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long', symbol: 'AAPL' }));
-      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'AAPL',
+        bid: 149,
+        ask: 151,
+        last: 150,
+        ts: new Date().toISOString(),
+      });
       const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
       prisma.tradeIntent.update.mockResolvedValue(failed);
 
@@ -768,8 +907,16 @@ describe('TradeIntentService', () => {
 
     it('placeOrder throws → status=failed, no throw to caller', async () => {
       enableReal(kv);
-      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long', symbol: 'AAPL' }));
-      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'AAPL',
+        bid: 149,
+        ask: 151,
+        last: 150,
+        ts: new Date().toISOString(),
+      });
       gateway.placeOrder.mockRejectedValue(new Error('Broker connection refused'));
       const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
       prisma.tradeIntent.update.mockResolvedValue(failed);
@@ -796,12 +943,33 @@ describe('TradeIntentService', () => {
         cash: 10_000,
         positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 140 }],
       });
-      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'exit', symbol: 'AAPL' }));
-      gateway.getQuote.mockResolvedValue({ symbol: 'AAPL', bid: 149, ask: 151, last: 150, ts: new Date().toISOString() });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'AAPL',
+        bid: 149,
+        ask: 151,
+        last: 150,
+        ts: new Date().toISOString(),
+      });
       // For exit in real mode, we look up held qty from the paper portfolio to know how many to sell
-      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: portfolioWithPosition, updatedAt: new Date() });
-      gateway.placeOrder.mockResolvedValue({ id: 'order_456', status: 'accepted', filled_qty: '10' });
-      const executed = pendingIntent({ status: 'executed', fill_price: 150, quantity: 10, decided_by: 'autonomous' });
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioWithPosition,
+        updatedAt: new Date(),
+      });
+      gateway.placeOrder.mockResolvedValue({
+        id: 'order_456',
+        status: 'accepted',
+        filled_qty: '10',
+      });
+      const executed = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        quantity: 10,
+        decided_by: 'autonomous',
+      });
       prisma.tradeIntent.update.mockResolvedValue(executed);
 
       await service.autoProcess('ti_001');
@@ -826,8 +994,16 @@ describe('TradeIntentService', () => {
         max_drawdown_pct: 30, // >= 25 halt
       });
       prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
-      prisma.portfolio.findUnique.mockResolvedValue({ name: 'paper', data: portfolioWithDrawdown, updatedAt: new Date() });
-      const rejected = pendingIntent({ status: 'rejected', decided_by: 'autonomous', reject_reason: 'circuit breaker: drawdown 30% >= 25%' });
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioWithDrawdown,
+        updatedAt: new Date(),
+      });
+      const rejected = pendingIntent({
+        status: 'rejected',
+        decided_by: 'autonomous',
+        reject_reason: 'circuit breaker: drawdown 30% >= 25%',
+      });
       prisma.tradeIntent.update.mockResolvedValue(rejected);
 
       await service.autoProcess('ti_001');

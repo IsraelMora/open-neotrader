@@ -743,7 +743,16 @@ export class AgentsService {
 
   /** Fallback universe when KV `cycle.universe` is unset (override via PATCH /cycle/config). */
   private static readonly DEFAULT_UNIVERSE = [
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'SPY', 'QQQ', 'AMD',
+    'AAPL',
+    'MSFT',
+    'GOOGL',
+    'AMZN',
+    'NVDA',
+    'META',
+    'TSLA',
+    'SPY',
+    'QQQ',
+    'AMD',
   ];
 
   /**

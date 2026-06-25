@@ -20,8 +20,7 @@ describe('parseToolCalls', () => {
   // ── <tool_calls> tag block ───────────────────────────────────────────────────
 
   it('parses a <tool_calls> XML-style tag block', () => {
-    const text =
-      '<tool_calls>[{"tool":"position-sizing__size","args":{}}]</tool_calls>';
+    const text = '<tool_calls>[{"tool":"position-sizing__size","args":{}}]</tool_calls>';
 
     const result = parseToolCalls(text);
 

@@ -71,9 +71,10 @@ function mapNativeToolCalls(raw: OpenAiNativeToolCall[]): ToolCallRequest[] {
 /**
  * Builds the native `tools` array in OpenAI format from ProviderTool[].
  */
-function buildOpenAiTools(
-  tools: ProviderTool[],
-): Array<{ type: 'function'; function: { name: string; description: string; parameters: ProviderTool['input_schema'] } }> {
+function buildOpenAiTools(tools: ProviderTool[]): Array<{
+  type: 'function';
+  function: { name: string; description: string; parameters: ProviderTool['input_schema'] };
+}> {
   return tools.map((t) => ({
     type: 'function' as const,
     function: { name: t.name, description: t.description, parameters: t.input_schema },
@@ -327,11 +328,10 @@ export class LlmService implements OnModuleInit {
       throw new ServiceUnavailableException('OPENAI_API_KEY no configurada');
     }
     // Base URL configurable → permite gateways OpenAI-compatibles (OpenRouter, Groq,
-    // etc.) sin cambiar de backend. Default = OpenAI. Sin barra final.
-    const baseUrl = (this.cfg.get<string>('OPENAI_BASE_URL') ?? 'https://api.openai.com/v1').replace(
-      /\/+$/,
-      '',
-    );
+    // etc.) sin cambiar de backend. Default = OpenAI. Sin barra final (strip sin regex
+    // para evitar backtracking super-lineal / ReDoS).
+    let baseUrl = this.cfg.get<string>('OPENAI_BASE_URL') ?? 'https://api.openai.com/v1';
+    while (baseUrl.endsWith('/')) baseUrl = baseUrl.slice(0, -1);
 
     const skillsMeta = await this.plugins.getSkillsMetadata();
     const skillContents: string[] = [];
@@ -540,7 +540,9 @@ export class LlmService implements OnModuleInit {
         ? mapNativeToolCalls(nativeToolCalls)
         : [];
 
-    this.log.debug(`${provider.name} (${model}): ${text.length} chars, ${tool_calls.length} tool_calls`);
+    this.log.debug(
+      `${provider.name} (${model}): ${text.length} chars, ${tool_calls.length} tool_calls`,
+    );
 
     return {
       text,

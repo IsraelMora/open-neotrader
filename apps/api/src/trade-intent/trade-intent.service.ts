@@ -96,9 +96,7 @@ export class TradeIntentService {
       );
     }
     if (!isFinite(dto.confidence) || dto.confidence < 0 || dto.confidence > 1) {
-      throw new Error(
-        `Invalid confidence ${dto.confidence}. Must be a number in [0, 1].`,
-      );
+      throw new Error(`Invalid confidence ${dto.confidence}. Must be a number in [0, 1].`);
     }
 
     const created = await this.db.tradeIntent.create({
@@ -217,9 +215,23 @@ export class TradeIntentService {
     // "exit" always passes — closing a position reduces risk.
 
     if (effectiveMode === 'real') {
-      return this._executeReal(id, intent, policy, paperState, 'autonomous', policy.max_position_pct);
+      return this._executeReal(
+        id,
+        intent,
+        policy,
+        paperState,
+        'autonomous',
+        policy.max_position_pct,
+      );
     }
-    return this._runPaperExecution(id, intent.symbol, action, paperState, 'autonomous', policy.max_position_pct);
+    return this._runPaperExecution(
+      id,
+      intent.symbol,
+      action,
+      paperState,
+      'autonomous',
+      policy.max_position_pct,
+    );
   }
 
   // ── approve ───────────────────────────────────────────────────────────────────
@@ -271,7 +283,14 @@ export class TradeIntentService {
     if (effectiveMode === 'real') {
       return this._executeReal(id, intent, policy, state, decided_by, SIZING_PCT);
     }
-    return this._runPaperExecution(id, intent.symbol, intent.action as TradeAction, state, decided_by, SIZING_PCT);
+    return this._runPaperExecution(
+      id,
+      intent.symbol,
+      intent.action as TradeAction,
+      state,
+      decided_by,
+      SIZING_PCT,
+    );
   }
 
   // ── reject ─────────────────────────────────────────────────────────────────────
@@ -311,7 +330,15 @@ export class TradeIntentService {
       return isFinite(n) ? n : fallback;
     };
 
-    const [rawAutonomous, rawMaxPosPct, rawMaxOpenPos, rawMaxDrawdown, rawReal, rawBrokerId, rawMaxNotional] = await Promise.all([
+    const [
+      rawAutonomous,
+      rawMaxPosPct,
+      rawMaxOpenPos,
+      rawMaxDrawdown,
+      rawReal,
+      rawBrokerId,
+      rawMaxNotional,
+    ] = await Promise.all([
       this.kv.get('execution.autonomous'),
       this.kv.get('execution.max_position_pct'),
       this.kv.get('execution.max_open_positions'),
@@ -342,7 +369,15 @@ export class TradeIntentService {
     let max_order_notional = parseNum(rawMaxNotional, 1_000);
     if (max_order_notional <= 0) max_order_notional = 1_000;
 
-    return { autonomous, max_position_pct, max_open_positions, max_drawdown_halt_pct, real, broker_plugin_id, max_order_notional };
+    return {
+      autonomous,
+      max_position_pct,
+      max_open_positions,
+      max_drawdown_halt_pct,
+      real,
+      broker_plugin_id,
+      max_order_notional,
+    };
   }
 
   /** Current execution policy (operator-facing). */
@@ -507,7 +542,9 @@ export class TradeIntentService {
           status: 'failed',
           decided_at: new Date(),
           decided_by,
-          result_json: JSON.stringify({ error: `Computed qty=${qty} — not enough equity or no position to exit` }),
+          result_json: JSON.stringify({
+            error: `Computed qty=${qty} — not enough equity or no position to exit`,
+          }),
         },
       });
     }

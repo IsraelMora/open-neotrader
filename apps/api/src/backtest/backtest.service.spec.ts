@@ -229,7 +229,7 @@ describe('BacktestService — runWalkForward', () => {
     expect(plugin).toBe('backtester');
     expect(fn).toBe('run_walk_forward');
     expect(payload.config.n_windows).toBe(5);
-    expect(payload.config.in_sample_pct).toBe(0.7);
+    expect(payload.config.in_sample_pct).toBeCloseTo(0.7, 10);
   });
 
   it('defaults n_windows=5 / in_sample_pct=0.7 when omitted', async () => {
@@ -241,7 +241,7 @@ describe('BacktestService — runWalkForward', () => {
       config: { n_windows: number; in_sample_pct: number };
     };
     expect(payload.config.n_windows).toBe(5);
-    expect(payload.config.in_sample_pct).toBe(0.7);
+    expect(payload.config.in_sample_pct).toBeCloseTo(0.7, 10);
   });
 });
 
@@ -265,13 +265,24 @@ describe('BacktestService — configurable strategy params', () => {
     const { gateway } = makeGateway();
     const wf = {
       ok: true,
-      result: { ok: true, verdict: 'ROBUSTO', n_windows: 3, avg_oos_sharpe: 0.3, avg_robustness_ratio: 0.5, robust_windows: 2, total_windows: 3, windows: [] },
+      result: {
+        ok: true,
+        verdict: 'ROBUSTO',
+        n_windows: 3,
+        avg_oos_sharpe: 0.3,
+        avg_robustness_ratio: 0.5,
+        robust_windows: 2,
+        total_windows: 3,
+        windows: [],
+      },
     };
     const { sandbox, callPlugin } = makeSandbox(wf);
     const svc = makeService(gateway, sandbox);
     await svc.runWalkForward(makeDto({ params: { rsi_oversold: 25 } }));
 
-    const payload = (callPlugin.mock.calls[0] as unknown[])[2] as { config: { rsi_oversold: number } };
+    const payload = (callPlugin.mock.calls[0] as unknown[])[2] as {
+      config: { rsi_oversold: number };
+    };
     expect(payload.config.rsi_oversold).toBe(25);
   });
 });
@@ -281,7 +292,14 @@ describe('BacktestService — runCrossSectional', () => {
     ok: true,
     result: {
       ok: true,
-      metrics: { total_return_pct: 30, cagr_pct: 14, sharpe_ratio: 0.8, max_drawdown_pct: 18, buy_hold_return_pct: 22, alpha_pct: 8 },
+      metrics: {
+        total_return_pct: 30,
+        cagr_pct: 14,
+        sharpe_ratio: 0.8,
+        max_drawdown_pct: 18,
+        buy_hold_return_pct: 22,
+        alpha_pct: 8,
+      },
       equity_curve: [{ date: '2024-01-01', equity: 10000 }],
       final_holdings: ['NVDA'],
       n_dates: 300,

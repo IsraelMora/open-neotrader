@@ -24,7 +24,10 @@ function makePlugins(): PluginsService {
 }
 
 function makeKvStub() {
-  return { get: jest.fn().mockResolvedValue(null), set: jest.fn().mockResolvedValue(undefined) } as unknown as import("../common/kv.service").KvService;
+  return {
+    get: jest.fn().mockResolvedValue(null),
+    set: jest.fn().mockResolvedValue(undefined),
+  } as unknown as import('../common/kv.service').KvService;
 }
 
 // ── Fake Anthropic API response ───────────────────────────────────────────────
@@ -154,7 +157,11 @@ describe('LlmService.completeViaOpenAi — native tool_calls', () => {
   beforeEach(() => {
     plugins = makePlugins();
     service = new LlmService(
-      makeConfig({ LLM_BACKEND: 'openai', OPENAI_API_KEY: 'test-openai-key', LLM_MODEL: 'gpt-4o-mini' }),
+      makeConfig({
+        LLM_BACKEND: 'openai',
+        OPENAI_API_KEY: 'test-openai-key',
+        LLM_MODEL: 'gpt-4o-mini',
+      }),
       plugins,
       makeKvStub(),
     );
@@ -202,7 +209,7 @@ describe('LlmService.completeViaOpenAi — native tool_calls', () => {
   });
 
   it('returns tool_calls:[] and does not throw when response has no tool_calls field', async () => {
-    mockOpenAiFetch('Just text, no tool calls.', undefined);
+    mockOpenAiFetch('Just text, no tool calls.');
 
     const tool = makeDecisionTool();
     const result = await service.complete({ context: 'test', tools: [tool] });
@@ -255,10 +262,16 @@ describe('LlmService.completeViaOpenAi — native tool_calls', () => {
     const tool = makeDecisionTool();
     mockOpenAiFetch(null, [
       {
-        function: { name: 'decision__emit_trade_intent', arguments: '{"symbol":"AAPL","action":"long","confidence":0.8,"rationale":"a"}' },
+        function: {
+          name: 'decision__emit_trade_intent',
+          arguments: '{"symbol":"AAPL","action":"long","confidence":0.8,"rationale":"a"}',
+        },
       },
       {
-        function: { name: 'decision__emit_trade_intent', arguments: '{"symbol":"TSLA","action":"short","confidence":0.6,"rationale":"b"}' },
+        function: {
+          name: 'decision__emit_trade_intent',
+          arguments: '{"symbol":"TSLA","action":"short","confidence":0.6,"rationale":"b"}',
+        },
       },
     ]);
 
@@ -356,7 +369,11 @@ describe('LlmService — persistencia de config en KV', () => {
   it('onModuleInit restaura backend/model desde KV (sobre los defaults de env)', async () => {
     const kv = {
       get: jest.fn((k: string) =>
-        Promise.resolve(({ 'llm.backend': 'openai', 'llm.model': 'vendor/model:free' } as Record<string, string>)[k] ?? null),
+        Promise.resolve(
+          ({ 'llm.backend': 'openai', 'llm.model': 'vendor/model:free' } as Record<string, string>)[
+            k
+          ] ?? null,
+        ),
       ),
       set: jest.fn().mockResolvedValue(undefined),
     } as unknown as import('../common/kv.service').KvService;
@@ -368,7 +385,10 @@ describe('LlmService — persistencia de config en KV', () => {
 
   it('patchConfig persiste model+backend en KV', () => {
     const set = jest.fn().mockResolvedValue(undefined);
-    const kv = { get: jest.fn().mockResolvedValue(null), set } as unknown as import('../common/kv.service').KvService;
+    const kv = {
+      get: jest.fn().mockResolvedValue(null),
+      set,
+    } as unknown as import('../common/kv.service').KvService;
     const svc = new LlmService(makeConfig(), makePlugins(), kv);
     svc.patchConfig({ backend: 'openai', model: 'x/y:free' });
     expect(set).toHaveBeenCalledWith('llm.model', 'x/y:free');

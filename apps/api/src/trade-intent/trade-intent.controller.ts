@@ -21,7 +21,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags, ApiBearerAuth } from '@nestjs/swagger';
-import { IsString, IsNotEmpty, MaxLength, IsOptional, MinLength } from 'class-validator';
+import { IsString, IsNotEmpty, MaxLength, MinLength } from 'class-validator';
 import { TradeIntentService } from './trade-intent.service';
 import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 

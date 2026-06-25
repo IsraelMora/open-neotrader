@@ -10819,10 +10819,7 @@ describe('AgentsService._runSingleIteration — native tool_calls vs text fallba
     decisionPrompt: string | null;
   };
 
-  async function callRunSingleIteration(
-    service: AgentsService,
-    args: IterationArgs,
-  ) {
+  async function callRunSingleIteration(service: AgentsService, args: IterationArgs) {
     return (
       service as unknown as {
         _runSingleIteration: (args: IterationArgs) => Promise<unknown>;
@@ -10846,13 +10843,13 @@ describe('AgentsService._runSingleIteration — native tool_calls vs text fallba
       backend: 'api' as const,
       skills_read: [],
       skills_written: [],
-    } as LlmResponse);
+    });
 
     const plugins = makeFullPlugins('Use tools.', [TOOL]);
     plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'provider' }] as never);
 
     const service = makeFullAgentsService(
-      { complete: llmComplete } as Partial<LlmService>,
+      { complete: llmComplete },
       makeAudit(),
       plugins,
       makeSandbox(),
@@ -10885,7 +10882,7 @@ describe('AgentsService._runSingleIteration — native tool_calls vs text fallba
       backend: 'api' as const,
       skills_read: [],
       skills_written: [],
-    } as LlmResponse);
+    });
 
     const plugins = makeFullPlugins('Use tools.', [TOOL]);
     plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'provider' }] as never);
@@ -10893,21 +10890,21 @@ describe('AgentsService._runSingleIteration — native tool_calls vs text fallba
 
     const sandbox = makeSandbox();
     const service = makeFullAgentsService(
-      { complete: llmComplete } as Partial<LlmService>,
+      { complete: llmComplete },
       makeAudit(),
       plugins,
       sandbox,
       makeMemory(),
     );
 
-    const result = await callRunSingleIteration(service, {
+    const result = (await callRunSingleIteration(service, {
       cycle_id: CYCLE_ID,
       source: 'chat',
       context: 'buy AAPL',
       effectiveTools: [TOOL],
       visibleTools: [TOOL],
       decisionPrompt: 'Use tools.',
-    }) as { tool_calls: ToolCallRequest[] };
+    })) as { tool_calls: ToolCallRequest[] };
 
     // The native call must flow through unchanged.
     expect(result.tool_calls).toHaveLength(1);
@@ -10925,11 +10922,11 @@ describe('AgentsService._runSingleIteration — native tool_calls vs text fallba
 
     const llmComplete = jest.fn().mockResolvedValue({
       text: textWithBlock,
-      tool_calls: [],    // <── no native tool_calls
+      tool_calls: [], // <── no native tool_calls
       backend: 'api' as const,
       skills_read: [],
       skills_written: [],
-    } as LlmResponse);
+    });
 
     const plugins = makeFullPlugins('Use tools.', [TOOL]);
     plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'provider' }] as never);
@@ -10937,21 +10934,21 @@ describe('AgentsService._runSingleIteration — native tool_calls vs text fallba
 
     const sandbox = makeSandbox();
     const service = makeFullAgentsService(
-      { complete: llmComplete } as Partial<LlmService>,
+      { complete: llmComplete },
       makeAudit(),
       plugins,
       sandbox,
       makeMemory(),
     );
 
-    const result = await callRunSingleIteration(service, {
+    const result = (await callRunSingleIteration(service, {
       cycle_id: CYCLE_ID,
       source: 'chat',
       context: 'nvda signal',
       effectiveTools: [TOOL],
       visibleTools: [TOOL],
       decisionPrompt: 'Use tools.',
-    }) as { tool_calls: ToolCallRequest[] };
+    })) as { tool_calls: ToolCallRequest[] };
 
     // Fallback parsing must have extracted the tool call from text.
     expect(result.tool_calls).toHaveLength(1);
@@ -10970,7 +10967,7 @@ describe('AgentsService._runSingleIteration — native tool_calls vs text fallba
       backend: 'api' as const,
       skills_read: [],
       skills_written: [],
-    } as LlmResponse);
+    });
 
     const plugins = makeFullPlugins('Use tools.', [TOOL]);
     plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'provider' }] as never);
@@ -10978,21 +10975,21 @@ describe('AgentsService._runSingleIteration — native tool_calls vs text fallba
 
     const sandbox = makeSandbox();
     const service = makeFullAgentsService(
-      { complete: llmComplete } as Partial<LlmService>,
+      { complete: llmComplete },
       makeAudit(),
       plugins,
       sandbox,
       makeMemory(),
     );
 
-    const result = await callRunSingleIteration(service, {
+    const result = (await callRunSingleIteration(service, {
       cycle_id: CYCLE_ID,
       source: 'chat',
       context: 'spy signal',
       effectiveTools: [TOOL],
       visibleTools: [TOOL],
       decisionPrompt: 'Use tools.',
-    }) as { tool_calls: ToolCallRequest[] };
+    })) as { tool_calls: ToolCallRequest[] };
 
     expect(result.tool_calls).toHaveLength(1);
     expect(result.tool_calls[0].plugin_id).toBe('decision');

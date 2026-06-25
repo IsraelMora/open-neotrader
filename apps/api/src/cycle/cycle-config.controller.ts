@@ -39,8 +39,12 @@ export class CycleConfigController {
   @ApiOperation({ summary: 'Actualiza la config del ciclo (solo los campos enviados)' })
   async setConfig(@Body() dto: UpdateCycleConfigDto) {
     if (dto.universe !== undefined)
-      await this.kv.set('cycle.universe', dto.universe.map((s) => s.trim().toUpperCase()).join(','));
-    if (dto.data_provider !== undefined) await this.kv.set('cycle.data_provider', dto.data_provider);
+      await this.kv.set(
+        'cycle.universe',
+        dto.universe.map((s) => s.trim().toUpperCase()).join(','),
+      );
+    if (dto.data_provider !== undefined)
+      await this.kv.set('cycle.data_provider', dto.data_provider);
     if (dto.timeframe !== undefined) await this.kv.set('cycle.timeframe', dto.timeframe);
     if (dto.bars !== undefined) await this.kv.set('cycle.bars', String(dto.bars));
     if (dto.capital !== undefined) await this.kv.set('cycle.capital', String(dto.capital));

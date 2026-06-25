@@ -12,11 +12,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-const MIGRATION_DIR = path.resolve(
-  __dirname,
-  '../../..',
-  'prisma/migrations/0011_trade_intents',
-);
+const MIGRATION_DIR = path.resolve(__dirname, '../../..', 'prisma/migrations/0011_trade_intents');
 const MIGRATION_FILE = path.join(MIGRATION_DIR, 'migration.sql');
 
 describe('Migration 0011_trade_intents (HITL paper trade-execution)', () => {
