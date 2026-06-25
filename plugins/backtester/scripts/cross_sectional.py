@@ -137,16 +137,21 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
 
     metrics = _annualized_metrics(equity_curve, daily_returns, capital)
 
-    # Benchmark: equal-weight buy & hold of the WHOLE universe over the same dates.
-    bench_ret = 0.0
-    per_symbol = []
-    for s in symbols:
-        p0 = px[s].get(common[0])
-        p1 = px[s].get(common[-1])
-        if p0 and p1 and p0 > 0:
-            per_symbol.append(p1 / p0 - 1.0)
-    if per_symbol:
-        bench_ret = sum(per_symbol) / len(per_symbol) * 100
+    # Benchmark: equal-weight of the WHOLE universe, daily-compounded over the SAME
+    # common dates (consistent with how the strategy equity is built). This is robust
+    # to a single symbol's bad/split-glitched first print, unlike a naive p_last/p_first
+    # ratio which one outlier can blow up.
+    bench_eq = capital
+    for i in range(1, len(common)):
+        rets = []
+        for s in symbols:
+            p0 = px[s].get(common[i - 1])
+            p1 = px[s].get(common[i])
+            if p0 and p1 and p0 > 0:
+                rets.append(p1 / p0 - 1.0)
+        if rets:
+            bench_eq *= 1.0 + sum(rets) / len(rets)
+    bench_ret = (bench_eq / capital - 1.0) * 100 if capital > 0 else 0.0
     metrics["buy_hold_return_pct"] = round(bench_ret, 2)
     metrics["alpha_pct"] = round(metrics["total_return_pct"] - bench_ret, 2)
 

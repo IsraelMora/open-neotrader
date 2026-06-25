@@ -61,3 +61,15 @@ class TestCrossSectional:
         assert r["ok"]
         # Never holds a declining asset → return must not be deeply negative
         assert r["metrics"]["total_return_pct"] >= -1.0
+
+    def test_benchmark_is_sane_not_outlier_inflated(self, cs):
+        """Equal-weight benchmark is daily-compounded (robust). A smoothly rising
+        symbol + a flat one yields a sane positive benchmark, not an absurd ratio."""
+        prices = {
+            "UP": _bars(lambda i: 100.0 * (1.005 ** i)),
+            "FLAT": _bars(lambda i: 100.0),
+        }
+        r = cs.run_cross_sectional(prices, CFG)
+        assert r["ok"]
+        bh = r["metrics"]["buy_hold_return_pct"]
+        assert 0 < bh < 200, f"benchmark should be sane, got {bh}"
