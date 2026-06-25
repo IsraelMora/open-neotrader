@@ -70,7 +70,7 @@ stdin→stdout JSON. Commands: `list_plugins`, `call_plugin` (only functions dec
 
 ### Plugins
 
-62 plugins in `plugins/<id>/`, each with `manifest.toml` (id, type: `skill` | `universe_provider` | `discipline`, declared `[skills] keys`) and `plugin.py`. The Python SDK is `packages/plugin-sdk` (`neurotrader_sdk`).
+37 plugins in `plugins/<id>/`, each with `manifest.toml` (id, type: `skill` | `universe_provider` | `discipline`, declared `[skills] keys`) and `plugin.py`. The Python SDK is `packages/plugin-sdk` (`neurotrader_sdk`).
 
 ### Backtester (`plugins/backtester/`)
 

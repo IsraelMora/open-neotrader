@@ -136,6 +136,9 @@ export class BacktestService {
       slippage_pct: dto.slippage_pct ?? 0.0005,
       risk_per_trade: dto.risk_per_trade ?? 0.01,
       max_positions: dto.max_positions ?? 5,
+      // Arbitrary strategy params (MA periods, thresholds, ...) → reach the strategy's
+      // analyze(window, config). Spread last so custom params win → fully configurable.
+      ...(dto.params ?? {}),
     };
   }
 

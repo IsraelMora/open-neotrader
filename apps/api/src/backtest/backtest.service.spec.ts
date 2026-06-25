@@ -244,3 +244,34 @@ describe('BacktestService — runWalkForward', () => {
     expect(payload.config.in_sample_pct).toBe(0.7);
   });
 });
+
+describe('BacktestService — configurable strategy params', () => {
+  it('merges dto.params into the config sent to the strategy', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox, callPlugin } = makeSandbox();
+    const svc = makeService(gateway, sandbox);
+    await svc.runBacktest(makeDto({ params: { fast_period: 20, slow_period: 100 } }));
+
+    const payload = (callPlugin.mock.calls[0] as unknown[])[2] as {
+      config: { fast_period: number; slow_period: number; initial_capital: number };
+    };
+    expect(payload.config.fast_period).toBe(20);
+    expect(payload.config.slow_period).toBe(100);
+    // base config still present
+    expect(payload.config.initial_capital).toBeDefined();
+  });
+
+  it('custom params also flow into walk-forward config', async () => {
+    const { gateway } = makeGateway();
+    const wf = {
+      ok: true,
+      result: { ok: true, verdict: 'ROBUSTO', n_windows: 3, avg_oos_sharpe: 0.3, avg_robustness_ratio: 0.5, robust_windows: 2, total_windows: 3, windows: [] },
+    };
+    const { sandbox, callPlugin } = makeSandbox(wf);
+    const svc = makeService(gateway, sandbox);
+    await svc.runWalkForward(makeDto({ params: { rsi_oversold: 25 } }));
+
+    const payload = (callPlugin.mock.calls[0] as unknown[])[2] as { config: { rsi_oversold: number } };
+    expect(payload.config.rsi_oversold).toBe(25);
+  });
+});

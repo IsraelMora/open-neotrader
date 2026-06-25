@@ -7,6 +7,7 @@ import {
   IsOptional,
   IsNumber,
   IsInt,
+  IsObject,
   Min,
   Max,
   ValidateIf,
@@ -102,4 +103,14 @@ export class RunBacktestDto {
   @Max(100)
   @Type(() => Number)
   min_trades?: number;
+
+  /**
+   * Arbitrary strategy parameters (e.g. MA periods, lookback, thresholds) merged into
+   * the config passed to the strategy's analyze(). Lets you backtest ANY configuration
+   * instead of the manifest defaults. Keys depend on the strategy.
+   * Example: { "fast_ma": 20, "slow_ma": 100, "rsi_oversold": 25 }
+   */
+  @IsOptional()
+  @IsObject()
+  params?: Record<string, unknown>;
 }
