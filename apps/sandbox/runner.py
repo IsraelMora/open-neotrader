@@ -804,32 +804,11 @@ def cmd_run_cycle(req: dict) -> dict:
         except Exception as e:
             errors.append({"plugin": pid, "stage": "on_cycle", "error": str(e)})
 
-    # ── Step 2: discipline plugins ───────────────────────────────────────────
-    for pid, info in plugins_by_id.items():
-        if pid not in active_ids or info["type"] != "discipline":
-            continue
-        _mod, fn = _load_cycle_hook(pid, info["dir"], info["manifest"], hook_counter)
-        hook_counter += 1
-        if fn is None:
-            continue
-        try:
-            hook_ctx = {
-                **context,
-                "universe": universe,
-                "config": _config_for(info["manifest"]),
-                "portfolio": context.get("portfolio", {}),
-                "provider_tools": provider_tools,
-                "pending_signals": list(pending_signals),
-            }
-            result = fn(hook_ctx)
-            if not isinstance(result, dict):
-                result = {}
-            # disciplines return {"signals": [...], "logs": [...]}
-            new_signals = result.get("signals", pending_signals)
-            pending_signals[:] = new_signals
-            logs.extend(result.get("logs", []))
-        except Exception as e:
-            errors.append({"plugin": pid, "stage": "on_cycle", "error": str(e)})
+    # ── Disciplinas: NO se corren acá (de-duplicación) ───────────────────────
+    # Las discipline plugins (veto/sizing) las aplica el orquestador NestJS en su
+    # capa de veto (_runVetoLayer), UNA sola vez sobre estas pending_signals. Antes
+    # corrían también acá → doble veto/sizing. cmd_run_cycle solo GENERA señales (skills);
+    # el filtrado/sizing por riesgo vive en la capa de veto (TS), fuente única de verdad.
 
     result_dict: dict[str, Any] = {
         "universe": universe,

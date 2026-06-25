@@ -510,8 +510,10 @@ class TestRunCycleErrorIsolation:
             f"Expected error message to contain crash info, got: {err['error']}"
         )
 
-    def test_crashing_discipline_does_not_abort_cycle(self, tmp_path, monkeypatch):
-        """A crashing discipline must not lose the strategy signals accumulated before it."""
+    def test_disciplines_not_run_by_runner(self, tmp_path, monkeypatch):
+        """cmd_run_cycle only GENERATES signals (skills); discipline plugins (veto/sizing)
+        run once in the NestJS veto layer, NOT here. So a discipline that would crash is
+        never invoked by the runner, and skill signals pass through untouched."""
         import textwrap
 
         mod = _load_runner()
@@ -569,12 +571,12 @@ class TestRunCycleErrorIsolation:
         }
         result = mod.cmd_run_cycle(req)
 
-        # One error from bad-discipline
-        assert any(e["plugin"] == d_pid for e in result["errors"]), (
-            f"Expected error from {d_pid}; got: {result['errors']}"
+        # The discipline is NOT executed by the runner → no error from it, even though
+        # its on_cycle would raise. Disciplines are the veto layer's responsibility.
+        assert not any(e["plugin"] == d_pid for e in result["errors"]), (
+            f"Discipline {d_pid} should NOT be run by the runner; got errors: {result['errors']}"
         )
-        # Signal from good-skill must still be present
+        # Skill signal passes through untouched (no discipline filtering here).
         assert len(result["pending_signals"]) == 1, (
-            f"Expected signal from {s_pid} to survive discipline crash; "
-            f"got {result['pending_signals']}"
+            f"Expected skill signal from {s_pid} to pass through; got {result['pending_signals']}"
         )
