@@ -3,11 +3,15 @@
 Guía para dejar el sistema operando solo en **modo paper** (sin dinero real) en minutos.
 Stack auto-contenido: `docker compose up` levanta API + panel + sandbox.
 
-> ⚠️ **Expectativa de rentabilidad (honesta):** esto es un marco de research/automatización.
-> Las estrategias incluidas (trend-following, mean-reversion, etc.) en backtests honestos
-> rinden retornos modestos y con frecuencia **por debajo de comprar y aguantar** (alpha negativo).
-> No esperes "hacerte rico"; esperá una plataforma para investigar/operar estrategias con
-> disciplina de riesgo. Empezá SIEMPRE en paper y validá varios días/semanas antes de real.
+> ⚠️ **Expectativa de rentabilidad (honesta, con datos medidos):** esto es un marco de
+> research/automatización, **no** una máquina de ingresos. En backtests rigurosos (con
+> gestión de posición — flip en señal opuesta — y métricas correctas), las estrategias
+> incluidas sobre activos líquidos rinden aprox **3–8% CAGR con alpha NEGATIVO** (rinden
+> MENOS que comprar y aguantar un índice) y win-rate 35–45%. Ningún ajuste de parámetros
+> revierte ese alpha negativo — es estructural de las estrategias técnicas retail.
+> Para "ingresos pasivos" reales, un ETF de índice (SPY/QQQ) rinde más con menos riesgo.
+> Usá esto para investigar/operar con disciplina, empezá SIEMPRE en paper, y no inviertas
+> lo que no puedas perder. Verificá vos mismo con `POST /api/backtest` y `/backtest/walk-forward`.
 
 ## 1. Requisitos
 - Docker + Docker Compose.
