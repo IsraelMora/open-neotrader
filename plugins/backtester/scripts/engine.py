@@ -132,6 +132,47 @@ def run_backtest(
     # close, closed positions as realized PnL) instead of only at trade closes.
     legs: list[dict] = []
 
+    def _close_at(sym: str, exit_price: float, exec_dt: str, record_dt: str) -> None:
+        """Close an open position at exit_price. exec_dt = fill date (for leg/duration);
+        record_dt = the signal date recorded on the Trade. Used by both explicit exits
+        and flips (opposite-direction signal)."""
+        nonlocal equity
+        pos = open_positions.pop(sym)
+        gross = pos["shares"] * exit_price
+        comm_cost = gross * (commission + slippage)
+        proceeds = gross - comm_cost
+        pnl = proceeds - pos["cost"] if pos["direction"] == "long" else pos["cost"] - proceeds
+        try:
+            duration = (_date.fromisoformat(exec_dt) - _date.fromisoformat(pos["entry_date"])).days
+        except Exception:
+            duration = 0
+        equity += pos["cost"] + pnl
+        completed_trades.append(
+            Trade(
+                symbol=sym,
+                direction=pos["direction"],
+                entry_date=pos["entry_date"],
+                exit_date=record_dt,
+                entry_price=pos["entry_price"],
+                exit_price=exit_price,
+                shares=pos["shares"],
+                commission=comm_cost,
+                slippage=0,
+                pnl=pnl,
+                pnl_pct=pnl / pos["cost"] * 100,
+                duration_days=duration,
+            )
+        )
+        legs.append({
+            "symbol": sym,
+            "direction": pos["direction"],
+            "shares": pos["shares"],
+            "entry_price": pos["entry_price"],
+            "entry_date": pos["entry_date"],
+            "exit_date": exec_dt,
+            "pnl": pnl,
+        })
+
     for sig in signals_sorted:
         symbol = sig.get("symbol", "")
         action = sig.get("action", "")
@@ -148,8 +189,15 @@ def run_backtest(
         price = fill_bar["open"]
         exec_date = fill_bar["date"]
 
-        # Abrir posición
-        if action in ("long", "short") and symbol not in open_positions:
+        # Señal direccional: abrir, mantener (misma dirección) o dar vuelta (opuesta).
+        if action in ("long", "short"):
+            existing = open_positions.get(symbol)
+            if existing is not None:
+                if existing["direction"] == action:
+                    continue  # misma dirección → mantener, no reabrir
+                # Dirección opuesta → cerrar la posición actual (flip) antes de abrir.
+                _close_at(symbol, price, exec_date, sig_date)
+
             if len(open_positions) >= max_positions:
                 continue
 
@@ -177,55 +225,9 @@ def run_backtest(
                 "cost": cost,
             }
 
-        # Cerrar posición
+        # Cierre explícito
         elif action == "exit" and symbol in open_positions:
-            pos = open_positions.pop(symbol)
-            exit_price = price
-
-            gross = pos["shares"] * exit_price
-            comm_cost = gross * (commission + slippage)
-            proceeds = gross - comm_cost
-
-            pnl = proceeds - pos["cost"] if pos["direction"] == "long" else pos["cost"] - proceeds
-
-            pnl_pct = pnl / pos["cost"] * 100
-
-            # Calcular duración en días aproximado
-            try:
-                d1 = _date.fromisoformat(pos["entry_date"])
-                d2 = _date.fromisoformat(exec_date)
-                duration = (d2 - d1).days
-            except Exception:
-                duration = 0
-
-            equity += pos["cost"] + pnl
-
-            completed_trades.append(
-                Trade(
-                    symbol=symbol,
-                    direction=pos["direction"],
-                    entry_date=pos["entry_date"],
-                    exit_date=sig_date,
-                    entry_price=pos["entry_price"],
-                    exit_price=exit_price,
-                    shares=pos["shares"],
-                    commission=comm_cost,
-                    slippage=0,
-                    pnl=pnl,
-                    pnl_pct=pnl_pct,
-                    duration_days=duration,
-                )
-            )
-
-            legs.append({
-                "symbol": symbol,
-                "direction": pos["direction"],
-                "shares": pos["shares"],
-                "entry_price": pos["entry_price"],
-                "entry_date": pos["entry_date"],  # entry fill date
-                "exit_date": exec_date,  # exit fill date
-                "pnl": pnl,
-            })
+            _close_at(symbol, price, exec_date, sig_date)
 
     # Cerrar posiciones abiertas al precio del último bar disponible
     for symbol, pos in list(open_positions.items()):

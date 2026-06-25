@@ -170,6 +170,34 @@ class TestMarkToMarketEquity:
 
 
 # ---------------------------------------------------------------------------
+# 4d. Position flip — an opposite-direction signal closes (and reverses) the
+#     position instead of being ignored. Without this, a strategy that emits
+#     long/short (but never "exit") opens ONE trade and holds it forever.
+# ---------------------------------------------------------------------------
+class TestPositionFlip:
+    def test_opposite_signal_closes_and_flips(self, engine):
+        bars = _series(datetime.date(2024, 1, 1), 8, lambda i: 100.0 + i, lambda i: 100.0 + i)
+        signals = [
+            {"symbol": "AAA", "action": "long", "date": "2024-01-01"},
+            {"symbol": "AAA", "action": "short", "date": "2024-01-05"},  # opposite → flip
+        ]
+        result = engine.run_backtest(signals, {"AAA": bars}, {"initial_capital": 1000})
+        # The long is CLOSED at the flip and a short opens (closed at end) → 2 trades,
+        # NOT 1 held-forever trade.
+        assert result.total_trades == 2
+        assert sorted(t["direction"] for t in result.trades) == ["long", "short"]
+
+    def test_same_direction_signal_does_not_reopen(self, engine):
+        bars = _series(datetime.date(2024, 1, 1), 8, lambda i: 100.0 + i, lambda i: 100.0 + i)
+        signals = [
+            {"symbol": "AAA", "action": "long", "date": "2024-01-01"},
+            {"symbol": "AAA", "action": "long", "date": "2024-01-05"},  # same dir → hold
+        ]
+        result = engine.run_backtest(signals, {"AAA": bars}, {"initial_capital": 1000})
+        assert result.total_trades == 1
+
+
+# ---------------------------------------------------------------------------
 # 4c. Equity floors at zero (account ruin) — drawdown never exceeds 100%
 # ---------------------------------------------------------------------------
 class TestRuinFloor:
