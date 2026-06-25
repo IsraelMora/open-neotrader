@@ -37,9 +37,9 @@ export const auth = {
 
 export const client: KyInstance = ky.create({
   // Root-anchored: sin esto, ky resuelve 'api/...' contra la ruta actual y en páginas
-  // con barra final (p.ej. /login/) produce /login/api/... → 405. Con prefixUrl '/'
-  // todas las llamadas resuelven a /api/... sin importar la página activa.
-  prefixUrl: '/',
+  // con barra final (p.ej. /login/) produce /login/api/... → 405. Con prefix '/' (ky v2;
+  // antes prefixUrl) todas las llamadas resuelven a /api/... sin importar la página.
+  prefix: '/',
   credentials: 'same-origin',
   hooks: {
     beforeRequest: [
@@ -76,7 +76,7 @@ export const client: KyInstance = ky.create({
 
 // Public-route client (no auth injection — used for login/register)
 const publicClient: KyInstance = ky.create({
-  prefixUrl: '/', // mismo anclaje a raíz que `client` (evita /login/api/... → 405)
+  prefix: '/', // mismo anclaje a raíz que `client` (ky v2; evita /login/api/... → 405)
   hooks: {
     beforeError: [
       async ({ error }) => {
