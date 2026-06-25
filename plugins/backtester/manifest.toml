@@ -28,5 +28,11 @@ in_sample_pct   = { type = "number",  default = 0.7,  description = "Fracción I
 n_windows       = { type = "integer", default = 5,    description = "Número de ventanas walk-forward" }
 min_trades      = { type = "integer", default = 10,   description = "Mínimo de trades OOS para ventana válida" }
 
+# Cross-sectional momentum params (used by backtester.run_cross_sectional)
+top_n           = { type = "integer", default = 3,    description = "Número de activos a mantener (top-N por momentum)" }
+rebalance_days  = { type = "integer", default = 21,   description = "Cada cuántas barras rebalancear (~mensual)" }
+lookback        = { type = "integer", default = 252,  description = "Ventana de momentum en barras (~12 meses)" }
+skip            = { type = "integer", default = 21,   description = "Barras recientes a saltar (momentum 12-1)" }
+
 [skills]
-keys = ["backtester.run", "backtester.run_walk_forward"]
+keys = ["backtester.run", "backtester.run_walk_forward", "backtester.run_cross_sectional"]

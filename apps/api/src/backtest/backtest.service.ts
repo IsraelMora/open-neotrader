@@ -42,6 +42,23 @@ export interface BacktestResponse {
   trades: BacktestTrade[];
 }
 
+/** Cross-sectional momentum portfolio backtest result. */
+export interface CrossSectionalResponse {
+  ok: true;
+  metrics: {
+    total_return_pct: number;
+    cagr_pct: number;
+    sharpe_ratio: number;
+    max_drawdown_pct: number;
+    buy_hold_return_pct: number;
+    alpha_pct: number;
+  };
+  equity_curve: { date: string; equity: number }[];
+  final_holdings: string[];
+  n_dates: number;
+  universe_size: number;
+}
+
 /** Walk-forward (anchored) validation result — overfit detection. */
 export interface WalkForwardResponse {
   ok: true;
@@ -125,6 +142,42 @@ export class BacktestService {
     const result = response.result as WalkForwardResponse & { ok: boolean; error?: string };
     if (!result.ok) {
       throw new BadGatewayException(`Walk-forward error: ${result.error ?? 'unknown error'}`);
+    }
+    return result;
+  }
+
+  /**
+   * Cross-sectional momentum portfolio backtest: ranks the universe (all `symbols`)
+   * by 12-1 momentum, holds the top-N, rebalances. Reports alpha vs equal-weight buy&hold.
+   */
+  async runCrossSectional(
+    dto: RunBacktestDto & {
+      top_n?: number;
+      rebalance_days?: number;
+      lookback?: number;
+      skip?: number;
+    },
+  ): Promise<CrossSectionalResponse> {
+    const prices = await this._buildPrices(dto);
+    const config: Record<string, unknown> = {
+      initial_capital: dto.capital ?? 10000,
+      ...(dto.top_n !== undefined ? { top_n: dto.top_n } : {}),
+      ...(dto.rebalance_days !== undefined ? { rebalance_days: dto.rebalance_days } : {}),
+      ...(dto.lookback !== undefined ? { lookback: dto.lookback } : {}),
+      ...(dto.skip !== undefined ? { skip: dto.skip } : {}),
+      ...(dto.params ?? {}),
+    };
+
+    const response = await this.sandbox.callPlugin('backtester', 'run_cross_sectional', {
+      prices,
+      config,
+    });
+    if (!response.ok) {
+      throw new BadGatewayException(`Sandbox error: ${response.error ?? 'unknown error'}`);
+    }
+    const result = response.result as CrossSectionalResponse & { ok: boolean; error?: string };
+    if (!result.ok) {
+      throw new BadGatewayException(`Cross-sectional error: ${result.error ?? 'unknown error'}`);
     }
     return result;
   }

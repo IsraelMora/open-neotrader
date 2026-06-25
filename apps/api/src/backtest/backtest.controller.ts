@@ -1,5 +1,10 @@
 import { Controller, Post, Body, HttpCode, HttpStatus } from '@nestjs/common';
-import { BacktestService, BacktestResponse, WalkForwardResponse } from './backtest.service';
+import {
+  BacktestService,
+  BacktestResponse,
+  WalkForwardResponse,
+  CrossSectionalResponse,
+} from './backtest.service';
 import { RunBacktestDto } from './dto/run-backtest.dto';
 
 /** Executes a strategy backtest over historical OHLCV data fetched from the active provider. */
@@ -18,5 +23,17 @@ export class BacktestController {
   @HttpCode(HttpStatus.OK)
   walkForward(@Body() dto: RunBacktestDto): Promise<WalkForwardResponse> {
     return this.backtestService.runWalkForward(dto);
+  }
+
+  /**
+   * Cross-sectional momentum portfolio backtest over `symbols` (the universe).
+   * Note: `strategy` is required by the shared DTO but IGNORED here — this route
+   * always runs the cross-sectional momentum engine. Params: top_n, rebalance_days,
+   * lookback, skip.
+   */
+  @Post('cross-sectional')
+  @HttpCode(HttpStatus.OK)
+  crossSectional(@Body() dto: RunBacktestDto): Promise<CrossSectionalResponse> {
+    return this.backtestService.runCrossSectional(dto);
   }
 }

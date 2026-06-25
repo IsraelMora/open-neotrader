@@ -17,6 +17,27 @@ if _SCRIPTS_STR not in sys.path:
 from engine import run_backtest
 from generate import generate_signals
 from walk_forward import run_walk_forward as _run_walk_forward
+from cross_sectional import run_cross_sectional as _run_cross_sectional
+
+
+def run_cross_sectional(prices: dict, config: dict, _context=None) -> dict:
+    """Cross-sectional momentum portfolio backtest: rank the universe by 12-1
+    momentum, hold the top-N equal-weight, rebalance periodically.
+
+    Args:
+        prices: {symbol: [normalized bars with date/open/high/low/close/volume]}
+        config: {top_n, rebalance_days, lookback, skip, initial_capital}
+    Returns:
+        {ok, metrics{total_return_pct,cagr_pct,sharpe_ratio,max_drawdown_pct,
+         buy_hold_return_pct,alpha_pct}, equity_curve, final_holdings, ...}
+        or {ok: False, error}
+    """
+    if not prices:
+        return {"ok": False, "error": "No price data provided"}
+    try:
+        return _run_cross_sectional(prices, config)
+    except Exception as exc:  # noqa: BLE001 — surface as structured error
+        return {"ok": False, "error": f"Cross-sectional backtest failed: {exc}"}
 
 
 def run(

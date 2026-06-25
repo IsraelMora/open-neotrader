@@ -275,3 +275,37 @@ describe('BacktestService — configurable strategy params', () => {
     expect(payload.config.rsi_oversold).toBe(25);
   });
 });
+
+describe('BacktestService — runCrossSectional', () => {
+  const CS_OK = {
+    ok: true,
+    result: {
+      ok: true,
+      metrics: { total_return_pct: 30, cagr_pct: 14, sharpe_ratio: 0.8, max_drawdown_pct: 18, buy_hold_return_pct: 22, alpha_pct: 8 },
+      equity_curve: [{ date: '2024-01-01', equity: 10000 }],
+      final_holdings: ['NVDA'],
+      n_dates: 300,
+      universe_size: 5,
+    },
+  };
+
+  it('calls backtester.run_cross_sectional with prices + config (no strategy_id)', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox, callPlugin } = makeSandbox(CS_OK);
+    const svc = makeService(gateway, sandbox);
+    const result = await svc.runCrossSectional(makeDto({ top_n: 2, lookback: 200, skip: 20 }));
+
+    expect(result.metrics.alpha_pct).toBe(8);
+    const [plugin, fn, payload] = callPlugin.mock.calls[0] as [
+      string,
+      string,
+      { prices: unknown; config: { top_n: number; lookback: number; skip: number } },
+    ];
+    expect(plugin).toBe('backtester');
+    expect(fn).toBe('run_cross_sectional');
+    expect(payload.config.top_n).toBe(2);
+    expect(payload.config.lookback).toBe(200);
+    expect(payload.config.skip).toBe(20);
+    expect(payload.prices).toBeDefined();
+  });
+});
