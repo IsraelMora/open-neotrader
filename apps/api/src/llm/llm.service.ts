@@ -3,12 +3,17 @@ import { ConfigService } from '@nestjs/config';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { PluginsService } from '../plugins/plugins.service';
+import type { ProviderTool } from '../plugins/plugins.service';
 import { buildSubscriptionArgs } from './subscription-args';
 
 /** Petición al LLM: contexto del ciclo y prompt de sistema opcional. */
 export interface LlmRequest {
   context: string;
   system_prompt?: string;
+  /** Native tool definitions to send to the provider (OpenAI/OpenRouter compatible). When set,
+   *  the backend will include `tools` + `tool_choice:'auto'` in the request and parse structured
+   *  tool_calls from the response instead of returning []. */
+  tools?: ProviderTool[];
 }
 
 /** Tool call propuesta por el LLM: qué función de qué plugin invocar y con qué argumentos. */
@@ -30,6 +35,49 @@ export interface LlmResponse {
 const execFileAsync = promisify(execFile);
 
 type LlmBackend = 'anthropic' | 'openai' | 'gemini' | 'subscription' | 'custom';
+
+// ── Native tool-call response type (OpenAI format) ───────────────────────────
+
+interface OpenAiNativeToolCall {
+  id?: string;
+  type?: string;
+  function: { name: string; arguments: string };
+}
+
+/**
+ * Maps an array of OpenAI-format native tool_calls to ToolCallRequest[].
+ * - name.split('__')[0]           → plugin_id
+ * - name.split('__').slice(1).join('__') → function
+ * - safe JSON.parse(arguments)    → args (defaults to {} on parse error)
+ * Never throws.
+ */
+function mapNativeToolCalls(raw: OpenAiNativeToolCall[]): ToolCallRequest[] {
+  return raw.map((tc) => {
+    const name = tc.function.name;
+    const sep = name.indexOf('__');
+    const plugin_id = sep === -1 ? name : name.slice(0, sep);
+    const fn = sep === -1 ? '' : name.slice(sep + 2);
+    let args: Record<string, unknown> = {};
+    try {
+      args = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+    } catch {
+      // malformed arguments — default to empty object
+    }
+    return { plugin_id, function: fn, args };
+  });
+}
+
+/**
+ * Builds the native `tools` array in OpenAI format from ProviderTool[].
+ */
+function buildOpenAiTools(
+  tools: ProviderTool[],
+): Array<{ type: 'function'; function: { name: string; description: string; parameters: ProviderTool['input_schema'] } }> {
+  return tools.map((t) => ({
+    type: 'function' as const,
+    function: { name: t.name, description: t.description, parameters: t.input_schema },
+  }));
+}
 
 export interface CustomLlmProvider {
   id: string; // identificador único, e.g. "groq", "openrouter"
@@ -276,20 +324,27 @@ export class LlmService {
       .filter(Boolean)
       .join('\n\n');
 
+    const hasTools = req.tools && req.tools.length > 0;
+    const requestBody: Record<string, unknown> = {
+      model: this._model.startsWith('gpt') ? this._model : 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemContent },
+        { role: 'user', content: req.context },
+      ],
+      max_tokens: 4096,
+    };
+    if (hasTools) {
+      requestBody['tools'] = buildOpenAiTools(req.tools!);
+      requestBody['tool_choice'] = 'auto';
+    }
+
     const res = await globalThis.fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({
-        model: this._model.startsWith('gpt') ? this._model : 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemContent },
-          { role: 'user', content: req.context },
-        ],
-        max_tokens: 4096,
-      }),
+      body: JSON.stringify(requestBody),
       signal: AbortSignal.timeout(60_000),
     });
 
@@ -299,13 +354,19 @@ export class LlmService {
     }
 
     const data = (await res.json()) as {
-      choices?: [{ message?: { content?: string } }];
+      choices?: [{ message?: { content?: string | null; tool_calls?: OpenAiNativeToolCall[] } }];
     };
-    const text = data.choices?.[0]?.message?.content?.trim() ?? '';
+    const message = data.choices?.[0]?.message;
+    const text = message?.content?.trim() ?? '';
+    const nativeToolCalls = message?.tool_calls;
+    const tool_calls =
+      hasTools && Array.isArray(nativeToolCalls) && nativeToolCalls.length > 0
+        ? mapNativeToolCalls(nativeToolCalls)
+        : [];
 
     return {
       text,
-      tool_calls: [],
+      tool_calls,
       backend: 'api',
       skills_read: skillsMeta.map((s) => s.name),
       skills_written: [],
@@ -416,18 +477,25 @@ export class LlmService {
       headers['X-Title'] = 'NeuroTrader';
     }
 
+    const hasTools = req.tools && req.tools.length > 0;
+    const requestBody: Record<string, unknown> = {
+      model,
+      messages: [
+        { role: 'system', content: systemContent },
+        { role: 'user', content: req.context },
+      ],
+      max_tokens: 4096,
+      temperature: 0.2,
+    };
+    if (hasTools) {
+      requestBody['tools'] = buildOpenAiTools(req.tools!);
+      requestBody['tool_choice'] = 'auto';
+    }
+
     const res = await globalThis.fetch(`${provider.base_url}/chat/completions`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: systemContent },
-          { role: 'user', content: req.context },
-        ],
-        max_tokens: 4096,
-        temperature: 0.2,
-      }),
+      body: JSON.stringify(requestBody),
       signal: AbortSignal.timeout(120_000),
     });
 
@@ -439,15 +507,21 @@ export class LlmService {
     }
 
     const data = (await res.json()) as {
-      choices?: [{ message?: { content?: string } }];
+      choices?: [{ message?: { content?: string | null; tool_calls?: OpenAiNativeToolCall[] } }];
     };
-    const text = data.choices?.[0]?.message?.content?.trim() ?? '';
+    const message = data.choices?.[0]?.message;
+    const text = message?.content?.trim() ?? '';
+    const nativeToolCalls = message?.tool_calls;
+    const tool_calls =
+      hasTools && Array.isArray(nativeToolCalls) && nativeToolCalls.length > 0
+        ? mapNativeToolCalls(nativeToolCalls)
+        : [];
 
-    this.log.debug(`${provider.name} (${model}): ${text.length} chars`);
+    this.log.debug(`${provider.name} (${model}): ${text.length} chars, ${tool_calls.length} tool_calls`);
 
     return {
       text,
-      tool_calls: [],
+      tool_calls,
       backend: 'api',
       skills_read: skillsMeta.map((s) => s.name),
       skills_written: [],

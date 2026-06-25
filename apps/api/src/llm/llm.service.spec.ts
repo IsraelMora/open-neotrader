@@ -1,4 +1,5 @@
 import { LlmService } from './llm.service';
+import type { ProviderTool } from '../plugins/plugins.service';
 import { ConfigService } from '@nestjs/config';
 import { PluginsService } from '../plugins/plugins.service';
 
@@ -29,6 +30,52 @@ function mockFetch(responseText: string): void {
     ok: true,
     json: () => Promise.resolve({ content: [{ text: responseText }] }),
   });
+}
+
+// ── Fake OpenAI API response helpers ─────────────────────────────────────────
+
+type OpenAiToolCall = {
+  id?: string;
+  type?: string;
+  function: { name: string; arguments: string };
+};
+
+function mockOpenAiFetch(content: string | null, toolCalls?: OpenAiToolCall[]): jest.Mock {
+  const fetchMock = jest.fn().mockResolvedValue({
+    ok: true,
+    json: () =>
+      Promise.resolve({
+        choices: [
+          {
+            message: {
+              content,
+              ...(toolCalls ? { tool_calls: toolCalls } : {}),
+            },
+          },
+        ],
+      }),
+    text: () => Promise.resolve(''),
+  });
+  globalThis.fetch = fetchMock;
+  return fetchMock;
+}
+
+function makeDecisionTool(): ProviderTool {
+  return {
+    plugin_id: 'decision',
+    name: 'decision__emit_trade_intent',
+    description: 'Emits a trade intent signal.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string' },
+        action: { type: 'string' },
+        confidence: { type: 'number' },
+        rationale: { type: 'string' },
+      },
+      required: ['symbol', 'action', 'confidence', 'rationale'],
+    },
+  };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -91,5 +138,210 @@ describe('LlmService.complete() — inert contract (no parseToolCalls)', () => {
     expect(result.backend).toBe('api');
     expect(Array.isArray(result.skills_read)).toBe(true);
     expect(Array.isArray(result.skills_written)).toBe(true);
+  });
+});
+
+// ── Native tool calls — completeViaOpenAi ─────────────────────────────────────
+
+describe('LlmService.completeViaOpenAi — native tool_calls', () => {
+  let service: LlmService;
+  let plugins: PluginsService;
+
+  beforeEach(() => {
+    plugins = makePlugins();
+    service = new LlmService(
+      makeConfig({ LLM_BACKEND: 'openai', OPENAI_API_KEY: 'test-openai-key', LLM_MODEL: 'gpt-4o-mini' }),
+      plugins,
+    );
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('maps native tool_calls to ToolCallRequest[] when response contains function calls', async () => {
+    const tool = makeDecisionTool();
+    const nativeArgs = { symbol: 'AAPL', action: 'long', confidence: 0.7, rationale: 'x' };
+    mockOpenAiFetch(null, [
+      {
+        id: 'call_abc123',
+        type: 'function',
+        function: { name: 'decision__emit_trade_intent', arguments: JSON.stringify(nativeArgs) },
+      },
+    ]);
+
+    const result = await service.complete({ context: 'buy signal', tools: [tool] });
+
+    expect(result.tool_calls).toHaveLength(1);
+    expect(result.tool_calls[0]).toEqual({
+      plugin_id: 'decision',
+      function: 'emit_trade_intent',
+      args: nativeArgs,
+    });
+  });
+
+  it('includes tools and tool_choice:auto in the request body when tools are provided', async () => {
+    const tool = makeDecisionTool();
+    const fetchMock = mockOpenAiFetch('no-op', []);
+
+    await service.complete({ context: 'test', tools: [tool] });
+
+    const callArgs = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(callArgs[1].body as string) as Record<string, unknown>;
+
+    expect(body['tool_choice']).toBe('auto');
+    expect(Array.isArray(body['tools'])).toBe(true);
+    const tools = body['tools'] as Array<{ type: string; function: { name: string } }>;
+    expect(tools[0].type).toBe('function');
+    expect(tools[0].function.name).toBe('decision__emit_trade_intent');
+  });
+
+  it('returns tool_calls:[] and does not throw when response has no tool_calls field', async () => {
+    mockOpenAiFetch('Just text, no tool calls.', undefined);
+
+    const tool = makeDecisionTool();
+    const result = await service.complete({ context: 'test', tools: [tool] });
+
+    expect(result.tool_calls).toEqual([]);
+    expect(result.text).toBe('Just text, no tool calls.');
+  });
+
+  it('returns args:{} and does not throw when tool_call arguments contain malformed JSON', async () => {
+    const tool = makeDecisionTool();
+    mockOpenAiFetch(null, [
+      {
+        id: 'call_bad',
+        type: 'function',
+        function: { name: 'decision__emit_trade_intent', arguments: 'not-valid-json' },
+      },
+    ]);
+
+    const result = await service.complete({ context: 'test', tools: [tool] });
+
+    expect(result.tool_calls).toHaveLength(1);
+    expect(result.tool_calls[0].args).toEqual({});
+  });
+
+  it('does NOT include tools or tool_choice in request body when no tools provided', async () => {
+    const fetchMock = mockOpenAiFetch('plain response');
+
+    await service.complete({ context: 'test' });
+
+    const callArgs = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(callArgs[1].body as string) as Record<string, unknown>;
+
+    expect(body['tool_choice']).toBeUndefined();
+    expect(body['tools']).toBeUndefined();
+  });
+
+  it('still returns tool_calls:[] when tools is an empty array', async () => {
+    const fetchMock = mockOpenAiFetch('plain response');
+
+    await service.complete({ context: 'test', tools: [] });
+
+    const callArgs = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(callArgs[1].body as string) as Record<string, unknown>;
+
+    expect(body['tool_choice']).toBeUndefined();
+    expect(body['tools']).toBeUndefined();
+  });
+
+  it('handles multiple tool_calls in a single response', async () => {
+    const tool = makeDecisionTool();
+    mockOpenAiFetch(null, [
+      {
+        function: { name: 'decision__emit_trade_intent', arguments: '{"symbol":"AAPL","action":"long","confidence":0.8,"rationale":"a"}' },
+      },
+      {
+        function: { name: 'decision__emit_trade_intent', arguments: '{"symbol":"TSLA","action":"short","confidence":0.6,"rationale":"b"}' },
+      },
+    ]);
+
+    const result = await service.complete({ context: 'test', tools: [tool] });
+
+    expect(result.tool_calls).toHaveLength(2);
+    expect(result.tool_calls[0].args['symbol']).toBe('AAPL');
+    expect(result.tool_calls[1].args['symbol']).toBe('TSLA');
+  });
+
+  it('splits name with __ correctly: plugin_id=first segment, function=rest joined', async () => {
+    const tool: ProviderTool = {
+      plugin_id: 'paper',
+      name: 'paper__open__position',
+      description: 'desc',
+      input_schema: { type: 'object', properties: {}, required: [] },
+    };
+    mockOpenAiFetch(null, [
+      { function: { name: 'paper__open__position', arguments: '{"qty":1}' } },
+    ]);
+
+    const result = await service.complete({ context: 'test', tools: [tool] });
+
+    expect(result.tool_calls[0].plugin_id).toBe('paper');
+    expect(result.tool_calls[0].function).toBe('open__position');
+  });
+});
+
+// ── Native tool calls — completeViaCustom ─────────────────────────────────────
+
+describe('LlmService.completeViaCustom — native tool_calls', () => {
+  let service: LlmService;
+  let plugins: PluginsService;
+
+  beforeEach(() => {
+    plugins = makePlugins();
+    service = new LlmService(
+      makeConfig({ LLM_BACKEND: 'custom', LLM_MODEL: 'nvidia/nemotron-3-super-120b-a12b:free' }),
+      plugins,
+    );
+    // Register a custom provider and activate it
+    service.addCustomProvider({
+      id: 'openrouter',
+      name: 'OpenRouter',
+      base_url: 'https://openrouter.ai/api/v1',
+      api_key_env: 'OPENROUTER_API_KEY',
+      default_model: 'nvidia/nemotron-3-super-120b-a12b:free',
+    });
+    service.patchConfig({ custom_provider_id: 'openrouter' });
+    process.env['OPENROUTER_API_KEY'] = 'test-or-key';
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    delete process.env['OPENROUTER_API_KEY'];
+  });
+
+  it('maps native tool_calls from custom provider response', async () => {
+    const tool = makeDecisionTool();
+    const nativeArgs = { symbol: 'NVDA', action: 'long', confidence: 0.85, rationale: 'momentum' };
+    mockOpenAiFetch(null, [
+      {
+        id: 'call_xyz',
+        type: 'function',
+        function: { name: 'decision__emit_trade_intent', arguments: JSON.stringify(nativeArgs) },
+      },
+    ]);
+
+    const result = await service.complete({ context: 'nvda signal', tools: [tool] });
+
+    expect(result.tool_calls).toHaveLength(1);
+    expect(result.tool_calls[0]).toEqual({
+      plugin_id: 'decision',
+      function: 'emit_trade_intent',
+      args: nativeArgs,
+    });
+  });
+
+  it('includes tools and tool_choice:auto in request body for custom provider', async () => {
+    const tool = makeDecisionTool();
+    const fetchMock = mockOpenAiFetch('ok', []);
+
+    await service.complete({ context: 'test', tools: [tool] });
+
+    const callArgs = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(callArgs[1].body as string) as Record<string, unknown>;
+
+    expect(body['tool_choice']).toBe('auto');
+    expect(Array.isArray(body['tools'])).toBe(true);
   });
 });

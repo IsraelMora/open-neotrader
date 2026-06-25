@@ -511,9 +511,14 @@ export class AgentsService {
     const llmResponse = await this.llm.complete({
       context: args.context,
       system_prompt: builtSystemPrompt || undefined,
+      tools: effectiveTools,
     });
 
-    // ── Parse tool_calls with parse_miss audit ────────────────────────────────
+    // ── Parse tool_calls: native wins, text-fallback for non-tool backends ────
+    // When the LLM backend supports native tool_calls (OpenAI/OpenRouter), it
+    // returns them directly in llmResponse.tool_calls.  We only fall back to
+    // text parsing when the response carries no native calls — this keeps
+    // backwards compat with Anthropic/Gemini/subscription backends.
     const auditFn = (raw: string): void => {
       void this.audit.log({
         cycle_id,
@@ -521,7 +526,9 @@ export class AgentsService {
         meta: { raw_block: raw.slice(0, 500) },
       });
     };
-    llmResponse.tool_calls = parseToolCalls(llmResponse.text, auditFn);
+    if (!llmResponse.tool_calls || llmResponse.tool_calls.length === 0) {
+      llmResponse.tool_calls = parseToolCalls(llmResponse.text, auditFn);
+    }
 
     const skills_read = llmResponse.skills_read ?? [];
     const skills_written = llmResponse.skills_written ?? [];

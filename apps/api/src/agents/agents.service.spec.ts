@@ -10794,3 +10794,208 @@ describe('_assembleReflectionContext — budget ≤ 5000 and all sections presen
     expect(ctx.length).toBeLessThanOrEqual(5000);
   });
 });
+
+// ── Native tool_calls: agents.service passes tools and uses fallback correctly ─
+
+describe('AgentsService._runSingleIteration — native tool_calls vs text fallback', () => {
+  /**
+   * Helper to call _runSingleIteration directly via any cast.
+   * We test the private method because runGovernedTurn wraps it with additional
+   * concerns (kv, multi-iteration) that would require more mocking.
+   * The key behaviour we verify:
+   *   1. llm.complete is called WITH the effectiveTools passed.
+   *   2. When llm returns native tool_calls, parseToolCalls is NOT called.
+   *   3. When llm returns no tool_calls, parseToolCalls fallback IS used.
+   */
+  type IterationArgs = {
+    cycle_id: string;
+    source: 'chat' | 'cycle' | 'pretest' | 'reflection';
+    context: string;
+    system_prompt?: string;
+    effectiveTools: import('../plugins/plugins.service').ProviderTool[];
+    visibleTools: import('../plugins/plugins.service').ProviderTool[];
+    _activePlugins?: import('../plugins/plugins.service').HydratedPlugin[];
+    virtual_only?: boolean;
+    decisionPrompt: string | null;
+  };
+
+  async function callRunSingleIteration(
+    service: AgentsService,
+    args: IterationArgs,
+  ) {
+    return (
+      service as unknown as {
+        _runSingleIteration: (args: IterationArgs) => Promise<unknown>;
+      }
+    )._runSingleIteration(args);
+  }
+
+  const TOOL: import('../plugins/plugins.service').ProviderTool = {
+    plugin_id: 'decision',
+    name: 'decision__emit_trade_intent',
+    description: 'Emits a trade intent.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  };
+
+  const CYCLE_ID = 'native-tool-test-001';
+
+  it('passes effectiveTools to llm.complete', async () => {
+    const llmComplete = jest.fn().mockResolvedValue({
+      text: '',
+      tool_calls: [{ plugin_id: 'decision', function: 'emit_trade_intent', args: {} }],
+      backend: 'api' as const,
+      skills_read: [],
+      skills_written: [],
+    } as LlmResponse);
+
+    const plugins = makeFullPlugins('Use tools.', [TOOL]);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'provider' }] as never);
+
+    const service = makeFullAgentsService(
+      { complete: llmComplete } as Partial<LlmService>,
+      makeAudit(),
+      plugins,
+      makeSandbox(),
+      makeMemory(),
+    );
+
+    await callRunSingleIteration(service, {
+      cycle_id: CYCLE_ID,
+      source: 'chat',
+      context: 'buy signal',
+      effectiveTools: [TOOL],
+      visibleTools: [TOOL],
+      decisionPrompt: 'Use tools.',
+    });
+
+    const callArgs = llmComplete.mock.calls[0] as [{ tools?: unknown }];
+    expect(callArgs[0].tools).toEqual([TOOL]);
+  });
+
+  it('uses native tool_calls directly when LLM returns them (parseToolCalls NOT called)', async () => {
+    // The LLM returns a native tool_call — no text block.
+    const nativeCall: ToolCallRequest = {
+      plugin_id: 'decision',
+      function: 'emit_trade_intent',
+      args: { symbol: 'AAPL', action: 'long', confidence: 0.9, rationale: 'bullish' },
+    };
+    const llmComplete = jest.fn().mockResolvedValue({
+      text: '',
+      tool_calls: [nativeCall],
+      backend: 'api' as const,
+      skills_read: [],
+      skills_written: [],
+    } as LlmResponse);
+
+    const plugins = makeFullPlugins('Use tools.', [TOOL]);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'provider' }] as never);
+    plugins.getProviderTools.mockResolvedValue([TOOL] as never);
+
+    const sandbox = makeSandbox();
+    const service = makeFullAgentsService(
+      { complete: llmComplete } as Partial<LlmService>,
+      makeAudit(),
+      plugins,
+      sandbox,
+      makeMemory(),
+    );
+
+    const result = await callRunSingleIteration(service, {
+      cycle_id: CYCLE_ID,
+      source: 'chat',
+      context: 'buy AAPL',
+      effectiveTools: [TOOL],
+      visibleTools: [TOOL],
+      decisionPrompt: 'Use tools.',
+    }) as { tool_calls: ToolCallRequest[] };
+
+    // The native call must flow through unchanged.
+    expect(result.tool_calls).toHaveLength(1);
+    expect(result.tool_calls[0].plugin_id).toBe('decision');
+    expect(result.tool_calls[0].function).toBe('emit_trade_intent');
+
+    // sandbox must have been called (tool call was dispatched).
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to parseToolCalls when LLM returns tool_calls:[] but text has a block', async () => {
+    // LLM returns no native tool_calls, but text contains a parseable block.
+    const textWithBlock =
+      '<tool_calls>[{"tool":"decision__emit_trade_intent","args":{"symbol":"NVDA","action":"long","confidence":0.7,"rationale":"y"}}]</tool_calls>';
+
+    const llmComplete = jest.fn().mockResolvedValue({
+      text: textWithBlock,
+      tool_calls: [],    // <── no native tool_calls
+      backend: 'api' as const,
+      skills_read: [],
+      skills_written: [],
+    } as LlmResponse);
+
+    const plugins = makeFullPlugins('Use tools.', [TOOL]);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'provider' }] as never);
+    plugins.getProviderTools.mockResolvedValue([TOOL] as never);
+
+    const sandbox = makeSandbox();
+    const service = makeFullAgentsService(
+      { complete: llmComplete } as Partial<LlmService>,
+      makeAudit(),
+      plugins,
+      sandbox,
+      makeMemory(),
+    );
+
+    const result = await callRunSingleIteration(service, {
+      cycle_id: CYCLE_ID,
+      source: 'chat',
+      context: 'nvda signal',
+      effectiveTools: [TOOL],
+      visibleTools: [TOOL],
+      decisionPrompt: 'Use tools.',
+    }) as { tool_calls: ToolCallRequest[] };
+
+    // Fallback parsing must have extracted the tool call from text.
+    expect(result.tool_calls).toHaveLength(1);
+    expect(result.tool_calls[0].plugin_id).toBe('decision');
+    expect(result.tool_calls[0].function).toBe('emit_trade_intent');
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to parseToolCalls when LLM returns undefined tool_calls', async () => {
+    const textWithBlock =
+      '<tool_calls>[{"tool":"decision__emit_trade_intent","args":{"symbol":"SPY","action":"long","confidence":0.6,"rationale":"z"}}]</tool_calls>';
+
+    const llmComplete = jest.fn().mockResolvedValue({
+      text: textWithBlock,
+      tool_calls: undefined as unknown as ToolCallRequest[],
+      backend: 'api' as const,
+      skills_read: [],
+      skills_written: [],
+    } as LlmResponse);
+
+    const plugins = makeFullPlugins('Use tools.', [TOOL]);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'provider' }] as never);
+    plugins.getProviderTools.mockResolvedValue([TOOL] as never);
+
+    const sandbox = makeSandbox();
+    const service = makeFullAgentsService(
+      { complete: llmComplete } as Partial<LlmService>,
+      makeAudit(),
+      plugins,
+      sandbox,
+      makeMemory(),
+    );
+
+    const result = await callRunSingleIteration(service, {
+      cycle_id: CYCLE_ID,
+      source: 'chat',
+      context: 'spy signal',
+      effectiveTools: [TOOL],
+      visibleTools: [TOOL],
+      decisionPrompt: 'Use tools.',
+    }) as { tool_calls: ToolCallRequest[] };
+
+    expect(result.tool_calls).toHaveLength(1);
+    expect(result.tool_calls[0].plugin_id).toBe('decision');
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+  });
+});
