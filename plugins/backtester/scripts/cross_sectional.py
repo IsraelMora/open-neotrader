@@ -75,7 +75,12 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     skip = int(config.get("skip", 21))
     capital = float(config.get("initial_capital", 10000))
     # Regime filter (dual momentum, Antonacci): when market breadth is weak (few names
-    # with positive momentum) go fully to cash to dodge market-wide drawdowns.
+    # with positive momentum) go fully to cash. Off by default.
+    # EMPIRICAL NOTE (2016-2026, 20 mega-caps): this breadth filter did NOT reduce max
+    # drawdown and slightly lowered returns — the period was mostly bullish so it rarely
+    # triggered, and the monthly rebalance lag meant it didn't dodge fast drawdowns. It
+    # may help in prolonged bear regimes, but that benefit is unproven here. Don't assume
+    # it improves risk-adjusted returns without re-testing on YOUR universe/period.
     regime_filter = bool(config.get("regime_filter", False))
     regime_min_breadth = float(config.get("regime_min_breadth", 0.5))
 
