@@ -395,3 +395,40 @@ describe('LlmService — persistencia de config en KV', () => {
     expect(set).toHaveBeenCalledWith('llm.backend', 'openai');
   });
 });
+
+describe('LlmService.getReadiness — diagnóstico de credencial del LLM', () => {
+  it('backend openai SIN OPENAI_API_KEY → no listo (la causa del "no opera")', () => {
+    const svc = new LlmService(
+      makeConfig({ LLM_BACKEND: 'openai', OPENAI_API_KEY: '' }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const r = svc.getReadiness();
+    expect(r.backend).toBe('openai');
+    expect(r.credentialPresent).toBe(false);
+    expect(r.requiredEnv).toBe('OPENAI_API_KEY');
+  });
+
+  it('backend anthropic CON key → listo', () => {
+    const svc = new LlmService(
+      makeConfig({ LLM_BACKEND: 'anthropic', ANTHROPIC_API_KEY: 'sk-ant-x' }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const r = svc.getReadiness();
+    expect(r.backend).toBe('anthropic');
+    expect(r.credentialPresent).toBe(true);
+    expect(r.requiredEnv).toBe('ANTHROPIC_API_KEY');
+  });
+
+  it('backend subscription no requiere API key → listo', () => {
+    const svc = new LlmService(
+      makeConfig({ LLM_BACKEND: 'subscription' }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const r = svc.getReadiness();
+    expect(r.credentialPresent).toBe(true);
+    expect(r.requiredEnv).toBeNull();
+  });
+});

@@ -126,6 +126,52 @@ export class LlmService implements OnModuleInit {
     } catch (e) {
       this.log.warn(`No se pudo leer la config LLM de KV: ${e instanceof Error ? e.message : e}`);
     }
+
+    // Fail-LOUD readiness check: if the active backend has no usable credential, every
+    // cycle will silently fail (no decision → no trade). Surface it at boot, not buried
+    // in the audit log 13 days later.
+    const r = this.getReadiness();
+    if (!r.credentialPresent) {
+      this.log.error(
+        `LLM NO OPERATIVO: backend='${r.backend}' requiere ${r.requiredEnv} y no está configurada. ` +
+          `El agente NO podrá decidir ni operar hasta cargarla (Credenciales / .env). Modelo=${r.model}`,
+      );
+    }
+  }
+
+  /**
+   * Readiness del LLM: ¿el backend activo tiene una credencial usable? No expone la key,
+   * solo si está presente. Lo consume el /doctor y el log de arranque para que un backend
+   * sin credencial sea imposible de pasar por alto (causa raíz de "el agente no opera").
+   */
+  getReadiness(): {
+    backend: LlmBackend;
+    model: string;
+    credentialPresent: boolean;
+    requiredEnv: string | null;
+    detail: string;
+  } {
+    const envByBackend: Partial<Record<LlmBackend, string>> = {
+      anthropic: 'ANTHROPIC_API_KEY',
+      openai: 'OPENAI_API_KEY',
+      gemini: 'GEMINI_API_KEY',
+    };
+    const requiredEnv = envByBackend[this._backend] ?? null;
+
+    let credentialPresent: boolean;
+    if (this._backend === 'subscription') {
+      credentialPresent = true; // OAuth vía plugin claude-subscription, sin API key
+    } else if (this._backend === 'custom') {
+      credentialPresent = this._activeCustomId !== null; // la key vive en el provider custom
+    } else {
+      credentialPresent = requiredEnv !== null && !!this.cfg.get<string>(requiredEnv);
+    }
+
+    const detail = credentialPresent
+      ? `LLM listo (backend=${this._backend}, model=${this._model})`
+      : `${requiredEnv ?? 'credencial'} no configurada — el agente NO podrá decidir ni operar`;
+
+    return { backend: this._backend, model: this._model, credentialPresent, requiredEnv, detail };
   }
 
   /** Devuelve la configuración activa del LLM: modelo, backend y capacidades. */

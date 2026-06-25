@@ -121,11 +121,17 @@ export class PanelService {
       this.plugins.findAll(),
       this.sandbox.call({ cmd: 'list_plugins', active_ids: [] }).catch(() => null),
     ]);
+    const llm = this.llm.getReadiness();
     return {
       ok: true,
       plugins_registered: plugins.length,
       plugins_active: plugins.filter((p) => p.active).length,
       sandbox_reachable: sandboxRes?.ok ?? false,
+      // Surfaces a missing/misconfigured LLM credential: if false, cycles can't decide
+      // or trade. This is the single highest-signal "why isn't it trading" check.
+      llm_ready: llm.credentialPresent,
+      llm_backend: llm.backend,
+      llm_detail: llm.detail,
       timestamp: new Date().toISOString(),
     };
   }
@@ -161,6 +167,16 @@ export class PanelService {
         title: 'Sandbox no disponible',
         source: 'platform',
         body: 'El runner.py no respondió. Los plugins no funcionarán hasta resolver esto.',
+        ts: new Date().toISOString(),
+      });
+    }
+
+    if (!doctorData.llm_ready) {
+      items.push({
+        level: 'error',
+        title: 'LLM sin credencial — el agente no puede operar',
+        source: 'platform',
+        body: doctorData.llm_detail,
         ts: new Date().toISOString(),
       });
     }
