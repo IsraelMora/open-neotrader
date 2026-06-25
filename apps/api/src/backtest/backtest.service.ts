@@ -3,6 +3,11 @@ import { ProviderGatewayService } from '../providers/provider-gateway.service';
 import { SandboxGateway } from '../sandbox/sandbox.gateway';
 import { RunBacktestDto } from './dto/run-backtest.dto';
 import { CrossSectionalDto } from './dto/cross-sectional.dto';
+import { StrategyService } from '../strategy/strategy.service';
+import { PluginsService } from '../plugins/plugins.service';
+
+/** Universo por defecto cuando una estrategia no define cycle.universe. */
+const DEFAULT_UNIVERSE = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META'];
 
 /** Minimal shape needed to fetch + normalize OHLCV — satisfied by both DTOs. */
 interface PriceQuery {
@@ -87,7 +92,70 @@ export class BacktestService {
   constructor(
     private readonly providerGateway: ProviderGatewayService,
     private readonly sandbox: SandboxGateway,
+    private readonly strategies: StrategyService,
+    private readonly plugins: PluginsService,
   ) {}
+
+  /** Plugins que proveen backtest (declaran una skill 'backtester.*'). */
+  async listProviders(): Promise<{ id: string; name: string; active: boolean }[]> {
+    const all = await this.plugins.findAll();
+    return all
+      .filter((p) => (p.skills ?? []).some((s) => s.startsWith('backtester.')))
+      .map((p) => ({ id: p.id, name: p.name, active: p.active }));
+  }
+
+  /**
+   * Corre un backtest para cada estrategia seleccionada usando el provider de backtest
+   * elegido (plugin) y devuelve la curva de equity de cada una → gráfico de competencia.
+   */
+  async compareStrategies(input: {
+    strategy_ids: string[];
+    provider_id?: string;
+    timeframe?: string;
+    bars?: number;
+  }): Promise<{
+    provider_id: string;
+    timeframe: string;
+    bars: number;
+    series: Record<string, { ts: string; equity: number }[]>;
+    errors: Record<string, string>;
+  }> {
+    const providerId = input.provider_id || 'backtester';
+    const timeframe = input.timeframe || '1d';
+    const bars = input.bars ?? 500;
+    const series: Record<string, { ts: string; equity: number }[]> = {};
+    const errors: Record<string, string> = {};
+
+    for (const sid of input.strategy_ids) {
+      try {
+        const s = await this.strategies.get(sid);
+        const universe = (s.config['cycle.universe'] ?? '')
+          .split(',')
+          .map((x) => x.trim())
+          .filter(Boolean);
+        const symbols = universe.length >= 2 ? universe : DEFAULT_UNIVERSE;
+        const prices = await this._buildPrices({ symbols, timeframe, limit: bars });
+        const config: Record<string, unknown> = {
+          initial_capital: Number(s.config['cycle.capital']) || 10000,
+        };
+        const resp = await this.sandbox.callPlugin(providerId, 'run_cross_sectional', {
+          prices,
+          config,
+        });
+        const result = resp.result as
+          | { ok?: boolean; equity_curve?: { date: string; equity: number }[]; error?: string }
+          | undefined;
+        if (resp.ok && result?.ok && Array.isArray(result.equity_curve)) {
+          series[s.name] = result.equity_curve.map((p) => ({ ts: p.date, equity: p.equity }));
+        } else {
+          errors[s.name] = String(resp.error ?? result?.error ?? 'backtest falló');
+        }
+      } catch (e) {
+        errors[sid] = e instanceof Error ? e.message : String(e);
+      }
+    }
+    return { provider_id: providerId, timeframe, bars, series, errors };
+  }
 
   async runBacktest(dto: RunBacktestDto): Promise<BacktestResponse> {
     const prices = await this._buildPrices(dto);

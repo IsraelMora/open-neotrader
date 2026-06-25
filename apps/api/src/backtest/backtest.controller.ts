@@ -1,4 +1,4 @@
-import { Controller, Post, Body, HttpCode, HttpStatus } from '@nestjs/common';
+import { Controller, Post, Get, Body, HttpCode, HttpStatus } from '@nestjs/common';
 import {
   BacktestService,
   BacktestResponse,
@@ -7,6 +7,7 @@ import {
 } from './backtest.service';
 import { RunBacktestDto } from './dto/run-backtest.dto';
 import { CrossSectionalDto } from './dto/cross-sectional.dto';
+import { BacktestCompareDto } from './dto/backtest-compare.dto';
 
 /** Executes a strategy backtest over historical OHLCV data fetched from the active provider. */
 @Controller('backtest')
@@ -35,5 +36,18 @@ export class BacktestController {
   @HttpCode(HttpStatus.OK)
   crossSectional(@Body() dto: CrossSectionalDto): Promise<CrossSectionalResponse> {
     return this.backtestService.runCrossSectional(dto);
+  }
+
+  /** Plugins que proveen backtest (seleccionables como motor). */
+  @Get('providers')
+  providers() {
+    return this.backtestService.listProviders();
+  }
+
+  /** Compara estrategias por backtest → curva de equity de cada una (gráfico de competencia). */
+  @Post('compare')
+  @HttpCode(HttpStatus.OK)
+  compare(@Body() dto: BacktestCompareDto) {
+    return this.backtestService.compareStrategies(dto);
   }
 }

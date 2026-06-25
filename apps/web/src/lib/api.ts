@@ -164,6 +164,21 @@ export const api = {
     client.post(`api/strategies/${id}/apply`, { json: {} }).json<JsonObject>(),
   strategyPublish: (id: string) =>
     client.post(`api/strategies/${id}/publish`, { json: {} }).json<JsonObject>(),
+  backtestProviders: () =>
+    client.get('api/backtest/providers').json<{ id: string; name: string; active: boolean }[]>(),
+  backtestCompare: (body: {
+    strategy_ids: string[];
+    provider_id?: string;
+    timeframe?: string;
+    bars?: number;
+  }) =>
+    client.post('api/backtest/compare', { json: body }).json<{
+      provider_id: string;
+      timeframe: string;
+      bars: number;
+      series: Record<string, { ts: string; equity: number }[]>;
+      errors: Record<string, string>;
+    }>(),
   strategyStats: (id: string) =>
     client.get(`api/strategies/${id}/stats`).json<{
       strategy_id: string;

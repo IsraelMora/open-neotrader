@@ -2,7 +2,7 @@
 id          = "backtester"
 name        = "Backtester"
 version     = "1.0.0"
-type        = "extra"
+type        = "provider"
 description = "Motor de backtesting integrado. Permite testear estrategias con datos históricos usando numpy puro (sin dependencias externas). Calcula Sharpe, max drawdown, win rate, profit factor y curva de equity."
 author      = "OpenNeoTrader"
 tags        = ["backtesting", "analysis", "performance", "extra"]

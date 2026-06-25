@@ -19,6 +19,7 @@ import {
   Bell,
   TrendingUp,
   DraftingCompass,
+  ChartArea,
   Brain,
   Globe,
   SlidersHorizontal,
@@ -51,12 +52,14 @@ import Chat from './Chat';
 import Journal from './Journal';
 import Plugins from './Plugins';
 import Store from './Store';
+import BacktestCompare from './BacktestCompare';
 
 const PAGES: Record<string, () => JSX.Element> = {
   dashboard: () => <Dashboard />,
   notifications: () => <Notifications />,
   trades: () => <Trades />,
   strategies: () => <Strategies />,
+  backtest: () => <BacktestCompare />,
   skills: () => <Skills />,
   universe: () => <Universe />,
   parametros: () => <Parametros />,
@@ -80,6 +83,7 @@ const GRUPOS: { label: string; items: { href: string; label: string; icon: Lucid
       { href: '/notifications', label: 'Notificaciones', icon: Bell },
       { href: '/trades', label: 'Operaciones', icon: TrendingUp },
       { href: '/strategies', label: 'Estrategias', icon: DraftingCompass },
+      { href: '/backtest', label: 'Backtest', icon: ChartArea },
       { href: '/skills', label: 'Skills', icon: Brain },
     ],
   },

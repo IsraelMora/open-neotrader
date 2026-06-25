@@ -90,7 +90,13 @@ function makeSandbox(response: Record<string, unknown> = SANDBOX_SUCCESS) {
 }
 
 function makeService(gateway: ProviderGatewayService, sandbox: SandboxGateway): BacktestService {
-  return new BacktestService(gateway, sandbox);
+  const strategies = {
+    get: jest.fn(),
+  } as unknown as import('../strategy/strategy.service').StrategyService;
+  const plugins = {
+    findAll: jest.fn().mockResolvedValue([]),
+  } as unknown as import('../plugins/plugins.service').PluginsService;
+  return new BacktestService(gateway, sandbox, strategies, plugins);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
