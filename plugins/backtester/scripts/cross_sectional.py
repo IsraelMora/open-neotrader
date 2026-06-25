@@ -74,6 +74,13 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     lookback = int(config.get("lookback", 252))
     skip = int(config.get("skip", 21))
     capital = float(config.get("initial_capital", 10000))
+    # Transaction costs charged on the notional traded at each rebalance (and on the
+    # initial entry from cash). Without this the portfolio rebalances for free, which
+    # OVERSTATES returns — turnover is not costless. Defaults match the per-symbol
+    # engine / RunBacktestDto so both engines price friction consistently.
+    cost_pct = float(config.get("commission_pct", 0.001)) + float(
+        config.get("slippage_pct", 0.0005)
+    )
     # Regime filter (dual momentum, Antonacci): when market breadth is weak (few names
     # with positive momentum) go fully to cash. Off by default.
     # EMPIRICAL NOTE (2016-2026, 20 mega-caps): this breadth filter did NOT reduce max
@@ -110,9 +117,14 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
 
     equity = capital
     holdings: list[str] = []
+    weights: dict[str, float] = {}  # current equal-weight allocation by symbol
+    total_cost = 0.0
     equity_curve: list[dict] = []
     daily_returns: list[float] = []
     prev_val = capital
+
+    def _equal_weights(names: list[str]) -> dict[str, float]:
+        return {s: 1.0 / len(names) for s in names} if names else {}
 
     for i in range(len(common)):
         date = common[i]
@@ -132,6 +144,18 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
                 # Hold only positive-momentum names (don't buy falling assets).
                 holdings = [s for s, m in ranked[:top_n] if m is not None and m > 0]
 
+            # Charge cost on the traded notional: sum of |Δweight| across all names
+            # (covers both the names sold and the names bought, incl. entry from cash).
+            new_weights = _equal_weights(holdings)
+            traded = sum(
+                abs(new_weights.get(s, 0.0) - weights.get(s, 0.0))
+                for s in set(new_weights) | set(weights)
+            )
+            cost = cost_pct * traded * equity
+            equity = max(0.0, equity - cost)
+            total_cost += cost
+            weights = new_weights
+
         # Apply one day of equal-weight return from yesterday's holdings.
         if holdings and i > 0:
             rets = []
@@ -150,6 +174,7 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
         prev_val = equity
 
     metrics = _annualized_metrics(equity_curve, daily_returns, capital)
+    metrics["total_cost_pct"] = round((total_cost / capital * 100) if capital > 0 else 0.0, 2)
 
     # Benchmark: equal-weight of the WHOLE universe, daily-compounded over the SAME
     # common dates (consistent with how the strategy equity is built). This is robust

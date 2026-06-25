@@ -33,6 +33,8 @@ top_n           = { type = "integer", default = 3,    description = "Número de 
 rebalance_days  = { type = "integer", default = 21,   description = "Cada cuántas barras rebalancear (~mensual)" }
 lookback        = { type = "integer", default = 252,  description = "Ventana de momentum en barras (~12 meses)" }
 skip            = { type = "integer", default = 21,   description = "Barras recientes a saltar (momentum 12-1)" }
+regime_filter   = { type = "boolean", default = false, description = "Dual momentum: ir a cash si la amplitud del mercado es débil" }
+regime_min_breadth = { type = "number", default = 0.5, description = "Fracción mínima de nombres con momentum positivo para invertir" }
 
 [skills]
 keys = ["backtester.run", "backtester.run_walk_forward", "backtester.run_cross_sectional"]

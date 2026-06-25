@@ -32,6 +32,52 @@ def _bars(fn, n=150, start=datetime.date(2023, 1, 1)):
 CFG = {"top_n": 1, "lookback": 60, "skip": 5, "rebalance_days": 20, "initial_capital": 10000}
 
 
+class TestTransactionCosts:
+    def test_costs_reduce_returns(self, cs):
+        """Rebalancing into positions is not free. With non-zero commission/slippage
+        the same run must yield a LOWER total return than the cost-free run — otherwise
+        the backtest is overstating profitability (a real correctness gap)."""
+        prices = {
+            "WIN": _bars(lambda i: 100.0 * (1.01 ** i)),
+            "FLAT": _bars(lambda i: 100.0),
+            "LOSE": _bars(lambda i: 100.0 * (0.99 ** i)),
+        }
+        free = cs.run_cross_sectional(
+            prices, {**CFG, "commission_pct": 0.0, "slippage_pct": 0.0}
+        )
+        costly = cs.run_cross_sectional(
+            prices, {**CFG, "commission_pct": 0.01, "slippage_pct": 0.005}
+        )
+        assert free["ok"] and costly["ok"]
+        assert (
+            costly["metrics"]["total_return_pct"] < free["metrics"]["total_return_pct"]
+        ), (costly["metrics"], free["metrics"])
+
+    def test_turnover_costs_more_than_steady_holding(self, cs):
+        """A portfolio that swaps its holding mid-run must pay more in costs than one
+        that holds the same leader throughout. `churn` has A lead the first half and B
+        the second (forces a sell+buy); `steady` keeps A on top the whole time."""
+        cfg = {
+            "top_n": 1, "lookback": 20, "skip": 1, "rebalance_days": 20,
+            "initial_capital": 10000, "commission_pct": 0.02, "slippage_pct": 0.0,
+        }
+        churn = {
+            "A": _bars(lambda i: 100.0 * (1.03 ** i) if i < 60 else 100.0 * (1.03 ** 59), n=120),
+            "B": _bars(lambda i: 100.0 if i < 60 else 100.0 * (1.03 ** (i - 60)), n=120),
+        }
+        steady = {
+            "A": _bars(lambda i: 100.0 * (1.02 ** i), n=120),
+            "B": _bars(lambda i: 100.0, n=120),
+        }
+        r_churn = cs.run_cross_sectional(churn, cfg)
+        r_steady = cs.run_cross_sectional(steady, cfg)
+        assert r_churn["ok"] and r_steady["ok"]
+        assert r_churn["metrics"]["total_cost_pct"] > r_steady["metrics"]["total_cost_pct"], (
+            r_churn["metrics"]["total_cost_pct"],
+            r_steady["metrics"]["total_cost_pct"],
+        )
+
+
 class TestRegimeFilter:
     def test_goes_to_cash_when_breadth_is_weak(self, cs):
         """Regime filter (dual momentum): if too few names have positive momentum

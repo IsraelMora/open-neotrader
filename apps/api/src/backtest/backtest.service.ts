@@ -61,6 +61,7 @@ export interface CrossSectionalResponse {
     max_drawdown_pct: number;
     buy_hold_return_pct: number;
     alpha_pct: number;
+    total_cost_pct: number;
   };
   equity_curve: { date: string; equity: number }[];
   final_holdings: string[];
@@ -167,6 +168,8 @@ export class BacktestService {
       ...(dto.rebalance_days !== undefined ? { rebalance_days: dto.rebalance_days } : {}),
       ...(dto.lookback !== undefined ? { lookback: dto.lookback } : {}),
       ...(dto.skip !== undefined ? { skip: dto.skip } : {}),
+      ...(dto.commission_pct !== undefined ? { commission_pct: dto.commission_pct } : {}),
+      ...(dto.slippage_pct !== undefined ? { slippage_pct: dto.slippage_pct } : {}),
       ...(dto.params ?? {}),
     };
 

@@ -79,6 +79,22 @@ export class CrossSectionalDto {
   @Type(() => Number)
   skip?: number;
 
+  /** Commission charged on notional traded at each rebalance (0.001 = 0.1%). */
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(0.1)
+  @Type(() => Number)
+  commission_pct?: number;
+
+  /** Slippage charged on notional traded at each rebalance (0.0005 = 0.05%). */
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(0.1)
+  @Type(() => Number)
+  slippage_pct?: number;
+
   /** Extra config overrides forwarded to the engine. */
   @IsOptional()
   @IsObject()
