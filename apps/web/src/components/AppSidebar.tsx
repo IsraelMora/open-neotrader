@@ -118,20 +118,24 @@ export default function AppShell({
   path: string;
   page: string;
 }) {
-  const [authed, setAuthed] = useState<boolean | null>(null);
+  // Inicialización SÍNCRONA: el token vive en localStorage, así que ya en el primer
+  // render sabemos si hay sesión → no hay flash de "Verificando sesión" en cada navegación.
+  const [authed] = useState<boolean>(() => {
+    try {
+      return typeof window !== 'undefined' && auth.isAuthenticated();
+    } catch {
+      return false;
+    }
+  });
 
   useEffect(() => {
-    if (!auth.isAuthenticated()) {
-      window.location.href = '/login';
-    } else {
-      setAuthed(true);
-    }
+    if (!auth.isAuthenticated()) window.location.href = '/login';
   }, []);
 
   if (!authed) {
     return (
       <div className="min-h-screen flex items-center justify-center text-muted-foreground text-sm">
-        Verificando sesión…
+        Redirigiendo al login…
       </div>
     );
   }

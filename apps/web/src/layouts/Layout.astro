@@ -1,5 +1,6 @@
 ---
 import '../styles/globals.css';
+import { ClientRouter } from 'astro:transitions';
 import AppShell from '../components/AppSidebar.tsx';
 const { title = 'Panel', page = 'dashboard' } = Astro.props;
 const path = Astro.url.pathname;
@@ -17,6 +18,7 @@ const path = Astro.url.pathname;
       href="https://fonts.googleapis.com/css2?family=Tomorrow:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=BioRhyme:wght@400;700&display=swap"
       rel="stylesheet"
     />
+    <ClientRouter />
     <script is:inline>
       (function () {
         try {
