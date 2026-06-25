@@ -24,6 +24,17 @@ def load_generate():
     return mod
 
 
+def load_cross_sectional():
+    """Load cross_sectional.py as a fresh module from the scripts directory."""
+    spec = importlib.util.spec_from_file_location(
+        "backtester_cross_sectional",
+        str(_SCRIPTS_DIR / "cross_sectional.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+
 def load_plugin():
     """Load plugin.py with scripts/ on sys.path so it can import generate/engine."""
     scripts_str = str(_SCRIPTS_DIR)
