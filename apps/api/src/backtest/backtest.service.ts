@@ -42,6 +42,19 @@ export interface BacktestResponse {
   trades: BacktestTrade[];
 }
 
+/** Walk-forward (anchored) validation result — overfit detection. */
+export interface WalkForwardResponse {
+  ok: true;
+  verdict: 'ROBUSTO' | 'SOBREAJUSTADO' | 'INSUFICIENTE_DATOS';
+  n_windows: number;
+  avg_oos_sharpe: number;
+  avg_robustness_ratio: number;
+  robust_windows: number;
+  total_windows: number;
+  windows: Record<string, unknown>[];
+  summary?: Record<string, unknown>;
+}
+
 @Injectable()
 export class BacktestService {
   constructor(
@@ -50,64 +63,12 @@ export class BacktestService {
   ) {}
 
   async runBacktest(dto: RunBacktestDto): Promise<BacktestResponse> {
-    const {
-      strategy,
-      symbols,
-      timeframe = '1d',
-      limit = 500,
-      capital = 10000,
-      commission_pct = 0.001,
-      slippage_pct = 0.0005,
-      risk_per_trade = 0.01,
-      max_positions = 5,
-      provider_id = null,
-    } = dto;
-
-    // Fetch OHLCV for all symbols in parallel
-    const barArrays = await Promise.all(
-      symbols.map((symbol) =>
-        this.providerGateway.getOhlcv(provider_id ?? null, symbol, timeframe, limit),
-      ),
-    );
-
-    // Validate and normalize: ts → date, keep all numeric fields
-    const prices: Record<
-      string,
-      { date: string; open: number; high: number; low: number; close: number; volume: number }[]
-    > = {};
-
-    for (let i = 0; i < symbols.length; i++) {
-      const symbol = symbols[i];
-      const bars = barArrays[i];
-
-      if (!bars || bars.length === 0) {
-        throw new BadRequestException(
-          `No OHLCV data returned for symbol '${symbol}'. Check that the provider has data for this symbol.`,
-        );
-      }
-
-      prices[symbol] = bars.map((bar) => ({
-        date: bar.ts.slice(0, 10), // "2024-03-15T..." → "2024-03-15"
-        open: bar.open,
-        high: bar.high,
-        low: bar.low,
-        close: bar.close,
-        volume: bar.volume,
-      }));
-    }
-
-    const sandboxCfg = {
-      initial_capital: capital,
-      commission_pct,
-      slippage_pct,
-      risk_per_trade,
-      max_positions,
-    };
+    const prices = await this._buildPrices(dto);
 
     const response = await this.sandbox.callPlugin('backtester', 'run', {
-      strategy_id: strategy,
+      strategy_id: dto.strategy,
       prices,
-      config: sandboxCfg,
+      config: this._buildConfig(dto),
     });
 
     if (!response.ok) {
@@ -132,5 +93,88 @@ export class BacktestService {
       equity_curve: result.equity_curve ?? [],
       trades: result.trades ?? [],
     };
+  }
+
+  /**
+   * Anchored walk-forward validation — splits history into rolling in-sample/out-of-sample
+   * windows and reports a robustness verdict. The honest tool to detect OVERFIT strategies
+   * that look great in-sample but fail out-of-sample.
+   */
+  async runWalkForward(
+    dto: RunBacktestDto & { n_windows?: number; in_sample_pct?: number },
+  ): Promise<WalkForwardResponse> {
+    const prices = await this._buildPrices(dto);
+    const config = {
+      ...this._buildConfig(dto),
+      n_windows: dto.n_windows ?? 5,
+      in_sample_pct: dto.in_sample_pct ?? 0.7,
+    };
+
+    const response = await this.sandbox.callPlugin('backtester', 'run_walk_forward', {
+      strategy_id: dto.strategy,
+      prices,
+      config,
+    });
+
+    if (!response.ok) {
+      throw new BadGatewayException(`Sandbox error: ${response.error ?? 'unknown error'}`);
+    }
+
+    const result = response.result as WalkForwardResponse & { ok: boolean; error?: string };
+    if (!result.ok) {
+      throw new BadGatewayException(`Walk-forward error: ${result.error ?? 'unknown error'}`);
+    }
+    return result;
+  }
+
+  private _buildConfig(dto: RunBacktestDto) {
+    return {
+      initial_capital: dto.capital ?? 10000,
+      commission_pct: dto.commission_pct ?? 0.001,
+      slippage_pct: dto.slippage_pct ?? 0.0005,
+      risk_per_trade: dto.risk_per_trade ?? 0.01,
+      max_positions: dto.max_positions ?? 5,
+    };
+  }
+
+  /** Fetch + normalize OHLCV for every requested symbol (ts → date). */
+  private async _buildPrices(
+    dto: RunBacktestDto,
+  ): Promise<
+    Record<
+      string,
+      { date: string; open: number; high: number; low: number; close: number; volume: number }[]
+    >
+  > {
+    const { symbols, timeframe = '1d', limit = 500, provider_id = null } = dto;
+    const barArrays = await Promise.all(
+      symbols.map((symbol) =>
+        this.providerGateway.getOhlcv(provider_id ?? null, symbol, timeframe, limit),
+      ),
+    );
+
+    const prices: Record<
+      string,
+      { date: string; open: number; high: number; low: number; close: number; volume: number }[]
+    > = {};
+
+    for (let i = 0; i < symbols.length; i++) {
+      const symbol = symbols[i];
+      const bars = barArrays[i];
+      if (!bars || bars.length === 0) {
+        throw new BadRequestException(
+          `No OHLCV data returned for symbol '${symbol}'. Check that the provider has data for this symbol.`,
+        );
+      }
+      prices[symbol] = bars.map((bar) => ({
+        date: bar.ts.slice(0, 10),
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        volume: bar.volume,
+      }));
+    }
+    return prices;
   }
 }

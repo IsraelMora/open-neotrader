@@ -198,3 +198,49 @@ describe('BacktestService — runBacktest', () => {
     expect(callArgs[2].strategy_id).toBe('mean-reversion');
   });
 });
+
+describe('BacktestService — runWalkForward', () => {
+  const WF_OK = {
+    ok: true,
+    result: {
+      ok: true,
+      verdict: 'ROBUSTO',
+      n_windows: 5,
+      avg_oos_sharpe: 0.42,
+      avg_robustness_ratio: 0.61,
+      robust_windows: 3,
+      total_windows: 5,
+      windows: [],
+    },
+  };
+
+  it('calls backtester.run_walk_forward and returns the verdict', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox, callPlugin } = makeSandbox(WF_OK);
+    const svc = makeService(gateway, sandbox);
+    const result = await svc.runWalkForward(makeDto({ n_windows: 5, in_sample_pct: 0.7 }));
+
+    expect(result.verdict).toBe('ROBUSTO');
+    const [plugin, fn, payload] = callPlugin.mock.calls[0] as [
+      string,
+      string,
+      { config: { n_windows: number; in_sample_pct: number } },
+    ];
+    expect(plugin).toBe('backtester');
+    expect(fn).toBe('run_walk_forward');
+    expect(payload.config.n_windows).toBe(5);
+    expect(payload.config.in_sample_pct).toBe(0.7);
+  });
+
+  it('defaults n_windows=5 / in_sample_pct=0.7 when omitted', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox, callPlugin } = makeSandbox(WF_OK);
+    const svc = makeService(gateway, sandbox);
+    await svc.runWalkForward(makeDto());
+    const payload = (callPlugin.mock.calls[0] as unknown[])[2] as {
+      config: { n_windows: number; in_sample_pct: number };
+    };
+    expect(payload.config.n_windows).toBe(5);
+    expect(payload.config.in_sample_pct).toBe(0.7);
+  });
+});

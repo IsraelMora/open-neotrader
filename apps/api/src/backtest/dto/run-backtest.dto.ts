@@ -78,4 +78,19 @@ export class RunBacktestDto {
   @ValidateIf((o: RunBacktestDto) => o.provider_id !== null && o.provider_id !== undefined)
   @IsString()
   provider_id?: string | null = null;
+
+  // ── Walk-forward only (ignored by plain backtest) ────────────────────────
+  @IsOptional()
+  @IsInt()
+  @Min(2)
+  @Max(20)
+  @Type(() => Number)
+  n_windows?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0.3)
+  @Max(0.9)
+  @Type(() => Number)
+  in_sample_pct?: number;
 }
