@@ -139,6 +139,7 @@ export const api = {
     client.get(`api/logs/${stream}?limit=${limit}`).json<JsonObject>(),
   // ── Estrategias (perfiles de configuración del ciclo) ─────────────────────
   strategies: () => client.get('api/strategies').json<JsonObject[]>(),
+  strategyGet: (id: string) => client.get(`api/strategies/${id}`).json<JsonObject>(),
   strategyCurrentConfig: () =>
     client.get('api/strategies/config/current').json<Record<string, string>>(),
   strategyCreate: (body: {

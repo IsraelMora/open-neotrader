@@ -3,7 +3,8 @@ import { api } from '../lib/api';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Switch } from './ui/switch';
-import { Trash2, FlaskConical, Radio } from 'lucide-react';
+import { Trash2, FlaskConical, Radio, Settings2 } from 'lucide-react';
+import StrategyDetail from './StrategyDetail';
 
 interface Strategy {
   id: string;
@@ -30,6 +31,7 @@ export default function Strategies() {
   const [name, setName] = useState('');
   const [desc, setDesc] = useState('');
   const [busy, setBusy] = useState(false);
+  const [selected, setSelected] = useState<string | null>(null);
 
   const loadStatsFor = (id: string) =>
     api
@@ -82,6 +84,17 @@ export default function Strategies() {
       setDesc('');
     }, '✓ Estrategia creada desde la configuración actual.');
   };
+
+  if (selected)
+    return (
+      <StrategyDetail
+        id={selected}
+        onBack={() => {
+          setSelected(null);
+          load();
+        }}
+      />
+    );
 
   if (err)
     return (
@@ -230,6 +243,13 @@ export default function Strategies() {
                 )}
               </div>
               <div className="flex items-center gap-2">
+                <button
+                  title="Configurar"
+                  onClick={() => setSelected(s.id)}
+                  className="rounded p-1 text-mut hover:bg-edge/40 hover:text-ink"
+                >
+                  <Settings2 className="h-4 w-4" />
+                </button>
                 <Switch
                   checked={s.active}
                   onCheckedChange={() =>
