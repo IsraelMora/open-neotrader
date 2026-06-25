@@ -18,12 +18,31 @@ describe('manifest.validator', () => {
     expect(m.id).toBe('tech-momentum');
     expect(m.type).toBe('universe');
   });
-  it('rechaza type=provider (código, fase 2)', () => {
-    expect(() =>
-      parseAndValidateManifest(
-        UNI.replace('type = "universe"', 'type = "provider"'),
-      ),
-    ).toThrow(ManifestError);
+  it('acepta cualquier tipo de plugin del proyecto (provider, discipline, extra, …)', () => {
+    for (const t of ['provider', 'discipline', 'extra', 'preset']) {
+      const m = parseAndValidateManifest(
+        UNI.replace('type = "universe"', `type = "${t}"`).replace(
+          /\[universe\][\s\S]*$/,
+          '',
+        ),
+      );
+      expect(m.type).toBe(t);
+    }
+  });
+
+  it('acepta un skill SIN bloque [skill] (formato runtime, payload va en el tarball)', () => {
+    const skill = `
+[plugin]
+id = "trend-following"
+name = "Trend Following"
+type = "skill"
+version = "1.0.0"
+author = "a"
+description = "d"
+[skills]
+keys = ["trend.analyze"]
+`;
+    expect(parseAndValidateManifest(skill).type).toBe('skill');
   });
   it('rechaza id no kebab', () => {
     expect(() =>

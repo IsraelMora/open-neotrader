@@ -4,12 +4,6 @@ import { parse as parseToml, type TomlTable } from 'smol-toml';
 export class ManifestError extends Error {}
 
 const CLASES_ACTIVO = new Set(['equity', 'etf', 'crypto', 'commodity']);
-const TIPOS_DATOS = new Set([
-  'skill',
-  'universe',
-  'preset',
-  'discipline-profile',
-]);
 const KEBAB = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 /**
@@ -71,15 +65,6 @@ function validatePluginFields(meta: PluginBlock): void {
   }
 }
 
-function validatePluginType(meta: PluginBlock): string {
-  const type = meta['type'] as string;
-  if (type === 'provider')
-    throw new ManifestError('type=provider es fase 2 (código)');
-  if (!TIPOS_DATOS.has(type))
-    throw new ManifestError(`type '${type}' desconocido`);
-  return type;
-}
-
 const PAYLOAD_BLOCK_MAP: Record<string, string> = {
   skill: 'skill',
   universe: 'universe',
@@ -87,15 +72,25 @@ const PAYLOAD_BLOCK_MAP: Record<string, string> = {
   'discipline-profile': 'discipline',
 };
 
-function extractPayload(
+/**
+ * Extrae y valida el bloque de payload SOLO si está presente.
+ *
+ * La tienda alberga todos los tipos de plugin del proyecto (skill, universe,
+ * preset, discipline, discipline-profile, provider, extra, …): el contenido real
+ * viaja en el tarball y el manifiesto solo aporta metadatos de catálogo. Por eso
+ * NO exigimos un bloque de payload ni restringimos el `type`. Si el manifiesto
+ * incluye un bloque conocido (p.ej. `[skill]`), validamos su forma — esto preserva
+ * los chequeos de seguridad como el de path traversal en `[skill].file`.
+ */
+function extractOptionalPayload(
   data: TomlTable,
   type: string,
 ): Record<string, unknown> {
   const blockName = PAYLOAD_BLOCK_MAP[type];
+  if (!blockName) return {};
   const payload = data[blockName];
-  if (!isNonNullObject(payload)) {
-    throw new ManifestError(`falta el bloque [${blockName}]`);
-  }
+  if (!isNonNullObject(payload)) return {};
+  validatePayload(type, payload);
   return payload;
 }
 
@@ -130,12 +125,11 @@ export function parseAndValidateManifest(text: string): Manifest {
   validatePluginFields(meta);
 
   const id = meta['id'] as string;
-  const type = validatePluginType(meta);
+  const type = meta['type'] as string; // ya validado como string requerido por validatePluginFields
 
   if (!KEBAB.test(id)) throw new ManifestError(`id '${id}' no es kebab-case`);
 
-  const payload = extractPayload(data, type);
-  validatePayload(type, payload);
+  const payload = extractOptionalPayload(data, type);
 
   const configSpec = extractConfigSpec(data);
 
