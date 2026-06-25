@@ -731,6 +731,9 @@ export class AgentsService {
     };
   }
 
+  /** Starting capital context fed to risk/sizing disciplines (matches the paper executor). */
+  private static readonly PAPER_CAPITAL = 10_000;
+
   /** Default liquid universe used when KV `cycle.universe` is not set. */
   private static readonly DEFAULT_UNIVERSE = [
     'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'SPY', 'QQQ', 'AMD',
@@ -815,10 +818,25 @@ export class AgentsService {
       universe: market.universe,
       ohlcv: market.ohlcv,
       config: {},
+      // Capital/portfolio context so risk/sizing disciplines can APPROVE + size signals.
+      // Without this they see zero capital and veto everything. Mirrors the paper
+      // executor's starting capital; real broker-position sync is a later refinement.
       portfolio: {},
+      portfolio_value: AgentsService.PAPER_CAPITAL,
+      positions: [],
+      trade_history: [],
     };
     const hookResult = await this.sandbox.runCycle(activeIds, cycleCtx);
-    const hookCtx = (hookResult.result ?? cycleCtx) as Record<string, unknown>;
+    const baseCtx = (hookResult.result ?? cycleCtx) as Record<string, unknown>;
+    // Ensure the capital context survives into the veto layer (the runner result
+    // does not echo the input context).
+    const hookCtx: Record<string, unknown> = {
+      ...baseCtx,
+      portfolio_value: AgentsService.PAPER_CAPITAL,
+      positions: baseCtx['positions'] ?? [],
+      portfolio: baseCtx['portfolio'] ?? {},
+      trade_history: baseCtx['trade_history'] ?? [],
+    };
     const pendingSignals: unknown[] = Array.isArray(hookCtx['pending_signals'])
       ? (hookCtx['pending_signals'] as unknown[])
       : [];
