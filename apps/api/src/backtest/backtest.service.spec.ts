@@ -93,10 +93,7 @@ function makeService(gateway: ProviderGatewayService, sandbox: SandboxGateway): 
   const strategies = {
     get: jest.fn(),
   } as unknown as import('../strategy/strategy.service').StrategyService;
-  const plugins = {
-    findAll: jest.fn().mockResolvedValue([]),
-  } as unknown as import('../plugins/plugins.service').PluginsService;
-  return new BacktestService(gateway, sandbox, strategies, plugins);
+  return new BacktestService(gateway, sandbox, strategies);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

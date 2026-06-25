@@ -4,7 +4,6 @@ import { SandboxGateway } from '../sandbox/sandbox.gateway';
 import { RunBacktestDto } from './dto/run-backtest.dto';
 import { CrossSectionalDto } from './dto/cross-sectional.dto';
 import { StrategyService } from '../strategy/strategy.service';
-import { PluginsService } from '../plugins/plugins.service';
 
 /** Universo por defecto cuando una estrategia no define cycle.universe. */
 const DEFAULT_UNIVERSE = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META'];
@@ -93,15 +92,23 @@ export class BacktestService {
     private readonly providerGateway: ProviderGatewayService,
     private readonly sandbox: SandboxGateway,
     private readonly strategies: StrategyService,
-    private readonly plugins: PluginsService,
   ) {}
 
-  /** Plugins que proveen backtest (declaran una skill 'backtester.*'). */
+  /**
+   * Plugins que proveen backtest (declaran una skill 'backtester.*'). Se listan desde el
+   * sandbox (filesystem de /plugins) — los plugins horneados no siempre están en el registry DB.
+   */
   async listProviders(): Promise<{ id: string; name: string; active: boolean }[]> {
-    const all = await this.plugins.findAll();
-    return all
+    const res = await this.sandbox.call({ cmd: 'list_plugins', active_ids: [] });
+    const plugins = (res.ok && Array.isArray(res.result) ? res.result : []) as {
+      id: string;
+      name?: string;
+      skills?: string[];
+      active?: boolean;
+    }[];
+    return plugins
       .filter((p) => (p.skills ?? []).some((s) => s.startsWith('backtester.')))
-      .map((p) => ({ id: p.id, name: p.name, active: p.active }));
+      .map((p) => ({ id: p.id, name: p.name ?? p.id, active: !!p.active }));
   }
 
   /**
@@ -134,7 +141,16 @@ export class BacktestService {
           .map((x) => x.trim())
           .filter(Boolean);
         const symbols = universe.length >= 2 ? universe : DEFAULT_UNIVERSE;
-        const prices = await this._buildPrices({ symbols, timeframe, limit: bars });
+        // Para backtest necesitamos historia: usar el data provider de la estrategia o, por
+        // defecto, yahoo-finance-provider (gratis, devuelve OHLCV histórico). El provider
+        // por defecto del sistema puede ser un broker que solo devuelve la última barra.
+        const dataProvider = s.config['cycle.data_provider'] || 'yahoo-finance-provider';
+        const prices = await this._buildPrices({
+          symbols,
+          timeframe,
+          limit: bars,
+          provider_id: dataProvider,
+        });
         const config: Record<string, unknown> = {
           initial_capital: Number(s.config['cycle.capital']) || 10000,
         };
