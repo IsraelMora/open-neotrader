@@ -6,6 +6,7 @@ import {
   CrossSectionalResponse,
 } from './backtest.service';
 import { RunBacktestDto } from './dto/run-backtest.dto';
+import { CrossSectionalDto } from './dto/cross-sectional.dto';
 
 /** Executes a strategy backtest over historical OHLCV data fetched from the active provider. */
 @Controller('backtest')
@@ -27,13 +28,12 @@ export class BacktestController {
 
   /**
    * Cross-sectional momentum portfolio backtest over `symbols` (the universe).
-   * Note: `strategy` is required by the shared DTO but IGNORED here — this route
-   * always runs the cross-sectional momentum engine. Params: top_n, rebalance_days,
-   * lookback, skip.
+   * Params: top_n, rebalance_days, lookback, skip. No `strategy` field — this route
+   * always runs the cross-sectional momentum engine.
    */
   @Post('cross-sectional')
   @HttpCode(HttpStatus.OK)
-  crossSectional(@Body() dto: RunBacktestDto): Promise<CrossSectionalResponse> {
+  crossSectional(@Body() dto: CrossSectionalDto): Promise<CrossSectionalResponse> {
     return this.backtestService.runCrossSectional(dto);
   }
 }

@@ -113,33 +113,4 @@ export class RunBacktestDto {
   @IsOptional()
   @IsObject()
   params?: Record<string, unknown>;
-
-  // ── Cross-sectional momentum only (POST /backtest/cross-sectional) ────────
-  @IsOptional()
-  @IsInt()
-  @Min(1)
-  @Max(50)
-  @Type(() => Number)
-  top_n?: number;
-
-  @IsOptional()
-  @IsInt()
-  @Min(1)
-  @Max(252)
-  @Type(() => Number)
-  rebalance_days?: number;
-
-  @IsOptional()
-  @IsInt()
-  @Min(20)
-  @Max(1000)
-  @Type(() => Number)
-  lookback?: number;
-
-  @IsOptional()
-  @IsInt()
-  @Min(0)
-  @Max(60)
-  @Type(() => Number)
-  skip?: number;
 }

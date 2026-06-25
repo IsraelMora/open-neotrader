@@ -293,7 +293,13 @@ describe('BacktestService — runCrossSectional', () => {
     const { gateway } = makeGateway();
     const { sandbox, callPlugin } = makeSandbox(CS_OK);
     const svc = makeService(gateway, sandbox);
-    const result = await svc.runCrossSectional(makeDto({ top_n: 2, lookback: 200, skip: 20 }));
+    const result = await svc.runCrossSectional({
+      symbols: ['AAPL', 'MSFT', 'NVDA'],
+      provider_id: null,
+      top_n: 2,
+      lookback: 200,
+      skip: 20,
+    });
 
     expect(result.metrics.alpha_pct).toBe(8);
     const [plugin, fn, payload] = callPlugin.mock.calls[0] as [

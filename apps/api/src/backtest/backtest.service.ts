@@ -2,6 +2,15 @@ import { Injectable, BadRequestException, BadGatewayException } from '@nestjs/co
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
 import { SandboxGateway } from '../sandbox/sandbox.gateway';
 import { RunBacktestDto } from './dto/run-backtest.dto';
+import { CrossSectionalDto } from './dto/cross-sectional.dto';
+
+/** Minimal shape needed to fetch + normalize OHLCV — satisfied by both DTOs. */
+interface PriceQuery {
+  symbols: string[];
+  timeframe?: string;
+  limit?: number;
+  provider_id?: string | null;
+}
 
 export interface BacktestMetrics {
   total_return_pct: number;
@@ -150,14 +159,7 @@ export class BacktestService {
    * Cross-sectional momentum portfolio backtest: ranks the universe (all `symbols`)
    * by 12-1 momentum, holds the top-N, rebalances. Reports alpha vs equal-weight buy&hold.
    */
-  async runCrossSectional(
-    dto: RunBacktestDto & {
-      top_n?: number;
-      rebalance_days?: number;
-      lookback?: number;
-      skip?: number;
-    },
-  ): Promise<CrossSectionalResponse> {
+  async runCrossSectional(dto: CrossSectionalDto): Promise<CrossSectionalResponse> {
     const prices = await this._buildPrices(dto);
     const config: Record<string, unknown> = {
       initial_capital: dto.capital ?? 10000,
@@ -197,14 +199,14 @@ export class BacktestService {
 
   /** Fetch + normalize OHLCV for every requested symbol (ts → date). */
   private async _buildPrices(
-    dto: RunBacktestDto,
+    q: PriceQuery,
   ): Promise<
     Record<
       string,
       { date: string; open: number; high: number; low: number; close: number; volume: number }[]
     >
   > {
-    const { symbols, timeframe = '1d', limit = 500, provider_id = null } = dto;
+    const { symbols, timeframe = '1d', limit = 500, provider_id = null } = q;
     const barArrays = await Promise.all(
       symbols.map((symbol) =>
         this.providerGateway.getOhlcv(provider_id ?? null, symbol, timeframe, limit),
