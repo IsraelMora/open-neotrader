@@ -731,6 +731,66 @@ export class AgentsService {
     };
   }
 
+  /** Default liquid universe used when KV `cycle.universe` is not set. */
+  private static readonly DEFAULT_UNIVERSE = [
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'SPY', 'QQQ', 'AMD',
+  ];
+
+  /**
+   * Resolves the trading universe and fetches normalized OHLCV for the cycle.
+   * Runs on the NestJS side (which has network); the data is injected into the
+   * sandbox cycle ctx so the strategy on_cycle hooks read it via
+   * provider_tools.get_ohlcv WITHOUT the sandbox ever touching the network.
+   * Fail-soft: missing gateway → empty; per-symbol fetch errors are skipped.
+   */
+  private async _buildMarketContext(): Promise<{
+    universe: string[];
+    ohlcv: Record<string, unknown[]>;
+  }> {
+    if (!this.providerGateway) return { universe: [], ohlcv: {} };
+
+    let universe = AgentsService.DEFAULT_UNIVERSE;
+    try {
+      const raw = this.kv ? await this.kv.get('cycle.universe') : null;
+      if (raw && raw.trim()) {
+        const parsed = raw
+          .split(',')
+          .map((s) => s.trim().toUpperCase())
+          .filter(Boolean);
+        if (parsed.length > 0) universe = parsed;
+      }
+    } catch {
+      /* use default */
+    }
+    universe = universe.slice(0, 30);
+
+    const timeframe = (this.kv ? await this.kv.get('cycle.timeframe') : null) || '1d';
+    const bars = Number((this.kv ? await this.kv.get('cycle.bars') : null) || 0) || 150;
+    const brokerId = (this.kv ? await this.kv.get('execution.broker_plugin_id') : null) || null;
+
+    const ohlcv: Record<string, unknown[]> = {};
+    await Promise.all(
+      universe.map(async (symbol) => {
+        try {
+          const raw = await this.providerGateway!.getOhlcv(brokerId, symbol, timeframe, bars);
+          ohlcv[symbol] = (raw ?? []).map((b) => ({
+            date: typeof b.ts === 'string' ? b.ts.slice(0, 10) : b.ts,
+            open: b.open,
+            high: b.high,
+            low: b.low,
+            close: b.close,
+            volume: b.volume,
+          }));
+        } catch (e: unknown) {
+          this.log.warn(
+            `OHLCV fetch falló para ${symbol}: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }),
+    );
+    return { universe, ohlcv };
+  }
+
   private async _executeCycle(
     cycle_id: string,
     context: string,
@@ -746,7 +806,17 @@ export class AgentsService {
     const activePlugins = await this.plugins.findActive();
     const activeIds = activePlugins.map((p: HydratedPlugin) => p.id);
 
-    const cycleCtx: Record<string, unknown> = { cycle_id };
+    // Market data for the strategy hooks: NestJS (which has network) resolves the
+    // universe and fetches OHLCV, then injects it so the sandbox on_cycle hooks can
+    // read it via provider_tools.get_ohlcv WITHOUT the sandbox ever touching the net.
+    const market = await this._buildMarketContext();
+    const cycleCtx: Record<string, unknown> = {
+      cycle_id,
+      universe: market.universe,
+      ohlcv: market.ohlcv,
+      config: {},
+      portfolio: {},
+    };
     const hookResult = await this.sandbox.runCycle(activeIds, cycleCtx);
     const hookCtx = (hookResult.result ?? cycleCtx) as Record<string, unknown>;
     const pendingSignals: unknown[] = Array.isArray(hookCtx['pending_signals'])

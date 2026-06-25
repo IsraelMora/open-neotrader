@@ -648,13 +648,76 @@ def cmd_analyze_plugin(req: dict) -> dict:
     return _analyzer.analyze_plugin(plugin_dir, manifest)
 
 
+def _load_cycle_hook(plugin_id: str, plugin_dir: Path, manifest: dict, n: int):
+    """
+    Load hooks/cycle.py for a plugin and return the (module, on_cycle_fn) pair,
+    or (None, None) if the hook file does not exist or on_cycle is absent.
+
+    Uses a unique sys.modules name (f"_cycle_{plugin_id}_{n}") to avoid cross-plugin
+    collisions when multiple plugins all ship a hooks/cycle.py file.
+
+    Also puts the plugin's scripts/ directory on sys.path so that relative imports
+    inside cycle.py (e.g. `from trend_following import analyze`) resolve correctly.
+    This mirrors what cmd_run_hook does for the same reason.
+    """
+    hooks_cfg: dict = manifest.get("hooks", {})
+    hook_file_rel: str = hooks_cfg.get("on_cycle", "hooks/cycle.py")
+    hook_path = plugin_dir / hook_file_rel
+
+    if not hook_path.exists():
+        return None, None
+
+    # Put the plugin root on sys.path so hooks can import from scripts/
+    plugin_str = str(plugin_dir)
+    if plugin_str not in sys.path:
+        sys.path.insert(0, plugin_str)
+
+    module_name = f"_cycle_{plugin_id}_{n}"
+    spec = importlib.util.spec_from_file_location(module_name, hook_path)
+    if spec is None or spec.loader is None:
+        return None, None
+
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+
+    fn = getattr(mod, "on_cycle", None)
+    return mod, fn
+
+
 def cmd_run_cycle(req: dict) -> dict:
+    """
+    Execute one agent cycle by calling on_cycle(ctx) on every active plugin
+    that ships a hooks/cycle.py file.
+
+    Order:
+      1. Build provider_tools with a no-network get_ohlcv backed by injected ohlcv data.
+      2. Call skill plugins (type=skill) in sorted order; collect their signals into
+         pending_signals, tagging each with _plugin=<id>.
+      3. Call discipline plugins (type=discipline) in sorted order; each receives
+         pending_signals and returns {"signals": [...], "logs": [...]}; update
+         pending_signals from result["signals"].
+      4. Collect all logs and per-plugin errors.
+
+    Returns {"universe", "pending_signals", "signals", "logs", "errors"} where
+    "pending_signals" and "signals" reference the same list (backward compat).
+    """
     active_ids: set[str] = set(req.get("active_ids", []))
     context: dict = req.get("context", {})
 
-    if not PLUGINS_DIR.exists():
-        return {"universe": [], "signals": [], "errors": []}
+    pending_signals: list[dict] = []
+    logs: list[dict] = []
+    errors: list[dict] = []
 
+    if not PLUGINS_DIR.exists():
+        return {
+            "universe": [],
+            "pending_signals": pending_signals,
+            "signals": pending_signals,
+            "logs": logs,
+            "errors": errors,
+        }
+
+    # ── Enumerate plugins ────────────────────────────────────────────────────
     plugins_by_id: dict[str, dict] = {}
     for entry in sorted(PLUGINS_DIR.iterdir()):
         if not entry.is_dir():
@@ -664,82 +727,120 @@ def cmd_run_cycle(req: dict) -> dict:
             continue
         pid = m.get("plugin", {}).get("id", entry.name)
         plugins_by_id[pid] = {
-            "dir": entry.name,
+            "dir_name": entry.name,
+            "dir": PLUGINS_DIR / entry.name,
             "manifest": m,
             "type": m.get("plugin", {}).get("type", "skill"),
         }
 
-    results: dict[str, Any] = {"universe": [], "signals": [], "errors": []}
-
-    # Soft SDK version check for each active plugin — never blocks, never raises
+    # ── Soft SDK version check ───────────────────────────────────────────────
+    warnings_out: list[str] = []
     for pid, info in plugins_by_id.items():
         if pid not in active_ids:
             continue
         _w = _sdk_version_warning(info["manifest"])
         if _w:
-            results.setdefault("warnings", []).append(_w)
+            warnings_out.append(_w)
 
-    # 1. Collect universe
+    # ── Universe (universe_provider plugins) ─────────────────────────────────
+    universe: list[str] = list(context.get("universe", []))
     for pid, info in plugins_by_id.items():
         if pid not in active_ids or info["type"] != "universe_provider":
             continue
         try:
-            mod = _load_module(info["dir"])
+            mod = _load_module(info["dir_name"])
             if hasattr(mod, "get_universe"):
                 syms = mod.get_universe()
                 if isinstance(syms, list):
-                    results["universe"].extend(syms)
+                    universe.extend(syms)
         except Exception as e:
-            results["errors"].append({"plugin": pid, "stage": "universe", "error": str(e)})
+            errors.append({"plugin": pid, "stage": "universe", "error": str(e)})
+    universe = list(dict.fromkeys(universe))
 
-    results["universe"] = list(dict.fromkeys(results["universe"]))
+    # ── Build provider_tools with no-network get_ohlcv ───────────────────────
+    _ohlcv_data: dict = context.get("ohlcv", {})
 
-    # 2. Run disciplines
+    def _get_ohlcv(symbol=None, timeframe=None, limit=None, **kw):
+        bars = _ohlcv_data.get(symbol, [])
+        if limit is not None and len(bars) > limit:
+            return bars[-limit:]
+        return bars
+
+    provider_tools = {"get_ohlcv": _get_ohlcv}
+
+    # ── Config defaults from manifest ────────────────────────────────────────
+    def _config_for(manifest: dict) -> dict:
+        config_defaults = {
+            field: (spec_data.get("default") if isinstance(spec_data, dict) else spec_data)
+            for field, spec_data in manifest.get("config", {}).items()
+        }
+        return {**config_defaults, **context.get("config", {})}
+
+    # ── Step 1: skill plugins ────────────────────────────────────────────────
+    hook_counter = 0
+    for pid, info in plugins_by_id.items():
+        if pid not in active_ids or info["type"] != "skill":
+            continue
+        _mod, fn = _load_cycle_hook(pid, info["dir"], info["manifest"], hook_counter)
+        hook_counter += 1
+        if fn is None:
+            continue
+        try:
+            hook_ctx = {
+                **context,
+                "universe": universe,
+                "config": _config_for(info["manifest"]),
+                "portfolio": context.get("portfolio", {}),
+                "provider_tools": provider_tools,
+                "pending_signals": pending_signals,
+            }
+            result = fn(hook_ctx)
+            if not isinstance(result, dict):
+                result = {}
+            for sig in result.get("signals", []):
+                sig["_plugin"] = pid
+                pending_signals.append(sig)
+            logs.extend(result.get("logs", []))
+        except Exception as e:
+            errors.append({"plugin": pid, "stage": "on_cycle", "error": str(e)})
+
+    # ── Step 2: discipline plugins ───────────────────────────────────────────
     for pid, info in plugins_by_id.items():
         if pid not in active_ids or info["type"] != "discipline":
             continue
+        _mod, fn = _load_cycle_hook(pid, info["dir"], info["manifest"], hook_counter)
+        hook_counter += 1
+        if fn is None:
+            continue
         try:
-            mod = _load_module(info["dir"])
-            fn_name = info["manifest"].get("discipline", {}).get("function", "run_discipline")
-            fn = getattr(mod, fn_name, None)
-            if fn is None:
-                continue
-            ctx = _SdkContext(plugin_id=pid, operator=context.get("operator", ""), metadata=context)
-            signals = fn(universe=results["universe"], _context=ctx)
-            if isinstance(signals, list):
-                for sig in signals:
-                    sig["_plugin"] = pid
-                results["signals"].extend(signals)
+            hook_ctx = {
+                **context,
+                "universe": universe,
+                "config": _config_for(info["manifest"]),
+                "portfolio": context.get("portfolio", {}),
+                "provider_tools": provider_tools,
+                "pending_signals": list(pending_signals),
+            }
+            result = fn(hook_ctx)
+            if not isinstance(result, dict):
+                result = {}
+            # disciplines return {"signals": [...], "logs": [...]}
+            new_signals = result.get("signals", pending_signals)
+            pending_signals[:] = new_signals
+            logs.extend(result.get("logs", []))
         except Exception as e:
-            results["errors"].append({"plugin": pid, "stage": "discipline", "error": str(e)})
+            errors.append({"plugin": pid, "stage": "on_cycle", "error": str(e)})
 
-    # 3. Enrich signals with skills
-    skill_plugins = [
-        (pid, info)
-        for pid, info in plugins_by_id.items()
-        if pid in active_ids and info["type"] == "skill"
-    ]
-    enriched = []
-    for signal in results["signals"]:
-        enriched_sig = dict(signal)
-        for pid, info in skill_plugins:
-            try:
-                mod = _load_module(info["dir"])
-                ctx = _SdkContext(
-                    plugin_id=pid, operator=context.get("operator", ""), metadata=context
-                )
-                for key in info["manifest"].get("skills", {}).get("keys", []):
-                    fn_name = key.split(".")[-1]
-                    fn = getattr(mod, fn_name, None)
-                    if fn is None:
-                        continue
-                    enriched_sig[key] = fn(signal=signal, _context=ctx)
-            except Exception:
-                pass
-        enriched.append(enriched_sig)
-
-    results["signals"] = enriched
-    return results
+    result_dict: dict[str, Any] = {
+        "universe": universe,
+        "pending_signals": pending_signals,
+        "signals": pending_signals,  # alias for backward compatibility
+        "logs": logs,
+        "errors": errors,
+    }
+    if warnings_out:
+        result_dict["warnings"] = warnings_out
+    return result_dict
 
 
 # ---------------------------------------------------------------------------
