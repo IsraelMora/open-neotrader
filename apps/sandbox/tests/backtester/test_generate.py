@@ -193,3 +193,47 @@ class TestSessionBreakout:
     def test_no_lookahead(self, gen):
         bars = make_flat_with_gap_up(40, gap_at=30)
         _assert_no_lookahead(gen, self.STRATEGY, bars, {"symbol": "X"})
+
+
+# ---------------------------------------------------------------------------
+# max_lookback (fast mode) — caps the analyze() window without lookahead
+# ---------------------------------------------------------------------------
+class TestMaxLookback:
+    def test_caps_window_when_set_and_full_by_default(self, gen, monkeypatch):
+        seen: list[int] = []
+
+        class FakeMod:
+            @staticmethod
+            def analyze(window, config):
+                seen.append(len(window))
+                return {"signal": "none"}
+
+        monkeypatch.setattr(gen, "_load_strategy_module", lambda *a, **k: FakeMod)
+        bars = make_accelerating_uptrend(300)
+
+        # Default: full growing window → reaches len(bars)
+        seen.clear()
+        gen.generate_signals("trend-following", bars, {"symbol": "X"})
+        assert max(seen) == len(bars)
+
+        # max_lookback=120 (> min_bars 78) → window never exceeds 120
+        seen.clear()
+        gen.generate_signals("trend-following", bars, {"symbol": "X", "max_lookback": 120})
+        assert seen and max(seen) <= 120
+
+    def test_clamped_to_min_bars(self, gen, monkeypatch):
+        """max_lookback below the strategy's min_bars is raised to min_bars so the
+        strategy always has the history it needs."""
+        seen: list[int] = []
+
+        class FakeMod:
+            @staticmethod
+            def analyze(window, config):
+                seen.append(len(window))
+                return {"signal": "none"}
+
+        monkeypatch.setattr(gen, "_load_strategy_module", lambda *a, **k: FakeMod)
+        bars = make_accelerating_uptrend(300)
+        # trend-following min_bars = 78; ask for 10 → clamped up to 78
+        gen.generate_signals("trend-following", bars, {"symbol": "X", "max_lookback": 10})
+        assert seen and max(seen) <= 78 and max(seen) >= 70

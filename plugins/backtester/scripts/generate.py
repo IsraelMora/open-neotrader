@@ -99,11 +99,18 @@ def _slide_adapter(plugin_id: str, script_name: str, min_bars_fn):
     def adapter(bars: list[dict], config: dict, symbol: str) -> list[dict]:
         mod = _load_strategy_module(plugin_id, script_name)
         min_bars = max(1, int(min_bars_fn(config)))
+        # Optional fast mode: cap the look-back window so generate is O(n·W) instead of
+        # O(n²) — useful for parameter sweeps over long histories. Indicators (EMA/RSI…)
+        # have bounded effective memory, so a generous cap is numerically ~equivalent.
+        # Clamped to >= min_bars so the strategy always has the history it needs.
+        raw_lb = config.get("max_lookback")
+        max_lookback = max(int(raw_lb), min_bars) if raw_lb else None
         signals: list[dict] = []
         for i in range(len(bars)):
             if i + 1 < min_bars:
                 continue  # not enough history yet
-            window = bars[: i + 1]  # STRICTLY no future bars
+            start = max(0, i + 1 - max_lookback) if max_lookback is not None else 0
+            window = bars[start : i + 1]  # STRICTLY no future bars (bounded when max_lookback set)
             result = mod.analyze(window, config)
             signal = result.get("signal", "none")
             if signal in ("long", "short", "exit"):
