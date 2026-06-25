@@ -77,6 +77,7 @@ model NavSnapshot {
   ts           DateTime @default(now())
   cycle_id     String?                   // ciclo que generó el snapshot
   provider_id  String?                   // provider consultado
+  strategy_id  String?                   // estrategia (perfil de config) dueña del snapshot
   equity       Float                     // valor total (cash + posiciones)
   cash         Float
   positions    String                    // JSON: Position[]
@@ -84,7 +85,23 @@ model NavSnapshot {
   meta         String?                   // JSON libre
 
   @@index([ts])
+  @@index([strategy_id, ts])
   @@map("nav_snapshots")
+}
+
+// Estrategia = perfil nombrado con un bundle de configuración del ciclo.
+// Varias pueden estar activas y competir; cada una acumula su propio NAV (NavSnapshot.strategy_id).
+model Strategy {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  description String?
+  config      String                     // JSON: Record<string,string> (snapshot de claves KV del ciclo)
+  active      Boolean  @default(false)    // participa en la competencia (se le corre el ciclo)
+  mode        String   @default("test")   // "test" = data real, NO opera (mide) | "live" = opera de verdad
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  @@map("strategies")
 }
 
 // Alerta proactiva de riesgo generada por el AlertEngine

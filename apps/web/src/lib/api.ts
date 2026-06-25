@@ -137,7 +137,30 @@ export const api = {
   notifications: () => client.get('api/notifications').json<JsonObject>(),
   logs: (stream: string, limit = 100) =>
     client.get(`api/logs/${stream}?limit=${limit}`).json<JsonObject>(),
-  strategies: () => client.get('api/strategies').json<JsonObject>(),
+  // ── Estrategias (perfiles de configuración del ciclo) ─────────────────────
+  strategies: () => client.get('api/strategies').json<JsonObject[]>(),
+  strategyCurrentConfig: () =>
+    client.get('api/strategies/config/current').json<Record<string, string>>(),
+  strategyCreate: (body: {
+    name: string;
+    description?: string;
+    config?: Record<string, string>;
+    mode?: 'test' | 'live';
+  }) => client.post('api/strategies', { json: body }).json<JsonObject>(),
+  strategyUpdate: (
+    id: string,
+    body: {
+      name?: string;
+      description?: string;
+      config?: Record<string, string>;
+      mode?: 'test' | 'live';
+    },
+  ) => client.patch(`api/strategies/${id}`, { json: body }).json<JsonObject>(),
+  strategyDelete: (id: string) => client.delete(`api/strategies/${id}`).text(),
+  strategySetActive: (id: string, active: boolean) =>
+    client.post(`api/strategies/${id}/activate`, { json: { active } }).json<JsonObject>(),
+  strategyApply: (id: string) =>
+    client.post(`api/strategies/${id}/apply`, { json: {} }).json<JsonObject>(),
 
   universeCheck: (symbol: string, kind = 'equity') =>
     client.get(`api/universe/check?symbol=${symbol}&kind=${kind}`).json<JsonObject>(),

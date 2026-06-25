@@ -31,6 +31,7 @@ import { PretestModule } from './pretest/pretest.module';
 import { DashboardModule } from './dashboard/dashboard.module';
 import { BacktestModule } from './backtest/backtest.module';
 import { TradeIntentModule } from './trade-intent/trade-intent.module';
+import { StrategyModule } from './strategy/strategy.module';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard';
 import { CorrelationMiddleware } from './common/correlation.middleware';
 
@@ -75,6 +76,7 @@ import { CorrelationMiddleware } from './common/correlation.middleware';
     DashboardModule,
     BacktestModule,
     TradeIntentModule,
+    StrategyModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: JwtAuthGuard },
