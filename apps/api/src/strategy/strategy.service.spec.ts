@@ -23,6 +23,7 @@ function makeKv(initial: Record<string, string> = {}): KvService {
 function makePrisma(over: Partial<Record<string, jest.Mock>> = {}): {
   db: PrismaService;
   strategy: Record<string, jest.Mock>;
+  navSnapshot: Record<string, jest.Mock>;
 } {
   const strategy = {
     findMany: jest.fn(),
@@ -32,7 +33,8 @@ function makePrisma(over: Partial<Record<string, jest.Mock>> = {}): {
     delete: jest.fn(),
     ...over,
   };
-  return { db: { strategy } as unknown as PrismaService, strategy };
+  const navSnapshot = { findMany: jest.fn() };
+  return { db: { strategy, navSnapshot } as unknown as PrismaService, strategy, navSnapshot };
 }
 
 const ROW = {
@@ -158,5 +160,50 @@ describe('StrategyService', () => {
     strategy.findUnique.mockResolvedValue({ ...ROW, config: '{}' });
     const svc = new StrategyService(db, makeKv(), makeStore().store);
     await expect(svc.publishToStore('s1')).rejects.toThrow();
+  });
+
+  it('getStats calcula nav/retorno/maxDD desde los NavSnapshots', async () => {
+    const { db, strategy, navSnapshot } = makePrisma();
+    strategy.findUnique.mockResolvedValue(ROW);
+    // serie de equity: 100 → 110 → 99 → 120
+    navSnapshot.findMany.mockResolvedValue([
+      { equity: 100 },
+      { equity: 110 },
+      { equity: 99 },
+      { equity: 120 },
+    ]);
+    const svc = new StrategyService(db, makeKv(), makeStore().store);
+    const st = await svc.getStats('s1');
+    expect(st.n_points).toBe(4);
+    expect(st.nav).toBe(120);
+    expect(st.return_pct).toBe(20); // (120-100)/100
+    expect(st.max_drawdown_pct).toBeCloseTo(10, 0); // 110 → 99 = -10%
+    expect(st.sharpe).not.toBeNull();
+  });
+
+  it('getStats sin datos devuelve nulos', async () => {
+    const { db, strategy, navSnapshot } = makePrisma();
+    strategy.findUnique.mockResolvedValue(ROW);
+    navSnapshot.findMany.mockResolvedValue([]);
+    const svc = new StrategyService(db, makeKv(), makeStore().store);
+    const st = await svc.getStats('s1');
+    expect(st.n_points).toBe(0);
+    expect(st.nav).toBeNull();
+    expect(st.return_pct).toBeNull();
+  });
+
+  it('navHistory agrupa por strategy_id', async () => {
+    const { db, navSnapshot } = makePrisma();
+    const ts = new Date();
+    navSnapshot.findMany.mockResolvedValue([
+      { ts, equity: 100, strategy_id: 'a' },
+      { ts, equity: 105, strategy_id: 'a' },
+      { ts, equity: 50, strategy_id: 'b' },
+    ]);
+    const svc = new StrategyService(db, makeKv(), makeStore().store);
+    const series = await svc.navHistory();
+    expect(series['a']).toHaveLength(2);
+    expect(series['b']).toHaveLength(1);
+    expect(series['a'][1].equity).toBe(105);
   });
 });

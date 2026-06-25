@@ -6,12 +6,13 @@ import { ProvidersModule } from '../providers/providers.module';
 import { LongTermMemoryModule } from '../long-term-memory/long-term-memory.module';
 import { MlSignalRecordModule } from '../ml-signal-record/ml-signal-record.module';
 import { MlSignalRecordService } from '../ml-signal-record/ml-signal-record.service';
+import { KvService } from '../common/kv.service';
 
 @Module({
   // LongTermMemoryModule is a leaf (PrismaModule only) — no circular dep risk.
   // MlSignalRecordModule is a leaf (PrismaModule only) — no circular dep risk.
   imports: [PrismaModule, ProvidersModule, LongTermMemoryModule, MlSignalRecordModule],
-  providers: [SnapshotService, MlSignalRecordService],
+  providers: [SnapshotService, MlSignalRecordService, KvService],
   controllers: [SnapshotController],
   exports: [SnapshotService],
 })

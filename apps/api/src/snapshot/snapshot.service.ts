@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService, Portfolio } from '../providers/provider-gateway.service';
 import { LongTermMemoryService } from '../long-term-memory/long-term-memory.service';
 import { MlSignalRecordService } from '../ml-signal-record/ml-signal-record.service';
+import { KvService } from '../common/kv.service';
 
 export interface NavEntry {
   id: string;
@@ -31,6 +32,10 @@ export class SnapshotService {
     // Absent → updateOutcomeAggregate call is skipped; snapshot is byte-identical to pre-s1.
     @Optional()
     private readonly mlSignalRecord?: MlSignalRecordService,
+    // KvService @Optional() — para etiquetar el snapshot con la estrategia aplicada
+    // (KV 'strategy.applied'). Ausente → strategy_id queda null (comportamiento previo).
+    @Optional()
+    private readonly kv?: KvService,
   ) {}
 
   /** Toma un snapshot del NAV actual desde el provider por defecto. */
@@ -43,10 +48,21 @@ export class SnapshotService {
       return null;
     }
 
+    // Estrategia cuya config está aplicada al ciclo (para atribuir el NAV).
+    let strategyId: string | null = null;
+    if (this.kv) {
+      try {
+        strategyId = await this.kv.get('strategy.applied');
+      } catch {
+        strategyId = null;
+      }
+    }
+
     const entry = await this.db.navSnapshot.create({
       data: {
         cycle_id: cycleId ?? null,
         provider_id: portfolio.provider_id,
+        strategy_id: strategyId,
         equity: portfolio.equity,
         cash: portfolio.cash,
         positions: JSON.stringify(portfolio.positions),

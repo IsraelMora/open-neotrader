@@ -26,6 +26,58 @@ export function kebabId(name: string): string {
   return out || 'estrategia';
 }
 
+const round2 = (x: number): number => Math.round(x * 100) / 100;
+
+/** Sharpe anualizado a partir de la serie de equity (null si no hay suficientes puntos). */
+function annualizedSharpe(equity: number[]): number | null {
+  const rets: number[] = [];
+  for (let i = 1; i < equity.length; i++) {
+    if (equity[i - 1] > 0) rets.push(equity[i] / equity[i - 1] - 1);
+  }
+  if (rets.length < 2) return null;
+  const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const variance = rets.reduce((a, b) => a + (b - mean) ** 2, 0) / (rets.length - 1);
+  const std = Math.sqrt(variance);
+  return std > 0 ? round2((mean / std) * Math.sqrt(252)) : null;
+}
+
+/** Máximo drawdown (%) de la serie de equity. */
+function maxDrawdownPct(equity: number[]): number {
+  let peak = equity[0];
+  let maxDd = 0;
+  for (const e of equity) {
+    if (e > peak) peak = e;
+    if (peak > 0) {
+      const dd = ((peak - e) / peak) * 100;
+      if (dd > maxDd) maxDd = dd;
+    }
+  }
+  return round2(maxDd);
+}
+
+/** Métricas de rendimiento a partir de una serie de equity (NAV). */
+function computeStats(equity: number[]): {
+  n_points: number;
+  nav: number | null;
+  return_pct: number | null;
+  sharpe: number | null;
+  max_drawdown_pct: number | null;
+} {
+  const n = equity.length;
+  if (n === 0) {
+    return { n_points: 0, nav: null, return_pct: null, sharpe: null, max_drawdown_pct: null };
+  }
+  const first = equity[0];
+  const last = equity[n - 1];
+  return {
+    n_points: n,
+    nav: round2(last),
+    return_pct: first > 0 ? round2(((last - first) / first) * 100) : null,
+    sharpe: annualizedSharpe(equity),
+    max_drawdown_pct: maxDrawdownPct(equity),
+  };
+}
+
 /**
  * Claves KV que constituyen una "estrategia" (perfil de configuración del ciclo).
  *
@@ -208,7 +260,44 @@ export class StrategyService {
       await this.kv.set(k, v);
       applied.push(k);
     }
+    // Marca esta estrategia como la "aplicada": SnapshotService atribuye el NAV de cada
+    // ciclo a esta estrategia (strategy_id) → así acumula estadísticas reales.
+    await this.kv.set('strategy.applied', id);
     return { applied };
+  }
+
+  /** Estadísticas de rendimiento de una estrategia, calculadas desde sus NavSnapshots. */
+  async getStats(id: string): Promise<{
+    strategy_id: string;
+    n_points: number;
+    nav: number | null;
+    return_pct: number | null;
+    sharpe: number | null;
+    max_drawdown_pct: number | null;
+  }> {
+    await this.get(id);
+    const rows = (await this.db.navSnapshot.findMany({
+      where: { strategy_id: id },
+      orderBy: { ts: 'asc' },
+      select: { equity: true },
+    })) as { equity: number }[];
+    return { strategy_id: id, ...computeStats(rows.map((r) => r.equity)) };
+  }
+
+  /** Series de NAV por estrategia (para el gráfico de competencia). */
+  async navHistory(limit = 500): Promise<Record<string, { ts: string; equity: number }[]>> {
+    const rows = (await this.db.navSnapshot.findMany({
+      where: { strategy_id: { not: null } },
+      orderBy: { ts: 'asc' },
+      take: limit,
+      select: { ts: true, equity: true, strategy_id: true },
+    })) as { ts: Date; equity: number; strategy_id: string }[];
+    const series: Record<string, { ts: string; equity: number }[]> = {};
+    for (const r of rows) {
+      if (!series[r.strategy_id]) series[r.strategy_id] = [];
+      series[r.strategy_id].push({ ts: r.ts.toISOString(), equity: r.equity });
+    }
+    return series;
   }
 
   /** Serializa la estrategia como manifiesto de preset TOML (para la tienda). */

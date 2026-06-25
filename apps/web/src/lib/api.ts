@@ -163,6 +163,15 @@ export const api = {
     client.post(`api/strategies/${id}/apply`, { json: {} }).json<JsonObject>(),
   strategyPublish: (id: string) =>
     client.post(`api/strategies/${id}/publish`, { json: {} }).json<JsonObject>(),
+  strategyStats: (id: string) =>
+    client.get(`api/strategies/${id}/stats`).json<{
+      strategy_id: string;
+      n_points: number;
+      nav: number | null;
+      return_pct: number | null;
+      sharpe: number | null;
+      max_drawdown_pct: number | null;
+    }>(),
 
   universeCheck: (symbol: string, kind = 'equity') =>
     client.get(`api/universe/check?symbol=${symbol}&kind=${kind}`).json<JsonObject>(),

@@ -33,10 +33,23 @@ export class StrategyController {
     return this.svc.captureCurrentConfig();
   }
 
+  /** Series de NAV por estrategia (gráfico de competencia). Antes de :id para no colisionar. */
+  @Get('nav-history')
+  @ApiOperation({ summary: 'Series de NAV por estrategia' })
+  navHistory() {
+    return this.svc.navHistory();
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Detalle de una estrategia' })
   get(@Param('id') id: string) {
     return this.svc.get(id);
+  }
+
+  @Get(':id/stats')
+  @ApiOperation({ summary: 'Estadísticas de rendimiento (NAV, retorno, sharpe, maxDD)' })
+  stats(@Param('id') id: string) {
+    return this.svc.getStats(id);
   }
 
   @Post()

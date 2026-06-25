@@ -14,19 +14,39 @@ interface Strategy {
   mode: 'test' | 'live';
 }
 
+interface Stats {
+  n_points: number;
+  nav: number | null;
+  return_pct: number | null;
+  sharpe: number | null;
+  max_drawdown_pct: number | null;
+}
+
 export default function Strategies() {
   const [items, setItems] = useState<Strategy[] | null>(null);
+  const [stats, setStats] = useState<Record<string, Stats>>({});
   const [err, setErr] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ ok: boolean; t: string } | null>(null);
   const [name, setName] = useState('');
   const [desc, setDesc] = useState('');
   const [busy, setBusy] = useState(false);
 
+  const loadStatsFor = (id: string) =>
+    api
+      .strategyStats(id)
+      .then((st) => setStats((prev) => ({ ...prev, [id]: st })))
+      .catch(() => undefined);
+
   const load = () => {
     setErr(null);
     api
       .strategies()
-      .then((d) => setItems(d as unknown as Strategy[]))
+      .then((d) => {
+        const list = d as unknown as Strategy[];
+        setItems(list);
+        // Carga las estadísticas de cada estrategia (no bloquea el render).
+        list.forEach((s) => void loadStatsFor(s.id));
+      })
       .catch((e: unknown) =>
         setErr(e instanceof Error ? e.message : 'No se pudieron cargar las estrategias'),
       );
@@ -187,6 +207,27 @@ export default function Strategies() {
                     publicar en tienda
                   </button>
                 </p>
+                {stats[s.id] && stats[s.id].n_points > 0 && (
+                  <div className="mt-1.5 flex flex-wrap gap-1.5 text-[11px]">
+                    <span className="rounded bg-edge/40 px-1.5 py-0.5 text-mut">
+                      NAV <span className="text-ink">{stats[s.id].nav}</span>
+                    </span>
+                    <span
+                      className={`rounded px-1.5 py-0.5 ${(stats[s.id].return_pct ?? 0) >= 0 ? 'bg-accent/15 text-accent' : 'bg-danger/15 text-danger'}`}
+                    >
+                      ret {stats[s.id].return_pct}%
+                    </span>
+                    <span className="rounded bg-edge/40 px-1.5 py-0.5 text-mut">
+                      sharpe <span className="text-ink">{stats[s.id].sharpe ?? '—'}</span>
+                    </span>
+                    <span className="rounded bg-edge/40 px-1.5 py-0.5 text-mut">
+                      maxDD <span className="text-ink">{stats[s.id].max_drawdown_pct}%</span>
+                    </span>
+                    <span className="rounded bg-edge/40 px-1.5 py-0.5 text-mut">
+                      {stats[s.id].n_points} pts
+                    </span>
+                  </div>
+                )}
               </div>
               <div className="flex items-center gap-2">
                 <Switch
