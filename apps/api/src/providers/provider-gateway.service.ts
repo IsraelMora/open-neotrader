@@ -269,8 +269,11 @@ export class ProviderGatewayService implements OnModuleInit {
     });
 
     const bars = this.normalizeBars(raw, fmt);
-    this.cache.setOhlcv(providerId, symbol, timeframe, limit, bars);
-    return bars;
+    // Honor the requested bar count: providers like Yahoo only accept a coarse `range`
+    // bucket and over-fetch, so slice to the LAST `limit` bars (most recent).
+    const limited = limit > 0 && bars.length > limit ? bars.slice(-limit) : bars;
+    this.cache.setOhlcv(providerId, symbol, timeframe, limit, limited);
+    return limited;
   }
 
   /** Obtiene la cotización en tiempo real (bid/ask/last) para un símbolo, con caché. */

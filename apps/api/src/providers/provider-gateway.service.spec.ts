@@ -527,4 +527,28 @@ describe('ProviderGatewayService — getOhlcv cache integration', () => {
     expect(result).toHaveLength(1);
     expect(result[0].ts).toBe('2024-01-01T00:00:00Z');
   });
+
+  it('slices over-fetched bars to the requested limit (keeps the most recent)', async () => {
+    const many = Array.from({ length: 5 }, (_, i) => ({
+      t: `2024-01-0${i + 1}T00:00:00Z`,
+      o: 1,
+      h: 2,
+      l: 0.5,
+      c: 1 + i,
+      v: 100,
+    }));
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ bars: many }),
+    });
+    const svc = makeAlpacaService({
+      getOhlcv: jest.fn().mockReturnValue(null),
+      setOhlcv: jest.fn(),
+    });
+
+    const result = await svc.getOhlcv('alpaca', 'AAPL', '1d', 3);
+
+    expect(result).toHaveLength(3); // 5 fetched → sliced to 3
+    expect(result[result.length - 1].close).toBe(5); // keeps the LAST (most recent) bars
+  });
 });
