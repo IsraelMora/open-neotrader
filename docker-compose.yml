@@ -41,6 +41,9 @@ services:
       # contenedor, y @nestjs/config NO deja que /data/.env pise una env ya presente →
       # la credencial real del volumen queda TAPADA ("no configurada"). Se cargan por
       # POST /api/credentials, que las persiste en /data/.env (DOTENV_PATH).
+      # Tienda comunitaria de plugins: la API hace proxy a este servicio interno.
+      # El store usa setGlobalPrefix('api'), por eso la URL incluye /api.
+      STORE_URL: ${STORE_URL:-http://store:3002/api}
       # CORS — separar por comas si hay múltiples origins
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
     expose:
@@ -84,6 +87,31 @@ services:
       - internal
     restart: unless-stopped
 
+  # ── Tienda de plugins (NestJS independiente, Prisma/SQLite propio) ──────────
+  store:
+    build:
+      context: ./apps/store
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: production
+      PORT: 3002
+      # DB SQLite propia de la tienda, en su volumen persistente.
+      DATABASE_URL: file:/data/store.db
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+    expose:
+      - "3002"
+    volumes:
+      - store-data:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -sf http://localhost:3002/api >/dev/null 2>&1 || exit 1']
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
+    networks:
+      - internal
+    restart: unless-stopped
+
 networks:
   # Red interna — el API no tiene acceso a internet desde Docker
   # (para el sandbox Python sin red, usar SANDBOX_NETWORK=none en runtime)
@@ -93,3 +121,4 @@ networks:
 
 volumes:
   api-data:     # Base de datos SQLite + config persistente
+  store-data:   # Base de datos SQLite de la tienda de plugins
