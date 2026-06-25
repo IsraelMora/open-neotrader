@@ -30,9 +30,9 @@ export class StoreController {
 
   @Post('publish')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Publicar un plugin en la tienda' })
-  publish(@Body() body: { pluginId: string }) {
-    return this.svc.publish(body.pluginId);
+  @ApiOperation({ summary: 'Publicar un plugin en la tienda (firmado)' })
+  publish(@Body() body: { manifestToml: string; payloadBase64: string }) {
+    return this.svc.publish(body.manifestToml, body.payloadBase64);
   }
 
   @Post('vote')
