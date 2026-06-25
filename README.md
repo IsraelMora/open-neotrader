@@ -2,6 +2,10 @@
 
 Plataforma self-hosted de agentes de IA para trading. El LLM actúa como orquestador que analiza contexto textual (noticias, eventos) y ejecuta skills declarados en plugins Python. Nunca ve series de precios directamente ni ejecuta código arbitrario.
 
+> **Instalación y operación autónoma:** ver **[INSTALL.md](INSTALL.md)** (o `scripts/setup.sh` para dejarlo configurado en un comando). Tool-calling nativo (estándar OpenAI/MCP); funciona con LLMs **free** (OpenRouter) y broker **paper** (Alpaca).
+>
+> ⚠️ **Expectativa honesta:** es un marco de research/automatización con disciplina de riesgo, **no** una máquina de ingresos garantizados. En backtests honestos las estrategias incluidas rinden retornos modestos y a menudo **por debajo de comprar y aguantar un índice** (alpha negativo). Empezá SIEMPRE en paper. No inviertas dinero que no puedas perder.
+
 ## Arquitectura
 
 ```
@@ -26,10 +30,14 @@ Browser
 ```bash
 # 1. Variables de entorno
 cp .env.example .env
-# Editar .env: añadir ANTHROPIC_API_KEY
+# Editar .env: JWT_SECRET + un LLM (OpenRouter free o Anthropic) — ver .env.example
 
 # 2. Levantar
 docker compose up -d
+
+# 3. Configurar autónomo (un comando) — ver INSTALL.md para el detalle
+#   API_URL=http://localhost:8080 ADMIN_USER=admin ADMIN_PASS=... LLM_API_KEY=sk-or-v1-... \
+#   bash scripts/setup.sh
 
 # Panel en http://localhost:8080
 # API docs en http://localhost:3000/api/docs (solo dev)
