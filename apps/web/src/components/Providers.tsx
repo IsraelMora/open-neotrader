@@ -1,74 +1,66 @@
 import { useEffect, useState } from 'react';
-import { api, type JsonObject } from '../lib/api';
+import { api } from '../lib/api';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
-import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from './ui/select';
-import { Check } from 'lucide-react';
+import { Switch } from './ui/switch';
 
-const MODES: Record<string, { field: string; opts: [string, string][] }> = {
-  alpaca: {
-    field: 'mode',
-    opts: [
-      ['interno', 'desactivado (paper interno)'],
-      ['alpaca_paper', 'paper (órdenes reales sin dinero)'],
-      ['alpaca_live', 'LIVE (dinero real, doble llave)'],
-    ],
-  },
-  binance: {
-    field: 'crypto_mode',
-    opts: [
-      ['interno', 'desactivado (paper interno)'],
-      ['binance_testnet', 'testnet (sandbox)'],
-      ['binance_live', 'LIVE (dinero real, doble llave)'],
-    ],
-  },
-};
-
-interface ProviderItem {
-  plugin_id: string;
-  [key: string]: unknown;
+interface Provider {
+  id: string;
+  name: string;
+  description?: string;
+  active?: boolean;
+  type: string;
 }
 
 export default function Providers() {
-  const [provs, setProvs] = useState<ProviderItem[] | null>(null);
-  const [cfg, setCfg] = useState<JsonObject | null>(null);
+  const [provs, setProvs] = useState<Provider[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ ok: boolean; t: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+
   const load = () => {
-    api.config().then((d) => setCfg(d));
-    api.providers().then((d) => setProvs(d as unknown as ProviderItem[]));
+    setErr(null);
+    api
+      .plugins()
+      .then((d) => {
+        const all = d as unknown as Provider[];
+        setProvs(all.filter((p) => p.type === 'provider'));
+      })
+      .catch((e: unknown) =>
+        setErr(e instanceof Error ? e.message : 'No se pudieron cargar los proveedores'),
+      );
   };
   useEffect(() => {
     load();
   }, []);
-  if (!provs || !cfg)
-    return <div className="text-mut text-sm animate-pulse">Cargando proveedores…</div>;
 
-  const save = async (next: JsonObject) => {
+  const toggle = async (p: Provider) => {
+    setBusy(true);
     try {
-      const r = await api.saveConfig(next);
-      setCfg((r as { config: JsonObject }).config);
-      setMsg({ ok: true, t: '✓ Guardado. Aplica desde el próximo ciclo.' });
+      await api.pluginAction(p.id, p.active ? 'deactivate' : 'activate');
+      setMsg({ ok: true, t: `✓ ${p.name} ${p.active ? 'desactivado' : 'activado'}` });
       load();
     } catch (e: unknown) {
       setMsg({ ok: false, t: '✗ ' + (e instanceof Error ? e.message : 'error') });
+    } finally {
+      setBusy(false);
     }
   };
-  const setMode = (prov: string, val: string) => {
-    const next = structuredClone(cfg) as Record<string, Record<string, unknown>>;
-    if (!next.broker) next.broker = {};
-    next.broker[MODES[prov].field] = val;
-    save(next as JsonObject);
-  };
-  const toggleSym = (prov: string, sym: string) => {
-    const next = structuredClone(cfg) as Record<string, Record<string, unknown>>;
-    if (!next.providers) next.providers = {};
-    const key = prov + '_universe';
-    const cur: string[] = (next.providers[key] as string[]) || [];
-    next.providers[key] = cur.includes(sym) ? cur.filter((s) => s !== sym) : [...cur, sym];
-    save(next as JsonObject);
-  };
 
-  const cfgTyped = cfg as Record<string, Record<string, unknown>>;
+  if (err)
+    return (
+      <div className="rounded-md border border-danger/40 bg-danger/10 px-4 py-3 text-sm text-danger">
+        <div className="font-medium">No se pudieron cargar los proveedores</div>
+        <p className="mt-1 text-[12px] opacity-80">{err}</p>
+        <button
+          onClick={load}
+          className="mt-2 rounded border border-danger/40 px-3 py-1 text-[12px] hover:bg-danger/20"
+        >
+          Reintentar
+        </button>
+      </div>
+    );
+  if (!provs) return <div className="text-mut text-sm animate-pulse">Cargando proveedores…</div>;
 
   return (
     <div className="space-y-5">
@@ -80,76 +72,45 @@ export default function Providers() {
         </div>
       )}
       <p className="text-[12px] text-mut">
-        Activa qué proveedor ejecuta y con qué activos. Sub-universo vacío = el proveedor opera
-        TODOS los de su clase. Requiere credenciales (pestaña Credenciales).
+        Encendé o apagá cada proveedor de datos/ejecución. El modo <strong>paper vs real</strong> NO
+        se decide acá: se maneja a nivel de cada estrategia (modo test/opera). Requiere credenciales
+        (pestaña Credenciales) para los que las necesiten.
       </p>
-      {['alpaca', 'binance'].map((prov) => {
-        const sub: string[] =
-          (cfgTyped.providers && (cfgTyped.providers[prov + '_universe'] as string[])) || [];
-        const mode =
-          (cfgTyped.broker && (cfgTyped.broker[MODES[prov].field] as string)) || 'interno';
-        const activo = mode !== 'interno';
-        const clase = prov === 'alpaca' ? 'acciones/ETFs' : 'criptomonedas';
-        const universe = cfgTyped.universe || {};
-        const candidatos = Object.keys(universe).filter(
-          (k) => universe[k] === (prov === 'alpaca' ? 'equity' : 'crypto'),
-        );
 
-        return (
-          <Card key={prov}>
-            <CardHeader
-              title={prov.toUpperCase() + ' · ' + clase}
-              hint={prov === 'alpaca' ? 'Equities (SPY, QQQ, ETFs…)' : 'Crypto (BTC, ETH…)'}
-            />
-            <CardBody className="space-y-3">
-              <div className="flex items-center gap-3">
-                <label className="text-[12px] text-mut w-32">Modo de ejecución</label>
-                <Select value={mode} onValueChange={(v) => setMode(prov, v)}>
-                  <SelectTrigger className="w-72">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {MODES[prov].opts.map(([v, l]) => (
-                      <SelectItem key={v} value={v}>
-                        {l}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Badge tone={activo ? 'ok' : 'mut'}>{activo ? 'activo' : 'inactivo'}</Badge>
-              </div>
-              <div>
-                <div className="text-[12px] text-mut mb-1.5">
-                  Sub-universo ({sub.length ? sub.join(', ') : 'todos los de su clase'}):
+      <Card>
+        <CardHeader
+          title={`Proveedores (${provs.length})`}
+          hint="Plugins de tipo provider: datos de mercado y ejecución de órdenes."
+        />
+        <CardBody className="space-y-2.5">
+          {provs.length === 0 && (
+            <p className="text-[12px] text-mut">No hay proveedores instalados.</p>
+          )}
+          {provs.map((p) => (
+            <div
+              key={p.id}
+              className="flex items-start justify-between gap-3 rounded-md border border-edge/60 px-3 py-2.5"
+            >
+              <div className="flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-[13px] font-medium text-ink">{p.name}</span>
+                  <Badge tone={p.active ? 'ok' : 'mut'}>{p.active ? 'encendido' : 'apagado'}</Badge>
                 </div>
-                <div className="flex flex-wrap gap-2">
-                  {candidatos.map((sym) => {
-                    const on = sub.includes(sym);
-                    return (
-                      <button
-                        key={sym}
-                        onClick={() => toggleSym(prov, sym)}
-                        className={`rounded-md border px-2.5 py-1 text-[12px] num ${on ? 'border-accent/50 bg-accent/15 text-accent' : 'border-edge bg-edge/30 text-mut hover:text-ink'}`}
-                      >
-                        {on && <Check className="inline h-3 w-3 -mt-0.5 mr-1" />}
-                        {sym}
-                      </button>
-                    );
-                  })}
-                  {!candidatos.length && (
-                    <span className="text-mut text-[12px]">
-                      sin activos de esta clase en el universo
-                    </span>
-                  )}
-                </div>
-                <p className="text-[11px] text-mut mt-1.5">
-                  Vacío = opera todos. Marca símbolos para restringir (ej. solo BTC).
-                </p>
+                {p.description && (
+                  <p className="mt-0.5 text-[12px] leading-snug text-mut">{p.description}</p>
+                )}
+                <p className="mt-1 text-[11px] text-mut">{p.id}</p>
               </div>
-            </CardBody>
-          </Card>
-        );
-      })}
+              <Switch
+                checked={!!p.active}
+                disabled={busy}
+                onCheckedChange={() => void toggle(p)}
+                aria-label={p.active ? 'Apagar' : 'Encender'}
+              />
+            </div>
+          ))}
+        </CardBody>
+      </Card>
     </div>
   );
 }
