@@ -29,16 +29,18 @@ services:
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET requerido en .env}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
       TOTP_ISSUER: ${TOTP_ISSUER:-NeuroTrader}
-      # LLM — la API key se inyecta desde el host; nunca queda en la imagen.
-      # Defaults alineados con .env.example (OpenRouter vía backend OpenAI-compatible).
-      # OPENAI_BASE_URL es imprescindible con backend=openai: sin él, la key de OpenRouter
-      # apunta a api.openai.com y los modelos OpenRouter (p.ej. nemotron) fallan.
+      # LLM — config NO-secreta acá; defaults alineados con .env.example (OpenRouter vía
+      # backend OpenAI-compatible). OPENAI_BASE_URL es imprescindible con backend=openai:
+      # sin él, la key de OpenRouter apunta a api.openai.com y los modelos OpenRouter
+      # (p.ej. nemotron) fallan.
       LLM_BACKEND: ${LLM_BACKEND:-openai}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-nvidia/nemotron-3-super-120b-a12b:free}
+      # NOTA: las API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, brokers)
+      # NO van acá. Declararlas con default vacío (${VAR:-}) las define como "" en el
+      # contenedor, y @nestjs/config NO deja que /data/.env pise una env ya presente →
+      # la credencial real del volumen queda TAPADA ("no configurada"). Se cargan por
+      # POST /api/credentials, que las persiste en /data/.env (DOTENV_PATH).
       # CORS — separar por comas si hay múltiples origins
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
     expose:
