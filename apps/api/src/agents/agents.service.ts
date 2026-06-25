@@ -731,10 +731,10 @@ export class AgentsService {
     };
   }
 
-  /** Starting capital context fed to risk/sizing disciplines (matches the paper executor). */
-  private static readonly PAPER_CAPITAL = 10_000;
+  /** Fallback capital when KV `cycle.capital` is unset (override via PATCH /cycle/config). */
+  private static readonly DEFAULT_CAPITAL = 10_000;
 
-  /** Default liquid universe used when KV `cycle.universe` is not set. */
+  /** Fallback universe when KV `cycle.universe` is unset (override via PATCH /cycle/config). */
   private static readonly DEFAULT_UNIVERSE = [
     'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'SPY', 'QQQ', 'AMD',
   ];
@@ -817,16 +817,18 @@ export class AgentsService {
     // universe and fetches OHLCV, then injects it so the sandbox on_cycle hooks can
     // read it via provider_tools.get_ohlcv WITHOUT the sandbox ever touching the net.
     const market = await this._buildMarketContext();
+    // Capital fed to risk/sizing disciplines (so they can APPROVE + size signals).
+    // Configurable via KV `cycle.capital`; falls back to a sane default.
+    const capital =
+      Number((this.kv ? await this.kv.get('cycle.capital') : null) || 0) ||
+      AgentsService.DEFAULT_CAPITAL;
     const cycleCtx: Record<string, unknown> = {
       cycle_id,
       universe: market.universe,
       ohlcv: market.ohlcv,
       config: {},
-      // Capital/portfolio context so risk/sizing disciplines can APPROVE + size signals.
-      // Without this they see zero capital and veto everything. Mirrors the paper
-      // executor's starting capital; real broker-position sync is a later refinement.
       portfolio: {},
-      portfolio_value: AgentsService.PAPER_CAPITAL,
+      portfolio_value: capital,
       positions: [],
       trade_history: [],
     };
@@ -836,7 +838,7 @@ export class AgentsService {
     // does not echo the input context).
     const hookCtx: Record<string, unknown> = {
       ...baseCtx,
-      portfolio_value: AgentsService.PAPER_CAPITAL,
+      portfolio_value: capital,
       positions: baseCtx['positions'] ?? [],
       portfolio: baseCtx['portfolio'] ?? {},
       trade_history: baseCtx['trade_history'] ?? [],
