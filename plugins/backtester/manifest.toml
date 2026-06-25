@@ -35,6 +35,9 @@ lookback        = { type = "integer", default = 252,  description = "Ventana de 
 skip            = { type = "integer", default = 21,   description = "Barras recientes a saltar (momentum 12-1)" }
 regime_filter   = { type = "boolean", default = false, description = "Dual momentum: ir a cash si la amplitud del mercado es débil" }
 regime_min_breadth = { type = "number", default = 0.5, description = "Fracción mínima de nombres con momentum positivo para invertir" }
+vol_target      = { type = "number", default = 0.0,  description = "Objetivo de volatilidad anualizada (0.15=15%); 0 desactiva el vol targeting" }
+vol_window      = { type = "integer", default = 21,  description = "Ventana (barras) para estimar volatilidad realizada" }
+max_leverage    = { type = "number", default = 1.0,  description = "Tope de exposición con vol targeting (1.0 = sin apalancamiento)" }
 
 [skills]
 keys = ["backtester.run", "backtester.run_walk_forward", "backtester.run_cross_sectional"]

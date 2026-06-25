@@ -90,6 +90,15 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     # it improves risk-adjusted returns without re-testing on YOUR universe/period.
     regime_filter = bool(config.get("regime_filter", False))
     regime_min_breadth = float(config.get("regime_min_breadth", 0.5))
+    # Volatility targeting (Barroso & Santa-Clara 2015, "Momentum has its moments"):
+    # scale exposure toward a constant annualized target vol using the portfolio's
+    # trailing realized vol (PAST returns only → no lookahead). High vol → shrink
+    # exposure into cash; low vol → cap at max_leverage (no borrowing by default).
+    # Off when vol_target <= 0. This is one of the few robustly documented improvements
+    # to momentum: it raises Sharpe and cuts the worst crash drawdowns.
+    vol_target = float(config.get("vol_target", 0.0))
+    vol_window = max(2, int(config.get("vol_window", 21)))
+    max_leverage = float(config.get("max_leverage", 1.0))
 
     # Common trading dates across the ENTIRE universe (so every symbol has a price).
     date_sets = [set(b["date"] for b in bars) for bars in prices.values() if bars]
@@ -115,8 +124,32 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
             return None
         return p_now / p_old - 1.0
 
+    def _exposure(names: list[str], i: int) -> float:
+        """Vol-target scale for `names` using trailing realized vol up to index i."""
+        if vol_target <= 0 or not names:
+            return 1.0
+        port_rets: list[float] = []
+        for k in range(max(1, i - vol_window + 1), i + 1):
+            day = []
+            for s in names:
+                p0 = px[s].get(common[k - 1])
+                p1 = px[s].get(common[k])
+                if p0 and p1 and p0 > 0:
+                    day.append(p1 / p0 - 1.0)
+            if day:
+                port_rets.append(sum(day) / len(day))
+        if len(port_rets) < 2:
+            return 1.0
+        mean_r = sum(port_rets) / len(port_rets)
+        var = sum((r - mean_r) ** 2 for r in port_rets) / (len(port_rets) - 1)
+        ann_vol = math.sqrt(var) * math.sqrt(252)
+        if ann_vol <= 0:
+            return 1.0
+        return min(max_leverage, vol_target / ann_vol)
+
     equity = capital
     holdings: list[str] = []
+    exposure = 1.0  # vol-target scale applied to daily portfolio returns
     weights: dict[str, float] = {}  # current equal-weight allocation by symbol
     total_cost = 0.0
     equity_curve: list[dict] = []
@@ -155,8 +188,11 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
             equity = max(0.0, equity - cost)
             total_cost += cost
             weights = new_weights
+            # Set vol-target exposure for the upcoming holding period.
+            exposure = _exposure(holdings, i)
 
-        # Apply one day of equal-weight return from yesterday's holdings.
+        # Apply one day of equal-weight return from yesterday's holdings, scaled by the
+        # vol-target exposure (the un-invested fraction sits in cash, earning 0).
         if holdings and i > 0:
             rets = []
             for s in holdings:
@@ -165,7 +201,7 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
                 if p0 and p1 and p0 > 0:
                     rets.append(p1 / p0 - 1.0)
             if rets:
-                equity *= 1.0 + sum(rets) / len(rets)
+                equity *= 1.0 + exposure * (sum(rets) / len(rets))
 
         equity = max(0.0, equity)
         equity_curve.append({"date": date, "equity": round(equity, 2)})

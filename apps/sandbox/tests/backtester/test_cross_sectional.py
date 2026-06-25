@@ -32,6 +32,49 @@ def _bars(fn, n=150, start=datetime.date(2023, 1, 1)):
 CFG = {"top_n": 1, "lookback": 60, "skip": 5, "rebalance_days": 20, "initial_capital": 10000}
 
 
+class TestVolatilityTargeting:
+    """Volatility-managed momentum (Barroso & Santa-Clara 2015): scale exposure toward
+    a constant target vol. High realized vol → shrink exposure (hold cash); low vol →
+    cap at max_leverage (no borrowing by default). Off when vol_target <= 0."""
+
+    # A net-rising but very volatile name (alternating +10% / -5%) → high realized vol.
+    _vol_riser = staticmethod(lambda i: 100.0 * (1.10 ** ((i + 1) // 2)) * (0.95 ** (i // 2)))
+    _cfg = {
+        "top_n": 1, "lookback": 20, "skip": 1, "rebalance_days": 20,
+        "initial_capital": 10000, "commission_pct": 0.0, "slippage_pct": 0.0,
+    }
+
+    def test_scales_down_a_high_vol_holding(self, cs):
+        prices = {
+            "V": _bars(self._vol_riser, n=120),
+            "FLAT": _bars(lambda i: 100.0, n=120),
+        }
+        plain = cs.run_cross_sectional(prices, self._cfg)
+        vt = cs.run_cross_sectional(prices, {**self._cfg, "vol_target": 0.15, "vol_window": 10})
+        assert plain["ok"] and vt["ok"]
+        assert "V" in plain["final_holdings"]
+        # Dampened exposure on a volatile riser → smaller (still positive) net move.
+        assert 0 < vt["metrics"]["total_return_pct"] < plain["metrics"]["total_return_pct"], (
+            vt["metrics"]["total_return_pct"],
+            plain["metrics"]["total_return_pct"],
+        )
+
+    def test_caps_at_no_leverage_when_vol_is_low(self, cs):
+        prices = {
+            "S": _bars(lambda i: 100.0 * (1.005 ** i), n=120),  # smooth → ~zero realized vol
+            "FLAT": _bars(lambda i: 100.0, n=120),
+        }
+        plain = cs.run_cross_sectional(prices, self._cfg)
+        vt = cs.run_cross_sectional(
+            prices, {**self._cfg, "vol_target": 0.50, "vol_window": 10, "max_leverage": 1.0}
+        )
+        assert plain["ok"] and vt["ok"]
+        # Realized vol below target but capped at 1.0 → no leverage → identical returns.
+        assert abs(
+            vt["metrics"]["total_return_pct"] - plain["metrics"]["total_return_pct"]
+        ) < 0.01, (vt["metrics"]["total_return_pct"], plain["metrics"]["total_return_pct"])
+
+
 class TestTransactionCosts:
     def test_costs_reduce_returns(self, cs):
         """Rebalancing into positions is not free. With non-zero commission/slippage

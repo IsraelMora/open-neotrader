@@ -95,6 +95,33 @@ export class CrossSectionalDto {
   @Type(() => Number)
   slippage_pct?: number;
 
+  /**
+   * Annualized volatility target (0.15 = 15%). When > 0, exposure is scaled toward this
+   * vol using trailing realized vol (Barroso & Santa-Clara 2015). 0 = off (full exposure).
+   */
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(2)
+  @Type(() => Number)
+  vol_target?: number;
+
+  /** Trailing window (bars) for realized-vol estimation when vol_target > 0. */
+  @IsOptional()
+  @IsInt()
+  @Min(2)
+  @Max(252)
+  @Type(() => Number)
+  vol_window?: number;
+
+  /** Exposure cap when vol targeting (1.0 = no leverage/borrowing). */
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(3)
+  @Type(() => Number)
+  max_leverage?: number;
+
   /** Extra config overrides forwarded to the engine. */
   @IsOptional()
   @IsObject()

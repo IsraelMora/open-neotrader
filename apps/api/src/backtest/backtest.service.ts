@@ -170,6 +170,9 @@ export class BacktestService {
       ...(dto.skip !== undefined ? { skip: dto.skip } : {}),
       ...(dto.commission_pct !== undefined ? { commission_pct: dto.commission_pct } : {}),
       ...(dto.slippage_pct !== undefined ? { slippage_pct: dto.slippage_pct } : {}),
+      ...(dto.vol_target !== undefined ? { vol_target: dto.vol_target } : {}),
+      ...(dto.vol_window !== undefined ? { vol_window: dto.vol_window } : {}),
+      ...(dto.max_leverage !== undefined ? { max_leverage: dto.max_leverage } : {}),
       ...(dto.params ?? {}),
     };
 
