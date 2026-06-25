@@ -176,6 +176,15 @@ export default function Strategies() {
                     }
                   >
                     aplicar al ciclo
+                  </button>{' '}
+                  ·{' '}
+                  <button
+                    className="underline hover:text-ink"
+                    onClick={() =>
+                      void run(() => api.strategyPublish(s.id), '✓ Publicada en la tienda.')
+                    }
+                  >
+                    publicar en tienda
                   </button>
                 </p>
               </div>

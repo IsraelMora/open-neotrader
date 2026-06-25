@@ -161,6 +161,8 @@ export const api = {
     client.post(`api/strategies/${id}/activate`, { json: { active } }).json<JsonObject>(),
   strategyApply: (id: string) =>
     client.post(`api/strategies/${id}/apply`, { json: {} }).json<JsonObject>(),
+  strategyPublish: (id: string) =>
+    client.post(`api/strategies/${id}/publish`, { json: {} }).json<JsonObject>(),
 
   universeCheck: (symbol: string, kind = 'equity') =>
     client.get(`api/universe/check?symbol=${symbol}&kind=${kind}`).json<JsonObject>(),

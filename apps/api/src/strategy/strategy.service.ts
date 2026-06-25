@@ -1,6 +1,30 @@
 import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { KvService } from '../common/kv.service';
+import { StoreService } from '../store/store.service';
+
+/** Escapa un string para un valor TOML básico ("..."). */
+function tomlStr(v: string): string {
+  return '"' + v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n') + '"';
+}
+
+/** id kebab-case derivado de un nombre arbitrario (requisito del store). */
+export function kebabId(name: string): string {
+  const ascii = name.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); // quita diacríticos (lineal, sin backtracking)
+  let out = '';
+  let prevDash = false;
+  for (const ch of ascii) {
+    if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
+      out += ch;
+      prevDash = false;
+    } else if (out && !prevDash) {
+      out += '-';
+      prevDash = true;
+    }
+  }
+  if (out.endsWith('-')) out = out.slice(0, -1);
+  return out || 'estrategia';
+}
 
 /**
  * Claves KV que constituyen una "estrategia" (perfil de configuración del ciclo).
@@ -71,6 +95,7 @@ export class StrategyService {
   constructor(
     private readonly db: PrismaService,
     private readonly kv: KvService,
+    private readonly store: StoreService,
   ) {}
 
   /** Lee el snapshot actual de las claves de estrategia desde el KV global. */
@@ -184,5 +209,36 @@ export class StrategyService {
       applied.push(k);
     }
     return { applied };
+  }
+
+  /** Serializa la estrategia como manifiesto de preset TOML (para la tienda). */
+  buildPresetManifest(s: StrategyDto): string {
+    const description = s.description ?? 'Preset de estrategia: ' + s.name;
+    const lines = [
+      '[plugin]',
+      `id = ${tomlStr(kebabId(s.name))}`,
+      `name = ${tomlStr(s.name)}`,
+      'type = "preset"',
+      'version = "1.0.0"',
+      'author = "OpenNeoTrader"',
+      `description = ${tomlStr(description)}`,
+      '',
+      '[preset.config]',
+      ...Object.entries(s.config).map(([k, v]) => `${tomlStr(k)} = ${tomlStr(v)}`),
+      '',
+    ];
+    return lines.join('\n');
+  }
+
+  /** Publica la estrategia en la tienda comunitaria como un plugin de tipo `preset`. */
+  async publishToStore(id: string): Promise<unknown> {
+    const s = await this.get(id);
+    if (Object.keys(s.config).length === 0) {
+      throw new ConflictException('La estrategia no tiene configuración para publicar');
+    }
+    const manifestToml = this.buildPresetManifest(s);
+    // El payload es un blob opaco para el store; usamos la propia config como contenido.
+    const payloadBase64 = Buffer.from(JSON.stringify(s.config), 'utf8').toString('base64');
+    return this.store.publish(manifestToml, payloadBase64);
   }
 }

@@ -71,4 +71,11 @@ export class StrategyController {
   apply(@Param('id') id: string) {
     return this.svc.apply(id);
   }
+
+  @Post(':id/publish')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Publica la estrategia en la tienda como preset (firmado)' })
+  publish(@Param('id') id: string) {
+    return this.svc.publishToStore(id);
+  }
 }

@@ -1,6 +1,12 @@
-import { StrategyService, STRATEGY_CONFIG_KEYS } from './strategy.service';
+import { StrategyService, STRATEGY_CONFIG_KEYS, kebabId } from './strategy.service';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { KvService } from '../common/kv.service';
+import type { StoreService } from '../store/store.service';
+
+function makeStore(): { store: StoreService; publish: jest.Mock } {
+  const publish = jest.fn().mockResolvedValue({ id: 'p1', manifestId: 'x', version: '1.0.0' });
+  return { store: { publish } as unknown as StoreService, publish };
+}
 
 function makeKv(initial: Record<string, string> = {}): KvService {
   const store = { ...initial };
@@ -49,7 +55,7 @@ describe('StrategyService', () => {
       'random.key': 'z', // NO es clave de estrategia
     });
     const { db } = makePrisma();
-    const svc = new StrategyService(db, kv);
+    const svc = new StrategyService(db, kv, makeStore().store);
     const cfg = await svc.captureCurrentConfig();
     expect(cfg['execution.autonomous']).toBe('true');
     expect(cfg['llm.model']).toBe('x/y');
@@ -66,9 +72,12 @@ describe('StrategyService', () => {
     strategy.create.mockImplementation(({ data }: { data: Record<string, unknown> }) =>
       Promise.resolve({ ...ROW, ...data }),
     );
-    const svc = new StrategyService(db, kv);
+    const svc = new StrategyService(db, kv, makeStore().store);
     const r = await svc.create({ name: 'Conservadora' });
-    const arg = strategy.create.mock.calls[0][0].data as { config: string; mode: string };
+    const createCalls = strategy.create.mock.calls as Array<
+      [{ data: { config: string; mode: string } }]
+    >;
+    const arg = createCalls[0][0].data;
     const captured = JSON.parse(arg.config) as Record<string, string>;
     expect(captured['cycle.timeframe']).toBe('1d');
     expect(captured['execution.real']).toBe('false');
@@ -83,11 +92,15 @@ describe('StrategyService', () => {
       ...ROW,
       config: JSON.stringify({ 'execution.autonomous': 'false', 'llm.model': 'm/n' }),
     });
-    const svc = new StrategyService(db, kv);
+    const svc = new StrategyService(db, kv, makeStore().store);
     const res = await svc.apply('s1');
-    expect(res.applied.sort()).toEqual(['execution.autonomous', 'llm.model']);
-    expect(kv.set).toHaveBeenCalledWith('execution.autonomous', 'false');
-    expect(kv.set).toHaveBeenCalledWith('llm.model', 'm/n');
+    expect([...res.applied].sort((a, b) => a.localeCompare(b))).toEqual([
+      'execution.autonomous',
+      'llm.model',
+    ]);
+    const setMock = (kv as unknown as { set: jest.Mock }).set;
+    expect(setMock).toHaveBeenCalledWith('execution.autonomous', 'false');
+    expect(setMock).toHaveBeenCalledWith('llm.model', 'm/n');
   });
 
   it('toDto (vía list) parsea config y normaliza mode', async () => {
@@ -96,7 +109,7 @@ describe('StrategyService', () => {
       { ...ROW, mode: 'live' },
       { ...ROW, id: 's2', mode: 'raro' },
     ]);
-    const svc = new StrategyService(db, makeKv());
+    const svc = new StrategyService(db, makeKv(), makeStore().store);
     const list = await svc.list();
     expect(list[0].config['execution.autonomous']).toBe('true');
     expect(list[0].mode).toBe('live');
@@ -106,7 +119,44 @@ describe('StrategyService', () => {
   it('get lanza NotFound si no existe', async () => {
     const { db, strategy } = makePrisma();
     strategy.findUnique.mockResolvedValue(null);
-    const svc = new StrategyService(db, makeKv());
+    const svc = new StrategyService(db, makeKv(), makeStore().store);
     await expect(svc.get('nope')).rejects.toThrow();
+  });
+
+  it('kebabId normaliza nombres con acentos/espacios', () => {
+    expect(kebabId('Momentum Agresivo')).toBe('momentum-agresivo');
+    expect(kebabId('Rotación Sectorial')).toBe('rotacion-sectorial');
+  });
+
+  it('publishToStore genera un manifest preset válido y llama a store.publish', async () => {
+    const { db, strategy } = makePrisma();
+    strategy.findUnique.mockResolvedValue({
+      ...ROW,
+      name: 'Momentum Agresivo',
+      config: JSON.stringify({ 'llm.model': 'm/n', 'execution.real': 'false' }),
+    });
+    const { store, publish } = makeStore();
+    const svc = new StrategyService(db, makeKv(), store);
+    await svc.publishToStore('s1');
+    expect(publish).toHaveBeenCalledTimes(1);
+    const calls = publish.mock.calls as [string, string][];
+    const [manifestToml, payloadB64] = calls[0];
+    expect(manifestToml).toContain('type = "preset"');
+    expect(manifestToml).toContain('id = "momentum-agresivo"');
+    expect(manifestToml).toContain('[preset.config]');
+    expect(manifestToml).toContain('"llm.model" = "m/n"');
+    // payload base64 decodifica a la config
+    const decoded = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8')) as Record<
+      string,
+      string
+    >;
+    expect(decoded['execution.real']).toBe('false');
+  });
+
+  it('publishToStore rechaza estrategias sin config', async () => {
+    const { db, strategy } = makePrisma();
+    strategy.findUnique.mockResolvedValue({ ...ROW, config: '{}' });
+    const svc = new StrategyService(db, makeKv(), makeStore().store);
+    await expect(svc.publishToStore('s1')).rejects.toThrow();
   });
 });
