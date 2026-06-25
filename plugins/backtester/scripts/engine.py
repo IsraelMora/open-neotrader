@@ -286,6 +286,10 @@ def run_backtest(
                 if bar is not None:
                     sign = 1.0 if leg["direction"] == "long" else -1.0
                     eq += (bar["close"] - leg["entry_price"]) * leg["shares"] * sign
+        # Ruina realista: una cuenta no puede valer menos que cero (te liquidan
+        # antes). Sin esto, un short con pérdida ilimitada da drawdowns >100% que
+        # falsean las métricas de riesgo.
+        eq = max(0.0, eq)
         mtm_curve.append({"date": d, "equity": round(eq, 2)})
         if prev_eq > 0:
             daily_returns.append((eq - prev_eq) / prev_eq)

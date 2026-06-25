@@ -170,6 +170,28 @@ class TestMarkToMarketEquity:
 
 
 # ---------------------------------------------------------------------------
+# 4c. Equity floors at zero (account ruin) — drawdown never exceeds 100%
+# ---------------------------------------------------------------------------
+class TestRuinFloor:
+    def test_short_blowup_caps_drawdown_at_100(self, engine):
+        """A short whose price triples loses >100% of capital. Real accounts get
+        liquidated at zero — equity must floor at 0 and max_drawdown_pct <= 100%."""
+        bars = [
+            _bar("2024-01-01", 100.0, 100.0),
+            _bar("2024-01-02", 100.0, 100.0),
+            _bar("2024-01-03", 300.0, 300.0),  # 3x → short loss far exceeds capital
+            _bar("2024-01-04", 300.0, 300.0),
+        ]
+        signals = [
+            {"symbol": "AAA", "action": "short", "date": "2024-01-01"},
+            {"symbol": "AAA", "action": "exit", "date": "2024-01-04"},
+        ]
+        result = engine.run_backtest(signals, {"AAA": bars}, {"initial_capital": 1000})
+        assert result.max_drawdown_pct <= 100.0
+        assert all(p["equity"] >= 0 for p in result.equity_curve)
+
+
+# ---------------------------------------------------------------------------
 # 4b. Capital exhaustion must not crash (no division by zero)
 # ---------------------------------------------------------------------------
 class TestCapitalExhaustion:
