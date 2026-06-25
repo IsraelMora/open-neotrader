@@ -255,6 +255,12 @@ export class LlmService {
     if (!apiKey) {
       throw new ServiceUnavailableException('OPENAI_API_KEY no configurada');
     }
+    // Base URL configurable → permite gateways OpenAI-compatibles (OpenRouter, Groq,
+    // etc.) sin cambiar de backend. Default = OpenAI. Sin barra final.
+    const baseUrl = (this.cfg.get<string>('OPENAI_BASE_URL') ?? 'https://api.openai.com/v1').replace(
+      /\/+$/,
+      '',
+    );
 
     const skillsMeta = await this.plugins.getSkillsMetadata();
     const skillContents: string[] = [];
@@ -270,7 +276,7 @@ export class LlmService {
       .filter(Boolean)
       .join('\n\n');
 
-    const res = await globalThis.fetch('https://api.openai.com/v1/chat/completions', {
+    const res = await globalThis.fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
