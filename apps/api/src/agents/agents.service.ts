@@ -784,7 +784,9 @@ export class AgentsService {
     universe = universe.slice(0, 30);
 
     const timeframe = (this.kv ? await this.kv.get('cycle.timeframe') : null) || '1d';
-    const bars = Number((this.kv ? await this.kv.get('cycle.bars') : null) || 0) || 150;
+    // Default 300: cubre el lookback de estrategias de momentum (12-1 ≈ 252+skip) para que
+    // operen desde el PRIMER ciclo (la historia se baja del provider, no se espera a acumular).
+    const bars = Number((this.kv ? await this.kv.get('cycle.bars') : null) || 0) || 300;
     // DATA provider for OHLCV is decoupled from the EXECUTION broker: Alpaca's free
     // IEX feed returns no historical bars, so default market data comes from Yahoo
     // (free, full history). Override via KV `cycle.data_provider`.
