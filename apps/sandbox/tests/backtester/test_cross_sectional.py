@@ -32,6 +32,27 @@ def _bars(fn, n=150, start=datetime.date(2023, 1, 1)):
 CFG = {"top_n": 1, "lookback": 60, "skip": 5, "rebalance_days": 20, "initial_capital": 10000}
 
 
+class TestRegimeFilter:
+    def test_goes_to_cash_when_breadth_is_weak(self, cs):
+        """Regime filter (dual momentum): if too few names have positive momentum
+        (weak market breadth), hold CASH instead of buying into a falling market."""
+        prices = {
+            "UP": _bars(lambda i: 100.0 * (1.01 ** i)),
+            "D1": _bars(lambda i: 100.0 * (0.99 ** i)),
+            "D2": _bars(lambda i: 100.0 * (0.99 ** i)),
+            "D3": _bars(lambda i: 100.0 * (0.99 ** i)),
+        }
+        # breadth = 1/4 positive = 0.25 < 0.5 → cash
+        r = cs.run_cross_sectional(
+            prices, {**CFG, "top_n": 2, "regime_filter": True, "regime_min_breadth": 0.5}
+        )
+        assert r["ok"]
+        assert r["final_holdings"] == [], r["final_holdings"]
+        # without the filter it would still hold the riser
+        r2 = cs.run_cross_sectional(prices, {**CFG, "top_n": 2})
+        assert "UP" in r2["final_holdings"]
+
+
 class TestCrossSectional:
     def test_selects_highest_momentum_and_profits(self, cs):
         prices = {

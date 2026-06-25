@@ -74,6 +74,10 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     lookback = int(config.get("lookback", 252))
     skip = int(config.get("skip", 21))
     capital = float(config.get("initial_capital", 10000))
+    # Regime filter (dual momentum, Antonacci): when market breadth is weak (few names
+    # with positive momentum) go fully to cash to dodge market-wide drawdowns.
+    regime_filter = bool(config.get("regime_filter", False))
+    regime_min_breadth = float(config.get("regime_min_breadth", 0.5))
 
     # Common trading dates across the ENTIRE universe (so every symbol has a price).
     date_sets = [set(b["date"] for b in bars) for bars in prices.values() if bars]
@@ -115,8 +119,13 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
                 key=lambda x: (x[1] is not None, x[1]),
                 reverse=True,
             )
-            # Hold only positive-momentum names (don't buy falling assets).
-            holdings = [s for s, m in ranked[:top_n] if m is not None and m > 0]
+            valid = [m for _, m in ranked if m is not None]
+            breadth = (sum(1 for m in valid if m > 0) / len(valid)) if valid else 0.0
+            if regime_filter and breadth < regime_min_breadth:
+                holdings = []  # weak market-wide breadth → cash
+            else:
+                # Hold only positive-momentum names (don't buy falling assets).
+                holdings = [s for s, m in ranked[:top_n] if m is not None and m > 0]
 
         # Apply one day of equal-weight return from yesterday's holdings.
         if holdings and i > 0:
