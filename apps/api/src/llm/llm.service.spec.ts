@@ -23,6 +23,10 @@ function makePlugins(): PluginsService {
   } as unknown as PluginsService;
 }
 
+function makeKvStub() {
+  return { get: jest.fn().mockResolvedValue(null), set: jest.fn().mockResolvedValue(undefined) } as unknown as import("../common/kv.service").KvService;
+}
+
 // ── Fake Anthropic API response ───────────────────────────────────────────────
 
 function mockFetch(responseText: string): void {
@@ -86,7 +90,7 @@ describe('LlmService.complete() — inert contract (no parseToolCalls)', () => {
 
   beforeEach(() => {
     plugins = makePlugins();
-    service = new LlmService(makeConfig(), plugins);
+    service = new LlmService(makeConfig(), plugins, makeKvStub());
   });
 
   afterEach(() => {
@@ -152,6 +156,7 @@ describe('LlmService.completeViaOpenAi — native tool_calls', () => {
     service = new LlmService(
       makeConfig({ LLM_BACKEND: 'openai', OPENAI_API_KEY: 'test-openai-key', LLM_MODEL: 'gpt-4o-mini' }),
       plugins,
+      makeKvStub(),
     );
   });
 
@@ -293,6 +298,7 @@ describe('LlmService.completeViaCustom — native tool_calls', () => {
     service = new LlmService(
       makeConfig({ LLM_BACKEND: 'custom', LLM_MODEL: 'nvidia/nemotron-3-super-120b-a12b:free' }),
       plugins,
+      makeKvStub(),
     );
     // Register a custom provider and activate it
     service.addCustomProvider({
@@ -343,5 +349,29 @@ describe('LlmService.completeViaCustom — native tool_calls', () => {
 
     expect(body['tool_choice']).toBe('auto');
     expect(Array.isArray(body['tools'])).toBe(true);
+  });
+});
+
+describe('LlmService — persistencia de config en KV', () => {
+  it('onModuleInit restaura backend/model desde KV (sobre los defaults de env)', async () => {
+    const kv = {
+      get: jest.fn((k: string) =>
+        Promise.resolve(({ 'llm.backend': 'openai', 'llm.model': 'vendor/model:free' } as Record<string, string>)[k] ?? null),
+      ),
+      set: jest.fn().mockResolvedValue(undefined),
+    } as unknown as import('../common/kv.service').KvService;
+    const svc = new LlmService(makeConfig(), makePlugins(), kv);
+    await svc.onModuleInit();
+    expect(svc.getConfig().backend).toBe('openai');
+    expect(svc.getConfig().model).toBe('vendor/model:free');
+  });
+
+  it('patchConfig persiste model+backend en KV', () => {
+    const set = jest.fn().mockResolvedValue(undefined);
+    const kv = { get: jest.fn().mockResolvedValue(null), set } as unknown as import('../common/kv.service').KvService;
+    const svc = new LlmService(makeConfig(), makePlugins(), kv);
+    svc.patchConfig({ backend: 'openai', model: 'x/y:free' });
+    expect(set).toHaveBeenCalledWith('llm.model', 'x/y:free');
+    expect(set).toHaveBeenCalledWith('llm.backend', 'openai');
   });
 });

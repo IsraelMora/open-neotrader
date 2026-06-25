@@ -1,9 +1,10 @@
-import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { PluginsService } from '../plugins/plugins.service';
 import type { ProviderTool } from '../plugins/plugins.service';
+import { KvService } from '../common/kv.service';
 import { buildSubscriptionArgs } from './subscription-args';
 
 /** Petición al LLM: contexto del ciclo y prompt de sistema opcional. */
@@ -92,7 +93,7 @@ export interface CustomLlmProvider {
 
 /** Abstracción multi-backend del LLM: Anthropic API, OpenAI, Gemini, Claude subscription y providers custom OpenAI-compatible. */
 @Injectable()
-export class LlmService {
+export class LlmService implements OnModuleInit {
   private readonly log = new Logger(LlmService.name);
   private _model: string;
   private _backend: LlmBackend;
@@ -102,9 +103,28 @@ export class LlmService {
   constructor(
     private readonly cfg: ConfigService,
     private readonly plugins: PluginsService,
+    private readonly kv: KvService,
   ) {
     this._model = cfg.get<string>('LLM_MODEL', 'claude-haiku-4-5-20251001');
     this._backend = (cfg.get<string>('LLM_BACKEND', 'anthropic') as LlmBackend) ?? 'anthropic';
+  }
+
+  /**
+   * Carga backend/model persistidos en KV (DB, confiable) sobre los defaults de env.
+   * Esto hace que la config del LLM sobreviva reinicios de forma robusta — sin depender
+   * del timing de carga del .env. Fail-soft: si falla, usa los defaults de env.
+   */
+  async onModuleInit(): Promise<void> {
+    try {
+      const [b, m] = await Promise.all([this.kv.get('llm.backend'), this.kv.get('llm.model')]);
+      if (b) this._backend = b as LlmBackend;
+      if (m) this._model = m;
+      if (b || m) {
+        this.log.log(`LLM config restaurada de KV: backend=${this._backend} model=${this._model}`);
+      }
+    } catch (e) {
+      this.log.warn(`No se pudo leer la config LLM de KV: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   /** Devuelve la configuración activa del LLM: modelo, backend y capacidades. */
@@ -162,6 +182,9 @@ export class LlmService {
     this.log.log(
       `LLM config: model=${this._model} backend=${this._backend} custom=${this._activeCustomId ?? 'none'}`,
     );
+    // Persistir en KV (DB) para que la config sobreviva reinicios. Fire-and-forget.
+    void this.kv.set('llm.model', this._model).catch(() => undefined);
+    void this.kv.set('llm.backend', this._backend).catch(() => undefined);
     return this.getConfig();
   }
 
