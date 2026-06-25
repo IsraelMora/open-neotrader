@@ -145,14 +145,19 @@ export class BacktestService {
         // defecto, yahoo-finance-provider (gratis, devuelve OHLCV histórico). El provider
         // por defecto del sistema puede ser un broker que solo devuelve la última barra.
         const dataProvider = s.config['cycle.data_provider'] || 'yahoo-finance-provider';
+        // El motor de momentum necesita un warmup de `lookback` barras antes de poder operar.
+        // Traemos bars + warmup y luego recortamos el warmup → la curva mostrada opera desde
+        // el inicio (no arranca con ~1 año plano).
+        const lookback = 252;
         const prices = await this._buildPrices({
           symbols,
           timeframe,
-          limit: bars,
+          limit: bars + lookback,
           provider_id: dataProvider,
         });
         const config: Record<string, unknown> = {
           initial_capital: Number(s.config['cycle.capital']) || 10000,
+          lookback,
         };
         const resp = await this.sandbox.callPlugin(providerId, 'run_cross_sectional', {
           prices,
@@ -162,7 +167,9 @@ export class BacktestService {
           | { ok?: boolean; equity_curve?: { date: string; equity: number }[]; error?: string }
           | undefined;
         if (resp.ok && result?.ok && Array.isArray(result.equity_curve)) {
-          series[s.name] = result.equity_curve.map((p) => ({ ts: p.date, equity: p.equity }));
+          // Recortar el warmup: mostrar solo las últimas `bars` (cuando ya opera).
+          const curve = result.equity_curve.slice(-bars);
+          series[s.name] = curve.map((p) => ({ ts: p.date, equity: p.equity }));
         } else {
           errors[s.name] = String(resp.error ?? result?.error ?? 'backtest falló');
         }

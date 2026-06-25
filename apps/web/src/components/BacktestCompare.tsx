@@ -81,7 +81,8 @@ export default function BacktestCompare() {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [providerId, setProviderId] = useState('backtester');
-  const [bars, setBars] = useState(500);
+  const [years, setYears] = useState(2);
+  const TRADING_DAYS_PER_YEAR = 252;
   const [data, setData] = useState<ChartPoint[]>([]);
   const [keys, setKeys] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -131,7 +132,8 @@ export default function BacktestCompare() {
       const r = await api.backtestCompare({
         strategy_ids: [...sel],
         provider_id: providerId,
-        bars,
+        // El backend trabaja en barras; convertimos los años elegidos (diario ≈ 252/año).
+        bars: Math.max(60, Math.round(years * TRADING_DAYS_PER_YEAR)),
       });
       const k = Object.keys(r.series);
       setKeys(k);
@@ -195,13 +197,14 @@ export default function BacktestCompare() {
               </select>
             </div>
             <div>
-              <div className="mb-1 text-[12px] text-mut">Barras (período)</div>
+              <div className="mb-1 text-[12px] text-mut">Años a probar</div>
               <input
                 type="number"
-                value={bars}
-                min={60}
-                max={5000}
-                onChange={(e) => setBars(Number(e.target.value))}
+                value={years}
+                min={0.5}
+                max={20}
+                step={0.5}
+                onChange={(e) => setYears(Number(e.target.value))}
                 className="w-28 rounded-md border border-edge/60 bg-transparent px-2 py-1.5 text-[13px] text-ink outline-none"
               />
             </div>

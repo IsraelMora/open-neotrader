@@ -2,14 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Markdown } from './Markdown';
 import { Bot, User, Send, MessageSquare } from 'lucide-react';
-import { client } from '../lib/api';
+import { api } from '../lib/api';
 
 type Msg = { role: 'user' | 'ai' | 'err'; text: string };
-
-interface SseData {
-  delta?: string;
-  error?: string;
-}
 
 const SUGERENCIAS = [
   '¿Cómo van las carteras?',
@@ -50,40 +45,6 @@ function bubbleClass(role: Msg['role']): string {
   return 'bg-edge/50 text-ink rounded-tl-sm';
 }
 
-async function processSseStream(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  onDelta: (acc: string) => void,
-  onError: (msg: string) => void,
-): Promise<string> {
-  const dec = new TextDecoder();
-  let buf = '';
-  let acc = '';
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const eventos = buf.split('\n\n');
-    buf = eventos.pop() || '';
-    for (const ev of eventos) {
-      const linea = ev.split('\n').find((l) => l.startsWith('data:'));
-      if (!linea) continue;
-      let data: SseData;
-      try {
-        data = JSON.parse(linea.slice(5).trim()) as SseData;
-      } catch {
-        continue;
-      }
-      if (data.delta) {
-        acc += data.delta;
-        onDelta(acc);
-      } else if (data.error) {
-        onError(data.error);
-      }
-    }
-  }
-  return acc;
-}
-
 export default function Chat() {
   const [q, setQ] = useState('');
   const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -108,36 +69,15 @@ export default function Chat() {
     setBusy(true);
 
     try {
-      const r = await client.post('api/chat/stream', { json: { question, history } });
-      if (!r.ok || !r.body) throw new Error(r.statusText || 'sin respuesta');
-
-      const reader = r.body.getReader();
-      const acc = await processSseStream(
-        reader,
-        (partial) => {
-          setMsgs((m) => {
-            const c = [...m];
-            c[c.length - 1] = { role: 'ai', text: partial };
-            return c;
-          });
-        },
-        (errMsg) => {
-          setMsgs((m) => {
-            const c = [...m];
-            c[c.length - 1] = { role: 'err', text: errMsg };
-            return c;
-          });
-        },
-      );
-
-      if (!acc) {
-        setMsgs((m) => {
-          const c = [...m];
-          if (c[c.length - 1].role === 'ai' && !c[c.length - 1].text)
-            c[c.length - 1] = { role: 'err', text: 'respuesta vacía' };
-          return c;
-        });
-      }
+      const r = await api.chat(question, history);
+      const answer = (r as { response?: string }).response ?? '';
+      setMsgs((m) => {
+        const c = [...m];
+        c[c.length - 1] = answer
+          ? { role: 'ai', text: answer }
+          : { role: 'err', text: 'respuesta vacía' };
+        return c;
+      });
     } catch (e: unknown) {
       const errMsg = e instanceof Error ? e.message : 'Error desconocido';
       setMsgs((m) => {
