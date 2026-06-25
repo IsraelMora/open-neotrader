@@ -769,13 +769,17 @@ export class AgentsService {
 
     const timeframe = (this.kv ? await this.kv.get('cycle.timeframe') : null) || '1d';
     const bars = Number((this.kv ? await this.kv.get('cycle.bars') : null) || 0) || 150;
-    const brokerId = (this.kv ? await this.kv.get('execution.broker_plugin_id') : null) || null;
+    // DATA provider for OHLCV is decoupled from the EXECUTION broker: Alpaca's free
+    // IEX feed returns no historical bars, so default market data comes from Yahoo
+    // (free, full history). Override via KV `cycle.data_provider`.
+    const dataProvider =
+      (this.kv ? await this.kv.get('cycle.data_provider') : null) || 'yahoo-finance-provider';
 
     const ohlcv: Record<string, unknown[]> = {};
     await Promise.all(
       universe.map(async (symbol) => {
         try {
-          const raw = await this.providerGateway!.getOhlcv(brokerId, symbol, timeframe, bars);
+          const raw = await this.providerGateway!.getOhlcv(dataProvider, symbol, timeframe, bars);
           ohlcv[symbol] = (raw ?? []).map((b) => ({
             date: typeof b.ts === 'string' ? b.ts.slice(0, 10) : b.ts,
             open: b.open,
