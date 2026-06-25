@@ -101,13 +101,15 @@ export class BacktestService {
    * that look great in-sample but fail out-of-sample.
    */
   async runWalkForward(
-    dto: RunBacktestDto & { n_windows?: number; in_sample_pct?: number },
+    dto: RunBacktestDto & { n_windows?: number; in_sample_pct?: number; min_trades?: number },
   ): Promise<WalkForwardResponse> {
     const prices = await this._buildPrices(dto);
     const config = {
       ...this._buildConfig(dto),
       n_windows: dto.n_windows ?? 5,
       in_sample_pct: dto.in_sample_pct ?? 0.7,
+      // Only override the plugin default (10) when explicitly provided.
+      ...(dto.min_trades !== undefined ? { min_trades: dto.min_trades } : {}),
     };
 
     const response = await this.sandbox.callPlugin('backtester', 'run_walk_forward', {

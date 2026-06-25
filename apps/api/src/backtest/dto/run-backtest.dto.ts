@@ -93,4 +93,13 @@ export class RunBacktestDto {
   @Max(0.9)
   @Type(() => Number)
   in_sample_pct?: number;
+
+  /** Min trades per OOS window to count it as valid. Lower = usable for low-frequency
+   *  strategies, but less statistical confidence. Default 10 (set in the plugin). */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  @Type(() => Number)
+  min_trades?: number;
 }
