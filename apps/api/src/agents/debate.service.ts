@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { LlmService } from '../llm/llm.service';
 import { sanitizeText } from './sanitize.util';
 import type { DebateRole, DebateStance, DebateConsensus } from './debate.types';
@@ -24,6 +24,8 @@ function abstainFor(roleName: string): DebateStance {
  */
 @Injectable()
 export class DebateService {
+  private readonly log = new Logger(DebateService.name);
+
   /** Panel timeout in ms. Set only by tests via the static factory below; production uses default. */
   private readonly panelTimeoutMs: number = DEFAULT_PANEL_TIMEOUT_MS;
 
@@ -154,8 +156,11 @@ export class DebateService {
               // Copy block flag from role onto stance so synthesizeConsensus can use it
               return { ...stance, block: role.block };
             })
-            .catch(() => {
-              // Per-call failure → abstain; panel remains alive
+            .catch((err: unknown) => {
+              // Per-call failure → abstain; panel remains alive. Log para no perder la causa.
+              this.log.warn(
+                `rol de debate '${role.name}' falló: ${err instanceof Error ? err.message : String(err)}`,
+              );
               return { ...abstainFor(role.name), block: role.block };
             });
         }),

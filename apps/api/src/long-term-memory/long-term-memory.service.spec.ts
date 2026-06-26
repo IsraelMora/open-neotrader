@@ -9,7 +9,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import Database from 'better-sqlite3';
-import { LongTermMemoryService } from './long-term-memory.service';
+import { LongTermMemoryService, MAX_LESSON_ROWS } from './long-term-memory.service';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { EpisodeInput } from './memory-provider.interface';
 
@@ -371,27 +371,27 @@ describe('LongTermMemoryService promote + listLessons (integration)', () => {
     await expect(s.promote({ text: 'lesson' })).resolves.not.toThrow();
   });
 
-  it('FIFO prune: after inserting 31st lesson, count stays at 30', async () => {
-    // Insert 30 lessons
-    for (let i = 0; i < 30; i++) {
+  it('FIFO prune: count se mantiene en MAX_LESSON_ROWS tras pasarse', async () => {
+    // Insert MAX_LESSON_ROWS lessons
+    for (let i = 0; i < MAX_LESSON_ROWS; i++) {
       await service.promote({ text: `Lesson ${String(i)}` });
     }
     let count = (db.prepare('SELECT COUNT(*) as n FROM lesson_memory').get() as { n: number }).n;
-    expect(count).toBe(30);
+    expect(count).toBe(MAX_LESSON_ROWS);
 
-    // Insert the 31st — oldest should be deleted
-    await service.promote({ text: 'Lesson 31 — newest' });
+    // Insert one more — oldest should be deleted
+    await service.promote({ text: 'Lesson newest' });
     count = (db.prepare('SELECT COUNT(*) as n FROM lesson_memory').get() as { n: number }).n;
-    expect(count).toBe(30);
+    expect(count).toBe(MAX_LESSON_ROWS);
   });
 
   it('FIFO prune: the oldest lesson is deleted (not the newest)', async () => {
-    // Insert 30 lessons with distinct text
+    // Insert MAX_LESSON_ROWS lessons with distinct text
     await service.promote({ text: 'OLDEST LESSON' });
-    for (let i = 1; i < 30; i++) {
+    for (let i = 1; i < MAX_LESSON_ROWS; i++) {
       await service.promote({ text: `Filler ${String(i)}` });
     }
-    // Insert the 31st
+    // Insert one more past the cap
     await service.promote({ text: 'NEWEST LESSON' });
 
     const rows = db.prepare('SELECT text FROM lesson_memory ORDER BY ts ASC').all() as {

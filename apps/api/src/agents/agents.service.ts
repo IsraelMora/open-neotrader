@@ -901,7 +901,13 @@ export class AgentsService {
     // ml-feature-extractor-s3: resolve model injection (opt-in, hash-validated, fail-soft).
     // Returns {} when ML plugin is inactive — no KV read, cycle byte-identical (AC-S3-1/12).
     const mlInjection: { model_blob?: string; feature_names?: string[] } =
-      await this._mlResolveModelInjection(activePlugins).catch(() => ({}));
+      await this._mlResolveModelInjection(activePlugins).catch((err: unknown) => {
+        // Fail-soft: el ciclo corre sin modelo ML, pero dejamos rastro para depurar.
+        this.log.warn(
+          `inyección de modelo ML falló (ciclo sin modelo): ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return {};
+      });
 
     const { vetoCtx, vetoSummary } = await this._runVetoLayer(
       cycle_id,

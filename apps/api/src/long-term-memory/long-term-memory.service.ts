@@ -19,6 +19,13 @@ import type {
   MemoryProvider,
 } from './memory-provider.interface';
 
+/**
+ * Tope de filas retenidas en lesson_memory (FIFO). Antes era 30 — muy poco para
+ * conservar el historial de aprendizaje. Las lecciones son texto corto y el prompt del LLM
+ * se limita aparte vía listLessons(limit), así que subir el storage no infla el contexto.
+ */
+export const MAX_LESSON_ROWS = 200;
+
 @Injectable()
 export class LongTermMemoryService implements MemoryProvider, OnModuleInit {
   private readonly log = new Logger(LongTermMemoryService.name);
@@ -136,8 +143,8 @@ export class LongTermMemoryService implements MemoryProvider, OnModuleInit {
   // ── promote + listLessons (PR3) ───────────────────────────────────────────
 
   /**
-   * Insert a lesson into lesson_memory. After insert, FIFO-prune to keep at most 30 rows
-   * (oldest by ts are deleted). Fail-soft: never throws.
+   * Insert a lesson into lesson_memory. After insert, FIFO-prune to keep at most
+   * MAX_LESSON_ROWS rows (oldest by ts are deleted). Fail-soft: never throws.
    */
   async promote(lesson: LessonRecord): Promise<void> {
     try {
@@ -149,13 +156,13 @@ export class LongTermMemoryService implements MemoryProvider, OnModuleInit {
           INSERT INTO lesson_memory (id, text, episode_id, rationale)
           VALUES (${id}, ${lesson.text}, ${lesson.episode_id ?? null}, ${lesson.rationale ?? null})
         `;
-        // FIFO prune: delete oldest rows when count exceeds 30
+        // FIFO prune: delete oldest rows when count exceeds MAX_LESSON_ROWS
         await tx.$executeRaw`
           DELETE FROM lesson_memory
           WHERE id IN (
             SELECT id FROM lesson_memory
             ORDER BY ts ASC
-            LIMIT MAX(0, (SELECT COUNT(*) FROM lesson_memory) - 30)
+            LIMIT MAX(0, (SELECT COUNT(*) FROM lesson_memory) - ${MAX_LESSON_ROWS})
           )
         `;
       });
