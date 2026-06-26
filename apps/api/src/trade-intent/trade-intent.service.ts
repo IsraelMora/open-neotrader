@@ -23,6 +23,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
 import { KvService } from '../common/kv.service';
+import { kvBool, kvNum, kvStr } from '../common/kv.util';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -54,6 +55,21 @@ export interface ExecutionPolicy {
   /** Hard ceiling per real order in notional value (qty * price). Default 1000. */
   max_order_notional: number;
 }
+
+/**
+ * Defaults de la política de ejecución (fallbacks cuando el KV no tiene la clave).
+ * Todos son configurables vía KV (`execution.*`), a mano o por el LLM; estos literales
+ * son solo el valor por defecto seguro.
+ */
+const DEFAULT_EXECUTION_POLICY: ExecutionPolicy = {
+  autonomous: true,
+  max_position_pct: 0.1,
+  max_open_positions: 10,
+  max_drawdown_halt_pct: 25,
+  real: false,
+  broker_plugin_id: '',
+  max_order_notional: 1_000,
+};
 
 /** Default capital for the shared paper portfolio if it doesn't exist yet. */
 const PAPER_PORTFOLIO_INITIAL_CAPITAL = 10_000;
@@ -324,12 +340,6 @@ export class TradeIntentService {
   // ── _readExecutionPolicy ──────────────────────────────────────────────────────
 
   private async _readExecutionPolicy(): Promise<ExecutionPolicy> {
-    const parseNum = (raw: string | null, fallback: number): number => {
-      if (raw === null) return fallback;
-      const n = Number(raw);
-      return isFinite(n) ? n : fallback;
-    };
-
     const [
       rawAutonomous,
       rawMaxPosPct,
@@ -348,26 +358,36 @@ export class TradeIntentService {
       this.kv.get('execution.max_order_notional'),
     ]);
 
-    const autonomous = rawAutonomous !== 'false';
+    // autonomous: only an explicit false disables it (default on). kvBool tolera el
+    // doble-encoding del KV ('false' crudo o '"false"' del panel).
+    const autonomous = kvBool(rawAutonomous, DEFAULT_EXECUTION_POLICY.autonomous);
 
-    let max_position_pct = parseNum(rawMaxPosPct, 0.1);
-    if (max_position_pct <= 0 || max_position_pct > 1) max_position_pct = 0.1;
+    let max_position_pct = kvNum(rawMaxPosPct, DEFAULT_EXECUTION_POLICY.max_position_pct);
+    if (max_position_pct <= 0 || max_position_pct > 1)
+      max_position_pct = DEFAULT_EXECUTION_POLICY.max_position_pct;
 
-    let max_open_positions = Math.round(parseNum(rawMaxOpenPos, 10));
+    let max_open_positions = Math.round(
+      kvNum(rawMaxOpenPos, DEFAULT_EXECUTION_POLICY.max_open_positions),
+    );
     if (max_open_positions < 1) max_open_positions = 1;
 
-    let max_drawdown_halt_pct = parseNum(rawMaxDrawdown, 25);
-    if (max_drawdown_halt_pct <= 0 || max_drawdown_halt_pct > 100) max_drawdown_halt_pct = 25;
+    let max_drawdown_halt_pct = kvNum(
+      rawMaxDrawdown,
+      DEFAULT_EXECUTION_POLICY.max_drawdown_halt_pct,
+    );
+    if (max_drawdown_halt_pct <= 0 || max_drawdown_halt_pct > 100)
+      max_drawdown_halt_pct = DEFAULT_EXECUTION_POLICY.max_drawdown_halt_pct;
 
-    // real: only the literal string 'true' enables it — everything else is false.
-    const real = rawReal === 'true';
+    // real: solo true explícito lo habilita (default false). kvBool tolera '"true"' del panel
+    // — sin esto la ejecución real nunca se activaba aunque el panel la marcara.
+    const real = kvBool(rawReal, DEFAULT_EXECUTION_POLICY.real);
 
     // broker_plugin_id: empty string is treated as "not set" → paper fallback.
-    const broker_plugin_id = (rawBrokerId ?? '').trim();
+    const broker_plugin_id = (kvStr(rawBrokerId) ?? '').trim();
 
-    // max_order_notional: hard ceiling per order in notional value. Default 1000.
-    let max_order_notional = parseNum(rawMaxNotional, 1_000);
-    if (max_order_notional <= 0) max_order_notional = 1_000;
+    // max_order_notional: hard ceiling per order in notional value.
+    let max_order_notional = kvNum(rawMaxNotional, DEFAULT_EXECUTION_POLICY.max_order_notional);
+    if (max_order_notional <= 0) max_order_notional = DEFAULT_EXECUTION_POLICY.max_order_notional;
 
     return {
       autonomous,

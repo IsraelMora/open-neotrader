@@ -5,6 +5,7 @@ import { promisify } from 'util';
 import { PluginsService } from '../plugins/plugins.service';
 import type { ProviderTool } from '../plugins/plugins.service';
 import { KvService } from '../common/kv.service';
+import { unwrapKv } from '../common/kv.util';
 import { buildSubscriptionArgs } from './subscription-args';
 
 /** Petición al LLM: contexto del ciclo y prompt de sistema opcional. */
@@ -91,21 +92,6 @@ export interface CustomLlmProvider {
 }
 
 // Sin presets — el usuario define sus propios providers via POST /llm/providers
-
-/**
- * Desenvuelve un valor de KV que puede venir crudo ('openai') o JSON-encoded ('"openai"').
- * El panel guarda config con JSON.stringify (saveConfig) mientras que KvService.set guarda
- * crudo → sin esto, leer 'llm.backend' podía devolver '"openai"' (con comillas) y no matchear.
- */
-function unwrapKv(v: string | null): string | null {
-  if (v == null) return v;
-  try {
-    const parsed: unknown = JSON.parse(v);
-    return typeof parsed === 'string' ? parsed : v;
-  } catch {
-    return v;
-  }
-}
 
 /** Abstracción multi-backend del LLM: Anthropic API, OpenAI, Gemini, Claude subscription y providers custom OpenAI-compatible. */
 @Injectable()

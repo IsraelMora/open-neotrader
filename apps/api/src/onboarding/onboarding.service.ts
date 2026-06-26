@@ -5,6 +5,7 @@ import { AuthService } from '../auth/auth.service';
 import { PluginsService } from '../plugins/plugins.service';
 import { LlmService } from '../llm/llm.service';
 import { KvService } from '../common/kv.service';
+import { kvBool } from '../common/kv.util';
 
 export interface OnboardingStep {
   id: string;
@@ -37,7 +38,7 @@ export class OnboardingService {
   /** Devuelve el estado del onboarding: si está completo, el paso pendiente actual y todos los pasos. */
   async getStatus(): Promise<OnboardingStatus> {
     const done = await this.kv.get(ONBOARDING_DONE_KEY);
-    if (done === 'true') {
+    if (kvBool(done, false)) {
       return { completed: true, current_step: null, steps: await this.buildSteps() };
     }
 

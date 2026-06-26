@@ -18,6 +18,7 @@ import { NotifierBridge } from '../notifier/notifier-bridge';
 import { ConfigService } from '@nestjs/config';
 import { PretestService } from '../pretest/pretest.service';
 import { KvService } from '../common/kv.service';
+import { kvBool, kvNum, kvStr } from '../common/kv.util';
 import { LongTermMemoryService } from '../long-term-memory/long-term-memory.service';
 import { DebateService } from './debate.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
@@ -2187,7 +2188,7 @@ export class AgentsService {
     if (!this.kv) return DEFAULTS;
     try {
       const raw = await this.kv.get('gating.hide_trades_when_cb_open');
-      return { hideTradesWhenCbOpen: raw !== 'false' }; // strict: only literal 'false' disables
+      return { hideTradesWhenCbOpen: kvBool(raw, true) }; // strict: only literal 'false' disables
     } catch {
       return DEFAULTS;
     }
@@ -2257,17 +2258,17 @@ export class AgentsService {
         this.kv.get('debate.fail_mode'),
       ]);
 
-      const enabled = rawEnabled === 'true';
+      const enabled = kvBool(rawEnabled, false);
 
-      const parsedPct = rawMinPct !== null ? Number(rawMinPct) : NaN;
+      const parsedPct = kvNum(rawMinPct, NaN);
       const minPct = Number.isFinite(parsedPct) && parsedPct > 0 ? parsedPct : DEFAULTS.minPct;
 
-      const parsedRoles = rawMaxRoles !== null ? Number(rawMaxRoles) : NaN;
+      const parsedRoles = kvNum(rawMaxRoles, NaN);
       const maxRoles = Number.isFinite(parsedRoles)
         ? Math.min(5, Math.max(1, Math.trunc(parsedRoles)))
         : DEFAULTS.maxRoles;
 
-      const failMode: 'allow' | 'block' = rawFailMode === 'block' ? 'block' : 'allow';
+      const failMode: 'allow' | 'block' = kvStr(rawFailMode) === 'block' ? 'block' : 'allow';
 
       return { enabled, minPct, maxRoles, failMode };
     } catch {

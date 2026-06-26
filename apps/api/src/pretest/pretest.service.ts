@@ -26,6 +26,7 @@ import { ContextMemoryService } from '../context-memory/context-memory.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
 import { AgentsService } from '../agents/agents.service';
 import { KvService } from '../common/kv.service';
+import { kvBool } from '../common/kv.util';
 import { AuditService } from '../audit/audit.service';
 
 /**
@@ -809,7 +810,7 @@ export class PretestService {
 
     // Step 3: HUMAN-CONFIRM — fail-safe parse: only literal 'false' disables.
     const rawConfirm = await this.kv.get('promotion.require_human_confirm');
-    const requireConfirm = rawConfirm !== 'false';
+    const requireConfirm = kvBool(rawConfirm, true);
 
     if (requireConfirm && !opts?.confirm) {
       return {
