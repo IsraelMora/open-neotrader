@@ -1,9 +1,12 @@
+# Build context: apps/web (compose usa context: ./apps/web)
 FROM node:22-alpine AS build
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
+# pnpm vía corepack (versión fijada en package.json → packageManager).
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 COPY . .
-RUN npm run build
+RUN pnpm build
 
 FROM nginx:1.27-alpine
 COPY --from=build /app/dist /usr/share/nginx/html

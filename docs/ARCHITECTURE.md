@@ -363,7 +363,7 @@ Los skills de los plugins activos se inyectan en el system prompt para todos los
 | Turborepo | Pipeline: `build → test → lint` |
 
 Scripts raíz: `pnpm dev`, `pnpm build`, `pnpm test`, `pnpm lint`.
-Migraciones: `pnpm db:migrate` / `pnpm db:generate` (TypeORM CLI sobre Prisma).
+Migraciones: `pnpm db:migrate` / `pnpm db:generate` (Prisma).
 
 ### Python (apps/sandbox, packages/plugin-sdk, plugins/)
 

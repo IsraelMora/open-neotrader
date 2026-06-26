@@ -63,7 +63,7 @@ STORE_URL=https://store.neurotrader.app
 cd apps/api && pnpm install && pnpm dev    # :3000
 
 # Frontend Astro
-cd apps/web && npm install && npm run dev  # :4321 (proxy /api → :3000)
+cd apps/web && pnpm install && pnpm dev    # :4321 (proxy /api → :3000)
 
 # Probar sandbox directamente
 echo '{"cmd":"list_plugins","active_ids":[]}' | python3 apps/sandbox/runner.py

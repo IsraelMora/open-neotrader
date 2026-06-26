@@ -24,17 +24,20 @@ pnpm test           # jest
 pnpm test -- path/to/file.spec.ts            # single test file
 pnpm test -- -t "describe or it name"        # single test by name
 pnpm lint:fix
-pnpm db:migrate     # prisma migrate deploy  (root db:migrate/db:generate scripts are STALE — they reference typeorm; the API uses Prisma)
+pnpm db:migrate     # prisma migrate deploy  (root db:migrate/db:generate delegate to the API's Prisma scripts)
 
 # apps/sandbox (Python) — run from apps/sandbox/
 python3 -m pytest                                          # all
 python3 -m pytest tests/backtester/test_engine.py -v       # single file
 python3 -m pytest -k "next_bar_open"                       # single test by name
 
-# apps/web (Astro) — run from apps/web/. Uses npm, not pnpm.
-npm run dev         # :4321, proxies /api → :3000
-npm run build
+# apps/web (Astro) — run from apps/web/. Uses pnpm like the rest of the monorepo.
+pnpm dev            # :4321, proxies /api → :3000
+pnpm build
 ```
+
+All JS/TS projects use **pnpm** (never npm/yarn). The workspace sets `shared-workspace-lockfile=false`
+in `.npmrc`, so each app keeps its own `pnpm-lock.yaml` — that's what the standalone Docker builds copy.
 
 Quick sandbox smoke test (no NestJS): `echo '{"cmd":"list_plugins","active_ids":[]}' | python3 apps/sandbox/runner.py`
 

@@ -87,11 +87,11 @@ src/
 
 ```bash
 # Desde la raíz del monorepo o desde apps/web/
-npm run dev        # Astro dev en :4321, proxea /api a :3000
-npm run build      # Genera dist/ estático
-npm run preview    # Sirve dist/ localmente
-npm run lint       # ESLint + Prettier check
-npm run format     # Prettier write
+pnpm dev           # Astro dev en :4321, proxea /api a :3000
+pnpm build         # Genera dist/ estático
+pnpm preview       # Sirve dist/ localmente
+pnpm lint          # ESLint + Prettier check
+pnpm format        # Prettier write
 ```
 
 Requiere que el backend NestJS esté corriendo en `http://127.0.0.1:3000` para que el proxy funcione en dev.

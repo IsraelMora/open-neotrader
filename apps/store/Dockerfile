@@ -6,19 +6,22 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
-COPY package.json package-lock.json ./
-RUN npm ci
+# pnpm vía corepack (versión fijada en package.json → packageManager).
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 # Genera el cliente Prisma una vez aquí; builder y runner copian node_modules.
 COPY prisma ./prisma
 COPY prisma.config.ts ./
-RUN npx prisma generate
+RUN pnpm exec prisma generate
 
 # ── Build TypeScript ──────────────────────────────────────────────────────────
 FROM node:22-slim AS builder
 WORKDIR /app
+RUN corepack enable
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN npm run build
+RUN pnpm build
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 FROM node:22-slim AS runner

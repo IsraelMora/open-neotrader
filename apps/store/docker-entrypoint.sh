@@ -11,6 +11,7 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 # Ya como `node`: aplica migraciones pendientes a la DB del volumen (idempotente).
-npx prisma migrate deploy --schema=prisma/schema.prisma
+# Binario local (node_modules/.bin) para no depender de npx/pnpm en runtime.
+node_modules/.bin/prisma migrate deploy --schema=prisma/schema.prisma
 
 exec "$@"

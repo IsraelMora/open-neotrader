@@ -6,20 +6,23 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
-COPY apps/api/package.json apps/api/package-lock.json ./
-RUN npm ci
+# pnpm vía corepack (versión fijada en package.json → packageManager).
+RUN corepack enable
+COPY apps/api/package.json apps/api/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 # Generate the Prisma client INTO node_modules here in deps: both the builder
 # (tsc needs the client types) and the runner (runtime needs the client) copy
 # node_modules from this stage, so generating once here covers both.
 COPY apps/api/prisma ./prisma
-RUN npx prisma generate
+RUN pnpm exec prisma generate
 
 # ── Build TypeScript ────────────────────────────────────────────────────────
 FROM node:22-slim AS builder
 WORKDIR /app
+RUN corepack enable
 COPY --from=deps /app/node_modules ./node_modules
 COPY apps/api/ .
-RUN npm run build
+RUN pnpm build
 
 # ── Runner: Node + Python (sandbox subprocess) ──────────────────────────────
 FROM node:22-slim AS runner

@@ -22,9 +22,9 @@ publicar, explorar y votar plugins de la comunidad, de forma anónima.
 ## Cómo correr
 
 ```bash
-npm install
-npx prisma migrate dev            # crea/actualiza dev.db con el esquema
-npm run start:dev                 # arranca en http://localhost:3000 (PORT configurable)
+pnpm install
+pnpm exec prisma migrate dev      # crea/actualiza dev.db con el esquema
+pnpm start:dev                    # arranca en http://localhost:3000 (PORT configurable)
 ```
 
 Variables de entorno (`.env`, nunca commiteado):
@@ -37,8 +37,8 @@ PORT=3000                         # opcional
 Tests:
 
 ```bash
-npm test            # unit (firma, guard, validador de manifiesto)
-npm run test:e2e    # e2e (publicar/explorar/descargar/votar/nombre) sobre test.db
+pnpm test           # unit (firma, guard, validador de manifiesto)
+pnpm test:e2e       # e2e (publicar/explorar/descargar/votar/nombre) sobre test.db
 ```
 
 ## Identidad y autenticación (anónima, sin cuentas)
