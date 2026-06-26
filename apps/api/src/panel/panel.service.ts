@@ -199,6 +199,32 @@ export class PanelService {
     return { series };
   }
 
+  // ── Journal / Evidencia (red anti-overfitting) ─────────────────────────────
+
+  /** Estado de disciplina/evidencia: candados de parámetros, gates de pretest y promoción. */
+  async getJournal(): Promise<Record<string, JsonValue>> {
+    const cfg = await this.getConfig();
+    const disciplina: Record<string, JsonValue> = {};
+    for (const [k, v] of Object.entries(cfg)) {
+      if (
+        k.startsWith('param') ||
+        k.startsWith('pretest') ||
+        k.startsWith('promotion') ||
+        k.startsWith('reflection') ||
+        k.includes('discipline') ||
+        k.includes('lock')
+      ) {
+        disciplina[k] = v;
+      }
+    }
+    const strategies = await this.db.strategy.count();
+    return {
+      nota: 'Red anti-overfitting: candados de parámetros, gates de pretest y promoción.',
+      estrategias_registradas: strategies,
+      disciplina,
+    };
+  }
+
   // ── Notifications ─────────────────────────────────────────────────────────
 
   /** Agrega notificaciones del sistema (sandbox caído) y las de plugins (clave 'notifications'). */

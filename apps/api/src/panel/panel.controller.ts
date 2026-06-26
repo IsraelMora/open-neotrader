@@ -119,6 +119,12 @@ export class PanelController {
     return this.svc.getNavHistory();
   }
 
+  @Get('journal')
+  @ApiOperation({ summary: 'Evidencia/disciplina anti-overfitting' })
+  journal() {
+    return this.svc.getJournal();
+  }
+
   // ── Skills ────────────────────────────────────────────────────────────────
 
   @Get('skills')
