@@ -124,7 +124,6 @@ export const api = {
   saveConfig: (cfg: JsonObject) => client.post('api/config', { json: cfg }).json<JsonObject>(),
   doctor: () => client.get('api/doctor').json<JsonObject>(),
   portfolios: () => client.get('api/portfolios').json<JsonObject>(),
-  vetoMetrics: (days = 7) => client.get(`api/veto-metrics?days=${days}`).json<JsonObject>(),
   runStatus: () => client.get('api/run-status').json<JsonObject>(),
   runCycle: (dry: boolean) =>
     client.post('api/run-cycle', { json: { dry_run: dry } }).json<JsonObject>(),
