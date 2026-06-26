@@ -5,7 +5,7 @@ import { Badge } from './ui/Badge';
 import { Switch } from './ui/switch';
 import { SearchInput } from './SearchInput';
 import { fuzzyFilter } from '../lib/fuzzy';
-import { Puzzle, Trash2, Plus, Share2 } from 'lucide-react';
+import { Puzzle, Trash2, Plus } from 'lucide-react';
 
 const TIPO_TONE: Record<string, string> = {
   universe: 'info',
@@ -143,7 +143,6 @@ export default function Plugins() {
   const [q, setQ] = useState('');
   const [fuente, setFuente] = useState('');
   const [instalando, setInstalando] = useState(false);
-  const [publicando, setPublicando] = useState<Record<string, boolean>>({});
 
   const load = () =>
     api
@@ -188,19 +187,6 @@ export default function Plugins() {
       setMsg({ ok: false, t: '✗ ' + (e instanceof Error ? e.message : 'error') });
     } finally {
       setInstalando(false);
-    }
-  };
-
-  const publicarEnTienda = async (p: Plugin) => {
-    setPublicando((prev) => ({ ...prev, [p.id]: true }));
-    setMsg(null);
-    try {
-      await api.storePublish(p.id);
-      setMsg({ ok: true, t: `✓ Plugin "${p.id}" publicado en la tienda` });
-    } catch (e: unknown) {
-      setMsg({ ok: false, t: '✗ ' + (e instanceof Error ? e.message : 'error') });
-    } finally {
-      setPublicando((prev) => ({ ...prev, [p.id]: false }));
     }
   };
 
@@ -263,15 +249,6 @@ export default function Plugins() {
                           size="sm"
                           aria-label={p.active ? 'Desactivar' : 'Activar'}
                         />
-                        <button
-                          onClick={() => publicarEnTienda(p)}
-                          disabled={!!publicando[p.id]}
-                          aria-label="Publicar en la tienda"
-                          title="Publicar en la tienda"
-                          className="text-mut hover:text-accent disabled:opacity-40"
-                        >
-                          <Share2 className="h-4 w-4" />
-                        </button>
                         <button
                           onClick={() => desinstalar(p)}
                           aria-label="Desinstalar"

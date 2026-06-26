@@ -113,25 +113,15 @@ export const api = {
   totpVerify: (code: string) =>
     client.post('api/auth/totp/verify', { json: { code } }).json<{ access_token: string }>(),
 
-  totpBackup: (code: string) =>
-    client.post('api/auth/totp/backup', { json: { code } }).json<{ access_token: string }>(),
-
-  me: () => client.get('api/auth/me').json<JsonObject>(),
-
   // ── Panel ─────────────────────────────────────────────────────────────────
-  status: () => client.get('api/status').json<JsonObject>(),
   config: () => client.get('api/config').json<JsonObject>(),
   saveConfig: (cfg: JsonObject) => client.post('api/config', { json: cfg }).json<JsonObject>(),
   doctor: () => client.get('api/doctor').json<JsonObject>(),
   portfolios: () => client.get('api/portfolios').json<JsonObject>(),
-  runStatus: () => client.get('api/run-status').json<JsonObject>(),
-  runCycle: (dry: boolean) =>
-    client.post('api/run-cycle', { json: { dry_run: dry } }).json<JsonObject>(),
   chat: (question: string, history?: JsonObject[]) =>
     client.post('api/chat', { json: { question, history } }).json<JsonObject>(),
   trades: (limit = 200) => client.get(`api/trades?limit=${limit}`).json<JsonObject>(),
   navHistory: () => client.get('api/nav-history').json<JsonObject>(),
-  providers: () => client.get('api/providers').json<JsonObject>(),
   journal: () => client.get('api/journal').json<JsonObject>(),
   notifications: () => client.get('api/notifications').json<JsonObject>(),
   logs: (stream: string, limit = 100) =>
@@ -139,8 +129,6 @@ export const api = {
   // ── Estrategias (perfiles de configuración del ciclo) ─────────────────────
   strategies: () => client.get('api/strategies').json<JsonObject[]>(),
   strategyGet: (id: string) => client.get(`api/strategies/${id}`).json<JsonObject>(),
-  strategyCurrentConfig: () =>
-    client.get('api/strategies/config/current').json<Record<string, string>>(),
   strategyCreate: (body: {
     name: string;
     description?: string;
@@ -194,10 +182,6 @@ export const api = {
     client.post('api/universe', { json: { action, symbol, kind, description } }).json<JsonObject>(),
 
   skills: () => client.get('api/skills').json<JsonObject>(),
-  addSkill: (name: string, description: string) =>
-    client.post('api/skills', { json: { name, description } }).json<JsonObject>(),
-  deleteSkill: (name: string) =>
-    client.delete(`api/skills/${encodeURIComponent(name)}`).json<JsonObject>(),
 
   // ── Credentials ───────────────────────────────────────────────────────────
   credentials: () => client.get('api/credentials').json<JsonObject>(),
@@ -217,14 +201,10 @@ export const api = {
   // ── Store ─────────────────────────────────────────────────────────────────
   storeBrowse: (qs = '') =>
     client.get('api/store/plugins' + (qs ? '?' + qs : '')).json<JsonObject>(),
-  storeDetail: (pub: string, mid: string) =>
-    client.get(`api/store/plugins/${pub}/${mid}`).json<JsonObject>(),
   storeInstall: (publisherId: string, manifestId: string, version: string) =>
     client
       .post('api/store/install', { json: { publisherId, manifestId, version } })
       .json<JsonObject>(),
-  storePublish: (pluginId: string) =>
-    client.post('api/store/publish', { json: { pluginId } }).json<JsonObject>(),
   storeVote: (pluginId: string, kind: 'like' | 'dislike') =>
     client.post('api/store/vote', { json: { pluginId, kind } }).json<JsonObject>(),
   storeReport: (pluginId: string, reason: string) =>
