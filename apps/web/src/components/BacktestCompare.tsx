@@ -11,6 +11,9 @@ import {
 } from 'recharts';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
+import { AsyncBoundary } from './ui/AsyncBoundary';
+import { useResource } from '../lib/useResource';
+import { useAction } from '../lib/useAction';
 import { api } from '../lib/api';
 
 const VARS = [
@@ -59,6 +62,11 @@ interface ChartPoint {
   [k: string]: string | number;
 }
 
+interface BacktestResult {
+  series: Series;
+  errors: Record<string, string>;
+}
+
 /** Normaliza cada serie a retorno % (base 100) y las fusiona por fecha. */
 function buildChartData(series: Series, keys: string[]): ChartPoint[] {
   const merged: Record<string, ChartPoint> = {};
@@ -77,17 +85,29 @@ function buildChartData(series: Series, keys: string[]): ChartPoint[] {
 }
 
 export default function BacktestCompare() {
-  const [strategies, setStrategies] = useState<Strategy[]>([]);
-  const [providers, setProviders] = useState<Provider[]>([]);
+  const {
+    data: strategies,
+    loading: strategiesLoading,
+    error: strategiesError,
+    reload: reloadStrategies,
+  } = useResource<Strategy[]>(() => api.strategies() as unknown as Promise<Strategy[]>);
+
+  const {
+    data: providers,
+    loading: providersLoading,
+    error: providersError,
+    reload: reloadProviders,
+  } = useResource<Provider[]>(() => api.backtestProviders());
+
+  const { busy, run } = useAction();
+
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [providerId, setProviderId] = useState('backtester');
   const [years, setYears] = useState(2);
   const TRADING_DAYS_PER_YEAR = 252;
-  const [data, setData] = useState<ChartPoint[]>([]);
-  const [keys, setKeys] = useState<string[]>([]);
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
+  const [result, setResult] = useState<BacktestResult | null>(null);
+  const [chartData, setChartData] = useState<ChartPoint[]>([]);
+  const [chartKeys, setChartKeys] = useState<string[]>([]);
   const [tema, setTema] = useState<Theme | null>(() =>
     typeof document !== 'undefined' ? leerTema() : null,
   );
@@ -99,19 +119,12 @@ export default function BacktestCompare() {
     return () => obs.disconnect();
   }, []);
 
+  // Set a default providerId once providers load
   useEffect(() => {
-    api
-      .strategies()
-      .then((d) => setStrategies(d as unknown as Strategy[]))
-      .catch(() => undefined);
-    api
-      .backtestProviders()
-      .then((p) => {
-        setProviders(p);
-        if (p.length && !p.some((x) => x.id === 'backtester')) setProviderId(p[0].id);
-      })
-      .catch(() => undefined);
-  }, []);
+    if (providers && providers.length && !providers.some((x) => x.id === 'backtester')) {
+      setProviderId(providers[0].id);
+    }
+  }, [providers]);
 
   const toggle = (id: string) =>
     setSel((prev) => {
@@ -121,34 +134,95 @@ export default function BacktestCompare() {
       return next;
     });
 
-  const run = async () => {
-    if (sel.size === 0) {
-      setMsg('Seleccioná al menos una estrategia.');
-      return;
-    }
-    setBusy(true);
-    setMsg(null);
-    try {
+  const runBacktest = () => {
+    if (sel.size === 0) return;
+    void run(async () => {
       const r = await api.backtestCompare({
         strategy_ids: [...sel],
         provider_id: providerId,
-        // El backend trabaja en barras; convertimos los años elegidos (diario ≈ 252/año).
+        // The backend works in bars; convert chosen years (daily ~ 252/year).
         bars: Math.max(60, Math.round(years * TRADING_DAYS_PER_YEAR)),
       });
       const k = Object.keys(r.series);
-      setKeys(k);
-      setData(buildChartData(r.series, k));
-      setErrors(r.errors);
-      if (k.length === 0) setMsg('Ningún backtest produjo resultados. Mirá los errores abajo.');
-    } catch (e: unknown) {
-      setMsg('✗ ' + (e instanceof Error ? e.message : 'error'));
-    } finally {
-      setBusy(false);
-    }
+      setChartKeys(k);
+      setChartData(buildChartData(r.series, k));
+      setResult(r);
+      if (k.length === 0)
+        throw new Error('Ningún backtest produjo resultados. Mirá los errores abajo.');
+    });
   };
 
   const color = (i: number) => tema?.serie[i % VARS.length] || '#888';
 
+  const loadingLists = strategiesLoading || providersLoading;
+  const errorLists = strategiesError ?? providersError;
+  const reloadLists = () => {
+    reloadStrategies();
+    reloadProviders();
+  };
+
+  return (
+    <AsyncBoundary
+      loading={loadingLists}
+      error={errorLists}
+      onRetry={reloadLists}
+      isEmpty={!strategies && !providers}
+      loadingText="Cargando estrategias y providers…"
+    >
+      <BacktestCompareContent
+        strategies={strategies ?? []}
+        providers={providers ?? []}
+        sel={sel}
+        providerId={providerId}
+        years={years}
+        busy={busy}
+        result={result}
+        chartData={chartData}
+        chartKeys={chartKeys}
+        tema={tema}
+        onToggle={toggle}
+        onProviderChange={setProviderId}
+        onYearsChange={setYears}
+        onRunBacktest={runBacktest}
+        colorFn={color}
+      />
+    </AsyncBoundary>
+  );
+}
+
+function BacktestCompareContent({
+  strategies,
+  providers,
+  sel,
+  providerId,
+  years,
+  busy,
+  result,
+  chartData,
+  chartKeys,
+  tema,
+  onToggle,
+  onProviderChange,
+  onYearsChange,
+  onRunBacktest,
+  colorFn,
+}: {
+  strategies: Strategy[];
+  providers: Provider[];
+  sel: Set<string>;
+  providerId: string;
+  years: number;
+  busy: boolean;
+  result: BacktestResult | null;
+  chartData: ChartPoint[];
+  chartKeys: string[];
+  tema: Theme | null;
+  onToggle: (id: string) => void;
+  onProviderChange: (id: string) => void;
+  onYearsChange: (y: number) => void;
+  onRunBacktest: () => void;
+  colorFn: (i: number) => string;
+}) {
   return (
     <div className="space-y-5">
       <Card>
@@ -170,7 +244,7 @@ export default function BacktestCompare() {
                 return (
                   <button
                     key={s.id}
-                    onClick={() => toggle(s.id)}
+                    onClick={() => onToggle(s.id)}
                     className={`rounded-md border px-2.5 py-1 text-[12px] ${on ? 'border-accent/50 bg-accent/15 text-accent' : 'border-edge bg-edge/30 text-mut hover:text-ink'}`}
                   >
                     {s.name}
@@ -185,7 +259,7 @@ export default function BacktestCompare() {
               <div className="mb-1 text-[12px] text-mut">Motor (provider)</div>
               <select
                 value={providerId}
-                onChange={(e) => setProviderId(e.target.value)}
+                onChange={(e) => onProviderChange(e.target.value)}
                 className="rounded-md border border-edge/60 bg-transparent px-2 py-1.5 text-[13px] text-ink outline-none"
               >
                 {providers.length === 0 && <option value="backtester">backtester</option>}
@@ -204,20 +278,24 @@ export default function BacktestCompare() {
                 min={0.5}
                 max={20}
                 step={0.5}
-                onChange={(e) => setYears(Number(e.target.value))}
+                onChange={(e) => onYearsChange(Number(e.target.value))}
                 className="w-28 rounded-md border border-edge/60 bg-transparent px-2 py-1.5 text-[13px] text-ink outline-none"
               />
             </div>
             <button
-              onClick={() => void run()}
-              disabled={busy}
+              onClick={onRunBacktest}
+              disabled={busy || sel.size === 0}
               className="rounded-md bg-accent px-4 py-1.5 text-[13px] font-medium text-bg disabled:opacity-50"
             >
               {busy ? 'Corriendo…' : 'Correr backtest'}
             </button>
           </div>
 
-          {msg && <div className="text-[12px] text-danger">{msg}</div>}
+          {sel.size === 0 && (
+            <div className="text-[12px] text-mut">
+              Seleccioná al menos una estrategia para correr el backtest.
+            </div>
+          )}
         </CardBody>
       </Card>
 
@@ -227,18 +305,18 @@ export default function BacktestCompare() {
           hint="Retorno % (base 100) a lo largo del período. Mayor = mejor."
         />
         <CardBody>
-          {data.length < 2 || !tema ? (
+          {chartData.length < 2 || !tema ? (
             <p className="py-8 text-center text-sm text-mut">
               Elegí estrategias y corré un backtest para ver el gráfico.
             </p>
           ) : (
             <ResponsiveContainer width="100%" height={340}>
-              <AreaChart data={data} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
+              <AreaChart data={chartData} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
                 <defs>
-                  {keys.map((k, i) => (
+                  {chartKeys.map((k, i) => (
                     <linearGradient key={k} id={`bt-${i}`} x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor={color(i)} stopOpacity={0.32} />
-                      <stop offset="100%" stopColor={color(i)} stopOpacity={0.02} />
+                      <stop offset="0%" stopColor={colorFn(i)} stopOpacity={0.32} />
+                      <stop offset="100%" stopColor={colorFn(i)} stopOpacity={0.02} />
                     </linearGradient>
                   ))}
                 </defs>
@@ -261,12 +339,12 @@ export default function BacktestCompare() {
                   formatter={(v: number) => (v >= 0 ? '+' : '') + v + '%'}
                 />
                 <Legend wrapperStyle={{ fontSize: 11 }} />
-                {keys.map((k, i) => (
+                {chartKeys.map((k, i) => (
                   <Area
                     key={k}
                     type="monotone"
                     dataKey={k}
-                    stroke={color(i)}
+                    stroke={colorFn(i)}
                     strokeWidth={2}
                     fill={`url(#bt-${i})`}
                     dot={false}
@@ -277,9 +355,9 @@ export default function BacktestCompare() {
               </AreaChart>
             </ResponsiveContainer>
           )}
-          {Object.keys(errors).length > 0 && (
+          {result && Object.keys(result.errors).length > 0 && (
             <div className="mt-3 space-y-1">
-              {Object.entries(errors).map(([k, v]) => (
+              {Object.entries(result.errors).map(([k, v]) => (
                 <div key={k} className="text-[11px] text-danger">
                   <Badge tone="danger">{k}</Badge> {v}
                 </div>

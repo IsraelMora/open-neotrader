@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AreaChart,
   Area,
@@ -10,7 +10,9 @@ import {
   Legend,
 } from 'recharts';
 import { Card, CardHeader, CardBody } from './ui/Card';
+import { AsyncBoundary } from './ui/AsyncBoundary';
 import { api, type JsonObject } from '../lib/api';
+import { useResource } from '../lib/useResource';
 
 // Paleta tomada del tema (globals.css). Se relee al cambiar claro/oscuro,
 // así el chart respeta el tema en vez de colores cableados.
@@ -94,8 +96,11 @@ function tooltipFormatter(v: number): string {
 }
 
 export default function NavChart() {
-  const [data, setData] = useState<ChartPoint[]>([]);
-  const [carteras, setCarteras] = useState<string[]>([]);
+  const { data, loading, error, reload } = useResource<NavHistoryResponse>(
+    () => api.navHistory() as unknown as Promise<NavHistoryResponse>,
+    { pollMs: 30000 },
+  );
+
   const [tema, setTema] = useState<ThemeColors | null>(() =>
     typeof document !== 'undefined' ? leerTema() : null,
   );
@@ -109,26 +114,12 @@ export default function NavChart() {
     return () => obs.disconnect();
   }, []);
 
-  useEffect(() => {
-    const processNavHistory = (d: JsonObject) => {
-      const response = d as NavHistoryResponse;
-      const series = response.series || {};
-      const keys = Object.keys(series).filter((k) => !['lab', 'plan'].includes(k));
-      setCarteras(keys);
-      const { data: chartData } = buildChartData(series, keys);
-      setData(chartData);
-    };
-
-    const load = () =>
-      api
-        .navHistory()
-        .then(processNavHistory)
-        .catch(() => {});
-
-    load();
-    const t = setInterval(load, 30000);
-    return () => clearInterval(t);
-  }, []);
+  const { carteras, chartData } = useMemo(() => {
+    const series = data?.series ?? {};
+    const keys = Object.keys(series).filter((k) => !['lab', 'plan'].includes(k));
+    const { data: chartPoints } = buildChartData(series, keys);
+    return { carteras: keys, chartData: chartPoints };
+  }, [data]);
 
   const color = (i: number) => tema?.serie[i % VARS.length] || '#888';
 
@@ -139,58 +130,62 @@ export default function NavChart() {
         hint="Retorno % de cada cartera desde su inicio. Las políticas compiten sobre el mismo mercado."
       />
       <CardBody>
-        {data.length < 2 || !tema ? (
-          <p className="text-mut text-sm py-8 text-center">
-            Aún se acumulan puntos de NAV (se llenan cada ciclo).
-          </p>
-        ) : (
-          <div ref={wrap}>
-            <ResponsiveContainer width="100%" height={300}>
-              <AreaChart data={data} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
-                <defs>
-                  {carteras.map((k, i) => (
-                    <linearGradient key={k} id={`grad-${k}`} x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor={color(i)} stopOpacity={0.35} />
-                      <stop offset="100%" stopColor={color(i)} stopOpacity={0.02} />
-                    </linearGradient>
-                  ))}
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke={tema.grid} strokeOpacity={0.4} />
-                <XAxis dataKey="ts" tick={{ fill: tema.tick, fontSize: 10 }} stroke={tema.grid} />
-                <YAxis
-                  tick={{ fill: tema.tick, fontSize: 10 }}
-                  stroke={tema.grid}
-                  tickFormatter={(v: number) => v + '%'}
-                />
-                <Tooltip
-                  contentStyle={{
-                    background: tema.tip,
-                    border: `1px solid ${tema.tipBorde}`,
-                    borderRadius: 8,
-                    fontSize: 12,
-                  }}
-                  labelStyle={{ color: tema.tipTexto }}
-                  itemStyle={{ color: tema.tipTexto }}
-                  formatter={tooltipFormatter}
-                />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
-                {carteras.map((k, i) => (
-                  <Area
-                    key={k}
-                    type="monotone"
-                    dataKey={k}
-                    stroke={color(i)}
-                    strokeWidth={2}
-                    fill={`url(#grad-${k})`}
-                    dot={false}
-                    connectNulls
-                    activeDot={{ r: 3 }}
+        <AsyncBoundary
+          loading={loading}
+          error={error}
+          onRetry={reload}
+          isEmpty={!data || chartData.length < 2}
+          emptyText="Aún se acumulan puntos de NAV (se llenan cada ciclo)."
+        >
+          {data && chartData.length >= 2 && tema && (
+            <div ref={wrap}>
+              <ResponsiveContainer width="100%" height={300}>
+                <AreaChart data={chartData} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
+                  <defs>
+                    {carteras.map((k, i) => (
+                      <linearGradient key={k} id={`grad-${k}`} x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={color(i)} stopOpacity={0.35} />
+                        <stop offset="100%" stopColor={color(i)} stopOpacity={0.02} />
+                      </linearGradient>
+                    ))}
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={tema.grid} strokeOpacity={0.4} />
+                  <XAxis dataKey="ts" tick={{ fill: tema.tick, fontSize: 10 }} stroke={tema.grid} />
+                  <YAxis
+                    tick={{ fill: tema.tick, fontSize: 10 }}
+                    stroke={tema.grid}
+                    tickFormatter={(v: number) => v + '%'}
                   />
-                ))}
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        )}
+                  <Tooltip
+                    contentStyle={{
+                      background: tema.tip,
+                      border: `1px solid ${tema.tipBorde}`,
+                      borderRadius: 8,
+                      fontSize: 12,
+                    }}
+                    labelStyle={{ color: tema.tipTexto }}
+                    itemStyle={{ color: tema.tipTexto }}
+                    formatter={tooltipFormatter}
+                  />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  {carteras.map((k, i) => (
+                    <Area
+                      key={k}
+                      type="monotone"
+                      dataKey={k}
+                      stroke={color(i)}
+                      strokeWidth={2}
+                      fill={`url(#grad-${k})`}
+                      dot={false}
+                      connectNulls
+                      activeDot={{ r: 3 }}
+                    />
+                  ))}
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </AsyncBoundary>
       </CardBody>
     </Card>
   );

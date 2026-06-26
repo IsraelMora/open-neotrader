@@ -1,5 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { api, type JsonObject } from '../lib/api';
+import { useResource } from '../lib/useResource';
+import { useAction } from '../lib/useAction';
+import { AsyncBoundary } from './ui/AsyncBoundary';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Switch } from './ui/switch';
@@ -32,6 +35,10 @@ interface Plugin {
   version?: string;
   active?: boolean;
   config_spec?: ConfigSpec;
+}
+
+interface PluginsResponse extends JsonObject {
+  plugins?: Plugin[];
 }
 
 function FieldInput({
@@ -115,10 +122,6 @@ function FormConfig({
   );
 }
 
-interface PluginsResponse extends JsonObject {
-  plugins?: Plugin[];
-}
-
 function groupByType(filtrados: Plugin[]): {
   porTipo: Record<string, Plugin[]>;
   tiposPresentes: string[];
@@ -137,82 +140,48 @@ function groupByType(filtrados: Plugin[]): {
   return { porTipo, tiposPresentes };
 }
 
-export default function Plugins() {
-  const [plugins, setPlugins] = useState<Plugin[]>([]);
-  const [msg, setMsg] = useState<{ ok: boolean; t: string } | null>(null);
+function PluginsList({ plugins, reload }: { plugins: Plugin[]; reload: () => void }) {
+  const { run: runAction } = useAction();
   const [q, setQ] = useState('');
   const [fuente, setFuente] = useState('');
-  const [instalando, setInstalando] = useState(false);
+  const { busy: instalando, run: runInstall } = useAction();
 
-  const load = () =>
-    api
-      .plugins()
-      .then((r) => setPlugins((r as PluginsResponse).plugins ?? []))
-      .catch(() => {});
-  useEffect(() => {
-    load();
-  }, []);
+  const togglePlugin = (p: Plugin) =>
+    runAction(() => api.pluginAction(p.id, p.active ? 'deactivate' : 'activate'), {
+      success: `Plugin ${p.id} ${p.active ? 'desactivado' : 'activado'}`,
+      onDone: reload,
+    });
 
-  const togglePlugin = async (p: Plugin) => {
-    try {
-      await api.pluginAction(p.id, p.active ? 'deactivate' : 'activate');
-      setMsg({ ok: true, t: `✓ Plugin ${p.id} ${p.active ? 'desactivado' : 'activado'}` });
-      load();
-    } catch (e: unknown) {
-      setMsg({ ok: false, t: '✗ ' + (e instanceof Error ? e.message : 'error') });
-    }
-  };
-
-  const desinstalar = async (p: Plugin) => {
+  const desinstalar = (p: Plugin) => {
     if (!confirm(`¿Desinstalar el plugin "${p.id}"?`)) return;
-    try {
-      await api.pluginUninstall(p.id);
-      setMsg({ ok: true, t: `✓ Plugin ${p.id} desinstalado` });
-      load();
-    } catch (e: unknown) {
-      setMsg({ ok: false, t: '✗ ' + (e instanceof Error ? e.message : 'error') });
-    }
+    void runAction(() => api.pluginUninstall(p.id), {
+      success: `Plugin ${p.id} desinstalado`,
+      onDone: reload,
+    });
   };
 
-  const instalar = async () => {
+  const instalar = () => {
     if (!fuente.trim()) return;
-    setInstalando(true);
-    setMsg(null);
-    try {
-      await api.pluginInstall(fuente.trim());
-      setMsg({ ok: true, t: '✓ Plugin instalado correctamente' });
-      setFuente('');
-      load();
-    } catch (e: unknown) {
-      setMsg({ ok: false, t: '✗ ' + (e instanceof Error ? e.message : 'error') });
-    } finally {
-      setInstalando(false);
-    }
+    void runInstall(() => api.pluginInstall(fuente.trim()), {
+      success: 'Plugin instalado correctamente',
+      onDone: () => {
+        setFuente('');
+        reload();
+      },
+    });
   };
 
-  const guardarConfig = async (id: string, vals: JsonObject) => {
-    try {
-      await api.pluginConfig(id, vals);
-      setMsg({ ok: true, t: `✓ Configuración de ${id} guardada` });
-      load();
-    } catch (e: unknown) {
-      setMsg({ ok: false, t: '✗ ' + (e instanceof Error ? e.message : 'error') });
-    }
-  };
+  const guardarConfig = (id: string, vals: JsonObject) =>
+    runAction(() => api.pluginConfig(id, vals), {
+      success: `Configuración de ${id} guardada`,
+      onDone: reload,
+    });
 
   const filtrados = fuzzyFilter(plugins, q, ['id', 'type']);
   const { porTipo, tiposPresentes } = groupByType(filtrados);
 
   return (
     <div className="space-y-5">
-      {msg && (
-        <div
-          className={`rounded-md border px-4 py-2.5 text-sm ${msg.ok ? 'border-accent/40 bg-accent/10 text-accent' : 'border-danger/40 bg-danger/10 text-danger'}`}
-        >
-          {msg.t}
-        </div>
-      )}
-
       <Card>
         <CardHeader
           title="Plugins"
@@ -245,7 +214,7 @@ export default function Plugins() {
                       <div className="flex items-center gap-2 shrink-0">
                         <Switch
                           checked={!!p.active}
-                          onCheckedChange={() => togglePlugin(p)}
+                          onCheckedChange={() => void togglePlugin(p)}
                           size="sm"
                           aria-label={p.active ? 'Desactivar' : 'Activar'}
                         />
@@ -259,7 +228,7 @@ export default function Plugins() {
                       </div>
                     </div>
                     {p.config_spec?.form && (
-                      <FormConfig plugin={p} onSave={(vals) => guardarConfig(p.id, vals)} />
+                      <FormConfig plugin={p} onSave={(vals) => void guardarConfig(p.id, vals)} />
                     )}
                   </div>
                 ))}
@@ -294,5 +263,17 @@ export default function Plugins() {
         </CardBody>
       </Card>
     </div>
+  );
+}
+
+export default function Plugins() {
+  const { data, loading, error, reload } = useResource<Plugin[]>(() =>
+    api.plugins().then((r) => (r as PluginsResponse).plugins ?? []),
+  );
+
+  return (
+    <AsyncBoundary loading={loading} error={error} onRetry={reload} isEmpty={!data}>
+      {data && <PluginsList plugins={data} reload={reload} />}
+    </AsyncBoundary>
   );
 }

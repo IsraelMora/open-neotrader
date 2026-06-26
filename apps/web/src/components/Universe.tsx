@@ -1,5 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { api, type JsonObject } from '../lib/api';
+import { useResource } from '../lib/useResource';
+import { useAction } from '../lib/useAction';
+import { AsyncBoundary } from './ui/AsyncBoundary';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Button } from './ui/button';
@@ -24,30 +27,25 @@ interface ConfigResponse extends JsonObject {
   universe_context?: Record<string, string>;
 }
 
-export default function Universe() {
-  const [uni, setUni] = useState<Record<string, string>>({});
-  const [ctx, setCtx] = useState<Record<string, string>>({});
+interface UniverseContentProps {
+  uni: Record<string, string>;
+  ctx: Record<string, string>;
+  reload: () => void;
+}
+
+function UniverseContent({ uni, ctx, reload }: UniverseContentProps) {
   const [sym, setSym] = useState('');
   const [kind, setKind] = useState('equity');
   const [desc, setDesc] = useState('');
   const [check, setCheck] = useState<CheckResult | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<{ ok: boolean; t: string } | null>(null);
+  const [verBusy, setVerBusy] = useState(false);
   const [q, setQ] = useState('');
 
-  const load = () =>
-    api.config().then((c) => {
-      const cfg = c as ConfigResponse;
-      setUni(cfg.universe || {});
-      setCtx(cfg.universe_context || {});
-    });
-  useEffect(() => {
-    load();
-  }, []);
+  const { busy, run } = useAction();
 
   const verificar = async () => {
     if (!sym.trim()) return;
-    setBusy(true);
+    setVerBusy(true);
     setCheck(null);
     try {
       setCheck(
@@ -56,26 +54,25 @@ export default function Universe() {
     } catch {
       setCheck({ ok: false, symbol: sym.trim(), detail: 'error de red' });
     }
-    setBusy(false);
+    setVerBusy(false);
   };
 
-  const añadir = async () => {
-    try {
-      await api.universeEdit('add', sym.trim().toUpperCase(), kind, desc.trim() || undefined);
-      setMsg({ ok: true, t: `✓ ${sym.toUpperCase()} añadido al universo` });
-      setSym('');
-      setDesc('');
-      setCheck(null);
-      load();
-    } catch (e: unknown) {
-      setMsg({ ok: false, t: '✗ ' + (e instanceof Error ? e.message : 'error') });
-    }
-  };
+  const handleAnadir = () =>
+    run(
+      () =>
+        api
+          .universeEdit('add', sym.trim().toUpperCase(), kind, desc.trim() || undefined)
+          .then(() => {
+            setSym('');
+            setDesc('');
+            setCheck(null);
+          }),
+      { success: `✓ ${sym.toUpperCase()} añadido al universo`, onDone: reload },
+    );
 
-  const quitar = async (s: string) => {
+  const handleQuitar = (s: string) => {
     if (!confirm('¿Quitar ' + s + ' del universo?')) return;
-    await api.universeEdit('remove', s);
-    load();
+    void run(() => api.universeEdit('remove', s), { onDone: reload });
   };
 
   const filteredEntries = useMemo(
@@ -85,14 +82,6 @@ export default function Universe() {
 
   return (
     <div className="space-y-5">
-      {msg && (
-        <div
-          className={`rounded-md border px-4 py-2.5 text-sm ${msg.ok ? 'border-accent/40 bg-accent/10 text-accent' : 'border-danger/40 bg-danger/10 text-danger'}`}
-        >
-          {msg.t}
-        </div>
-      )}
-
       <Card>
         <CardHeader
           title="Añadir activo al universo"
@@ -124,9 +113,9 @@ export default function Universe() {
                 <SelectItem value="crypto">crypto (par -USD)</SelectItem>
               </SelectContent>
             </Select>
-            <Button variant="outline" onClick={verificar} disabled={busy || !sym.trim()}>
+            <Button variant="outline" onClick={verificar} disabled={verBusy || busy || !sym.trim()}>
               <Search className="h-3.5 w-3.5" />
-              {busy ? 'verificando…' : 'Verificar datos'}
+              {verBusy ? 'verificando…' : 'Verificar datos'}
             </Button>
           </div>
           {check && (
@@ -155,7 +144,9 @@ export default function Universe() {
                 placeholder="descripción para el orquestador (opcional)"
                 className="flex-1"
               />
-              <Button onClick={añadir}>Añadir al universo</Button>
+              <Button onClick={handleAnadir} disabled={busy}>
+                Añadir al universo
+              </Button>
             </div>
           )}
         </CardBody>
@@ -193,7 +184,7 @@ export default function Universe() {
                   <TableCell className="text-[12px] text-mut">{ctx[s] || '—'}</TableCell>
                   <TableCell className="text-right">
                     <button
-                      onClick={() => quitar(s)}
+                      onClick={() => handleQuitar(s)}
                       aria-label="Quitar"
                       className="text-mut hover:text-danger"
                     >
@@ -207,5 +198,26 @@ export default function Universe() {
         </CardBody>
       </Card>
     </div>
+  );
+}
+
+export default function Universe() {
+  const { data, loading, error, reload } = useResource<ConfigResponse>(
+    () => api.config() as Promise<ConfigResponse>,
+  );
+
+  const uni = data?.universe ?? {};
+  const ctx = data?.universe_context ?? {};
+
+  return (
+    <AsyncBoundary
+      loading={loading}
+      error={error}
+      onRetry={reload}
+      isEmpty={false}
+      loadingText="Cargando universo…"
+    >
+      {data && <UniverseContent uni={uni} ctx={ctx} reload={reload} />}
+    </AsyncBoundary>
   );
 }

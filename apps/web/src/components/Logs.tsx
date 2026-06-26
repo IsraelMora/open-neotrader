@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Button } from './ui/button';
 import { fuzzyMatch } from '../lib/fuzzy';
 import { SearchInput } from './SearchInput';
 import { CircleX, TriangleAlert, CircleCheck, Info } from 'lucide-react';
 import { api } from '../lib/api';
+import { useResource } from '../lib/useResource';
+import { AsyncBoundary } from './ui/AsyncBoundary';
 
 const STREAMS = [
   'agent_cycles',
@@ -108,16 +110,24 @@ interface LogsResponse {
 
 export default function Logs() {
   const [stream, setStream] = useState('agent_cycles');
-  const [entries, setEntries] = useState<LogEntry[]>([]);
   const [q, setQ] = useState('');
   const [filtro, setFiltro] = useState<Nivel | 'all'>('all');
 
+  const { data, loading, error, reload } = useResource<LogsResponse>(
+    () => api.logs(stream, 100) as unknown as Promise<LogsResponse>,
+  );
+
+  // Re-fetch when stream changes; skip the initial mount (useResource already fetches then).
+  const mountedRef = useRef(false);
   useEffect(() => {
-    api
-      .logs(stream, 100)
-      .then((d) => setEntries(((d as LogsResponse).entries || []).slice().reverse()))
-      .catch(() => setEntries([]));
-  }, [stream]);
+    if (!mountedRef.current) {
+      mountedRef.current = true;
+      return;
+    }
+    reload();
+  }, [stream, reload]);
+
+  const entries: LogEntry[] = (data?.entries ?? []).slice().reverse();
 
   const visibles = entries
     .filter((e) => fuzzyMatch(JSON.stringify(e), q))
@@ -182,41 +192,43 @@ export default function Logs() {
           <SearchInput value={q} onChange={setQ} placeholder="Buscar en los logs… (difuso)" />
         </div>
 
-        <div className="max-h-[60vh] overflow-y-auto space-y-1.5">
-          {visibles.map((e, i) => {
-            const n = nivelLog(e);
-            const st = ESTILO[n];
-            const { timestamp, ...resto } = e;
-            return (
-              <div
-                key={i}
-                className={`rounded-r border-l-2 ${st.borde} bg-edge/15 pl-2.5 pr-2 py-1.5`}
-              >
-                <div className="flex items-center gap-2 mb-0.5">
-                  <span
-                    className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ${st.chip}`}
-                  >
-                    <st.Icon className="h-3 w-3" />
-                    {st.label}
-                  </span>
-                  {timestamp && <span className="text-[10px] text-mut num">{timestamp}</span>}
-                </div>
-                <pre
-                  className={`text-[11px] num whitespace-pre-wrap break-all ${st.texto} opacity-90`}
+        <AsyncBoundary loading={loading} error={error} onRetry={reload} isEmpty={false}>
+          <div className="max-h-[60vh] overflow-y-auto space-y-1.5">
+            {visibles.map((e, i) => {
+              const n = nivelLog(e);
+              const st = ESTILO[n];
+              const { timestamp, ...resto } = e;
+              return (
+                <div
+                  key={i}
+                  className={`rounded-r border-l-2 ${st.borde} bg-edge/15 pl-2.5 pr-2 py-1.5`}
                 >
-                  {JSON.stringify(resto)}
-                </pre>
-              </div>
-            );
-          })}
-          {!visibles.length && (
-            <p className="text-mut text-sm py-6 text-center">
-              {entries.length
-                ? 'Sin coincidencias con el filtro/búsqueda.'
-                : `Sin entradas en «${stream}».`}
-            </p>
-          )}
-        </div>
+                  <div className="flex items-center gap-2 mb-0.5">
+                    <span
+                      className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ${st.chip}`}
+                    >
+                      <st.Icon className="h-3 w-3" />
+                      {st.label}
+                    </span>
+                    {timestamp && <span className="text-[10px] text-mut num">{timestamp}</span>}
+                  </div>
+                  <pre
+                    className={`text-[11px] num whitespace-pre-wrap break-all ${st.texto} opacity-90`}
+                  >
+                    {JSON.stringify(resto)}
+                  </pre>
+                </div>
+              );
+            })}
+            {!visibles.length && (
+              <p className="text-mut text-sm py-6 text-center">
+                {entries.length
+                  ? 'Sin coincidencias con el filtro/búsqueda.'
+                  : `Sin entradas en «${stream}».`}
+              </p>
+            )}
+          </div>
+        </AsyncBoundary>
       </CardBody>
     </Card>
   );

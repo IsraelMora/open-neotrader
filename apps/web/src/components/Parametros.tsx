@@ -1,4 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useResource } from '../lib/useResource';
+import { useAction } from '../lib/useAction';
+import { AsyncBoundary } from './ui/AsyncBoundary';
 import { api, type JsonObject } from '../lib/api';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
@@ -90,19 +92,52 @@ function bloqueoMsg(porOp: boolean): string {
   return 'Edición pausada: la autogestión general adopta los parámetros óptimos validados cada cooldown. Desactiva la autogestión general para editar a mano.';
 }
 
-export default function Parametros() {
-  const [cfg, setCfg] = useState<JsonObject | null>(null);
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  useEffect(() => {
-    api
-      .config()
-      .then(setCfg)
-      .catch((e: Error) => setMsg({ ok: false, text: e.message }));
-  }, []);
-  if (!cfg) return <div className="text-mut text-sm animate-pulse">Cargando parámetros…</div>;
+function ParamRow({
+  sec,
+  k,
+  v,
+  general,
+  manualBloqueado,
+  set,
+}: {
+  sec: string;
+  k: string;
+  v: unknown;
+  general: boolean;
+  manualBloqueado: boolean;
+  set: (path: string, val: unknown) => void;
+}) {
+  const path = `${sec}.${k}`;
+  return (
+    <label key={path} className="block">
+      <div className="flex items-center gap-1.5">
+        <span className="text-[12px] text-ink num">{path}</span>
+        {general && AUTO_ADOPTA.has(path) && (
+          <span className="inline-flex items-center gap-1 text-[10px] text-warn">
+            <Bot className="h-3 w-3" />
+            IA
+          </span>
+        )}
+      </div>
+      <ParamField path={path} v={v} manualBloqueado={manualBloqueado} set={set} />
+      {EXPLICA[path] && (
+        <span className="mt-0.5 block text-[11px] text-mut leading-snug">{EXPLICA[path]}</span>
+      )}
+    </label>
+  );
+}
 
-  const advisor = cfg.advisor as Record<string, unknown> | undefined;
-  const iaFirst = cfg.ia_first as Record<string, unknown> | undefined;
+function ParametrosContent({
+  data,
+  setData,
+}: {
+  data: JsonObject;
+  setData: (d: JsonObject) => void;
+}) {
+  const { busy, run } = useAction();
+
+  const advisor = data.advisor as Record<string, unknown> | undefined;
+  const iaFirst = data.ia_first as Record<string, unknown> | undefined;
   const general = !!advisor?.auto_mode; // ① autogestión general
   const porOp = !!iaFirst?.enabled; // ② gestión por operación (AI-first)
 
@@ -111,41 +146,29 @@ export default function Parametros() {
   const generalBloqueado = porOp;
 
   const set = (path: string, val: unknown) => {
-    const next = structuredClone(cfg) as Record<string, Record<string, unknown>>;
+    const next = structuredClone(data) as Record<string, Record<string, unknown>>;
     const ks = path.split('.');
     let o: Record<string, unknown> = next;
     for (let i = 0; i < ks.length - 1; i++) o = o[ks[i]] as Record<string, unknown>;
     o[ks[ks.length - 1]] = val;
-    setCfg(next as JsonObject);
-  };
-
-  const save = async (override?: JsonObject) => {
-    try {
-      const r = await api.saveConfig(override ?? cfg);
-      setCfg((r as { config: JsonObject }).config);
-      setMsg({ ok: true, text: '✓ Guardado y validado. Aplica desde el próximo ciclo.' });
-    } catch (e: unknown) {
-      setMsg({ ok: false, text: '✗ ' + (e instanceof Error ? e.message : 'error') });
-    }
+    setData(next as JsonObject);
   };
 
   // Los toggles de automatización guardan al instante (cambian el modo).
-  const setAuto = (sec: string, key: string, val: unknown) => {
-    const next = structuredClone(cfg) as Record<string, Record<string, unknown>>;
+  function handleSetAuto(sec: string, key: string, val: unknown) {
+    const next = structuredClone(data) as Record<string, Record<string, unknown>>;
     next[sec][key] = val;
-    save(next as JsonObject);
-  };
+    void run(
+      () =>
+        api.saveConfig(next as JsonObject).then((r) => {
+          setData((r as { config: JsonObject }).config);
+        }),
+      { success: '✓ Guardado.' },
+    );
+  }
 
   return (
     <div className="space-y-5">
-      {msg && (
-        <div
-          className={`rounded-md border px-4 py-2.5 text-sm ${msg.ok ? 'border-accent/40 bg-accent/10 text-accent' : 'border-danger/40 bg-danger/10 text-danger'}`}
-        >
-          {msg.text}
-        </div>
-      )}
-
       {/* ───────── Modo de gestión (antes vista Automatización) ───────── */}
       <div className="flex items-center gap-2 text-[12px] text-mut">
         <Bot className="h-4 w-4" /> Modo de gestión de parámetros — quién decide los valores. Más
@@ -164,7 +187,7 @@ export default function Parametros() {
             <Switch
               checked={general}
               disabled={generalBloqueado}
-              onCheckedChange={(v) => setAuto('advisor', 'auto_mode', v)}
+              onCheckedChange={(v) => handleSetAuto('advisor', 'auto_mode', v)}
             />
             <Badge tone={modoTone(generalBloqueado, general)}>
               {modoLabel(generalBloqueado, general)}
@@ -184,7 +207,15 @@ export default function Parametros() {
               value={advisor?.auto_cooldown_hours as number | undefined}
               disabled={generalBloqueado}
               onChange={(e) => set('advisor.auto_cooldown_hours', parseInt(e.target.value))}
-              onBlur={() => save()}
+              onBlur={() =>
+                void run(
+                  () =>
+                    api.saveConfig(data).then((r) => {
+                      setData((r as { config: JsonObject }).config);
+                    }),
+                  { success: '✓ Guardado.' },
+                )
+              }
               className="w-20 rounded-md border border-edge bg-bg px-2 py-1 text-sm text-ink num outline-none focus:border-accent/50 disabled:opacity-50"
             />
           </div>
@@ -199,7 +230,10 @@ export default function Parametros() {
         />
         <CardBody className="space-y-3">
           <div className="flex items-center gap-3">
-            <Switch checked={porOp} onCheckedChange={(v) => setAuto('ia_first', 'enabled', v)} />
+            <Switch
+              checked={porOp}
+              onCheckedChange={(v) => handleSetAuto('ia_first', 'enabled', v)}
+            />
             <Badge tone={porOp ? 'ok' : 'mut'}>{porOp ? 'activado' : 'desactivado'}</Badge>
           </div>
           <p className="text-[12px] text-mut leading-relaxed">
@@ -217,7 +251,15 @@ export default function Parametros() {
               step="0.05"
               value={iaFirst?.per_asset_cap as number | undefined}
               onChange={(e) => set('ia_first.per_asset_cap', parseFloat(e.target.value))}
-              onBlur={() => save()}
+              onBlur={() =>
+                void run(
+                  () =>
+                    api.saveConfig(data).then((r) => {
+                      setData((r as { config: JsonObject }).config);
+                    }),
+                  { success: '✓ Guardado.' },
+                )
+              }
               className="w-20 rounded-md border border-edge bg-bg px-2 py-1 text-sm text-ink num outline-none focus:border-accent/50"
             />
           </div>
@@ -247,31 +289,20 @@ export default function Parametros() {
           <div
             className={`grid sm:grid-cols-2 gap-x-6 gap-y-3 ${manualBloqueado ? 'opacity-50 pointer-events-none select-none' : ''}`}
           >
-            {SECCIONES.filter((s) => cfg[s]).flatMap((sec) =>
-              Object.entries(cfg[sec] as Record<string, unknown>)
+            {SECCIONES.filter((s) => data[s]).flatMap((sec) =>
+              Object.entries(data[sec] as Record<string, unknown>)
                 .filter(([, v]) => typeof v !== 'object')
-                .map(([k, v]) => {
-                  const path = `${sec}.${k}`;
-                  return (
-                    <label key={path} className="block">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-[12px] text-ink num">{path}</span>
-                        {general && AUTO_ADOPTA.has(path) && (
-                          <span className="inline-flex items-center gap-1 text-[10px] text-warn">
-                            <Bot className="h-3 w-3" />
-                            IA
-                          </span>
-                        )}
-                      </div>
-                      <ParamField path={path} v={v} manualBloqueado={manualBloqueado} set={set} />
-                      {EXPLICA[path] && (
-                        <span className="mt-0.5 block text-[11px] text-mut leading-snug">
-                          {EXPLICA[path]}
-                        </span>
-                      )}
-                    </label>
-                  );
-                }),
+                .map(([k, v]) => (
+                  <ParamRow
+                    key={`${sec}.${k}`}
+                    sec={sec}
+                    k={k}
+                    v={v}
+                    general={general}
+                    manualBloqueado={manualBloqueado}
+                    set={set}
+                  />
+                )),
             )}
           </div>
         </CardBody>
@@ -279,8 +310,16 @@ export default function Parametros() {
 
       <div className="sticky bottom-4 flex items-center gap-3">
         <button
-          onClick={() => save()}
-          disabled={manualBloqueado}
+          onClick={() =>
+            void run(
+              () =>
+                api.saveConfig(data).then((r) => {
+                  setData((r as { config: JsonObject }).config);
+                }),
+              { success: '✓ Guardado y validado. Aplica desde el próximo ciclo.' },
+            )
+          }
+          disabled={manualBloqueado || busy}
           className="inline-flex items-center gap-2 rounded-md bg-accent/90 px-5 py-2.5 text-sm font-semibold text-bg hover:bg-accent shadow-lg disabled:opacity-40 disabled:cursor-not-allowed"
         >
           <Save className="h-4 w-4" />
@@ -291,5 +330,21 @@ export default function Parametros() {
         </Badge>
       </div>
     </div>
+  );
+}
+
+export default function Parametros() {
+  const { data, loading, error, reload, setData } = useResource<JsonObject>(() => api.config());
+
+  return (
+    <AsyncBoundary
+      loading={loading}
+      error={error}
+      onRetry={reload}
+      isEmpty={!data}
+      loadingText="Cargando parámetros…"
+    >
+      {data && <ParametrosContent data={data} setData={setData} />}
+    </AsyncBoundary>
   );
 }

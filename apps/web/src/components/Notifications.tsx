@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Button } from './ui/button';
+import { AsyncBoundary } from './ui/AsyncBoundary';
+import { useResource } from '../lib/useResource';
 import { NumberTicker } from './magic/NumberTicker';
 import { CircleX, TriangleAlert, Info, CircleCheck } from 'lucide-react';
 import { api } from '../lib/api';
@@ -32,20 +34,34 @@ interface NotificationsData {
 }
 
 export default function Notifications() {
-  const [data, setData] = useState<NotificationsData | null>(null);
+  const { data, loading, error, reload } = useResource<NotificationsData>(
+    () => api.notifications() as unknown as Promise<NotificationsData>,
+    { pollMs: 20000 },
+  );
   const [filtro, setFiltro] = useState('todos');
-  useEffect(() => {
-    const load = () =>
-      api
-        .notifications()
-        .then((d) => setData(d as unknown as NotificationsData))
-        .catch(() => {});
-    load();
-    const t = setInterval(load, 20000);
-    return () => clearInterval(t);
-  }, []);
-  if (!data) return <div className="text-mut text-sm animate-pulse">Cargando notificaciones…</div>;
 
+  return (
+    <AsyncBoundary
+      loading={loading}
+      error={error}
+      onRetry={reload}
+      isEmpty={!data}
+      loadingText="Cargando notificaciones…"
+    >
+      {data && <NotificationsContent data={data} filtro={filtro} setFiltro={setFiltro} />}
+    </AsyncBoundary>
+  );
+}
+
+function NotificationsContent({
+  data,
+  filtro,
+  setFiltro,
+}: {
+  data: NotificationsData;
+  filtro: string;
+  setFiltro: (f: string) => void;
+}) {
   const items = filtro === 'todos' ? data.items : data.items.filter((i) => i.nivel === filtro);
   return (
     <div className="space-y-5">

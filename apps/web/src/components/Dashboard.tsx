@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { fmt } from '../lib/utils';
 import { Card, CardHeader, CardBody } from './ui/Card';
@@ -7,6 +6,8 @@ import NavChart from './NavChart';
 import { Trophy } from 'lucide-react';
 import { NumberTicker } from './magic/NumberTicker';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from './ui/table';
+import { useResource } from '../lib/useResource';
+import { AsyncBoundary } from './ui/AsyncBoundary';
 
 const POLITICA: Record<string, string> = {
   principal: 'Ensemble mecánico + LLM que solo veta/recorta',
@@ -38,36 +39,33 @@ interface DoctorData {
 }
 
 export default function Dashboard() {
-  const [comp, setComp] = useState<PortfoliosData | null>(null);
-  const [doctor, setDoctor] = useState<DoctorData | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  const {
+    data: comp,
+    loading,
+    error,
+    reload,
+  } = useResource<PortfoliosData>(() => api.portfolios() as unknown as Promise<PortfoliosData>, {
+    pollMs: 15000,
+  });
+  const { data: doctor } = useResource<DoctorData>(
+    () => api.doctor() as unknown as Promise<DoctorData>,
+    { pollMs: 15000 },
+  );
 
-  useEffect(() => {
-    const load = () => {
-      api
-        .portfolios()
-        .then((d) => setComp(d as unknown as PortfoliosData))
-        .catch((e: Error) => setErr(e.message));
-      api
-        .doctor()
-        .then((d) => setDoctor(d as unknown as DoctorData))
-        .catch(() => {});
-    };
-    load();
-    const t = setInterval(load, 15000);
-    return () => clearInterval(t);
-  }, []);
+  return (
+    <AsyncBoundary
+      loading={loading}
+      error={error}
+      onRetry={reload}
+      isEmpty={!comp}
+      loadingText="Cargando estado…"
+    >
+      {comp && <DashboardContent comp={comp} doctor={doctor ?? null} />}
+    </AsyncBoundary>
+  );
+}
 
-  if (err)
-    return (
-      <Card>
-        <CardBody>
-          <span className="text-danger">Error: {err}. ¿Backend FastAPI activo?</span>
-        </CardBody>
-      </Card>
-    );
-  if (!comp) return <div className="text-mut text-sm animate-pulse">Cargando estado…</div>;
-
+function DashboardContent({ comp, doctor }: { comp: PortfoliosData; doctor: DoctorData | null }) {
   const carteras = comp.carteras || {};
   const lider = comp.lider_por_retorno;
   const checks = doctor?.checks || [];

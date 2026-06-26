@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Button } from './ui/button';
@@ -6,6 +6,9 @@ import { Input } from './ui/input';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from './ui/select';
 import { CircleCheck, X } from 'lucide-react';
 import { api } from '../lib/api';
+import { useResource } from '../lib/useResource';
+import { useAction } from '../lib/useAction';
+import { AsyncBoundary } from './ui/AsyncBoundary';
 
 interface Provider {
   env: string;
@@ -17,33 +20,26 @@ interface Provider {
   nota?: string;
 }
 
-export default function Credentials() {
-  const [provs, setProvs] = useState<Provider[]>([]);
+function CredentialsContent({ provs, reload }: { provs: Provider[]; reload: () => void }) {
   const [sel, setSel] = useState('');
   const [val, setVal] = useState('');
-  const [msg, setMsg] = useState('');
-  const load = () =>
-    api.credentials().then((d) => setProvs((d as { providers?: Provider[] }).providers || []));
-  useEffect(() => {
-    load();
-  }, []);
+  const { run } = useAction();
 
-  const guardar = async () => {
+  const guardar = () => {
     if (!sel || !val.trim()) return;
-    try {
-      await api.setCredential(sel, val.trim());
-      setMsg('✓ Credencial guardada en .env');
-    } catch {
-      setMsg('✗ error');
-    }
-    setVal('');
-    setSel('');
-    load();
+    void run(() => api.setCredential(sel, val.trim()), {
+      success: 'Credencial guardada en .env',
+      onDone: () => {
+        setVal('');
+        setSel('');
+        reload();
+      },
+    });
   };
-  const borrar = async (env: string) => {
+
+  const borrar = (env: string) => {
     if (!confirm('¿Borrar ' + env + '?')) return;
-    await api.setCredential(env, '');
-    load();
+    void run(() => api.setCredential(env, ''), { onDone: reload });
   };
 
   const configuradas = provs.filter((p) => p.estado === 'configurada');
@@ -57,7 +53,6 @@ export default function Credentials() {
           hint="Se guarda en .env (0600, fuera de git/backups). Una a la vez."
         />
         <CardBody>
-          {msg && <div className="mb-3 text-[12px] text-accent">{msg}</div>}
           <div className="flex gap-2 items-center flex-wrap">
             <Select value={sel} onValueChange={setSel}>
               <SelectTrigger className="min-w-[240px]">
@@ -142,5 +137,17 @@ export default function Credentials() {
         </CardBody>
       </Card>
     </div>
+  );
+}
+
+export default function Credentials() {
+  const { data, loading, error, reload } = useResource<Provider[]>(() =>
+    api.credentials().then((d) => (d as { providers?: Provider[] }).providers || []),
+  );
+
+  return (
+    <AsyncBoundary loading={loading} error={error} onRetry={reload} isEmpty={!data}>
+      {data && <CredentialsContent provs={data} reload={reload} />}
+    </AsyncBoundary>
   );
 }
