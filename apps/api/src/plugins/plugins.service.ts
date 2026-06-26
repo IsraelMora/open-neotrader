@@ -29,6 +29,7 @@ import type { Plugin } from '@prisma/client';
 // types at runtime. `import type` is erased at compile time, so the metadata would
 // degrade to `Function` and DI resolution fails (UnknownDependenciesException).
 import { KvService } from '../common/kv.service';
+import { kvNum } from '../common/kv.util';
 import { AuditService } from '../audit/audit.service';
 import { SandboxGateway } from '../sandbox/sandbox.gateway';
 
@@ -1296,12 +1297,6 @@ export class PluginsService implements OnApplicationBootstrap {
    * Mirrors the _readGateThresholds pattern from pretest.service.ts.
    */
   async _readTrustConfig(): Promise<{ weights: TrustWeights; threshold: number }> {
-    const parseNum = (raw: string | null, fallback: number): number => {
-      if (raw === null) return fallback;
-      const n = Number(raw);
-      return isFinite(n) ? n : fallback;
-    };
-
     const [rawWeights, rawThreshold] = await Promise.all([
       this.kv?.get('trust.weights') ?? Promise.resolve(null),
       this.kv?.get('trust.badge_threshold') ?? Promise.resolve(null),
@@ -1334,7 +1329,7 @@ export class PluginsService implements OnApplicationBootstrap {
     }
 
     // Parse threshold: numeric, clamped to [0, 100]
-    const rawNum = parseNum(rawThreshold, DEFAULT_BADGE_THRESHOLD);
+    const rawNum = kvNum(rawThreshold, DEFAULT_BADGE_THRESHOLD);
     const threshold = Math.max(0, Math.min(100, rawNum));
 
     return { weights, threshold };

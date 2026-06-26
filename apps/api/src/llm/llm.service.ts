@@ -285,21 +285,25 @@ export class LlmService implements OnModuleInit {
     return key;
   }
 
-  private async completeViaApi(req: LlmRequest): Promise<LlmResponse> {
-    const key = this.apiKey;
+  private async _loadSkillsSection(systemPrompt?: string): Promise<{
+    systemContent: string;
+    skillNames: string[];
+  }> {
     const skillsMeta = await this.plugins.getSkillsMetadata();
     const skillContents: string[] = [];
     for (const skill of skillsMeta) {
       const body = await this.plugins.loadSkillContent(skill.name);
       if (body) skillContents.push(`## Skill: ${skill.name}\n\n${body}`);
     }
+    const skillsSection =
+      skillContents.length > 0 ? `## Skills activos\n\n${skillContents.join('\n\n---\n\n')}` : '';
+    const systemContent = [systemPrompt ?? '', skillsSection].filter(Boolean).join('\n\n');
+    return { systemContent, skillNames: skillsMeta.map((s) => s.name) };
+  }
 
-    const systemContent = [
-      req.system_prompt ?? '',
-      skillContents.length > 0 ? `## Skills activos\n\n${skillContents.join('\n\n---\n\n')}` : '',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+  private async completeViaApi(req: LlmRequest): Promise<LlmResponse> {
+    const key = this.apiKey;
+    const { systemContent, skillNames } = await this._loadSkillsSection(req.system_prompt);
 
     const res = await globalThis.fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -333,7 +337,7 @@ export class LlmService implements OnModuleInit {
       text,
       tool_calls: [],
       backend: 'api',
-      skills_read: skillsMeta.map((s) => s.name),
+      skills_read: skillNames,
       skills_written: [],
     };
   }
@@ -342,23 +346,12 @@ export class LlmService implements OnModuleInit {
   // Inyecta el contenido de skills upfront (no hay tool calls en CLI mode).
 
   private async completeViaSubscription(req: LlmRequest): Promise<LlmResponse> {
-    const skillsMeta = await this.plugins.getSkillsMetadata();
-
-    const skillContents: string[] = [];
-    for (const skill of skillsMeta) {
-      const body = await this.plugins.loadSkillContent(skill.name);
-      if (body) skillContents.push(`## Skill: ${skill.name}\n\n${body}`);
-    }
-
-    const base = req.system_prompt ?? '';
-    const skillsSection =
-      skillContents.length > 0 ? `## Skills cargados\n\n${skillContents.join('\n\n---\n\n')}` : '';
-    const system = [base, skillsSection].filter(Boolean).join('\n\n');
+    const { systemContent, skillNames } = await this._loadSkillsSection(req.system_prompt);
 
     const args = buildSubscriptionArgs({
       model: this.model,
       prompt: req.context,
-      system,
+      system: systemContent,
     });
 
     try {
@@ -369,7 +362,7 @@ export class LlmService implements OnModuleInit {
         text: stdout.trim(),
         tool_calls: [],
         backend: 'subscription',
-        skills_read: skillsMeta.map((s) => s.name),
+        skills_read: skillNames,
         skills_written: [],
       };
     } catch (err: unknown) {
@@ -393,19 +386,7 @@ export class LlmService implements OnModuleInit {
     let baseUrl = this.cfg.get<string>('OPENAI_BASE_URL') ?? 'https://api.openai.com/v1';
     while (baseUrl.endsWith('/')) baseUrl = baseUrl.slice(0, -1);
 
-    const skillsMeta = await this.plugins.getSkillsMetadata();
-    const skillContents: string[] = [];
-    for (const skill of skillsMeta) {
-      const body = await this.plugins.loadSkillContent(skill.name);
-      if (body) skillContents.push(`## Skill: ${skill.name}\n\n${body}`);
-    }
-
-    const systemContent = [
-      req.system_prompt ?? '',
-      skillContents.length > 0 ? `## Skills activos\n\n${skillContents.join('\n\n---\n\n')}` : '',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+    const { systemContent, skillNames } = await this._loadSkillsSection(req.system_prompt);
 
     const hasTools = req.tools && req.tools.length > 0;
     const requestBody: Record<string, unknown> = {
@@ -451,7 +432,7 @@ export class LlmService implements OnModuleInit {
       text,
       tool_calls,
       backend: 'api',
-      skills_read: skillsMeta.map((s) => s.name),
+      skills_read: skillNames,
       skills_written: [],
     };
   }
@@ -465,19 +446,9 @@ export class LlmService implements OnModuleInit {
       throw new ServiceUnavailableException('GEMINI_API_KEY no configurada');
     }
 
-    const skillsMeta = await this.plugins.getSkillsMetadata();
-    const skillContents: string[] = [];
-    for (const skill of skillsMeta) {
-      const body = await this.plugins.loadSkillContent(skill.name);
-      if (body) skillContents.push(`## Skill: ${skill.name}\n\n${body}`);
-    }
-
-    const systemInstructions = [
-      req.system_prompt ?? '',
-      skillContents.length > 0 ? `## Skills activos\n\n${skillContents.join('\n\n---\n\n')}` : '',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+    const { systemContent: systemInstructions, skillNames } = await this._loadSkillsSection(
+      req.system_prompt,
+    );
 
     const modelId = this._model.startsWith('gemini') ? this._model : 'gemini-2.0-flash';
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
@@ -507,7 +478,7 @@ export class LlmService implements OnModuleInit {
       text,
       tool_calls: [],
       backend: 'api',
-      skills_read: skillsMeta.map((s) => s.name),
+      skills_read: skillNames,
       skills_written: [],
     };
   }
@@ -532,19 +503,7 @@ export class LlmService implements OnModuleInit {
       );
     }
 
-    const skillsMeta = await this.plugins.getSkillsMetadata();
-    const skillContents: string[] = [];
-    for (const skill of skillsMeta) {
-      const body = await this.plugins.loadSkillContent(skill.name);
-      if (body) skillContents.push(`## Skill: ${skill.name}\n\n${body}`);
-    }
-
-    const systemContent = [
-      req.system_prompt ?? '',
-      skillContents.length > 0 ? `## Skills activos\n\n${skillContents.join('\n\n---\n\n')}` : '',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+    const { systemContent, skillNames } = await this._loadSkillsSection(req.system_prompt);
 
     const model =
       this._model !== 'claude-haiku-4-5-20251001' ? this._model : provider.default_model;
@@ -599,7 +558,7 @@ export class LlmService implements OnModuleInit {
       text,
       tool_calls,
       backend: 'api',
-      skills_read: skillsMeta.map((s) => s.name),
+      skills_read: skillNames,
       skills_written: [],
     };
   }

@@ -26,7 +26,7 @@ import { ContextMemoryService } from '../context-memory/context-memory.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
 import { AgentsService } from '../agents/agents.service';
 import { KvService } from '../common/kv.service';
-import { kvBool } from '../common/kv.util';
+import { kvBool, kvNum } from '../common/kv.util';
 import { AuditService } from '../audit/audit.service';
 
 /**
@@ -694,11 +694,6 @@ export class PretestService {
     min_loss_trades: number;
     min_alpha: number;
   }> {
-    const parseNum = (raw: string | null, fallback: number): number => {
-      if (raw === null) return fallback;
-      const n = Number(raw);
-      return isFinite(n) ? n : fallback;
-    };
     const [rawMinTrades, rawMinSharpe, rawMaxDd, rawMinLossTrades, rawMinAlpha] = await Promise.all(
       [
         this.kv.get('pretest.gate.min_trades'),
@@ -709,13 +704,13 @@ export class PretestService {
       ],
     );
 
-    const min_trades_raw = parseNum(rawMinTrades, 20);
-    const min_sharpe_raw = parseNum(rawMinSharpe, 1.0);
-    const max_dd_pct_raw = parseNum(rawMaxDd, 20);
-    const min_loss_trades_raw = parseNum(rawMinLossTrades, 3);
+    const min_trades_raw = kvNum(rawMinTrades, 20);
+    const min_sharpe_raw = kvNum(rawMinSharpe, 1.0);
+    const max_dd_pct_raw = kvNum(rawMaxDd, 20);
+    const min_loss_trades_raw = kvNum(rawMinLossTrades, 3);
     // Default 0: a promotable strategy must at least MATCH buy & hold. A negative
     // threshold (operator opt-in) tolerates mild underperformance; no upper clamp.
-    const min_alpha = parseNum(rawMinAlpha, 0);
+    const min_alpha = kvNum(rawMinAlpha, 0);
 
     // Clamp: max_dd_pct must be in [1, 100] — anything below 1 almost certainly indicates
     // a fraction was stored (e.g. 0.20 meaning 20%) rather than a percentage; coerce to default 20.

@@ -1553,6 +1553,22 @@ export class AgentsService {
     }
   }
 
+  private _pretestUnavailableGuard(
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+  ): boolean {
+    if (this.pretest) return false;
+    decisions.push({ ...tc, allowed: false, reason: 'pretest_unavailable' });
+    sandbox_results.push({
+      plugin_id: 'kernel',
+      function: tc.function,
+      ok: false,
+      error: 'pretest_unavailable',
+    });
+    return true;
+  }
+
   /**
    * Dispatches a kernel-namespace tool call (plugin_id === 'kernel').
    * Routes to the appropriate PluginsService/PretestService method without entering the sandbox.
@@ -1563,20 +1579,25 @@ export class AgentsService {
     decisions: Decision[],
     sandbox_results: SandboxResult[],
   ): Promise<void> {
-    if (tc.function === 'write_skill') {
-      await this._kernelWriteSkill(cycle_id, tc, decisions, sandbox_results);
-    } else if (tc.function === 'create_pretest_variant') {
-      await this._kernelCreatePretestVariant(cycle_id, tc, decisions, sandbox_results);
-    } else if (tc.function === 'run_pretest_compare') {
-      await this._kernelRunPretestCompare(cycle_id, tc, decisions, sandbox_results);
-    } else if (tc.function === 'promote_pretest') {
-      await this._kernelPromotePretest(cycle_id, tc, decisions, sandbox_results);
-    } else if (tc.function === 'record_lesson') {
-      await this._kernelRecordLesson(cycle_id, tc, decisions, sandbox_results);
-    } else if (tc.function === 'train_ml_model') {
-      await this._kernelTrainMlModel(cycle_id, tc, decisions, sandbox_results);
-    } else if (tc.function === 'tune_plugin_param') {
-      await this._kernelTunePluginParam(cycle_id, tc, decisions, sandbox_results);
+    type KernelHandler = (
+      cycle_id: string,
+      tc: import('../llm/llm.service').ToolCallRequest,
+      decisions: Decision[],
+      sandbox_results: SandboxResult[],
+    ) => Promise<void>;
+
+    const kernelDispatch: Record<string, KernelHandler> = {
+      write_skill: (c, t, d, s) => this._kernelWriteSkill(c, t, d, s),
+      create_pretest_variant: (c, t, d, s) => this._kernelCreatePretestVariant(c, t, d, s),
+      run_pretest_compare: (c, t, d, s) => this._kernelRunPretestCompare(c, t, d, s),
+      promote_pretest: (c, t, d, s) => this._kernelPromotePretest(c, t, d, s),
+      record_lesson: (c, t, d, s) => this._kernelRecordLesson(c, t, d, s),
+      train_ml_model: (c, t, d, s) => this._kernelTrainMlModel(c, t, d, s),
+      tune_plugin_param: (c, t, d, s) => this._kernelTunePluginParam(c, t, d, s),
+    };
+    const handler = kernelDispatch[tc.function];
+    if (handler) {
+      await handler(cycle_id, tc, decisions, sandbox_results);
     } else {
       this.log.warn(`_dispatchKernelTool: unknown kernel function '${tc.function}' — dropped`);
       decisions.push({ ...tc, allowed: false, reason: 'unknown_kernel_tool' });
@@ -1613,16 +1634,7 @@ export class AgentsService {
     decisions: Decision[],
     sandbox_results: SandboxResult[],
   ): Promise<void> {
-    if (!this.pretest) {
-      decisions.push({ ...tc, allowed: false, reason: 'pretest_unavailable' });
-      sandbox_results.push({
-        plugin_id: 'kernel',
-        function: tc.function,
-        ok: false,
-        error: 'pretest_unavailable',
-      });
-      return;
-    }
+    if (this._pretestUnavailableGuard(tc, decisions, sandbox_results)) return;
 
     // Coerce args
     const name = typeof tc.args['name'] === 'string' ? tc.args['name'] : '';
@@ -1649,7 +1661,7 @@ export class AgentsService {
     }
 
     // Cap check
-    const existing = await this.pretest.findAll();
+    const existing = await this.pretest!.findAll();
     if (existing.length >= MAX_PRETEST_VARIANTS) {
       await this.audit.log({
         cycle_id,
@@ -1667,7 +1679,7 @@ export class AgentsService {
     }
 
     // Create
-    const pf = await this.pretest.create({ name, plugin_ids, plugin_configs });
+    const pf = await this.pretest!.create({ name, plugin_ids, plugin_configs });
     await this.audit.log({
       cycle_id,
       event_type: 'pretest_variant_created',
@@ -1689,20 +1701,11 @@ export class AgentsService {
     decisions: Decision[],
     sandbox_results: SandboxResult[],
   ): Promise<void> {
-    if (!this.pretest) {
-      decisions.push({ ...tc, allowed: false, reason: 'pretest_unavailable' });
-      sandbox_results.push({
-        plugin_id: 'kernel',
-        function: tc.function,
-        ok: false,
-        error: 'pretest_unavailable',
-      });
-      return;
-    }
+    if (this._pretestUnavailableGuard(tc, decisions, sandbox_results)) return;
 
     // Compare-only: reads current stored portfolio states.
     // ADR-3: no runAllActive() — avoids N recursive LLM pretest turns mid-reflection.
-    const cmp = await this.pretest.compare();
+    const cmp = await this.pretest!.compare();
     await this.audit.log({
       cycle_id,
       event_type: 'pretest_compared',
@@ -1742,16 +1745,7 @@ export class AgentsService {
     sandbox_results: SandboxResult[],
   ): Promise<void> {
     // 1. Pretest-unavailable guard (same shape as s3 helpers).
-    if (!this.pretest) {
-      decisions.push({ ...tc, allowed: false, reason: 'pretest_unavailable' });
-      sandbox_results.push({
-        plugin_id: 'kernel',
-        function: tc.function,
-        ok: false,
-        error: 'pretest_unavailable',
-      });
-      return;
-    }
+    if (this._pretestUnavailableGuard(tc, decisions, sandbox_results)) return;
 
     // 2. Coerce and validate pretest_id.
     const rawId = tc.args['pretest_id'];
@@ -1778,7 +1772,7 @@ export class AgentsService {
     // 4. Call promote() WITHOUT confirm — safety: LLM cannot auto-apply with default config.
     let result: import('../pretest/pretest.service').PromoteResult;
     try {
-      result = await this.pretest.promote(pretest_id);
+      result = await this.pretest!.promote(pretest_id);
     } catch (err: unknown) {
       const isNotFound = err instanceof NotFoundException;
       decisions.push({ ...tc, allowed: false, reason: isNotFound ? 'not_found' : String(err) });
@@ -2651,9 +2645,11 @@ export class AgentsService {
    * Enumerates each param as 'plugin_id.param(type,min..max)=current_value'.
    * Fail-soft: per-plugin errors silently skip that plugin; section omitted when nothing renders.
    */
-  private async _buildTunableParamsSection(cap: number): Promise<string | null> {
+  private async _buildTunableParamsSection(
+    cap: number,
+    allActive: import('../plugins/plugins.service').HydratedPlugin[],
+  ): Promise<string | null> {
     try {
-      const allActive = await this.plugins.findActive();
       const skillPlugins = allActive.filter((p) => p.type === 'skill');
       const paramLines: string[] = [];
       for (const plugin of skillPlugins) {
@@ -2680,9 +2676,11 @@ export class AgentsService {
    * Calls sandbox check_lock per tunable skill plugin. Read-only — never mutates state.
    * Fail-soft: per-plugin check_lock errors silently skip that plugin.
    */
-  private async _buildParamLockStatusSection(cap: number): Promise<string | null> {
+  private async _buildParamLockStatusSection(
+    cap: number,
+    allActive: import('../plugins/plugins.service').HydratedPlugin[],
+  ): Promise<string | null> {
     try {
-      const allActive = await this.plugins.findActive();
       const disciplinePlugin = allActive.find((p) => p.id === 'param-discipline');
       if (!disciplinePlugin) return null;
       const disciplineConfig = disciplinePlugin.config ?? {};
@@ -2866,11 +2864,22 @@ export class AgentsService {
       PAST_EPISODES_CAP,
     );
 
+    // Single findActive() call shared by tunable-params and param-lock sections.
+    // Fail-soft: both sections skip gracefully with an empty list on error.
+    const sharedActivePlugins: import('../plugins/plugins.service').HydratedPlugin[] =
+      await this.plugins.findActive().catch(() => []);
+
     // Section: TUNABLE PARAMS (cap 600) — LLM action space: active skill params with type/constraints/current.
-    const tunableParamsSection = await this._buildTunableParamsSection(TUNABLE_PARAMS_CAP);
+    const tunableParamsSection = await this._buildTunableParamsSection(
+      TUNABLE_PARAMS_CAP,
+      sharedActivePlugins,
+    );
 
     // Section: PARAM LOCK STATUS (cap 400) — per-plugin lock state via param-discipline check_lock.
-    const paramLockStatusSection = await this._buildParamLockStatusSection(PARAM_LOCK_STATUS_CAP);
+    const paramLockStatusSection = await this._buildParamLockStatusSection(
+      PARAM_LOCK_STATUS_CAP,
+      sharedActivePlugins,
+    );
 
     // Section: CURRENT REGIME (cap 200) — most recent volatility_regime signal from audit.
     // Cap accounts for '[CURRENT REGIME]\n' header (17 chars) so total section ≤ REGIME_CAP.

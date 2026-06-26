@@ -45,6 +45,14 @@ export interface CircuitBreakerState {
   reason: string | null;
 }
 
+const CLOSED_CB: CircuitBreakerState = {
+  state: 'closed',
+  consecutive_failures: 0,
+  last_failure_at: null,
+  last_success_at: null,
+  reason: null,
+};
+
 export interface SchedulerStatus extends SchedulerConfig {
   effective_interval_ms: number;
   plugin_schedules: PluginSchedule[];
@@ -166,24 +174,11 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
   /** Devuelve el estado actual del circuit breaker (closed/open/half_open). */
   async getCircuitBreaker(): Promise<CircuitBreakerState> {
     const raw = await this.store.get(CB_KEY);
-    if (!raw)
-      return {
-        state: 'closed',
-        consecutive_failures: 0,
-        last_failure_at: null,
-        last_success_at: null,
-        reason: null,
-      };
+    if (!raw) return { ...CLOSED_CB };
     try {
       return JSON.parse(raw) as CircuitBreakerState;
     } catch {
-      return {
-        state: 'closed',
-        consecutive_failures: 0,
-        last_failure_at: null,
-        last_success_at: null,
-        reason: null,
-      };
+      return { ...CLOSED_CB };
     }
   }
 
@@ -305,14 +300,7 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
         reason: null,
       });
 
-      await this.store.set(
-        CONFIG_KEY,
-        JSON.stringify({
-          ...cfg,
-          last_run: new Date().toISOString(),
-          run_count: cfg.run_count + 1,
-        }),
-      );
+      await this._bumpRunCount(cfg);
 
       // After a successful cycle, check if it's time to trigger a reflection turn.
       // Route via PanelService.reflectNow() — reusing the existing scheduler→panel edge
@@ -401,6 +389,17 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
     await this.store.set(CB_KEY, JSON.stringify(state));
   }
 
+  private async _bumpRunCount(cfg: SchedulerConfig): Promise<void> {
+    await this.store.set(
+      CONFIG_KEY,
+      JSON.stringify({
+        ...cfg,
+        last_run: new Date().toISOString(),
+        run_count: cfg.run_count + 1,
+      }),
+    );
+  }
+
   /** Dispara un ciclo inmediato fuera del intervalo programado; lanza si ya hay uno en curso. */
   async runNow(prompt?: string): Promise<void> {
     if (this.running || this.cycleExecutor.getRunStatus().running) {
@@ -411,14 +410,7 @@ export class CycleSchedulerService implements OnModuleInit, OnModuleDestroy {
       const result = this.cycleExecutor.runCycle(false, prompt);
       if (!result.accepted) throw new Error('Ciclo rechazado (ya hay uno en curso)');
       const cfg = await this.getConfig();
-      await this.store.set(
-        CONFIG_KEY,
-        JSON.stringify({
-          ...cfg,
-          last_run: new Date().toISOString(),
-          run_count: cfg.run_count + 1,
-        }),
-      );
+      await this._bumpRunCount(cfg);
     } finally {
       this.running = false;
     }
