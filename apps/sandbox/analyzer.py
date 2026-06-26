@@ -43,7 +43,6 @@ Finding categories (F3-s1 scope):
 from __future__ import annotations
 
 import ast
-import os
 from pathlib import Path
 from typing import Any
 
@@ -196,7 +195,7 @@ def _scan_file(path: Path, src: str) -> tuple[list[dict], set[str], set[str]]:
         # ------------------------------------------------------------------
         # Top-level function collection (for skills cross-check)
         # ------------------------------------------------------------------
-        elif isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # Collect ALL function names (not just top-level) so nested helpers
             # in plugins don't cause false-positive undefined_skill findings.
             defined_fns.add(node.name)
@@ -239,7 +238,7 @@ def _check_hook_files(plugin_dir: Path, manifest: dict) -> list[dict]:
     hooks_cfg: dict = manifest.get("hooks", {})
     for hook_name, hook_path_rel in hooks_cfg.items():
         hook_path = plugin_dir / hook_path_rel
-        if not os.path.exists(hook_path):
+        if not hook_path.exists():
             findings.append(
                 _finding(
                     severity="warn",

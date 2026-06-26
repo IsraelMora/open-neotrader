@@ -186,15 +186,7 @@ def neutralize_os_exec() -> None:
         _stub.__name__ = name
         return _stub
 
-    for fn_name in ("system", "popen"):
-        if hasattr(os, fn_name):
-            setattr(os, fn_name, _denied(fn_name))
-
-    for fn_name in ("fork", "forkpty"):
-        if hasattr(os, fn_name):
-            setattr(os, fn_name, _denied(fn_name))
-
-    for fn_name in ("execv", "execve", "execvp", "execvpe"):
+    for fn_name in ("system", "popen", "fork", "forkpty", "execv", "execve", "execvp", "execvpe"):
         if hasattr(os, fn_name):
             setattr(os, fn_name, _denied(fn_name))
 

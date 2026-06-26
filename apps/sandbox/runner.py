@@ -99,9 +99,13 @@ except ImportError:
 
 def _parse_semver(v: str) -> tuple[int, int, int] | None:
     """Parse a semver string 'X.Y.Z' into a tuple. Returns None if not parseable."""
-    import re
-    m = re.match(r'^(\d+)\.(\d+)\.(\d+)$', v)
-    return (int(m[1]), int(m[2]), int(m[3])) if m else None
+    try:
+        parts = v.split(".")
+        if len(parts) != 3:
+            return None
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    except (ValueError, AttributeError):
+        return None
 
 
 def _semver_gte(installed: str, required: str) -> bool:
@@ -538,13 +542,12 @@ def cmd_smoke_test(req: dict) -> dict:
         })
     else:
         try:
-            import importlib.util as _ilu
-            hook_spec = _ilu.spec_from_file_location(
+            hook_spec = importlib.util.spec_from_file_location(
                 f"_nt_smoke_{plugin_id}_on_activate", hook_path
             )
             if hook_spec is None or hook_spec.loader is None:
                 raise ImportError(f"Cannot load hook spec: {hook_path}")
-            hook_mod = _ilu.module_from_spec(hook_spec)
+            hook_mod = importlib.util.module_from_spec(hook_spec)
             plugin_str = str(plugin_dir)
             if plugin_str not in sys.path:
                 sys.path.insert(0, plugin_str)

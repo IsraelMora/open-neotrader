@@ -7,11 +7,11 @@ manifest [config] defaults — design D4). Defaults are duplicated from model.py
 """
 from __future__ import annotations
 
-import os
 import sys
+from pathlib import Path
 
 # Make scripts/ importable without requiring the runner's sys.path manipulation
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 
 from neurotrader_sdk import Context, skill  # noqa: E402
 from model import predict as _predict  # noqa: E402

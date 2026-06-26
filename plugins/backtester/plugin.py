@@ -9,10 +9,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-_SCRIPTS_DIR = Path(__file__).parent / "scripts"
-_SCRIPTS_STR = str(_SCRIPTS_DIR)
-if _SCRIPTS_STR not in sys.path:
-    sys.path.insert(0, _SCRIPTS_STR)
+_SCRIPTS_DIR = str(Path(__file__).parent / "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
 from engine import run_backtest
 from generate import generate_signals
