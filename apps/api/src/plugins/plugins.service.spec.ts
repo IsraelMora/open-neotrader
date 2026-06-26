@@ -36,7 +36,19 @@ import { readManifest, validateManifest } from './manifest';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Minimal PluginsService with only the dependencies needed for getActiveDecisionPrompt. */
+/** Restore readFileSync to the real implementation and clear call history. Used in afterEach blocks. */
+function restoreReadFileSync(): void {
+  (fs.readFileSync as jest.Mock).mockReset();
+  (fs.readFileSync as jest.Mock).mockImplementation(
+    jest.requireActual<typeof import('fs')>('fs').readFileSync,
+  );
+}
+
+/**
+ * Shared factory for PluginsService instances used in prompt + debate tests.
+ * Provides the same Prisma/events/cfg stubs regardless of which capability
+ * section (decision, reflection, debate) is under test.
+ */
 function makeService(
   activePlugins: { id: string; installed_path: string | null }[],
   manifestMap: Record<string, PluginManifest | null>,
@@ -149,58 +161,97 @@ function makeManifest(id: string, decisionSection?: PluginManifest['decision']):
   };
 }
 
-// ── Phase 5 Tests — getActiveDecisionPrompt ───────────────────────────────────
+function makeReflectionManifest(
+  id: string,
+  reflectionSection?: PluginManifest['reflection'],
+): PluginManifest {
+  return {
+    plugin: { id, name: id, version: '1.0.0', type: 'extra' },
+    reflection: reflectionSection,
+  };
+}
 
-describe('PluginsService.getActiveDecisionPrompt', () => {
-  beforeEach(() => jest.restoreAllMocks());
+// ── Shared writable_manifest (used in writeSkillGuarded + provenance suites) ──
 
-  it('returns null when no active plugin declares a [decision] section', async () => {
+const writable_manifest: PluginManifest = {
+  plugin: {
+    id: 'test-skill',
+    name: 'Test Skill',
+    version: '1.0.0',
+    type: 'skill',
+    llm_writable: true,
+  },
+};
+
+// ── Parameterised helper for decision / reflection prompt suites ──────────────
+
+/**
+ * Runs the full prompt-method test suite (7 scenarios) for either
+ * getActiveDecisionPrompt or getActiveReflectionPrompt.
+ *
+ * Both methods share identical behaviour (null when 0, verbatim when 1,
+ * prompt_file resolution, path traversal guard, prompt-over-file preference,
+ * throws-becomes-null, CRITICAL log when >1). Extracting them here avoids
+ * maintaining two identical suites; the parameterised version still runs both.
+ */
+function describePromptMethod(
+  methodName: 'getActiveDecisionPrompt' | 'getActiveReflectionPrompt',
+  manifestSection: 'decision' | 'reflection',
+  makeTestManifest: (
+    id: string,
+    section?: PluginManifest['decision'] | PluginManifest['reflection'],
+  ) => PluginManifest,
+  fileLabel: string,
+): void {
+  const callMethod = (service: PluginsService) =>
+    methodName === 'getActiveDecisionPrompt'
+      ? service.getActiveDecisionPrompt()
+      : service.getActiveReflectionPrompt();
+
+  it(`returns null when 0 active plugins declare a [${manifestSection}] section`, async () => {
     const service = makeService([{ id: 'some-plugin', installed_path: '/plugins/some-plugin' }], {
-      '/plugins/some-plugin': makeManifest('some-plugin') /* no decision */,
+      '/plugins/some-plugin': makeManifest('some-plugin') /* no section */,
     });
     const logSpy = jest.spyOn(service['log'], 'error');
 
-    const result = await service.getActiveDecisionPrompt();
+    const result = await callMethod(service);
 
     expect(result).toBeNull();
     expect(logSpy).not.toHaveBeenCalled();
   });
 
-  it('returns the decision.prompt verbatim when exactly one plugin has [decision]', async () => {
-    const prompt = 'Emit tool_calls as JSON inside <tool_calls></tool_calls> tags.';
-    const service = makeService([{ id: 'my-decision', installed_path: '/plugins/my-decision' }], {
-      '/plugins/my-decision': makeManifest('my-decision', { prompt }),
-    });
+  it(`returns the ${manifestSection}.prompt verbatim when exactly one plugin has [${manifestSection}]`, async () => {
+    const prompt = `Prompt for ${manifestSection} method.`;
+    const section = { prompt };
+    const service = makeService(
+      [{ id: `my-${manifestSection}`, installed_path: `/plugins/my-${manifestSection}` }],
+      {
+        [`/plugins/my-${manifestSection}`]: makeTestManifest(`my-${manifestSection}`, section),
+      },
+    );
 
-    const result = await service.getActiveDecisionPrompt();
+    const result = await callMethod(service);
 
     expect(result).toBe(prompt);
   });
 
-  it('reads decision.prompt_file relative to installed_path when prompt is absent', async () => {
-    const fileContent = 'Decision instructions from file.';
+  it(`reads ${manifestSection}.prompt_file relative to installed_path when prompt is absent`, async () => {
+    const fileContent = `${manifestSection} instructions from file.`;
     const readFileSyncSpy = (fs.readFileSync as jest.Mock).mockReturnValue(fileContent);
 
-    const service = makeService(
-      [{ id: 'file-decision', installed_path: '/plugins/file-decision' }],
-      {
-        '/plugins/file-decision': makeManifest('file-decision', {
-          prompt_file: 'DECISION.md',
-        }),
-      },
-    );
+    const pluginId = `file-${manifestSection}`;
+    const installedPath = `/plugins/${pluginId}`;
+    const section = { prompt_file: `${fileLabel}.md` };
+    const service = makeService([{ id: pluginId, installed_path: installedPath }], {
+      [installedPath]: makeTestManifest(pluginId, section),
+    });
 
-    const result = await service.getActiveDecisionPrompt();
+    const result = await callMethod(service);
 
     expect(result).toBe(fileContent);
-    // Must use path.join(installed_path, basename) — no path traversal.
     expect(readFileSyncSpy).toHaveBeenCalledWith(
-      path.join('/plugins/file-decision', 'DECISION.md'),
+      path.join(installedPath, `${fileLabel}.md`),
       'utf8',
-    );
-    readFileSyncSpy.mockReset();
-    (fs.readFileSync as jest.Mock).mockImplementation(
-      jest.requireActual<typeof import('fs')>('fs').readFileSync,
     );
   });
 
@@ -208,46 +259,35 @@ describe('PluginsService.getActiveDecisionPrompt', () => {
     const fileContent = 'Safe content.';
     const readFileSyncSpy = (fs.readFileSync as jest.Mock).mockReturnValue(fileContent);
 
-    const service = makeService(
-      [{ id: 'traversal-test', installed_path: '/plugins/traversal-test' }],
-      {
-        '/plugins/traversal-test': makeManifest('traversal-test', {
-          prompt_file: '../../etc/passwd',
-        }),
-      },
-    );
+    const pluginId = `traversal-${manifestSection}`;
+    const installedPath = `/plugins/${pluginId}`;
+    const section = { prompt_file: '../../etc/passwd' };
+    const service = makeService([{ id: pluginId, installed_path: installedPath }], {
+      [installedPath]: makeTestManifest(pluginId, section),
+    });
 
-    await service.getActiveDecisionPrompt();
+    await callMethod(service);
 
-    // Must resolve to basename only: 'passwd' — under installed_path, not /etc/passwd.
-    expect(readFileSyncSpy).toHaveBeenCalledWith(
-      path.join('/plugins/traversal-test', 'passwd'),
-      'utf8',
-    );
-    readFileSyncSpy.mockReset();
-    (fs.readFileSync as jest.Mock).mockImplementation(
-      jest.requireActual<typeof import('fs')>('fs').readFileSync,
-    );
+    expect(readFileSyncSpy).toHaveBeenCalledWith(path.join(installedPath, 'passwd'), 'utf8');
   });
 
   it('prefers prompt over prompt_file when both are present', async () => {
     const prompt = 'Inline prompt wins.';
     const readFileSyncSpy = fs.readFileSync as jest.Mock;
 
-    const service = makeService([{ id: 'both-set', installed_path: '/plugins/both-set' }], {
-      '/plugins/both-set': makeManifest('both-set', {
-        prompt,
-        prompt_file: 'DECISION.md',
-      }),
+    const pluginId = `both-${manifestSection}`;
+    const installedPath = `/plugins/${pluginId}`;
+    const section = { prompt, prompt_file: `${fileLabel}.md` };
+    const service = makeService([{ id: pluginId, installed_path: installedPath }], {
+      [installedPath]: makeTestManifest(pluginId, section),
     });
 
-    const result = await service.getActiveDecisionPrompt();
+    const result = await callMethod(service);
 
     expect(result).toBe(prompt);
-    // readFileSync must NOT be called since prompt wins over prompt_file.
     const calls = readFileSyncSpy.mock.calls as unknown[][];
     const relevantCalls = calls.filter(
-      (args) => typeof args[0] === 'string' && args[0].includes('DECISION'),
+      (args) => typeof args[0] === 'string' && args[0].includes(fileLabel),
     );
     expect(relevantCalls).toHaveLength(0);
   });
@@ -257,45 +297,52 @@ describe('PluginsService.getActiveDecisionPrompt', () => {
       throw new Error('ENOENT');
     });
 
-    const service = makeService([{ id: 'bad-file', installed_path: '/plugins/bad-file' }], {
-      '/plugins/bad-file': makeManifest('bad-file', { prompt_file: 'MISSING.md' }),
+    const pluginId = `bad-${manifestSection}`;
+    const installedPath = `/plugins/${pluginId}`;
+    const section = { prompt_file: 'MISSING.md' };
+    const service = makeService([{ id: pluginId, installed_path: installedPath }], {
+      [installedPath]: makeTestManifest(pluginId, section),
     });
 
-    const result = await service.getActiveDecisionPrompt();
+    const result = await callMethod(service);
     expect(result).toBeNull();
-    // Restore mock for subsequent tests.
-    (fs.readFileSync as jest.Mock).mockImplementation(
-      jest.requireActual<typeof import('fs')>('fs').readFileSync,
-    );
   });
 
-  // Keep existing test below this line
-  it('returns null and logs CRITICAL (as error) when >1 active plugins declare [decision]', async () => {
+  it(`returns null and logs CRITICAL (as error) when >1 active plugins declare [${manifestSection}]`, async () => {
+    const idA = `${manifestSection}-plugin-a`;
+    const idB = `${manifestSection}-plugin-b`;
+    const sectionA = { prompt: 'Prompt A' };
+    const sectionB = { prompt: 'Prompt B' };
     const service = makeService(
       [
-        { id: 'decision-plugin-a', installed_path: '/plugins/decision-plugin-a' },
-        { id: 'decision-plugin-b', installed_path: '/plugins/decision-plugin-b' },
+        { id: idA, installed_path: `/plugins/${idA}` },
+        { id: idB, installed_path: `/plugins/${idB}` },
       ],
       {
-        '/plugins/decision-plugin-a': makeManifest('decision-plugin-a', {
-          prompt: 'Prompt A',
-        }),
-        '/plugins/decision-plugin-b': makeManifest('decision-plugin-b', {
-          prompt: 'Prompt B',
-        }),
+        [`/plugins/${idA}`]: makeTestManifest(idA, sectionA),
+        [`/plugins/${idB}`]: makeTestManifest(idB, sectionB),
       },
     );
     const logSpy = jest.spyOn(service['log'], 'error');
 
-    const result = await service.getActiveDecisionPrompt();
+    const result = await callMethod(service);
 
     expect(result).toBeNull();
     expect(logSpy).toHaveBeenCalledTimes(1);
     const logMessage: string = (logSpy.mock.calls[0] as string[])[0];
     expect(logMessage).toContain('[CRITICAL]');
-    expect(logMessage).toContain('decision-plugin-a');
-    expect(logMessage).toContain('decision-plugin-b');
+    expect(logMessage).toContain(idA);
+    expect(logMessage).toContain(idB);
   });
+}
+
+// ── Phase 5 Tests — getActiveDecisionPrompt ───────────────────────────────────
+
+describe('PluginsService.getActiveDecisionPrompt', () => {
+  beforeEach(() => jest.restoreAllMocks());
+  afterEach(() => restoreReadFileSync());
+
+  describePromptMethod('getActiveDecisionPrompt', 'decision', makeManifest, 'DECISION');
 });
 
 // ── Phase 1.3: PluginManifest.llm_writable type test ─────────────────────────
@@ -356,187 +403,22 @@ describe('PluginManifest reflection block', () => {
 
 // ── s2 Task 1.5: PluginsService.getActiveReflectionPrompt tests ───────────────
 
-/** Build PluginsService configured for getActiveReflectionPrompt tests. */
-function makeReflectionService(
-  activePlugins: { id: string; installed_path: string | null }[],
-  manifestMap: Record<string, PluginManifest | null>,
-): PluginsService {
-  const db = {
-    plugin: {
-      findMany: jest.fn().mockImplementation(({ where }: { where?: { active?: boolean } }) => {
-        if (where?.active === true) return Promise.resolve(activePlugins);
-        return Promise.resolve([]);
-      }),
-      findUnique: jest.fn(),
-      findFirst: jest.fn(),
-      create: jest.fn(),
-      update: jest.fn(),
-      delete: jest.fn(),
-    },
-  } as unknown as import('../prisma/prisma.service').PrismaService;
-
-  const events = {
-    emit: jest.fn(),
-  } as unknown as import('./plugin-events.service').PluginEventsService;
-  const cfg = {
-    get: jest.fn().mockReturnValue('/var/plugins'),
-  } as unknown as import('@nestjs/config').ConfigService;
-
-  const service = new PluginsService(db, events, cfg);
-
-  service.getManifest = jest.fn().mockImplementation((installedPath: string | null) => {
-    if (!installedPath) return null;
-    return manifestMap[installedPath] ?? null;
-  });
-
-  return service;
-}
-
-function makeReflectionManifest(
-  id: string,
-  reflectionSection?: PluginManifest['reflection'],
-): PluginManifest {
-  return {
-    plugin: { id, name: id, version: '1.0.0', type: 'extra' },
-    reflection: reflectionSection,
-  };
-}
-
 describe('PluginsService.getActiveReflectionPrompt', () => {
   beforeEach(() => jest.restoreAllMocks());
+  afterEach(() => restoreReadFileSync());
 
-  it('s2-1.5a — returns null when 0 active plugins declare a [reflection] section', async () => {
-    const service = makeReflectionService(
-      [{ id: 'some-plugin', installed_path: '/plugins/some-plugin' }],
-      { '/plugins/some-plugin': makeManifest('some-plugin') /* no reflection */ },
-    );
-    const logSpy = jest.spyOn(service['log'], 'error');
-
-    const result = await service.getActiveReflectionPrompt();
-
-    expect(result).toBeNull();
-    expect(logSpy).not.toHaveBeenCalled();
-  });
-
-  it('s2-1.5b — returns reflection.prompt verbatim when exactly 1 plugin has [reflection] with prompt', async () => {
-    const prompt = 'Analyze your recent trade decisions and find patterns to improve.';
-    const service = makeReflectionService(
-      [{ id: 'my-reflector', installed_path: '/plugins/my-reflector' }],
-      { '/plugins/my-reflector': makeReflectionManifest('my-reflector', { prompt }) },
-    );
-
-    const result = await service.getActiveReflectionPrompt();
-
-    expect(result).toBe(prompt);
-  });
-
-  it('s2-1.5c — reads reflection.prompt_file relative to installed_path when prompt is absent', async () => {
-    const fileContent = 'Reflection instructions from file.';
-    const readFileSyncSpy = (fs.readFileSync as jest.Mock).mockReturnValue(fileContent);
-
-    const service = makeReflectionService(
-      [{ id: 'file-reflector', installed_path: '/plugins/file-reflector' }],
-      {
-        '/plugins/file-reflector': makeReflectionManifest('file-reflector', {
-          prompt_file: 'REFLECT.md',
-        }),
-      },
-    );
-
-    const result = await service.getActiveReflectionPrompt();
-
-    expect(result).toBe(fileContent);
-    // Must use path.join(installed_path, basename) — no path traversal.
-    expect(readFileSyncSpy).toHaveBeenCalledWith(
-      path.join('/plugins/file-reflector', 'REFLECT.md'),
-      'utf8',
-    );
-    readFileSyncSpy.mockReset();
-    (fs.readFileSync as jest.Mock).mockImplementation(
-      jest.requireActual<typeof import('fs')>('fs').readFileSync,
-    );
-  });
-
-  it('s2-1.5d — returns null and logs CRITICAL when >1 active plugins declare [reflection]', async () => {
-    const service = makeReflectionService(
-      [
-        { id: 'reflector-a', installed_path: '/plugins/reflector-a' },
-        { id: 'reflector-b', installed_path: '/plugins/reflector-b' },
-      ],
-      {
-        '/plugins/reflector-a': makeReflectionManifest('reflector-a', { prompt: 'Prompt A' }),
-        '/plugins/reflector-b': makeReflectionManifest('reflector-b', { prompt: 'Prompt B' }),
-      },
-    );
-    const logSpy = jest.spyOn(service['log'], 'error');
-
-    const result = await service.getActiveReflectionPrompt();
-
-    expect(result).toBeNull();
-    expect(logSpy).toHaveBeenCalledTimes(1);
-    const logMessage: string = (logSpy.mock.calls[0] as string[])[0];
-    expect(logMessage).toContain('[CRITICAL]');
-    expect(logMessage).toContain('reflector-a');
-    expect(logMessage).toContain('reflector-b');
-  });
-
-  it('s2-1.5e — never throws (returns null when prompt_file read fails)', async () => {
-    (fs.readFileSync as jest.Mock).mockImplementation(() => {
-      throw new Error('ENOENT');
-    });
-
-    const service = makeReflectionService(
-      [{ id: 'bad-file', installed_path: '/plugins/bad-file' }],
-      { '/plugins/bad-file': makeReflectionManifest('bad-file', { prompt_file: 'MISSING.md' }) },
-    );
-
-    const result = await service.getActiveReflectionPrompt();
-    expect(result).toBeNull();
-
-    (fs.readFileSync as jest.Mock).mockImplementation(
-      jest.requireActual<typeof import('fs')>('fs').readFileSync,
-    );
-  });
-
-  it('s2-1.5f — prefers reflection.prompt over reflection.prompt_file when both present', async () => {
-    const prompt = 'Inline reflection prompt wins.';
-    const readFileSyncSpy = fs.readFileSync as jest.Mock;
-
-    const service = makeReflectionService(
-      [{ id: 'both-set', installed_path: '/plugins/both-set' }],
-      {
-        '/plugins/both-set': makeReflectionManifest('both-set', {
-          prompt,
-          prompt_file: 'REFLECT.md',
-        }),
-      },
-    );
-
-    const result = await service.getActiveReflectionPrompt();
-
-    expect(result).toBe(prompt);
-    const calls = readFileSyncSpy.mock.calls as unknown[][];
-    const relevantCalls = calls.filter(
-      (args) => typeof args[0] === 'string' && args[0].includes('REFLECT'),
-    );
-    expect(relevantCalls).toHaveLength(0);
-  });
+  describePromptMethod(
+    'getActiveReflectionPrompt',
+    'reflection',
+    makeReflectionManifest,
+    'REFLECT',
+  );
 });
 
 // ── Phase 2.1: writeSkillGuarded unit tests ───────────────────────────────────
 
 describe('PluginsService.writeSkillGuarded', () => {
   beforeEach(() => jest.restoreAllMocks());
-
-  const writable_manifest: PluginManifest = {
-    plugin: {
-      id: 'test-skill',
-      name: 'Test Skill',
-      version: '1.0.0',
-      type: 'skill',
-      llm_writable: true,
-    },
-  };
 
   const non_writable_manifest: PluginManifest = {
     plugin: { id: 'test-skill', name: 'Test Skill', version: '1.0.0', type: 'skill' },
@@ -856,22 +738,12 @@ import type { SkillSnapshotEntry } from './plugins.service';
 describe('F6-s5 Provenance — writeSkillGuarded KV snapshot and audit event include written_by + written_at', () => {
   beforeEach(() => jest.restoreAllMocks());
 
-  const writable_manifest_prov: PluginManifest = {
-    plugin: {
-      id: 'test-skill',
-      name: 'Test Skill',
-      version: '1.0.0',
-      type: 'skill',
-      llm_writable: true,
-    },
-  };
-
   it('prov.1 — KV snapshot entry has body, written_by:"llm", and written_at (ISO string)', async () => {
     const existingBody = 'a'.repeat(100);
     const newBody = 'b'.repeat(130);
 
     const { service, kv } = makeServiceWithKv({
-      manifest: writable_manifest_prov,
+      manifest: writable_manifest,
       skillBody: existingBody,
       kvValue: null,
     });
@@ -909,7 +781,7 @@ describe('F6-s5 Provenance — writeSkillGuarded KV snapshot and audit event inc
     const newBody = 'b'.repeat(130);
 
     const { service, audit } = makeServiceWithKv({
-      manifest: writable_manifest_prov,
+      manifest: writable_manifest,
       skillBody: existingBody,
       kvValue: null,
     });
@@ -950,7 +822,7 @@ describe('F6-s5 Provenance — writeSkillGuarded KV snapshot and audit event inc
 
     const { service, writeSkillContentMock } = makeServiceWithKv({
       kvValue: JSON.stringify([snapshotEntry]),
-      manifest: writable_manifest_prov,
+      manifest: writable_manifest,
     });
 
     const result = await service.revertSkill('test-skill');
@@ -966,7 +838,7 @@ describe('F6-s5 Provenance — writeSkillGuarded KV snapshot and audit event inc
 
     const { service, writeSkillContentMock } = makeServiceWithKv({
       kvValue: JSON.stringify([legacyBody]),
-      manifest: writable_manifest_prov,
+      manifest: writable_manifest,
     });
 
     const result = await service.revertSkill('test-skill');
@@ -1674,8 +1546,8 @@ describe('F3-s4 — KV weight override in getTrustReport (AC-6)', () => {
 
 import type { DebateRole } from '../agents/debate.types';
 
-// Reuse makeReflectionService factory — identical shape, no duplication.
-const makeDebateService = makeReflectionService;
+// Reuse makeService factory — identical shape, no duplication.
+const makeDebateService = makeService;
 
 const THREE_DEBATE_ROLES: PluginManifest['debate'] = {
   roles: [
@@ -1805,9 +1677,7 @@ describe('PluginsService.getActiveDebateRoles', () => {
     expect(traversalCalls).toHaveLength(0);
 
     readFileSyncSpy.mockReset();
-    (fs.readFileSync as jest.Mock).mockImplementation(
-      jest.requireActual<typeof import('fs')>('fs').readFileSync,
-    );
+    restoreReadFileSync();
   });
 
   it('f6s3-a4.1f — never throws', async () => {
@@ -1860,11 +1730,7 @@ describe('PluginsService.getProviderTools — plugin_type', () => {
     return service;
   }
 
-  afterEach(() => {
-    (fs.readFileSync as jest.Mock).mockImplementation(
-      jest.requireActual<typeof import('fs')>('fs').readFileSync,
-    );
-  });
+  afterEach(() => restoreReadFileSync());
 
   it('f6s4-p1.1 — provider plugin tools carry plugin_type "provider"', async () => {
     const service = makeGetProviderToolsService(

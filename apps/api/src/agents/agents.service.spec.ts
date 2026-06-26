@@ -3394,6 +3394,40 @@ function makeServiceWithPretest(
   );
 }
 
+function makeServiceWithoutPretest(
+  auditMock: ReturnType<typeof makeAudit>,
+  sandboxMock?: ReturnType<typeof makeSandbox>,
+): AgentsService {
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+  ) => AgentsService)(
+    {},
+    sandboxMock ?? makeSandbox(),
+    {
+      getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
+      getProviderTools: jest.fn().mockResolvedValue([]),
+      findActive: jest.fn().mockResolvedValue([]),
+      writeSkillGuarded: jest.fn(),
+    },
+    {},
+    auditMock,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+  );
+}
+
 /** Helper to call _dispatchKernelTool directly */
 async function callDispatchKernelTool(
   service: AgentsService,
@@ -3527,34 +3561,7 @@ describe('F4-S3 Task 1.5 — _dispatchKernelTool: create_pretest_variant', () =>
     // Build service WITHOUT pretest (undefined)
     const audit = makeAudit();
     const sandbox = makeSandbox();
-    const serviceNoPretest = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-    ) => AgentsService)(
-      {},
-      sandbox,
-      {
-        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
-        getProviderTools: jest.fn().mockResolvedValue([]),
-        findActive: jest.fn().mockResolvedValue([]),
-        writeSkillGuarded: jest.fn(),
-      },
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined, // pretest is undefined
-    );
+    const serviceNoPretest = makeServiceWithoutPretest(audit, sandbox);
 
     const tc: import('../llm/llm.service').ToolCallRequest = {
       plugin_id: 'kernel',
@@ -3623,34 +3630,7 @@ describe('F4-S3 Task 1.6 — _dispatchKernelTool: run_pretest_compare', () => {
   it('1.6b — pretest unavailable (undefined): allowed:false reason:pretest_unavailable, no throw', async () => {
     const audit = makeAudit();
     const sandbox = makeSandbox();
-    const serviceNoPretest = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-    ) => AgentsService)(
-      {},
-      sandbox,
-      {
-        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
-        getProviderTools: jest.fn().mockResolvedValue([]),
-        findActive: jest.fn().mockResolvedValue([]),
-        writeSkillGuarded: jest.fn(),
-      },
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-    );
+    const serviceNoPretest = makeServiceWithoutPretest(audit, sandbox);
 
     const tc: import('../llm/llm.service').ToolCallRequest = {
       plugin_id: 'kernel',
@@ -3945,34 +3925,7 @@ describe('F4-S4 Phase 3 — _dispatchKernelTool: promote_pretest', () => {
     const audit = makeAudit();
     // Build service WITHOUT pretest (undefined)
     const sandbox = makeSandbox();
-    const serviceNoPretest = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-    ) => AgentsService)(
-      {},
-      sandbox,
-      {
-        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
-        getProviderTools: jest.fn().mockResolvedValue([]),
-        findActive: jest.fn().mockResolvedValue([]),
-        writeSkillGuarded: jest.fn(),
-      },
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-    );
+    const serviceNoPretest = makeServiceWithoutPretest(audit, sandbox);
 
     const tc: import('../llm/llm.service').ToolCallRequest = {
       plugin_id: 'kernel',
@@ -4174,6 +4127,45 @@ function makeLlmKernelToolCall(fn: string, args: Record<string, unknown> = {}): 
   return { text, tool_calls: [], backend: 'api', skills_read: [], skills_written: [] };
 }
 
+/**
+ * Build an AgentsService with KvService injected as the 11th constructor arg.
+ * Used for ReAct loop tests that need direct access to mocks for assertions.
+ */
+function makeKvAgentsService(opts: {
+  llm: { complete: jest.Mock } | Partial<LlmService>;
+  kv: jest.Mocked<Pick<KvService, 'get'>> | null;
+  plugins?: ReturnType<typeof makeFullPlugins>;
+  sandbox?: jest.Mocked<Pick<SandboxGateway, 'callPlugin'>> | ReturnType<typeof makeFullSandbox>;
+  audit?: ReturnType<typeof makeAudit>;
+  memory?: Record<string, unknown> | ReturnType<typeof makeMemory>;
+}): AgentsService {
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+  ) => AgentsService)(
+    opts.llm,
+    opts.sandbox ?? { callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }) },
+    opts.plugins ?? makeFullPlugins(null, []),
+    opts.memory ?? {},
+    opts.audit ?? makeAudit(),
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    opts.kv,
+  );
+}
+
 // ── T1: maxTurns=1 ≡ current behavior (byte-identical decision path — REGRESSION GATE) ─
 
 describe('F6-S1 T1 — maxTurns=1 byte-identical to pre-loop behavior (REGRESSION GATE)', () => {
@@ -4185,31 +4177,7 @@ describe('F6-S1 T1 — maxTurns=1 byte-identical to pre-loop behavior (REGRESSIO
     const llmComplete = jest.fn().mockResolvedValue(llmResponse);
 
     const plugins = makeFullPlugins(null, []);
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      { complete: llmComplete },
-      { callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }) },
-      plugins,
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      kv,
-    );
+    const service = makeKvAgentsService({ llm: { complete: llmComplete }, kv, plugins, audit });
 
     const inputContext = 'market context for cycle';
     const result = await service.runGovernedTurn({
@@ -4265,31 +4233,13 @@ describe('F6-S1 T1 — maxTurns=1 byte-identical to pre-loop behavior (REGRESSIO
       callPlugin: jest.fn().mockResolvedValue({ ok: true, result: { filled: true } }),
     } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      { complete: llmComplete },
-      sandbox,
-      plugins,
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+    const service = makeKvAgentsService({
+      llm: { complete: llmComplete },
       kv,
-    );
+      plugins,
+      sandbox,
+      audit,
+    });
 
     const result = await service.runGovernedTurn({
       source: 'cycle',
@@ -4355,31 +4305,13 @@ describe('F6-S1 T2 — multi-iteration accumulation + observations fed forward',
       callPlugin: jest.fn().mockResolvedValue({ ok: true, result: { filled: true } }),
     } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      { complete: llmComplete },
-      sandbox,
-      plugins,
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+    const service = makeKvAgentsService({
+      llm: { complete: llmComplete },
       kv,
-    );
+      plugins,
+      sandbox,
+      audit,
+    });
 
     const result = await service.runGovernedTurn({
       source: 'cycle',
@@ -4419,31 +4351,7 @@ describe('F6-S1 T3 — natural exit on first iteration (no tool_calls)', () => {
 
     const llmComplete = jest.fn().mockResolvedValue(makeLlmText('just a text response'));
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      { complete: llmComplete },
-      { callPlugin: jest.fn().mockResolvedValue({ ok: true }) },
-      plugins,
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      kv,
-    );
+    const service = makeKvAgentsService({ llm: { complete: llmComplete }, kv, plugins, audit });
 
     const result = await service.runGovernedTurn({ source: 'chat', context: 'hello' });
 
@@ -4486,31 +4394,13 @@ describe('F6-S1 T4 — budget exhaustion: react_budget_exhausted emitted, NO gra
       callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
     } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      { complete: llmComplete },
-      sandbox,
-      plugins,
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+    const service = makeKvAgentsService({
+      llm: { complete: llmComplete },
       kv,
-    );
+      plugins,
+      sandbox,
+      audit,
+    });
 
     const result = await service.runGovernedTurn({
       source: 'cycle',
@@ -4579,31 +4469,13 @@ describe('F6-S1 T5 — control re-application: kernel dropped on non-reflection 
       callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
     } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      { complete: llmComplete },
-      sandbox,
-      plugins,
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+    const service = makeKvAgentsService({
+      llm: { complete: llmComplete },
       kv,
-    );
+      plugins,
+      sandbox,
+      audit,
+    });
 
     await service.runGovernedTurn({
       source: 'cycle',
@@ -4673,31 +4545,13 @@ describe('F6-S1 T6 — control re-application: provider dropped in virtual_only 
       Pick<SandboxGateway, 'callPlugin'>
     >;
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      { complete: llmComplete },
-      sandbox,
-      plugins,
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+    const service = makeKvAgentsService({
+      llm: { complete: llmComplete },
       kv,
-    );
+      plugins,
+      sandbox,
+      audit,
+    });
 
     await service.runGovernedTurn({
       source: 'pretest',
@@ -4731,33 +4585,7 @@ describe('F6-S1 T6 — control re-application: provider dropped in virtual_only 
 
 describe('F6-S1 T7 — _resolveMaxTurns clamp and fail-safe', () => {
   async function resolveMaxTurns(kv: jest.Mocked<Pick<KvService, 'get'>>): Promise<number> {
-    const plugins = makeFullPlugins(null, []);
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      {},
-      {},
-      plugins,
-      {},
-      { log: jest.fn().mockResolvedValue(undefined) },
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      kv,
-    );
-
+    const service = makeKvAgentsService({ llm: {}, kv });
     return (service as unknown as { _resolveMaxTurns: () => Promise<number> })._resolveMaxTurns();
   }
 
@@ -4844,31 +4672,13 @@ describe('F6-S1 T8 — termination: loop stops at maxTurns even with LLM always 
       callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
     } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      { complete: llmComplete },
-      sandbox,
-      plugins,
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+    const service = makeKvAgentsService({
+      llm: { complete: llmComplete },
       kv,
-    );
+      plugins,
+      sandbox,
+      audit,
+    });
 
     const result = await service.runGovernedTurn({
       source: 'cycle',
@@ -4893,31 +4703,7 @@ describe('F6-S1 T8 — termination: loop stops at maxTurns even with LLM always 
       .fn()
       .mockResolvedValue(makeLlmKernelToolCall('write_skill', { skill: 'x', new_body: 'y' }));
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      { complete: llmComplete },
-      { callPlugin: jest.fn().mockResolvedValue({ ok: true }) },
-      plugins,
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      kv,
-    );
+    const service = makeKvAgentsService({ llm: { complete: llmComplete }, kv, plugins, audit });
 
     const result = await service.runGovernedTurn({ source: 'cycle', context: 'ctx' });
 
@@ -4984,31 +4770,13 @@ describe('F6-S1 T9 — _composeIterationContext: context cap enforced', () => {
         .mockResolvedValue({ ok: true, result: { status: 'filled', details: 'x'.repeat(500) } }),
     } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      { complete: llmComplete },
-      sandbox,
-      plugins,
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+    const service = makeKvAgentsService({
+      llm: { complete: llmComplete },
       kv,
-    );
+      plugins,
+      sandbox,
+      audit,
+    });
 
     const baseContext = 'base context - short';
     const result = await service.runGovernedTurn({
@@ -5043,31 +4811,7 @@ describe('F6-S1 T9 — _composeIterationContext: context cap enforced', () => {
       return Promise.resolve(makeLlmText('done'));
     });
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      { complete: llmComplete },
-      { callPlugin: jest.fn().mockResolvedValue({ ok: true }) },
-      plugins,
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      kv,
-    );
+    const service = makeKvAgentsService({ llm: { complete: llmComplete }, kv, plugins, audit });
 
     const base = 'the original context text';
     await service.runGovernedTurn({ source: 'chat', context: base });
@@ -5485,31 +5229,7 @@ describe('F6-S1 T10 — existing suite regression: _executeCycle reads accumulat
     // Build service with kv null (default 4 turns), but LLM returns no-tool text on iter1 after executing once
     const kv = makeKv(null); // → maxTurns=4, but natural exit after iter1 execution
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
-      llm,
-      sandbox,
-      plugins,
-      memory,
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      kv,
-    );
+    const service = makeKvAgentsService({ llm, kv, plugins, sandbox, audit, memory });
 
     const result = await callExecuteCyclePrivate(service, 'react-cycle-001', 'run cycle');
 
@@ -7196,31 +6916,7 @@ describe('AgentsService._computeVisibleTools', () => {
     const kv: jest.Mocked<Pick<KvService, 'get'>> = {
       get: jest.fn().mockResolvedValue(null),
     };
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => GatingAgentsService)(
-      {},
-      {},
-      {},
-      {},
-      makeAudit(),
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      kv,
-    );
+    const service = makeKvAgentsService({ llm: {}, kv }) as unknown as GatingAgentsService;
 
     const tools = [kernelTool, skillTool]; // no provider tools
     const visible = await service._computeVisibleTools(tools);
@@ -7327,31 +7023,14 @@ describe('AgentsService.runGovernedTurn — tool gating (F6-S4)', () => {
 
     const audit = makeAudit();
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
+    const service = makeKvAgentsService({
       llm,
-      makeSandbox(),
-      plugins,
-      makeMemory(),
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
       kv,
-    );
+      plugins,
+      sandbox: makeSandbox(),
+      audit,
+      memory: makeMemory(),
+    });
 
     return { service, audit, capturedSchema };
   }
@@ -7616,31 +7295,13 @@ describe('F6-s5 Elevated-still-obeys-policy — (c) promoted plugin tool still h
       { id: 'promoted-provider', type: 'provider', name: 'Promoted Provider' },
     ] as never);
 
-    const service = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-      kv: unknown,
-    ) => AgentsService)(
+    const service = makeKvAgentsService({
       llm,
-      makeSandbox(),
-      plugins,
-      makeMemory(),
-      makeAudit(),
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
       kv,
-    );
+      plugins,
+      sandbox: makeSandbox(),
+      memory: makeMemory(),
+    });
 
     await service.runGovernedTurn({ source: 'cycle', context: 'run' });
 
@@ -7676,34 +7337,7 @@ describe('F6-s5 Elevated-still-obeys-policy — (d) promote() hard-checks gate +
       runAllActive: jest.fn(),
     };
 
-    const serviceWithGateFail = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-    ) => AgentsService)(
-      {},
-      makeSandbox(),
-      {
-        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
-        getProviderTools: jest.fn().mockResolvedValue([]),
-        findActive: jest.fn().mockResolvedValue([]),
-        writeSkillGuarded: jest.fn(),
-      },
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      pretestWithGateFail,
-    );
+    const serviceWithGateFail = makeServiceWithPretest(audit, pretestWithGateFail);
 
     const decisions: import('./agents.service').Decision[] = [];
     const sandboxResults: import('./agents.service').SandboxResult[] = [];
@@ -7742,34 +7376,7 @@ describe('F6-s5 Elevated-still-obeys-policy — (d) promote() hard-checks gate +
       runAllActive: jest.fn(),
     };
 
-    const serviceWithConfirmRequired = new (AgentsService as unknown as new (
-      llm: unknown,
-      sandbox: unknown,
-      plugins: unknown,
-      memory: unknown,
-      audit: unknown,
-      alerts: unknown,
-      snapshot: unknown,
-      cfg: unknown,
-      notifier: unknown,
-      pretest: unknown,
-    ) => AgentsService)(
-      {},
-      makeSandbox(),
-      {
-        getActiveDecisionPrompt: jest.fn().mockResolvedValue(null),
-        getProviderTools: jest.fn().mockResolvedValue([]),
-        findActive: jest.fn().mockResolvedValue([]),
-        writeSkillGuarded: jest.fn(),
-      },
-      {},
-      audit,
-      { createBulk: jest.fn().mockResolvedValue([]) },
-      undefined,
-      undefined,
-      undefined,
-      pretestWithNeedsConfirm,
-    );
+    const serviceWithConfirmRequired = makeServiceWithPretest(audit, pretestWithNeedsConfirm);
 
     const decisions: import('./agents.service').Decision[] = [];
     const sandboxResults: import('./agents.service').SandboxResult[] = [];

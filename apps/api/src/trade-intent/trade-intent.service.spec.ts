@@ -91,6 +91,61 @@ function pendingIntent(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * Typed wrapper for `expect.objectContaining` — avoids `@typescript-eslint/no-unsafe-assignment`
+ * caused by the `any` return type of `expect.objectContaining` in `@types/jest`.
+ */
+function oc<T extends object>(obj: T): T {
+  return expect.objectContaining(obj) as T;
+}
+
+/** Wire gateway.getQuote to return a standard AAPL quote (bid:149/ask:151/last:150). */
+function mockAaplQuote(gateway: MockGateway): void {
+  gateway.getQuote.mockResolvedValue({
+    symbol: 'AAPL',
+    bid: 149,
+    ask: 151,
+    last: 150,
+    ts: new Date().toISOString(),
+  });
+}
+
+/** Wire prisma.portfolio.findUnique to return an empty paper portfolio. */
+function mockPaperPortfolio(prisma: MockPrisma): void {
+  prisma.portfolio.findUnique.mockResolvedValue({
+    name: 'paper',
+    data: EMPTY_PORTFOLIO_DATA,
+    updatedAt: new Date(),
+  });
+}
+
+/**
+ * Wire the full common chain for approve / autoProcess happy-path tests:
+ * findUnique → portfolio → quote → upsert → update.
+ * Returns the mocked "executed" intent so callers can assert on it.
+ */
+function setupApproveScenario(
+  prisma: MockPrisma,
+  gateway: MockGateway,
+  intentOverrides: Record<string, unknown> = {},
+  executedOverrides: Record<string, unknown> = {},
+) {
+  const intent = pendingIntent(intentOverrides);
+  prisma.tradeIntent.findUnique.mockResolvedValue(intent);
+  mockPaperPortfolio(prisma);
+  mockAaplQuote(gateway);
+  prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}', updatedAt: new Date() });
+  const executed = pendingIntent({
+    status: 'executed',
+    fill_price: 150,
+    decided_by: 'alice',
+    decided_at: new Date(),
+    ...executedOverrides,
+  });
+  prisma.tradeIntent.update.mockResolvedValue(executed);
+  return executed;
+}
+
 // ── Test suite ────────────────────────────────────────────────────────────────
 
 describe('TradeIntentService', () => {
@@ -127,8 +182,8 @@ describe('TradeIntentService', () => {
       });
 
       expect(prisma.tradeIntent.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
+        oc({
+          data: oc({
             symbol: 'AAPL',
             action: 'long',
             confidence: 0.8,
@@ -157,9 +212,7 @@ describe('TradeIntentService', () => {
       });
 
       expect(prisma.tradeIntent.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ cycle_id: 'cycle_abc', timeframe: '4h' }),
-        }),
+        oc({ data: oc({ cycle_id: 'cycle_abc', timeframe: '4h' }) }),
       );
     });
 
@@ -176,23 +229,12 @@ describe('TradeIntentService', () => {
       expect(prisma.tradeIntent.create).not.toHaveBeenCalled();
     });
 
-    it('rejects confidence below 0', async () => {
+    it.each([-0.1, 1.5])('rejects confidence %s out of range', async (confidence) => {
       await expect(
         service.recordIntent({
           symbol: 'AAPL',
           action: 'long',
-          confidence: -0.1,
-          rationale: 'test',
-        }),
-      ).rejects.toThrow(/confidence/i);
-    });
-
-    it('rejects confidence above 1', async () => {
-      await expect(
-        service.recordIntent({
-          symbol: 'AAPL',
-          action: 'long',
-          confidence: 1.5,
+          confidence,
           rationale: 'test',
         }),
       ).rejects.toThrow(/confidence/i);
@@ -209,7 +251,7 @@ describe('TradeIntentService', () => {
       const result = await service.list();
 
       expect(prisma.tradeIntent.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ orderBy: { created_at: 'desc' } }),
+        oc({ orderBy: { created_at: 'desc' } }),
       );
       expect(result).toHaveLength(2);
     });
@@ -220,7 +262,7 @@ describe('TradeIntentService', () => {
       await service.list('pending');
 
       expect(prisma.tradeIntent.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { status: 'pending' } }),
+        oc({ where: { status: 'pending' } }),
       );
     });
   });
@@ -233,7 +275,7 @@ describe('TradeIntentService', () => {
       const result = await service.listPending();
 
       expect(prisma.tradeIntent.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { status: 'pending' } }),
+        oc({ where: { status: 'pending' } }),
       );
       expect(result).toHaveLength(2);
     });
@@ -245,32 +287,7 @@ describe('TradeIntentService', () => {
     it('default policy (real unset) → paper mode in approve even if intent.mode is "live"', async () => {
       // Effective mode comes from policy, not intent.mode. Default policy → paper.
       kv.get.mockResolvedValue(null);
-      const intent = pendingIntent({ mode: 'live', action: 'long' });
-      prisma.tradeIntent.findUnique.mockResolvedValue(intent);
-      prisma.portfolio.findUnique.mockResolvedValue({
-        name: 'paper',
-        data: EMPTY_PORTFOLIO_DATA,
-        updatedAt: new Date(),
-      });
-      gateway.getQuote.mockResolvedValue({
-        symbol: 'AAPL',
-        bid: 149,
-        ask: 151,
-        last: 150,
-        ts: new Date().toISOString(),
-      });
-      prisma.portfolio.upsert.mockResolvedValue({
-        name: 'paper',
-        data: '{}',
-        updatedAt: new Date(),
-      });
-      const updated = pendingIntent({
-        status: 'executed',
-        fill_price: 150,
-        decided_by: 'alice',
-        decided_at: new Date(),
-      });
-      prisma.tradeIntent.update.mockResolvedValue(updated);
+      setupApproveScenario(prisma, gateway, { mode: 'live', action: 'long' });
 
       const result = await service.approve('ti_001', 'alice');
       expect(result.status).toBe('executed');
@@ -286,41 +303,15 @@ describe('TradeIntentService', () => {
     });
 
     it('executes a paper LONG: fetches quote, opens position, status=executed', async () => {
-      const intent = pendingIntent(); // action=long, mode=paper
-      prisma.tradeIntent.findUnique.mockResolvedValue(intent);
-      prisma.portfolio.findUnique.mockResolvedValue({
-        name: 'paper',
-        data: EMPTY_PORTFOLIO_DATA,
-        updatedAt: new Date(),
-      });
-      gateway.getQuote.mockResolvedValue({
-        symbol: 'AAPL',
-        bid: 149,
-        ask: 151,
-        last: 150,
-        ts: new Date().toISOString(),
-      });
-      prisma.portfolio.upsert.mockResolvedValue({
-        name: 'paper',
-        data: '{}',
-        updatedAt: new Date(),
-      });
-
-      const updated = pendingIntent({
-        status: 'executed',
-        fill_price: 150,
-        decided_by: 'alice',
-        decided_at: new Date(),
-      });
-      prisma.tradeIntent.update.mockResolvedValue(updated);
+      setupApproveScenario(prisma, gateway); // action=long, mode=paper
 
       const result = await service.approve('ti_001', 'alice');
 
       expect(gateway.getQuote).toHaveBeenCalledWith(null, 'AAPL');
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
+        oc({
           where: { id: 'ti_001' },
-          data: expect.objectContaining({
+          data: oc({
             status: 'executed',
             fill_price: 150,
             decided_by: 'alice',
@@ -333,11 +324,7 @@ describe('TradeIntentService', () => {
     it('sets status=failed (no throw) when getQuote fails', async () => {
       const intent = pendingIntent();
       prisma.tradeIntent.findUnique.mockResolvedValue(intent);
-      prisma.portfolio.findUnique.mockResolvedValue({
-        name: 'paper',
-        data: EMPTY_PORTFOLIO_DATA,
-        updatedAt: new Date(),
-      });
+      mockPaperPortfolio(prisma);
       gateway.getQuote.mockRejectedValue(new Error('Network timeout'));
 
       const failed = pendingIntent({
@@ -350,9 +337,7 @@ describe('TradeIntentService', () => {
       const result = await service.approve('ti_001', 'alice');
 
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ status: 'failed' }),
-        }),
+        oc({ data: oc({ status: 'failed' }) }),
       );
       expect(result.status).toBe('failed');
     });
@@ -372,13 +357,7 @@ describe('TradeIntentService', () => {
         data: portfolioWithPosition,
         updatedAt: new Date(),
       });
-      gateway.getQuote.mockResolvedValue({
-        symbol: 'AAPL',
-        bid: 149,
-        ask: 151,
-        last: 150,
-        ts: new Date().toISOString(),
-      });
+      mockAaplQuote(gateway);
       prisma.portfolio.upsert.mockResolvedValue({
         name: 'paper',
         data: '{}',
@@ -399,12 +378,7 @@ describe('TradeIntentService', () => {
       const result = await service.approve('ti_001', 'alice');
 
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
-            status: 'executed',
-            realized_pnl: 100,
-          }),
-        }),
+        oc({ data: oc({ status: 'executed', realized_pnl: 100 }) }),
       );
       expect(result.realized_pnl).toBe(100);
     });
@@ -428,9 +402,9 @@ describe('TradeIntentService', () => {
       const result = await service.reject('ti_001', 'alice', 'Too risky');
 
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
+        oc({
           where: { id: 'ti_001' },
-          data: expect.objectContaining({
+          data: oc({
             status: 'rejected',
             decided_by: 'alice',
             reject_reason: 'Too risky',
@@ -461,18 +435,8 @@ describe('TradeIntentService', () => {
       prisma.tradeIntent.create.mockResolvedValue(created);
       // autoProcess calls findUnique after create
       prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent());
-      prisma.portfolio.findUnique.mockResolvedValue({
-        name: 'paper',
-        data: EMPTY_PORTFOLIO_DATA,
-        updatedAt: new Date(),
-      });
-      gateway.getQuote.mockResolvedValue({
-        symbol: 'AAPL',
-        bid: 149,
-        ask: 151,
-        last: 150,
-        ts: new Date().toISOString(),
-      });
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
       prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}' });
       const executedIntent = pendingIntent({ status: 'executed', decided_by: 'autonomous' });
       prisma.tradeIntent.update.mockResolvedValue(executedIntent);
@@ -486,9 +450,7 @@ describe('TradeIntentService', () => {
 
       expect(result.status).toBe('executed');
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ decided_by: 'autonomous' }),
-        }),
+        oc({ data: oc({ decided_by: 'autonomous' }) }),
       );
     });
 
@@ -520,11 +482,11 @@ describe('TradeIntentService', () => {
       expect(gateway.getQuote).not.toHaveBeenCalled();
       expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
+        oc({
+          data: oc({
             status: 'rejected',
             decided_by: 'autonomous',
-            reject_reason: expect.stringMatching(/circuit|drawdown/i),
+            reject_reason: expect.stringMatching(/circuit|drawdown/i) as string,
           }),
         }),
       );
@@ -557,11 +519,11 @@ describe('TradeIntentService', () => {
 
       expect(gateway.getQuote).not.toHaveBeenCalled();
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
+        oc({
+          data: oc({
             status: 'rejected',
             decided_by: 'autonomous',
-            reject_reason: expect.stringMatching(/max open positions|positions/i),
+            reject_reason: expect.stringMatching(/max open positions|positions/i) as string,
           }),
         }),
       );
@@ -577,11 +539,7 @@ describe('TradeIntentService', () => {
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
       );
-      prisma.portfolio.findUnique.mockResolvedValue({
-        name: 'paper',
-        data: EMPTY_PORTFOLIO_DATA, // equity=10000, cash=10000, positions=[]
-        updatedAt: new Date(),
-      });
+      mockPaperPortfolio(prisma); // equity=10000, cash=10000, positions=[]
       gateway.getQuote.mockResolvedValue({
         symbol: 'AAPL',
         bid: 99,
@@ -600,11 +558,7 @@ describe('TradeIntentService', () => {
       await service.autoProcess('ti_001');
 
       // qty = floor(10000 * 0.05 / 100) = floor(5) = 5
-      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ quantity: 5 }),
-        }),
-      );
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(oc({ data: oc({ quantity: 5 }) }));
     });
 
     it('action "exit" auto-approved even at max positions and max drawdown', async () => {
@@ -652,11 +606,7 @@ describe('TradeIntentService', () => {
       kv.get.mockResolvedValue(null); // autonomous=true
 
       prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'hold' }));
-      prisma.portfolio.findUnique.mockResolvedValue({
-        name: 'paper',
-        data: EMPTY_PORTFOLIO_DATA,
-        updatedAt: new Date(),
-      });
+      mockPaperPortfolio(prisma);
       const executedIntent = pendingIntent({
         status: 'executed',
         quantity: 0,
@@ -710,11 +660,7 @@ describe('TradeIntentService', () => {
       kv.get.mockResolvedValue(null); // autonomous=true
 
       prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
-      prisma.portfolio.findUnique.mockResolvedValue({
-        name: 'paper',
-        data: EMPTY_PORTFOLIO_DATA,
-        updatedAt: new Date(),
-      });
+      mockPaperPortfolio(prisma);
       gateway.getQuote.mockRejectedValue(new Error('Network timeout'));
       const failedIntent = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
       prisma.tradeIntent.update.mockResolvedValue(failedIntent);
@@ -724,9 +670,7 @@ describe('TradeIntentService', () => {
 
       expect(result.status).toBe('failed');
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ status: 'failed' }),
-        }),
+        oc({ data: oc({ status: 'failed' }) }),
       );
       expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
     });
@@ -750,23 +694,26 @@ describe('TradeIntentService', () => {
       });
     }
 
-    it('default policy (real unset) → effective mode=paper, placeOrder NEVER called', async () => {
-      // All KV keys return null → real=false → paper path
-      kv.get.mockResolvedValue(null);
+    it.each([
+      [
+        'default policy (real unset) → effective mode=paper, placeOrder NEVER called',
+        () => kv.get.mockResolvedValue(null),
+      ],
+      [
+        'real=true but broker_plugin_id empty → effective mode=paper, placeOrder NOT called',
+        () =>
+          kv.get.mockImplementation((key: string) => {
+            if (key === 'execution.real') return Promise.resolve('true');
+            if (key === 'execution.broker_plugin_id') return Promise.resolve(''); // empty!
+            return Promise.resolve(null);
+          }),
+      ],
+    ])('%s', async (_label, setupKv) => {
+      setupKv();
 
       prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
-      prisma.portfolio.findUnique.mockResolvedValue({
-        name: 'paper',
-        data: EMPTY_PORTFOLIO_DATA,
-        updatedAt: new Date(),
-      });
-      gateway.getQuote.mockResolvedValue({
-        symbol: 'AAPL',
-        bid: 149,
-        ask: 151,
-        last: 150,
-        ts: new Date().toISOString(),
-      });
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
       prisma.portfolio.upsert.mockResolvedValue({
         name: 'paper',
         data: '{}',
@@ -785,58 +732,13 @@ describe('TradeIntentService', () => {
       expect(prisma.portfolio.upsert).toHaveBeenCalled(); // paper portfolio updated
     });
 
-    it('real=true but broker_plugin_id empty → effective mode=paper, placeOrder NOT called', async () => {
-      // Safety: real without broker must NEVER fire
-      kv.get.mockImplementation((key: string) => {
-        if (key === 'execution.real') return Promise.resolve('true');
-        if (key === 'execution.broker_plugin_id') return Promise.resolve(''); // empty!
-        return Promise.resolve(null);
-      });
-
-      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
-      prisma.portfolio.findUnique.mockResolvedValue({
-        name: 'paper',
-        data: EMPTY_PORTFOLIO_DATA,
-        updatedAt: new Date(),
-      });
-      gateway.getQuote.mockResolvedValue({
-        symbol: 'AAPL',
-        bid: 149,
-        ask: 151,
-        last: 150,
-        ts: new Date().toISOString(),
-      });
-      prisma.portfolio.upsert.mockResolvedValue({
-        name: 'paper',
-        data: '{}',
-        updatedAt: new Date(),
-      });
-      const executed = pendingIntent({
-        status: 'executed',
-        fill_price: 150,
-        decided_by: 'autonomous',
-      });
-      prisma.tradeIntent.update.mockResolvedValue(executed);
-
-      await service.autoProcess('ti_001');
-
-      expect(gateway.placeOrder).not.toHaveBeenCalled();
-      expect(prisma.portfolio.upsert).toHaveBeenCalled(); // still paper
-    });
-
     it('real=true + broker set → autoProcess long calls placeOrder with side=buy, type=market, qty>0, status=executed', async () => {
       enableReal(kv); // real=true, broker='alpaca-provider', max_order_notional=1000
       // qty = floor(10000 * 0.1 / 150) = floor(6.66) = 6; notional = 6*150 = 900 <= 1000 ✓
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
       );
-      gateway.getQuote.mockResolvedValue({
-        symbol: 'AAPL',
-        bid: 149,
-        ask: 151,
-        last: 150,
-        ts: new Date().toISOString(),
-      });
+      mockAaplQuote(gateway);
       gateway.placeOrder.mockResolvedValue({
         id: 'order_123',
         status: 'accepted',
@@ -854,16 +756,16 @@ describe('TradeIntentService', () => {
 
       expect(gateway.placeOrder).toHaveBeenCalledWith(
         'alpaca-provider',
-        expect.objectContaining({
+        oc({
           symbol: 'AAPL',
-          qty: expect.any(Number),
+          qty: expect.any(Number) as number,
           side: 'buy',
           type: 'market',
         }),
       );
       // qty must be > 0
-      const callArgs = gateway.placeOrder.mock.calls[0][1] as { qty: number };
-      expect(callArgs.qty).toBeGreaterThan(0);
+      const [[, placeOrderArg]] = gateway.placeOrder.mock.calls as [[unknown, { qty: number }]];
+      expect(placeOrderArg.qty).toBeGreaterThan(0);
       expect(result.status).toBe('executed');
       // Paper portfolio must NOT be upserted in real mode
       expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
@@ -881,13 +783,7 @@ describe('TradeIntentService', () => {
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
       );
-      gateway.getQuote.mockResolvedValue({
-        symbol: 'AAPL',
-        bid: 149,
-        ask: 151,
-        last: 150,
-        ts: new Date().toISOString(),
-      });
+      mockAaplQuote(gateway);
       const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
       prisma.tradeIntent.update.mockResolvedValue(failed);
 
@@ -896,10 +792,10 @@ describe('TradeIntentService', () => {
       expect(gateway.placeOrder).not.toHaveBeenCalled();
       expect(result.status).toBe('failed');
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
+        oc({
+          data: oc({
             status: 'failed',
-            result_json: expect.stringContaining('max_order_notional'),
+            result_json: expect.stringContaining('max_order_notional') as string,
           }),
         }),
       );
@@ -910,13 +806,7 @@ describe('TradeIntentService', () => {
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
       );
-      gateway.getQuote.mockResolvedValue({
-        symbol: 'AAPL',
-        bid: 149,
-        ask: 151,
-        last: 150,
-        ts: new Date().toISOString(),
-      });
+      mockAaplQuote(gateway);
       gateway.placeOrder.mockRejectedValue(new Error('Broker connection refused'));
       const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
       prisma.tradeIntent.update.mockResolvedValue(failed);
@@ -926,10 +816,10 @@ describe('TradeIntentService', () => {
 
       expect(result.status).toBe('failed');
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
+        oc({
+          data: oc({
             status: 'failed',
-            result_json: expect.stringContaining('Broker connection refused'),
+            result_json: expect.stringContaining('Broker connection refused') as string,
           }),
         }),
       );
@@ -946,13 +836,7 @@ describe('TradeIntentService', () => {
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'exit', symbol: 'AAPL' }),
       );
-      gateway.getQuote.mockResolvedValue({
-        symbol: 'AAPL',
-        bid: 149,
-        ask: 151,
-        last: 150,
-        ts: new Date().toISOString(),
-      });
+      mockAaplQuote(gateway);
       // For exit in real mode, we look up held qty from the paper portfolio to know how many to sell
       prisma.portfolio.findUnique.mockResolvedValue({
         name: 'paper',
@@ -976,12 +860,7 @@ describe('TradeIntentService', () => {
 
       expect(gateway.placeOrder).toHaveBeenCalledWith(
         'alpaca-provider',
-        expect.objectContaining({
-          symbol: 'AAPL',
-          side: 'sell',
-          qty: 10,
-          type: 'market',
-        }),
+        oc({ symbol: 'AAPL', side: 'sell', qty: 10, type: 'market' }),
       );
     });
 
@@ -1012,9 +891,7 @@ describe('TradeIntentService', () => {
       expect(gateway.getQuote).not.toHaveBeenCalled();
       expect(gateway.placeOrder).not.toHaveBeenCalled();
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ status: 'rejected' }),
-        }),
+        oc({ data: oc({ status: 'rejected' }) }),
       );
     });
 

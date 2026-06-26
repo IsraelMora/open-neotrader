@@ -120,6 +120,106 @@ function makeService(
   );
 }
 
+// ── Private-method cast helper ─────────────────────────────────────────────────
+type PrivateMethods = {
+  _simulateFills: (
+    tc: unknown[],
+    s: PretestState,
+    policy?: PretestPolicy,
+  ) => Promise<PretestTrade[]>;
+  _updateEquityMetrics: (s: PretestState) => Promise<void>;
+  _applyTrades: (s: PretestState, trades: PretestTrade[]) => PretestState;
+  _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+  _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+  _readPolicy: (p: import('./pretest.service').PretestPortfolio) => PretestPolicy;
+  _readGateThresholds: () => Promise<{
+    min_trades: number;
+    min_sharpe: number;
+    max_dd_pct: number;
+    min_loss_trades: number;
+  }>;
+  _recomputePluginReputations: (ids: string[]) => Promise<void>;
+  computeSignificance: (s: PretestState) => {
+    sharpe: number;
+    profit_factor: number | null;
+    win_rate: number;
+    max_dd: number;
+    n_trades: number;
+  };
+};
+
+function asPrivate(svc: PretestService): PrivateMethods {
+  return svc as unknown as PrivateMethods;
+}
+
+const DEFAULT_GATEWAY = makeGateway(() => Promise.resolve(makeQuote('AAPL', 100)));
+
+function makePortfolioRow(
+  id: string,
+  stateObj: PretestState,
+  overrides: {
+    name?: string;
+    initial_capital?: number;
+    plugin_ids?: string[];
+    plugin_configs?: Record<string, unknown>;
+    run_count?: number;
+  } = {},
+) {
+  return {
+    id,
+    name: overrides.name ?? `Portfolio ${id}`,
+    description: null,
+    initial_capital: overrides.initial_capital ?? 10_000,
+    plugin_ids: JSON.stringify(overrides.plugin_ids ?? []),
+    plugin_configs: JSON.stringify(overrides.plugin_configs ?? {}),
+    state: JSON.stringify(stateObj),
+    run_count: overrides.run_count ?? stateObj.trades.length,
+    last_run_at: null,
+    is_active: true,
+    created_at: new Date(),
+    updated_at: new Date(),
+  };
+}
+
+function makeTrade(overrides: Partial<PretestTrade> = {}): PretestTrade {
+  return {
+    ts: new Date().toISOString(),
+    symbol: 'AAPL',
+    action: 'buy',
+    price: 100,
+    quantity: 10,
+    ...overrides,
+  };
+}
+
+function makePortfolioWithPolicy(
+  policyOverrides: Record<string, unknown> = {},
+): import('./pretest.service').PretestPortfolio {
+  return {
+    plugin_configs: Object.keys(policyOverrides).length
+      ? { __pretest_policy__: policyOverrides }
+      : {},
+  } as unknown as import('./pretest.service').PretestPortfolio;
+}
+
+/** Factory for gate/compare/alpha tests: wires 9 args with stub stubs. */
+function makeGateService(
+  db: import('../prisma/prisma.service').PrismaService,
+  kv?: KvService,
+): PretestService {
+  return new PretestService(
+    db,
+    {} as unknown as SandboxGateway,
+    {} as unknown as PluginsService,
+    {} as unknown as LlmService,
+    {} as unknown as ContextMemoryService,
+    DEFAULT_GATEWAY,
+    makeStubAgents(),
+    kv ?? makeStubKv(),
+    makeStubAudit(),
+  );
+}
+
 // ── Phase 1.1: RED tests — fills use getQuote.last ────────────────────────────
 
 describe('PretestService._simulateFills (Phase 1)', () => {
@@ -133,11 +233,10 @@ describe('PretestService._simulateFills (Phase 1)', () => {
       const svc = makeService(gateway);
       const state = makeState();
 
-      const trades = await (
-        svc as unknown as {
-          _simulateFills: (tc: unknown[], s: PretestState) => Promise<PretestTrade[]>;
-        }
-      )._simulateFills([makeToolCall('AAPL', 'buy', { price: LLM_PRICE })], state);
+      const trades = await asPrivate(svc)._simulateFills(
+        [makeToolCall('AAPL', 'buy', { price: LLM_PRICE })],
+        state,
+      );
 
       expect(trades).toHaveLength(1);
       expect(trades[0].price).toBe(QUOTE_LAST);
@@ -157,11 +256,7 @@ describe('PretestService._simulateFills (Phase 1)', () => {
         cash: 5_000,
       });
 
-      const trades = await (
-        svc as unknown as {
-          _simulateFills: (tc: unknown[], s: PretestState) => Promise<PretestTrade[]>;
-        }
-      )._simulateFills([makeToolCall('TSLA', 'sell')], state);
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('TSLA', 'sell')], state);
 
       expect(trades).toHaveLength(1);
       expect(trades[0].price).toBe(QUOTE_LAST);
@@ -175,11 +270,7 @@ describe('PretestService._simulateFills (Phase 1)', () => {
       const svc = makeService(gateway);
       const state = makeState();
 
-      const trades = await (
-        svc as unknown as {
-          _simulateFills: (tc: unknown[], s: PretestState) => Promise<PretestTrade[]>;
-        }
-      )._simulateFills([makeToolCall('ETH', 'buy')], state);
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('ETH', 'buy')], state);
 
       expect(trades).toHaveLength(0);
     });
@@ -204,9 +295,7 @@ describe('PretestService._updateEquityMetrics (Phase 1)', () => {
         positions: [{ symbol: 'AAPL', quantity: QTY, avg_price: AVG_PRICE }],
       });
 
-      await (
-        svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
-      )._updateEquityMetrics(state);
+      await asPrivate(svc)._updateEquityMetrics(state);
 
       // current_price updated to market value
       expect(state.positions[0].current_price).toBe(MARKET_PRICE);
@@ -224,9 +313,7 @@ describe('PretestService._updateEquityMetrics (Phase 1)', () => {
         positions: [{ symbol: 'MSFT', quantity: 5, avg_price: 100 }],
       });
 
-      await (
-        svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
-      )._updateEquityMetrics(state);
+      await asPrivate(svc)._updateEquityMetrics(state);
 
       expect(state.positions[0].current_price).toBe(140);
       expect(state.positions[0].unrealized_pnl).toBeCloseTo(200); // (140-100)*5
@@ -242,9 +329,7 @@ describe('PretestService._updateEquityMetrics (Phase 1)', () => {
         max_equity: 1_000, // peak was 1000
       });
 
-      await (
-        svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
-      )._updateEquityMetrics(state);
+      await asPrivate(svc)._updateEquityMetrics(state);
 
       // equity = 0 + 80*10 = 800; dd = (1000-800)/1000*100 = 20%
       expect(state.max_drawdown_pct).toBeCloseTo(20);
@@ -260,11 +345,7 @@ describe('PretestService._updateEquityMetrics (Phase 1)', () => {
         positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 100, current_price: 95 }],
       });
 
-      await expect(
-        (
-          svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
-        )._updateEquityMetrics(state),
-      ).resolves.not.toThrow();
+      await expect(asPrivate(svc)._updateEquityMetrics(state)).resolves.not.toThrow();
 
       // Fallback to last-known current_price = 95
       expect(state.positions[0].current_price).toBe(95);
@@ -280,11 +361,7 @@ describe('PretestService._updateEquityMetrics (Phase 1)', () => {
         // no current_price set
       });
 
-      await expect(
-        (
-          svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
-        )._updateEquityMetrics(state),
-      ).resolves.not.toThrow();
+      await expect(asPrivate(svc)._updateEquityMetrics(state)).resolves.not.toThrow();
 
       // Fallback to avg_price = 30000
       expect(state.positions[0].current_price).toBe(30_000);
@@ -316,17 +393,11 @@ describe('PretestService — cost-basis tests updated for MTM (spec backward-com
     };
 
     // Apply trade sync, then update MTM async
-    const stateAfterTrade = (
-      svc as unknown as {
-        _applyTrades: (s: PretestState, trades: PretestTrade[]) => PretestState;
-      }
-    )._applyTrades(initialState, [buyTrade]);
+    const stateAfterTrade = asPrivate(svc)._applyTrades(initialState, [buyTrade]);
 
     // At this point _applyTrades calls _updateEquityMetrics synchronously in old code,
     // but after refactor it must be awaited. In the new async model we call it separately:
-    await (
-      svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
-    )._updateEquityMetrics(stateAfterTrade);
+    await asPrivate(svc)._updateEquityMetrics(stateAfterTrade);
 
     // After buy: cash = 10000 - 100*10 = 9000; MTM equity = 9000 + 110*10 = 10100
     // NOT cost-basis equity = 9000 + 100*10 = 10000
@@ -356,9 +427,7 @@ describe('PretestService._updateEquityMetrics — zero-quote guard (fix 1)', () 
         positions: [{ symbol: 'AAPL', quantity: QTY, avg_price: AVG, current_price: LAST_KNOWN }],
       });
 
-      await (
-        svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
-      )._updateEquityMetrics(state);
+      await asPrivate(svc)._updateEquityMetrics(state);
 
       // Must NOT use 0 as price — must fall back to current_price = 95
       expect(state.positions[0].current_price).toBe(LAST_KNOWN);
@@ -379,9 +448,7 @@ describe('PretestService._updateEquityMetrics — zero-quote guard (fix 1)', () 
         positions: [{ symbol: 'TSLA', quantity: QTY, avg_price: AVG }],
       });
 
-      await (
-        svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
-      )._updateEquityMetrics(state);
+      await asPrivate(svc)._updateEquityMetrics(state);
 
       // Must fall back to avg_price = 200
       expect(state.positions[0].current_price).toBe(AVG);
@@ -400,9 +467,7 @@ describe('PretestService._updateEquityMetrics — zero-quote guard (fix 1)', () 
         positions: [{ symbol: SYMBOL, quantity: 1, avg_price: 100 }],
       });
 
-      await (
-        svc as unknown as { _updateEquityMetrics: (s: PretestState) => Promise<void> }
-      )._updateEquityMetrics(state);
+      await asPrivate(svc)._updateEquityMetrics(state);
 
       // eslint-disable-next-line @typescript-eslint/unbound-method
       expect(gateway.getQuote).toHaveBeenCalledWith(null, SYMBOL);
@@ -423,13 +488,9 @@ describe('PretestService._readPolicy (Phase 2)', () => {
     it('returns { sizing_pct:0.05, slippage_pct:0, commission_pct:0 } when plugin_configs has no policy key', () => {
       const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: {},
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy();
 
-      const policy = (
-        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
-      )._readPolicy(portfolio);
+      const policy = asPrivate(svc)._readPolicy(portfolio);
 
       expect(policy).toEqual({ sizing_pct: 0.05, slippage_pct: 0, commission_pct: 0 });
     });
@@ -439,13 +500,9 @@ describe('PretestService._readPolicy (Phase 2)', () => {
     it('overrides sizing_pct and leaves others at default', () => {
       const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: { __pretest_policy__: { sizing_pct: 0.1 } },
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy({ sizing_pct: 0.1 });
 
-      const policy = (
-        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
-      )._readPolicy(portfolio);
+      const policy = asPrivate(svc)._readPolicy(portfolio);
 
       expect(policy.sizing_pct).toBeCloseTo(0.1);
       expect(policy.slippage_pct).toBe(0);
@@ -455,13 +512,9 @@ describe('PretestService._readPolicy (Phase 2)', () => {
     it('clamps sizing_pct to (0, 1]: value 0 is clamped to a minimum positive value', () => {
       const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: { __pretest_policy__: { sizing_pct: 0 } },
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy({ sizing_pct: 0 });
 
-      const policy = (
-        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
-      )._readPolicy(portfolio);
+      const policy = asPrivate(svc)._readPolicy(portfolio);
 
       expect(policy.sizing_pct).toBeGreaterThan(0);
     });
@@ -469,13 +522,9 @@ describe('PretestService._readPolicy (Phase 2)', () => {
     it('clamps slippage_pct to [0, 1]: negative becomes 0', () => {
       const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: { __pretest_policy__: { slippage_pct: -0.5 } },
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy({ slippage_pct: -0.5 });
 
-      const policy = (
-        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
-      )._readPolicy(portfolio);
+      const policy = asPrivate(svc)._readPolicy(portfolio);
 
       expect(policy.slippage_pct).toBe(0);
     });
@@ -483,13 +532,9 @@ describe('PretestService._readPolicy (Phase 2)', () => {
     it('clamps commission_pct to [0, 1]: value > 1 becomes 1', () => {
       const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: { __pretest_policy__: { commission_pct: 5 } },
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy({ commission_pct: 5 });
 
-      const policy = (
-        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
-      )._readPolicy(portfolio);
+      const policy = asPrivate(svc)._readPolicy(portfolio);
 
       expect(policy.commission_pct).toBe(1);
     });
@@ -497,13 +542,9 @@ describe('PretestService._readPolicy (Phase 2)', () => {
     it('coerces string numbers to numeric values', () => {
       const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: { __pretest_policy__: { sizing_pct: '0.10', commission_pct: '0.001' } },
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy({ sizing_pct: '0.10', commission_pct: '0.001' });
 
-      const policy = (
-        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
-      )._readPolicy(portfolio);
+      const policy = asPrivate(svc)._readPolicy(portfolio);
 
       expect(policy.sizing_pct).toBeCloseTo(0.1);
       expect(policy.commission_pct).toBeCloseTo(0.001);
@@ -518,25 +559,13 @@ describe('PretestService._readPolicy (Phase 2)', () => {
       // sizing_pct=0.05 (old) → budget=500 → qty=5
       const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', PRICE)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: { __pretest_policy__: { sizing_pct: 0.1 } },
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy({ sizing_pct: 0.1 });
       const state = makeState({ cash: CASH });
 
-      const trades = await (
-        svc as unknown as {
-          _simulateFills: (
-            tc: unknown[],
-            s: PretestState,
-            policy: PretestPolicy,
-          ) => Promise<PretestTrade[]>;
-        }
-      )._simulateFills(
+      const trades = await asPrivate(svc)._simulateFills(
         [makeToolCall('AAPL', 'buy')],
         state,
-        (svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy })._readPolicy(
-          portfolio,
-        ),
+        asPrivate(svc)._readPolicy(portfolio),
       );
 
       expect(trades).toHaveLength(1);
@@ -549,25 +578,13 @@ describe('PretestService._readPolicy (Phase 2)', () => {
       const CASH = 10_000;
       const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', PRICE)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: {},
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy();
       const state = makeState({ cash: CASH });
 
-      const trades = await (
-        svc as unknown as {
-          _simulateFills: (
-            tc: unknown[],
-            s: PretestState,
-            policy: PretestPolicy,
-          ) => Promise<PretestTrade[]>;
-        }
-      )._simulateFills(
+      const trades = await asPrivate(svc)._simulateFills(
         [makeToolCall('AAPL', 'buy')],
         state,
-        (svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy })._readPolicy(
-          portfolio,
-        ),
+        asPrivate(svc)._readPolicy(portfolio),
       );
 
       expect(trades).toHaveLength(1);
@@ -582,25 +599,13 @@ describe('PretestService._readPolicy (Phase 2)', () => {
       const SLIPPAGE = 0.01; // 1%
       const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', LAST)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: { __pretest_policy__: { slippage_pct: SLIPPAGE } },
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy({ slippage_pct: SLIPPAGE });
       const state = makeState({ cash: 10_000 });
 
-      const trades = await (
-        svc as unknown as {
-          _simulateFills: (
-            tc: unknown[],
-            s: PretestState,
-            policy: PretestPolicy,
-          ) => Promise<PretestTrade[]>;
-        }
-      )._simulateFills(
+      const trades = await asPrivate(svc)._simulateFills(
         [makeToolCall('AAPL', 'buy')],
         state,
-        (svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy })._readPolicy(
-          portfolio,
-        ),
+        asPrivate(svc)._readPolicy(portfolio),
       );
 
       expect(trades).toHaveLength(1);
@@ -613,28 +618,16 @@ describe('PretestService._readPolicy (Phase 2)', () => {
       const SLIPPAGE = 0.005; // 0.5%
       const gateway = makeGateway(() => Promise.resolve(makeQuote('TSLA', LAST)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: { __pretest_policy__: { slippage_pct: SLIPPAGE } },
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy({ slippage_pct: SLIPPAGE });
       const state = makeState({
         cash: 5_000,
         positions: [{ symbol: 'TSLA', quantity: 5, avg_price: 180 }],
       });
 
-      const trades = await (
-        svc as unknown as {
-          _simulateFills: (
-            tc: unknown[],
-            s: PretestState,
-            policy: PretestPolicy,
-          ) => Promise<PretestTrade[]>;
-        }
-      )._simulateFills(
+      const trades = await asPrivate(svc)._simulateFills(
         [makeToolCall('TSLA', 'sell')],
         state,
-        (svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy })._readPolicy(
-          portfolio,
-        ),
+        asPrivate(svc)._readPolicy(portfolio),
       );
 
       expect(trades).toHaveLength(1);
@@ -646,25 +639,13 @@ describe('PretestService._readPolicy (Phase 2)', () => {
       const LAST = 150;
       const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', LAST)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: {},
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy();
       const state = makeState({ cash: 10_000 });
 
-      const trades = await (
-        svc as unknown as {
-          _simulateFills: (
-            tc: unknown[],
-            s: PretestState,
-            policy: PretestPolicy,
-          ) => Promise<PretestTrade[]>;
-        }
-      )._simulateFills(
+      const trades = await asPrivate(svc)._simulateFills(
         [makeToolCall('AAPL', 'buy')],
         state,
-        (svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy })._readPolicy(
-          portfolio,
-        ),
+        asPrivate(svc)._readPolicy(portfolio),
       );
 
       expect(trades).toHaveLength(1);
@@ -684,19 +665,9 @@ describe('PretestService._readPolicy (Phase 2)', () => {
       const INITIAL_CASH = 10_000;
       const state = makeState({ cash: INITIAL_CASH });
 
-      const trade: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'AAPL',
-        action: 'buy',
-        price: FILL_PRICE,
-        quantity: QTY,
-      };
+      const trade = makeTrade({ price: FILL_PRICE, quantity: QTY });
 
-      (
-        svc as unknown as {
-          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-        }
-      )._applyBuy(state, trade, COMMISSION);
+      asPrivate(svc)._applyBuy(state, trade, COMMISSION);
 
       const cost = FILL_PRICE * QTY; // 500
       // cash = 10000 - cost - cost * commission_pct = 10000 - 500 - 0.5 = 9499.5
@@ -716,19 +687,9 @@ describe('PretestService._readPolicy (Phase 2)', () => {
         positions: [{ symbol: 'TSLA', quantity: QTY, avg_price: 180 }],
       });
 
-      const trade: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'TSLA',
-        action: 'sell',
-        price: FILL_PRICE,
-        quantity: QTY,
-      };
+      const trade = makeTrade({ symbol: 'TSLA', action: 'sell', price: FILL_PRICE, quantity: QTY });
 
-      (
-        svc as unknown as {
-          _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-        }
-      )._applySell(state, trade, COMMISSION);
+      asPrivate(svc)._applySell(state, trade, COMMISSION);
 
       const proceeds = FILL_PRICE * QTY; // 1000
       // cash = 5000 + proceeds - proceeds * commission_pct = 5000 + 1000 - 1 = 5999
@@ -744,19 +705,9 @@ describe('PretestService._readPolicy (Phase 2)', () => {
       const INITIAL_CASH = 10_000;
       const state = makeState({ cash: INITIAL_CASH });
 
-      const trade: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'AAPL',
-        action: 'buy',
-        price: FILL_PRICE,
-        quantity: QTY,
-      };
+      const trade = makeTrade({ price: FILL_PRICE, quantity: QTY });
 
-      (
-        svc as unknown as {
-          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-        }
-      )._applyBuy(state, trade, 0);
+      asPrivate(svc)._applyBuy(state, trade, 0);
 
       const cost = FILL_PRICE * QTY; // 500
       // cash = 10000 - 500 = 9500 (same as before)
@@ -779,19 +730,9 @@ describe('PretestService._readPolicy (Phase 2)', () => {
         realized_pnl: 0,
       });
 
-      const trade: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'TSLA',
-        action: 'sell',
-        price: FILL_PRICE,
-        quantity: QTY,
-      };
+      const trade = makeTrade({ symbol: 'TSLA', action: 'sell', price: FILL_PRICE, quantity: QTY });
 
-      (
-        svc as unknown as {
-          _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-        }
-      )._applySell(state, trade, COMMISSION);
+      asPrivate(svc)._applySell(state, trade, COMMISSION);
 
       const proceeds = FILL_PRICE * QTY; // 1000
       const gross_pnl = (FILL_PRICE - AVG_PRICE) * QTY; // (200-180)*5 = 100
@@ -813,19 +754,9 @@ describe('PretestService._readPolicy (Phase 2)', () => {
         realized_pnl: 0,
       });
 
-      const trade: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'TSLA',
-        action: 'sell',
-        price: FILL_PRICE,
-        quantity: QTY,
-      };
+      const trade = makeTrade({ symbol: 'TSLA', action: 'sell', price: FILL_PRICE, quantity: QTY });
 
-      (
-        svc as unknown as {
-          _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-        }
-      )._applySell(state, trade, 0);
+      asPrivate(svc)._applySell(state, trade, 0);
 
       const gross_pnl = (FILL_PRICE - AVG_PRICE) * QTY; // 100
       expect(state.realized_pnl).toBeCloseTo(gross_pnl);
@@ -856,26 +787,10 @@ describe('PretestService._applyTrades — ghost-trade guard (fix 2)', () => {
       const svc = makeService(gateway);
       const state = makeState({ cash: 600 });
 
-      const trade1: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'AAPL',
-        action: 'buy',
-        price: 500,
-        quantity: 1,
-      };
-      const trade2: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'MSFT',
-        action: 'buy',
-        price: 200,
-        quantity: 1, // cost=200 > remaining cash=100 after trade1 → should be rejected
-      };
+      const trade1 = makeTrade({ price: 500, quantity: 1 });
+      const trade2 = makeTrade({ symbol: 'MSFT', price: 200, quantity: 1 }); // cost=200 > remaining cash=100 after trade1 → should be rejected
 
-      const result = (
-        svc as unknown as {
-          _applyTrades: (s: PretestState, trades: PretestTrade[]) => PretestState;
-        }
-      )._applyTrades(state, [trade1, trade2]);
+      const result = asPrivate(svc)._applyTrades(state, [trade1, trade2]);
 
       // Only trade1 executed — state.trades must have exactly 1 entry
       expect(result.trades).toHaveLength(1);
@@ -897,19 +812,9 @@ describe('PretestService._applyTrades — ghost-trade guard (fix 2)', () => {
       const INITIAL_CASH = 50;
 
       const state = makeState({ cash: INITIAL_CASH });
-      const unaffordable: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'GOOG',
-        action: 'buy',
-        price: 3_000,
-        quantity: 1, // cost 3000 > cash 50
-      };
+      const unaffordable = makeTrade({ symbol: 'GOOG', price: 3_000, quantity: 1 }); // cost 3000 > cash 50
 
-      const result = (
-        svc as unknown as {
-          _applyTrades: (s: PretestState, trades: PretestTrade[]) => PretestState;
-        }
-      )._applyTrades(state, [unaffordable]);
+      const result = asPrivate(svc)._applyTrades(state, [unaffordable]);
 
       expect(result.cash).toBe(INITIAL_CASH);
       expect(result.trades).toHaveLength(0);
@@ -1063,32 +968,12 @@ describe('PretestService — commission cost-basis and cash/pnl conservation (fi
       const state = makeState({ cash: INITIAL_CASH });
 
       // Buy 10 @ 100
-      const buyTrade: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'AAPL',
-        action: 'buy',
-        price: BUY_PRICE,
-        quantity: QTY,
-      };
-      (
-        svc as unknown as {
-          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-        }
-      )._applyBuy(state, buyTrade, COMMISSION);
+      const buyTrade = makeTrade({ price: BUY_PRICE, quantity: QTY });
+      asPrivate(svc)._applyBuy(state, buyTrade, COMMISSION);
 
       // Sell 10 @ 120
-      const sellTrade: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'AAPL',
-        action: 'sell',
-        price: SELL_PRICE,
-        quantity: QTY,
-      };
-      (
-        svc as unknown as {
-          _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-        }
-      )._applySell(state, sellTrade, COMMISSION);
+      const sellTrade = makeTrade({ action: 'sell', price: SELL_PRICE, quantity: QTY });
+      asPrivate(svc)._applySell(state, sellTrade, COMMISSION);
 
       // Conservation invariant: after flat round-trip (no open positions)
       // final_cash must equal initial_cash + realized_pnl
@@ -1103,31 +988,11 @@ describe('PretestService — commission cost-basis and cash/pnl conservation (fi
       const INITIAL_CASH = 10_000;
       const state = makeState({ cash: INITIAL_CASH });
 
-      const buyTrade: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'AAPL',
-        action: 'buy',
-        price: 100,
-        quantity: 10,
-      };
-      (
-        svc as unknown as {
-          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-        }
-      )._applyBuy(state, buyTrade, 0);
+      const buyTrade = makeTrade();
+      asPrivate(svc)._applyBuy(state, buyTrade, 0);
 
-      const sellTrade: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'AAPL',
-        action: 'sell',
-        price: 120,
-        quantity: 10,
-      };
-      (
-        svc as unknown as {
-          _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-        }
-      )._applySell(state, sellTrade, 0);
+      const sellTrade = makeTrade({ action: 'sell', price: 120 });
+      asPrivate(svc)._applySell(state, sellTrade, 0);
 
       expect(state.positions).toHaveLength(0);
       expect(state.cash).toBeCloseTo(INITIAL_CASH + state.realized_pnl, 8);
@@ -1146,19 +1011,9 @@ describe('PretestService — commission cost-basis and cash/pnl conservation (fi
       const EXPECTED_AVG = (BUY_PRICE * QTY + BUY_PRICE * QTY * COMMISSION) / QTY;
 
       const state = makeState({ cash: 10_000 });
-      const trade: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'AAPL',
-        action: 'buy',
-        price: BUY_PRICE,
-        quantity: QTY,
-      };
+      const trade = makeTrade({ price: BUY_PRICE, quantity: QTY });
 
-      (
-        svc as unknown as {
-          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-        }
-      )._applyBuy(state, trade, COMMISSION);
+      asPrivate(svc)._applyBuy(state, trade, COMMISSION);
 
       expect(state.positions).toHaveLength(1);
       expect(state.positions[0].avg_price).toBeCloseTo(EXPECTED_AVG, 8);
@@ -1171,19 +1026,9 @@ describe('PretestService — commission cost-basis and cash/pnl conservation (fi
       const BUY_PRICE = 100;
       const QTY = 5;
       const state = makeState({ cash: 10_000 });
-      const trade: PretestTrade = {
-        ts: new Date().toISOString(),
-        symbol: 'AAPL',
-        action: 'buy',
-        price: BUY_PRICE,
-        quantity: QTY,
-      };
+      const trade = makeTrade({ price: BUY_PRICE, quantity: QTY });
 
-      (
-        svc as unknown as {
-          _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-        }
-      )._applyBuy(state, trade, 0);
+      asPrivate(svc)._applyBuy(state, trade, 0);
 
       expect(state.positions[0].avg_price).toBe(BUY_PRICE); // byte-identical default
     });
@@ -1207,23 +1052,15 @@ describe('PretestService._calcQuantity — commission-aware sizing (fix 5)', () 
       //           total_cost = 4 * 100 * 1.001 = 400.4 ≤ 500 ✓
       const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', PRICE)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: { __pretest_policy__: { commission_pct: COMMISSION } },
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy({ commission_pct: COMMISSION });
       const state = makeState({ cash: CASH });
-      const policy = (
-        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
-      )._readPolicy(portfolio);
+      const policy = asPrivate(svc)._readPolicy(portfolio);
 
-      const trades = await (
-        svc as unknown as {
-          _simulateFills: (
-            tc: unknown[],
-            s: PretestState,
-            policy: PretestPolicy,
-          ) => Promise<PretestTrade[]>;
-        }
-      )._simulateFills([makeToolCall('AAPL', 'buy')], state, policy);
+      const trades = await asPrivate(svc)._simulateFills(
+        [makeToolCall('AAPL', 'buy')],
+        state,
+        policy,
+      );
 
       expect(trades).toHaveLength(1);
       const qty = trades[0].quantity;
@@ -1239,23 +1076,15 @@ describe('PretestService._calcQuantity — commission-aware sizing (fix 5)', () 
       // qty = floor(10000*0.05 / 100) = floor(5) = 5
       const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', PRICE)));
       const svc = makeService(gateway);
-      const portfolio = {
-        plugin_configs: {},
-      } as unknown as import('./pretest.service').PretestPortfolio;
+      const portfolio = makePortfolioWithPolicy();
       const state = makeState({ cash: CASH });
-      const policy = (
-        svc as unknown as { _readPolicy: (p: typeof portfolio) => PretestPolicy }
-      )._readPolicy(portfolio);
+      const policy = asPrivate(svc)._readPolicy(portfolio);
 
-      const trades = await (
-        svc as unknown as {
-          _simulateFills: (
-            tc: unknown[],
-            s: PretestState,
-            policy: PretestPolicy,
-          ) => Promise<PretestTrade[]>;
-        }
-      )._simulateFills([makeToolCall('AAPL', 'buy')], state, policy);
+      const trades = await asPrivate(svc)._simulateFills(
+        [makeToolCall('AAPL', 'buy')],
+        state,
+        policy,
+      );
 
       expect(trades).toHaveLength(1);
       expect(trades[0].quantity).toBe(5); // floor(500/100) = 5, unchanged
@@ -1400,8 +1229,6 @@ function makeStateWithTrades(
   return makeState({ trades: tradeFull, max_drawdown_pct, win_trades, loss_trades });
 }
 
-const DEFAULT_GATEWAY = makeGateway(() => Promise.resolve(makeQuote('AAPL', 100)));
-
 describe('PretestService.computeSignificance (Phase 4.1.1)', () => {
   it('4.1.1 — computes sharpe, profit_factor, win_rate, max_dd, n_trades from closing trades', () => {
     // Two closing trades with defined pnl:
@@ -1422,17 +1249,7 @@ describe('PretestService.computeSignificance (Phase 4.1.1)', () => {
     );
 
     const svc = makeService(DEFAULT_GATEWAY);
-    const metrics = (
-      svc as unknown as {
-        computeSignificance: (s: PretestState) => {
-          sharpe: number;
-          profit_factor: number | null;
-          win_rate: number;
-          max_dd: number;
-          n_trades: number;
-        };
-      }
-    ).computeSignificance(state);
+    const metrics = asPrivate(svc).computeSignificance(state);
 
     expect(metrics.n_trades).toBe(2);
     expect(metrics.sharpe).toBeCloseTo(0.4243, 3);
@@ -1447,11 +1264,7 @@ describe('PretestService.computeSignificance (Phase 4.1.2)', () => {
     // Only one closing trade — cannot compute meaningful sharpe
     const state = makeStateWithTrades([{ action: 'sell', pnl: 100, price: 100, qty: 10 }]);
     const svc = makeService(DEFAULT_GATEWAY);
-    const metrics = (
-      svc as unknown as {
-        computeSignificance: (s: PretestState) => { sharpe: number; n_trades: number };
-      }
-    ).computeSignificance(state);
+    const metrics = asPrivate(svc).computeSignificance(state);
 
     expect(metrics.n_trades).toBe(1);
     expect(metrics.sharpe).toBe(0);
@@ -1465,11 +1278,7 @@ describe('PretestService.computeSignificance (Phase 4.1.2)', () => {
       { action: 'sell', pnl: 100, price: 100, qty: 10 },
     ]);
     const svc = makeService(DEFAULT_GATEWAY);
-    const metrics = (
-      svc as unknown as {
-        computeSignificance: (s: PretestState) => { sharpe: number; n_trades: number };
-      }
-    ).computeSignificance(state);
+    const metrics = asPrivate(svc).computeSignificance(state);
 
     expect(metrics.n_trades).toBe(3);
     expect(metrics.sharpe).toBe(0);
@@ -1484,11 +1293,7 @@ describe('PretestService.computeSignificance (Phase 4.1.3)', () => {
       { action: 'sell', pnl: 200, price: 100, qty: 10 },
     ]);
     const svc = makeService(DEFAULT_GATEWAY);
-    const metrics = (
-      svc as unknown as {
-        computeSignificance: (s: PretestState) => { profit_factor: number | null };
-      }
-    ).computeSignificance(state);
+    const metrics = asPrivate(svc).computeSignificance(state);
 
     expect(metrics.profit_factor).toBeNull();
   });
@@ -1545,17 +1350,7 @@ describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
       pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
     } as unknown as PrismaService;
     const kv = makeStubKv({}); // all defaults
-    const svc = new PretestService(
-      db,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as LlmService,
-      {} as unknown as ContextMemoryService,
-      DEFAULT_GATEWAY,
-      makeStubAgents(),
-      kv,
-      makeStubAudit(),
-    );
+    const svc = makeGateService(db, kv);
 
     const result = await svc.gate('port-gate-test');
 
@@ -1604,17 +1399,7 @@ describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
       pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
     } as unknown as PrismaService;
     const kv = makeStubKv({});
-    const svc = new PretestService(
-      db,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as LlmService,
-      {} as unknown as ContextMemoryService,
-      DEFAULT_GATEWAY,
-      makeStubAgents(),
-      kv,
-      makeStubAudit(),
-    );
+    const svc = makeGateService(db, kv);
 
     const result = await svc.gate('sharpe-test');
 
@@ -1663,17 +1448,7 @@ describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
       pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
     } as unknown as PrismaService;
     const kv = makeStubKv({});
-    const svc = new PretestService(
-      db,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as LlmService,
-      {} as unknown as ContextMemoryService,
-      DEFAULT_GATEWAY,
-      makeStubAgents(),
-      kv,
-      makeStubAudit(),
-    );
+    const svc = makeGateService(db, kv);
 
     const result = await svc.gate('dd-test');
 
@@ -1743,17 +1518,7 @@ describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
       pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
     } as unknown as PrismaService;
     const kv = makeStubKv({});
-    const svc = new PretestService(
-      db,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as LlmService,
-      {} as unknown as ContextMemoryService,
-      DEFAULT_GATEWAY,
-      makeStubAgents(),
-      kv,
-      makeStubAudit(),
-    );
+    const svc = makeGateService(db, kv);
 
     const result = await svc.gate('ready-test');
 
@@ -1832,17 +1597,7 @@ describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
     } as unknown as PrismaService;
     // Override min_trades=5 and min_sharpe=0 via KvService (so sharpe check passes with 6 trades)
     const kv = makeStubKv({ 'pretest.gate.min_trades': '5', 'pretest.gate.min_sharpe': '0' });
-    const svc = new PretestService(
-      db,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as LlmService,
-      {} as unknown as ContextMemoryService,
-      DEFAULT_GATEWAY,
-      makeStubAgents(),
-      kv,
-      makeStubAudit(),
-    );
+    const svc = makeGateService(db, kv);
 
     const result = await svc.gate('override-test');
 
@@ -1895,35 +1650,15 @@ describe('PretestService significance gate — all-wins overfit protection (jd-f
       win_trades: 20,
       loss_trades: 0, // ALL WINS — canonical overfit signature
     };
-    const row = {
-      id: 'all-wins-test',
+    const row = makePortfolioRow('all-wins-test', stateObj, {
       name: 'All Wins Portfolio',
-      description: null,
-      initial_capital: 10000,
-      plugin_ids: JSON.stringify([]),
-      plugin_configs: JSON.stringify({}),
-      state: JSON.stringify(stateObj),
       run_count: 20,
-      last_run_at: null,
-      is_active: true,
-      created_at: new Date(),
-      updated_at: new Date(),
-    };
+    });
     const db = {
       pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
     } as unknown as PrismaService;
     const kv = makeStubKv({}); // all defaults (min_loss_trades=3)
-    const svc = new PretestService(
-      db,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as LlmService,
-      {} as unknown as ContextMemoryService,
-      DEFAULT_GATEWAY,
-      makeStubAgents(),
-      kv,
-      makeStubAudit(),
-    );
+    const svc = makeGateService(db, kv);
 
     const result = await svc.gate('all-wins-test');
 
@@ -1974,35 +1709,15 @@ describe('PretestService significance gate — all-wins overfit protection (jd-f
       win_trades: 17,
       loss_trades: 3, // exactly at the threshold
     };
-    const row = {
-      id: 'enough-losses-test',
+    const row = makePortfolioRow('enough-losses-test', stateObj, {
       name: 'Enough Losses Portfolio',
-      description: null,
-      initial_capital: 10000,
-      plugin_ids: JSON.stringify([]),
-      plugin_configs: JSON.stringify({}),
-      state: JSON.stringify(stateObj),
       run_count: 20,
-      last_run_at: null,
-      is_active: true,
-      created_at: new Date(),
-      updated_at: new Date(),
-    };
+    });
     const db = {
       pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
     } as unknown as PrismaService;
     const kv = makeStubKv({}); // all defaults
-    const svc = new PretestService(
-      db,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as LlmService,
-      {} as unknown as ContextMemoryService,
-      DEFAULT_GATEWAY,
-      makeStubAgents(),
-      kv,
-      makeStubAudit(),
-    );
+    const svc = makeGateService(db, kv);
 
     const result = await svc.gate('enough-losses-test');
 
@@ -2042,35 +1757,15 @@ describe('PretestService significance gate — all-wins overfit protection (jd-f
       win_trades: 20,
       loss_trades: 0,
     };
-    const row = {
-      id: 'override-loss-test',
+    const row = makePortfolioRow('override-loss-test', stateObj, {
       name: 'Override Loss Test',
-      description: null,
-      initial_capital: 10000,
-      plugin_ids: JSON.stringify([]),
-      plugin_configs: JSON.stringify({}),
-      state: JSON.stringify(stateObj),
       run_count: 20,
-      last_run_at: null,
-      is_active: true,
-      created_at: new Date(),
-      updated_at: new Date(),
-    };
+    });
     const db = {
       pretestPortfolio: { findUnique: jest.fn().mockResolvedValue(row) },
     } as unknown as PrismaService;
     const kv = makeStubKv({ 'pretest.gate.min_loss_trades': '0' });
-    const svc = new PretestService(
-      db,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as LlmService,
-      {} as unknown as ContextMemoryService,
-      DEFAULT_GATEWAY,
-      makeStubAgents(),
-      kv,
-      makeStubAudit(),
-    );
+    const svc = makeGateService(db, kv);
 
     const result = await svc.gate('override-loss-test');
     // With min_loss_trades=0 the all-wins rule is disabled
@@ -2096,19 +1791,9 @@ describe('PretestService — cost-basis Sharpe denominator (jd-fix-2)', () => {
       cash: 5_000,
       positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 80 }],
     });
-    const trade: PretestTrade = {
-      ts: new Date().toISOString(),
-      symbol: 'AAPL',
-      action: 'sell',
-      price: 100, // exit/fill price
-      quantity: 10,
-    };
+    const trade = makeTrade({ action: 'sell', price: 100 }); // exit/fill price
 
-    (
-      svc as unknown as {
-        _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
-      }
-    )._applySell(state, trade, 0);
+    asPrivate(svc)._applySell(state, trade, 0);
 
     // entry_price must be set to the position's avg_price (80), NOT the fill price (100)
     expect(trade.entry_price).toBe(80);
@@ -2262,35 +1947,12 @@ describe('PretestService.compare — win_rate consistency (jd-fix-3)', () => {
       win_trades: 5,
       loss_trades: 0,
     };
-    const row = {
-      id: 'winrate-test',
-      name: 'WinRate Test',
-      description: null,
-      initial_capital: 10000,
-      plugin_ids: JSON.stringify([]),
-      plugin_configs: JSON.stringify({}),
-      state: JSON.stringify(stateObj),
-      run_count: 15,
-      last_run_at: null,
-      is_active: true,
-      created_at: new Date(),
-      updated_at: new Date(),
-    };
+    const row = makePortfolioRow('winrate-test', stateObj, { name: 'WinRate Test', run_count: 15 });
     const db = {
       pretestPortfolio: { findMany: jest.fn().mockResolvedValue([row]) },
     } as unknown as PrismaService;
     const kv = makeStubKv({});
-    const svc = new PretestService(
-      db,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as LlmService,
-      {} as unknown as ContextMemoryService,
-      DEFAULT_GATEWAY,
-      makeStubAgents(),
-      kv,
-      makeStubAudit(),
-    );
+    const svc = makeGateService(db, kv);
 
     const result = await svc.compare();
     const p = result.portfolios[0];
@@ -2315,16 +1977,7 @@ describe('PretestService._readGateThresholds — range validation (jd-fix-4)', (
     const kv = makeStubKv({ 'pretest.gate.max_dd_pct': '0.20' }); // stored as fraction by mistake
     const svc = makeService(gateway, makeStubAgents(), kv);
 
-    const thresholds = await (
-      svc as unknown as {
-        _readGateThresholds: () => Promise<{
-          min_trades: number;
-          min_sharpe: number;
-          max_dd_pct: number;
-          min_loss_trades: number;
-        }>;
-      }
-    )._readGateThresholds();
+    const thresholds = await asPrivate(svc)._readGateThresholds();
 
     // 0.20 is out of the expected (0,100] range for a percentage → coerce to default 20
     expect(thresholds.max_dd_pct).toBe(20);
@@ -2335,16 +1988,7 @@ describe('PretestService._readGateThresholds — range validation (jd-fix-4)', (
     const kv = makeStubKv({ 'pretest.gate.max_dd_pct': '0' });
     const svc = makeService(gateway, makeStubAgents(), kv);
 
-    const thresholds = await (
-      svc as unknown as {
-        _readGateThresholds: () => Promise<{
-          min_trades: number;
-          min_sharpe: number;
-          max_dd_pct: number;
-          min_loss_trades: number;
-        }>;
-      }
-    )._readGateThresholds();
+    const thresholds = await asPrivate(svc)._readGateThresholds();
 
     expect(thresholds.max_dd_pct).toBe(20);
   });
@@ -2354,16 +1998,7 @@ describe('PretestService._readGateThresholds — range validation (jd-fix-4)', (
     const kv = makeStubKv({ 'pretest.gate.min_sharpe': '-1' });
     const svc = makeService(gateway, makeStubAgents(), kv);
 
-    const thresholds = await (
-      svc as unknown as {
-        _readGateThresholds: () => Promise<{
-          min_trades: number;
-          min_sharpe: number;
-          max_dd_pct: number;
-          min_loss_trades: number;
-        }>;
-      }
-    )._readGateThresholds();
+    const thresholds = await asPrivate(svc)._readGateThresholds();
 
     expect(thresholds.min_sharpe).toBe(0);
   });
@@ -2373,16 +2008,7 @@ describe('PretestService._readGateThresholds — range validation (jd-fix-4)', (
     const kv = makeStubKv({ 'pretest.gate.min_trades': '0' });
     const svc = makeService(gateway, makeStubAgents(), kv);
 
-    const thresholds = await (
-      svc as unknown as {
-        _readGateThresholds: () => Promise<{
-          min_trades: number;
-          min_sharpe: number;
-          max_dd_pct: number;
-          min_loss_trades: number;
-        }>;
-      }
-    )._readGateThresholds();
+    const thresholds = await asPrivate(svc)._readGateThresholds();
 
     expect(thresholds.min_trades).toBeGreaterThanOrEqual(1);
   });
@@ -2397,16 +2023,7 @@ describe('PretestService._readGateThresholds — range validation (jd-fix-4)', (
     });
     const svc = makeService(gateway, makeStubAgents(), kv);
 
-    const thresholds = await (
-      svc as unknown as {
-        _readGateThresholds: () => Promise<{
-          min_trades: number;
-          min_sharpe: number;
-          max_dd_pct: number;
-          min_loss_trades: number;
-        }>;
-      }
-    )._readGateThresholds();
+    const thresholds = await asPrivate(svc)._readGateThresholds();
 
     expect(thresholds.max_dd_pct).toBe(15);
     expect(thresholds.min_sharpe).toBe(0.5);
@@ -2485,51 +2102,15 @@ describe('PretestService.compare gate_status (Phase 4.1.9-4.1.10)', () => {
       loss_trades: 0,
     };
 
-    const rowA = {
-      id: 'port-a',
-      name: 'Portfolio A',
-      description: null,
-      initial_capital: 10000,
-      plugin_ids: JSON.stringify([]),
-      plugin_configs: JSON.stringify({}),
-      state: JSON.stringify(stateA),
-      run_count: 25,
-      last_run_at: null,
-      is_active: true,
-      created_at: new Date(),
-      updated_at: new Date(),
-    };
-    const rowB = {
-      id: 'port-b',
-      name: 'Portfolio B',
-      description: null,
-      initial_capital: 10000,
-      plugin_ids: JSON.stringify([]),
-      plugin_configs: JSON.stringify({}),
-      state: JSON.stringify(stateB),
-      run_count: 3,
-      last_run_at: null,
-      is_active: true,
-      created_at: new Date(),
-      updated_at: new Date(),
-    };
+    const rowA = makePortfolioRow('port-a', stateA, { name: 'Portfolio A', run_count: 25 });
+    const rowB = makePortfolioRow('port-b', stateB, { name: 'Portfolio B', run_count: 3 });
 
     const db = {
       pretestPortfolio: { findMany: jest.fn().mockResolvedValue([rowA, rowB]) },
     } as unknown as PrismaService;
     const kv = makeStubKv({}); // default thresholds: min_trades=20
 
-    const svc = new PretestService(
-      db,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as LlmService,
-      {} as unknown as ContextMemoryService,
-      DEFAULT_GATEWAY,
-      makeStubAgents(),
-      kv,
-      makeStubAudit(),
-    );
+    const svc = makeGateService(db, kv);
 
     const result = await svc.compare();
 
@@ -2578,51 +2159,15 @@ describe('PretestService.compare gate_status (Phase 4.1.9-4.1.10)', () => {
       loss_trades: 0,
     };
 
-    const rowA = {
-      id: 'pa',
-      name: 'A',
-      description: null,
-      initial_capital: 10000,
-      plugin_ids: JSON.stringify([]),
-      plugin_configs: JSON.stringify({}),
-      state: JSON.stringify(stateA),
-      run_count: 25,
-      last_run_at: null,
-      is_active: true,
-      created_at: new Date(),
-      updated_at: new Date(),
-    };
-    const rowB = {
-      id: 'pb',
-      name: 'B',
-      description: null,
-      initial_capital: 10000,
-      plugin_ids: JSON.stringify([]),
-      plugin_configs: JSON.stringify({}),
-      state: JSON.stringify(stateB),
-      run_count: 2,
-      last_run_at: null,
-      is_active: true,
-      created_at: new Date(),
-      updated_at: new Date(),
-    };
+    const rowA = makePortfolioRow('pa', stateA, { name: 'A', run_count: 25 });
+    const rowB = makePortfolioRow('pb', stateB, { name: 'B', run_count: 2 });
 
     const db = {
       pretestPortfolio: { findMany: jest.fn().mockResolvedValue([rowA, rowB]) },
     } as unknown as PrismaService;
     const kv = makeStubKv({});
 
-    const svc = new PretestService(
-      db,
-      {} as unknown as SandboxGateway,
-      {} as unknown as PluginsService,
-      {} as unknown as LlmService,
-      {} as unknown as ContextMemoryService,
-      DEFAULT_GATEWAY,
-      makeStubAgents(),
-      kv,
-      makeStubAudit(),
-    );
+    const svc = makeGateService(db, kv);
 
     const result = await svc.compare();
 
