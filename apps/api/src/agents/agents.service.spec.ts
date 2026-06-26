@@ -170,6 +170,23 @@ function makeFullAgentsService(
   );
 }
 
+function findAuditEvent(
+  audit: ReturnType<typeof makeAudit>,
+  eventType: string,
+): Record<string, unknown> | undefined {
+  const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
+  const found = calls.find(([arg]) => arg['event_type'] === eventType);
+  return found?.[0];
+}
+
+/** Shared provider tool fixture used across multiple test groups. */
+const ALPACA_PROVIDER_TOOL = {
+  plugin_id: 'alpaca-provider',
+  name: 'alpaca-provider__place_order',
+  description: 'Place an order',
+  input_schema: { type: 'object', properties: {} },
+} as const;
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('AgentsService._validateToolCalls', () => {
@@ -392,10 +409,9 @@ describe('AgentsService._executeCycle — parse wiring', () => {
 
     await callExecuteCycle(service, CYCLE_ID, 'run cycle');
 
-    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const parseMissCall = calls.find(([arg]) => arg['event_type'] === 'parse_miss');
-    expect(parseMissCall).toBeDefined();
-    expect(parseMissCall![0]).toMatchObject({
+    const parseMissEvent = findAuditEvent(audit, 'parse_miss');
+    expect(parseMissEvent).toBeDefined();
+    expect(parseMissEvent).toMatchObject({
       cycle_id: CYCLE_ID,
       event_type: 'parse_miss',
     });
@@ -561,9 +577,7 @@ describe('AgentsService.runGovernedTurn — no-decision-plugin (source: chat)', 
     expect(result.backend).toBeDefined();
 
     // audit.log must have been called with chat_turn.
-    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const chatTurnCall = calls.find(([arg]) => arg['event_type'] === 'chat_turn');
-    expect(chatTurnCall).toBeDefined();
+    expect(findAuditEvent(audit, 'chat_turn')).toBeDefined();
 
     // sandbox.callPlugin must NOT have been called.
     expect(sandbox.callPlugin).not.toHaveBeenCalled();
@@ -576,15 +590,7 @@ describe('AgentsService.runGovernedTurn — valid tool call dispatched (source: 
       '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","qty":1}}]</tool_calls>';
     const llm = makeLlm(toolCallText);
     const audit = makeAudit();
-    const tools = [
-      {
-        plugin_id: 'alpaca-provider',
-        name: 'alpaca-provider__place_order',
-        description: 'Place an order',
-        input_schema: { type: 'object', properties: {} },
-      },
-    ];
-    const plugins = makeFullPlugins('Emit tool calls as JSON.', tools);
+    const plugins = makeFullPlugins('Emit tool calls as JSON.', [ALPACA_PROVIDER_TOOL]);
     // Plugin must appear active.
     plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
     const sandbox = makeSandbox();
@@ -604,9 +610,7 @@ describe('AgentsService.runGovernedTurn — valid tool call dispatched (source: 
     expect(result.tool_calls[0].plugin_id).toBe('alpaca-provider');
 
     // chat_turn audit must be present.
-    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const chatTurnCall = calls.find(([arg]) => arg['event_type'] === 'chat_turn');
-    expect(chatTurnCall).toBeDefined();
+    expect(findAuditEvent(audit, 'chat_turn')).toBeDefined();
   });
 });
 
@@ -616,14 +620,7 @@ describe('AgentsService.runGovernedTurn — hallucinated/inactive tool dropped (
     const llm = makeLlm(toolCallText);
     const audit = makeAudit();
     // ghost-plugin is NOT active and has no declared tools.
-    const plugins = makeFullPlugins('Emit tool calls as JSON.', [
-      {
-        plugin_id: 'alpaca-provider',
-        name: 'alpaca-provider__place_order',
-        description: 'Place an order',
-        input_schema: { type: 'object', properties: {} },
-      },
-    ]);
+    const plugins = makeFullPlugins('Emit tool calls as JSON.', [ALPACA_PROVIDER_TOOL]);
     // No active plugins — ghost-plugin won't pass validation.
     plugins.findActive.mockResolvedValue([]);
     const sandbox = makeSandbox();
@@ -642,10 +639,9 @@ describe('AgentsService.runGovernedTurn — hallucinated/inactive tool dropped (
     expect(result.tool_calls).toEqual([]);
 
     // tool_call_dropped audit must be present.
-    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const droppedCall = calls.find(([arg]) => arg['event_type'] === 'tool_call_dropped');
-    expect(droppedCall).toBeDefined();
-    expect(droppedCall![0]).toMatchObject({
+    const droppedEvent = findAuditEvent(audit, 'tool_call_dropped');
+    expect(droppedEvent).toBeDefined();
+    expect(droppedEvent).toMatchObject({
       event_type: 'tool_call_dropped',
       plugin_id: 'ghost-plugin',
     });
@@ -698,15 +694,7 @@ describe('AgentsService.runGovernedTurn — signalsEmitted in result', () => {
       '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","qty":1,"action":"buy"}}]</tool_calls>';
     const llm = makeLlm(toolCallText);
     const audit = makeAudit();
-    const tools = [
-      {
-        plugin_id: 'alpaca-provider',
-        name: 'alpaca-provider__place_order',
-        description: 'Place an order',
-        input_schema: { type: 'object', properties: {} },
-      },
-    ];
-    const plugins = makeFullPlugins('Emit tool calls.', tools);
+    const plugins = makeFullPlugins('Emit tool calls.', [ALPACA_PROVIDER_TOOL]);
     plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
     const sandbox = makeSandbox();
     const memory = makeMemory();
@@ -816,15 +804,7 @@ describe('AgentsService._executeCycle — findActive called exactly once per cyc
       '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"TSLA","action":"sell"}}]</tool_calls>';
     const llm = makeLlm(toolCallText);
     const audit = makeAudit();
-    const tools = [
-      {
-        plugin_id: 'alpaca-provider',
-        name: 'alpaca-provider__place_order',
-        description: 'Place an order',
-        input_schema: { type: 'object', properties: {} },
-      },
-    ];
-    const plugins = makeFullPlugins('Emit tool calls.', tools);
+    const plugins = makeFullPlugins('Emit tool calls.', [ALPACA_PROVIDER_TOOL]);
     plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
     const sandbox = makeFullSandbox();
     const memory = makeMemory();
@@ -960,10 +940,9 @@ describe('AgentsService.runGovernedTurn — pretest source (PR3)', () => {
       virtual_only: true,
     });
 
-    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const pretestTurnCall = calls.find(([arg]) => arg['event_type'] === 'pretest_turn');
-    expect(pretestTurnCall).toBeDefined();
-    expect(pretestTurnCall![0]).toMatchObject({
+    const pretestTurnEvent = findAuditEvent(audit, 'pretest_turn');
+    expect(pretestTurnEvent).toBeDefined();
+    expect(pretestTurnEvent).toMatchObject({
       event_type: 'pretest_turn',
     });
   });
@@ -985,9 +964,7 @@ describe('AgentsService.runGovernedTurn — pretest source (PR3)', () => {
 
     expect(result.text).toBe('cycle response');
     // No pretest_turn audit for a cycle source
-    const calls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const pretestTurnCall = calls.find(([arg]) => arg['event_type'] === 'pretest_turn');
-    expect(pretestTurnCall).toBeUndefined();
+    expect(findAuditEvent(audit, 'pretest_turn')).toBeUndefined();
   });
 
   it('3.1.7 — end-to-end virtual_only block: provider tool_call in LLM response is dropped, callPlugin not called, audit emitted', async () => {
@@ -997,13 +974,7 @@ describe('AgentsService.runGovernedTurn — pretest source (PR3)', () => {
     const llm = makeLlm(toolCallText);
     const audit = makeAudit();
 
-    const providerTool = {
-      plugin_id: 'alpaca-provider',
-      name: 'alpaca-provider__place_order',
-      description: 'Place an order',
-      input_schema: { type: 'object', properties: {} },
-    };
-    const plugins = makeFullPlugins('Emit tool calls as JSON.', [providerTool]);
+    const plugins = makeFullPlugins('Emit tool calls as JSON.', [ALPACA_PROVIDER_TOOL]);
     // alpaca-provider is active and is of type 'provider'
     plugins.findActive.mockResolvedValue([
       { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
@@ -1026,10 +997,9 @@ describe('AgentsService.runGovernedTurn — pretest source (PR3)', () => {
     expect(result.tool_calls).toEqual([]);
 
     // Must emit tool_call_dropped with reason virtual_mode_provider_blocked
-    const logCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const droppedCall = logCalls.find(([arg]) => arg['event_type'] === 'tool_call_dropped');
-    expect(droppedCall).toBeDefined();
-    expect(droppedCall![0]).toMatchObject({
+    const droppedEvent = findAuditEvent(audit, 'tool_call_dropped');
+    expect(droppedEvent).toBeDefined();
+    expect(droppedEvent).toMatchObject({
       event_type: 'tool_call_dropped',
       plugin_id: 'alpaca-provider',
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
@@ -1154,10 +1124,9 @@ describe('AgentsService — PRE cycle_abort skips LLM + audits cycle_aborted (A1
     expect(capturedOrder).not.toContain('llm');
 
     // audit cycle_aborted must have been emitted
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const abortAudit = auditCalls.find(([arg]) => arg['event_type'] === 'cycle_aborted');
+    const abortAudit = findAuditEvent(audit, 'cycle_aborted');
     expect(abortAudit).toBeDefined();
-    expect(abortAudit![0]).toMatchObject({
+    expect(abortAudit).toMatchObject({
       event_type: 'cycle_aborted',
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       meta: expect.objectContaining({ plugin_id: 'doctor' }),
@@ -1183,8 +1152,7 @@ describe('AgentsService — POST cycle_abort ignored (A1.3)', () => {
     expect(capturedOrder).toContain('llm');
 
     // Must NOT have audited cycle_aborted
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const abortAudit = auditCalls.find(([arg]) => arg['event_type'] === 'cycle_aborted');
+    const abortAudit = findAuditEvent(audit, 'cycle_aborted');
     expect(abortAudit).toBeUndefined();
   });
 });
@@ -1301,25 +1269,16 @@ describe('AgentsService._mergeExtraCtx — credential + decision-key protection 
     expect(merged['some_data']).toBe('allowed');
   });
 
-  it('Fix#2.2 — tool_calls from extra NOT merged into base context', () => {
-    const service = makeMinimalService();
-    const base = { cycle_id: 'c1' };
-    const extra = { tool_calls: [{ plugin_id: 'evil', function: 'do_bad', args: {} }] };
-
-    const merged = callMergeExtraCtx(service, base, extra);
-
-    expect(merged['tool_calls']).toBeUndefined();
-  });
-
-  it('Fix#2.3 — decisions from extra NOT merged into base context', () => {
-    const service = makeMinimalService();
-    const base = { cycle_id: 'c1' };
-    const extra = { decisions: [{ plugin_id: 'x', function: 'y', args: {}, allowed: true }] };
-
-    const merged = callMergeExtraCtx(service, base, extra);
-
-    expect(merged['decisions']).toBeUndefined();
-  });
+  it.each([
+    ['tool_calls', { tool_calls: [{ plugin_id: 'evil', function: 'do_bad', args: {} }] }],
+    ['decisions', { decisions: [{ plugin_id: 'x', function: 'y', args: {}, allowed: true }] }],
+  ] as [string, Record<string, unknown>][])(
+    'Fix#2.2-3 — %s from extra NOT merged into base context',
+    (key, extra) => {
+      const merged = callMergeExtraCtx(makeMinimalService(), { cycle_id: 'c1' }, extra);
+      expect(merged[key]).toBeUndefined();
+    },
+  );
 
   it('Fix#2.4 — veto_reasons from extra NOT merged into base context', () => {
     const service = makeMinimalService();
@@ -1737,31 +1696,18 @@ describe('AgentsService._persistNotificationIntents — bridge dispatch (B1.3)',
     expect(bridge.send).toHaveBeenCalledTimes(2);
   });
 
-  it('B1.3c — empty _collected_notify_intents → zero bridge.send calls', async () => {
-    const bridge = makeBridgeStub();
-    const audit = makeAudit();
-    const service = makeServiceWithBridge(bridge, audit);
-
-    const ctx: Record<string, unknown> = {
-      _collected_notify_intents: [],
-    };
-
-    await callPersistNotificationIntents(service, ctx, 'cycle-b1-003');
-
-    expect(bridge.send).not.toHaveBeenCalled();
-  });
-
-  it('B1.3d — absent _collected_notify_intents → zero bridge.send calls', async () => {
-    const bridge = makeBridgeStub();
-    const audit = makeAudit();
-    const service = makeServiceWithBridge(bridge, audit);
-
-    const ctx: Record<string, unknown> = {};
-
-    await callPersistNotificationIntents(service, ctx, 'cycle-b1-004');
-
-    expect(bridge.send).not.toHaveBeenCalled();
-  });
+  it.each([
+    ['empty', { _collected_notify_intents: [] }, 'cycle-b1-003'],
+    ['absent', {}, 'cycle-b1-004'],
+  ] as [string, Record<string, unknown>, string][])(
+    'B1.3c-d — %s _collected_notify_intents → zero bridge.send calls',
+    async (_label, ctx, cycleId) => {
+      const bridge = makeBridgeStub();
+      const service = makeServiceWithBridge(bridge, makeAudit());
+      await callPersistNotificationIntents(service, ctx, cycleId);
+      expect(bridge.send).not.toHaveBeenCalled();
+    },
+  );
 
   it('B1.3e — audits notification_sent per successful send', async () => {
     const bridge = makeBridgeStub();
@@ -1774,10 +1720,9 @@ describe('AgentsService._persistNotificationIntents — bridge dispatch (B1.3)',
 
     await callPersistNotificationIntents(service, ctx, 'cycle-b1-005');
 
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const sentAudit = auditCalls.find(([arg]) => arg['event_type'] === 'notification_sent');
+    const sentAudit = findAuditEvent(audit, 'notification_sent');
     expect(sentAudit).toBeDefined();
-    expect(sentAudit![0]).toMatchObject({
+    expect(sentAudit).toMatchObject({
       event_type: 'notification_sent',
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       meta: expect.objectContaining({ channel: 'telegram' }),
@@ -2076,9 +2021,11 @@ describe('F4-S1 Phase 3.4/3.5 — _executeToolCalls kernel dispatch', () => {
 
 // ── F4-S1 Phase 4.1 — Injection Gating Tests ─────────────────────────────────
 
+type NonReflectionSource = 'chat' | 'cycle' | 'pretest';
+
 describe('F4-S1 Phase 4.1 — runGovernedTurn tool schema injection gating', () => {
   function buildInjectionCapturingService(
-    source: 'chat' | 'cycle' | 'pretest',
+    source: NonReflectionSource,
     capturedSchema: { tools: string }[],
   ): AgentsService {
     const llm: Partial<LlmService> = {
@@ -2110,35 +2057,22 @@ describe('F4-S1 Phase 4.1 — runGovernedTurn tool schema injection gating', () 
     );
   }
 
-  it('4.1 source:cycle — kernel__write_skill NOT in injected [TOOL SCHEMA]', async () => {
-    const captured: { tools: string }[] = [];
-    const service = buildInjectionCapturingService('cycle', captured);
+  it.each([
+    ['cycle', 'run cycle'],
+    ['chat', 'ask something'],
+    ['pretest', 'pretest run'],
+  ] as [NonReflectionSource, string][])(
+    '4.1 source:%s — kernel__write_skill NOT in injected [TOOL SCHEMA]',
+    async (source, context) => {
+      const captured: { tools: string }[] = [];
+      const service = buildInjectionCapturingService(source, captured);
 
-    await service.runGovernedTurn({ source: 'cycle', context: 'run cycle' });
+      await service.runGovernedTurn({ source, context });
 
-    expect(captured).toHaveLength(1);
-    expect(captured[0].tools).not.toContain('kernel__write_skill');
-  });
-
-  it('4.1 source:chat — kernel__write_skill NOT in injected [TOOL SCHEMA]', async () => {
-    const captured: { tools: string }[] = [];
-    const service = buildInjectionCapturingService('chat', captured);
-
-    await service.runGovernedTurn({ source: 'chat', context: 'ask something' });
-
-    expect(captured).toHaveLength(1);
-    expect(captured[0].tools).not.toContain('kernel__write_skill');
-  });
-
-  it('4.1 source:pretest — kernel__write_skill NOT in injected [TOOL SCHEMA]', async () => {
-    const captured: { tools: string }[] = [];
-    const service = buildInjectionCapturingService('pretest', captured);
-
-    await service.runGovernedTurn({ source: 'pretest', context: 'pretest run' });
-
-    expect(captured).toHaveLength(1);
-    expect(captured[0].tools).not.toContain('kernel__write_skill');
-  });
+      expect(captured).toHaveLength(1);
+      expect(captured[0].tools).not.toContain('kernel__write_skill');
+    },
+  );
 
   it('4.1 source:reflection (cast) — kernel__write_skill IS in injected [TOOL SCHEMA]', async () => {
     const captured: { tools: string }[] = [];
@@ -2183,17 +2117,12 @@ describe('F4-S1 Fix — kernel tool DROPPED when source !== reflection (dispatch
     );
   }
 
-  it('src-gate.1 source:cycle — kernel__write_skill is DROPPED with kernel_source_not_allowed, writeSkillGuarded NOT called', async () => {
-    const plugins = makePluginsForSourceGate();
-    const audit = makeAudit();
-    const service = makeServiceForSourceGate(plugins, audit);
-
-    const calls: ToolCallRequest[] = [
-      { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
-    ];
-
-    // Call _validateToolCalls directly — cycle source means kernel call must be dropped
-    const result = await (
+  async function validateKernelWriteSkill(
+    service: AgentsService,
+    calls: ToolCallRequest[],
+    source: string,
+  ): Promise<ToolCallRequest[]> {
+    return (
       service as unknown as {
         _validateToolCalls: (
           c: string,
@@ -2204,90 +2133,33 @@ describe('F4-S1 Fix — kernel tool DROPPED when source !== reflection (dispatch
           source: string,
         ) => Promise<ToolCallRequest[]>;
       }
-    )._validateToolCalls(CYCLE_ID, calls, undefined, undefined, undefined, 'cycle');
+    )._validateToolCalls(CYCLE_ID, calls, undefined, undefined, undefined, source);
+  }
 
-    // Kernel call must be DROPPED (not allowed outside reflection)
-    expect(result).toHaveLength(0);
-    expect(audit.log).toHaveBeenCalledWith(
-      expect.objectContaining({
-        cycle_id: CYCLE_ID,
-        event_type: 'tool_call_dropped',
-        plugin_id: 'kernel',
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }),
-      }),
-    );
-    // CRITICAL: writeSkillGuarded must NEVER have been called
-    expect(plugins.writeSkillGuarded).not.toHaveBeenCalled();
-  });
+  it.each(['cycle', 'chat', 'pretest'])(
+    'src-gate — source:%s kernel__write_skill DROPPED, writeSkillGuarded NOT called',
+    async (source) => {
+      const plugins = makePluginsForSourceGate();
+      const audit = makeAudit();
+      const service = makeServiceForSourceGate(plugins, audit);
+      const calls: ToolCallRequest[] = [
+        { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
+      ];
 
-  it('src-gate.2 source:chat — kernel__write_skill DROPPED, writeSkillGuarded NOT called', async () => {
-    const plugins = makePluginsForSourceGate();
-    const audit = makeAudit();
-    const service = makeServiceForSourceGate(plugins, audit);
+      const result = await validateKernelWriteSkill(service, calls, source);
 
-    const calls: ToolCallRequest[] = [
-      { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
-    ];
-
-    const result = await (
-      service as unknown as {
-        _validateToolCalls: (
-          c: string,
-          t: ToolCallRequest[],
-          hoisted: undefined,
-          preloaded: undefined,
-          virtualOnly: undefined,
-          source: string,
-        ) => Promise<ToolCallRequest[]>;
-      }
-    )._validateToolCalls(CYCLE_ID, calls, undefined, undefined, undefined, 'chat');
-
-    expect(result).toHaveLength(0);
-    expect(audit.log).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_type: 'tool_call_dropped',
-        plugin_id: 'kernel',
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }),
-      }),
-    );
-    expect(plugins.writeSkillGuarded).not.toHaveBeenCalled();
-  });
-
-  it('src-gate.3 source:pretest — kernel__write_skill DROPPED, writeSkillGuarded NOT called', async () => {
-    const plugins = makePluginsForSourceGate();
-    const audit = makeAudit();
-    const service = makeServiceForSourceGate(plugins, audit);
-
-    const calls: ToolCallRequest[] = [
-      { plugin_id: 'kernel', function: 'write_skill', args: { skill: 'x', new_body: 'y' } },
-    ];
-
-    const result = await (
-      service as unknown as {
-        _validateToolCalls: (
-          c: string,
-          t: ToolCallRequest[],
-          hoisted: undefined,
-          preloaded: undefined,
-          virtualOnly: undefined,
-          source: string,
-        ) => Promise<ToolCallRequest[]>;
-      }
-    )._validateToolCalls(CYCLE_ID, calls, undefined, undefined, undefined, 'pretest');
-
-    expect(result).toHaveLength(0);
-    expect(audit.log).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_type: 'tool_call_dropped',
-        plugin_id: 'kernel',
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }),
-      }),
-    );
-    expect(plugins.writeSkillGuarded).not.toHaveBeenCalled();
-  });
+      expect(result).toHaveLength(0);
+      expect(audit.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event_type: 'tool_call_dropped',
+          plugin_id: 'kernel',
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+          meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }),
+        }),
+      );
+      expect(plugins.writeSkillGuarded).not.toHaveBeenCalled();
+    },
+  );
 
   it('src-gate.4 source:reflection — kernel__write_skill IS allowed, passes validation', async () => {
     const plugins = makePluginsForSourceGate();
@@ -2355,13 +2227,11 @@ describe('F4-S1 Fix — kernel tool DROPPED when source !== reflection (dispatch
     // writeSkillGuarded must NEVER have been called
     expect(pluginsWithKernel.writeSkillGuarded).not.toHaveBeenCalled();
     // Must have audited tool_call_dropped with kernel_source_not_allowed
-    const logCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const droppedCall = logCalls.find(
-      ([arg]) =>
-        arg['event_type'] === 'tool_call_dropped' &&
-        (arg['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
+    const droppedEvent = findAuditEvent(audit, 'tool_call_dropped');
+    expect(droppedEvent).toBeDefined();
+    expect((droppedEvent?.['meta'] as Record<string, unknown>)?.['reason']).toBe(
+      'kernel_source_not_allowed',
     );
-    expect(droppedCall).toBeDefined();
   });
 });
 
@@ -2371,71 +2241,43 @@ describe('F4-S1 Fix — kernel tool DROPPED when source !== reflection (dispatch
 // NEVER called for these kernel tools, and that the right drop reason is emitted.
 
 describe('F4-S3 Fix — kernel pretest tools DROPPED end-to-end when source !== reflection', () => {
-  it('src-gate.6 end-to-end: source:cycle + LLM emitting kernel__create_pretest_variant — sandbox.callPlugin NEVER called, kernel_source_not_allowed audited', async () => {
-    const toolCallText =
-      '<tool_calls>[{"tool":"kernel__create_pretest_variant","args":{"name":"v1","plugin_ids":["p1"]}}]</tool_calls>';
-    const llm = makeLlm(toolCallText);
-    const audit = makeAudit();
-    const plugins = makeFullPlugins('Emit tool calls.', []);
-    const sandbox = makeSandbox();
-    const memory = makeMemory();
-    const service = new AgentsService(
-      llm as unknown as LlmService,
-      sandbox as unknown as SandboxGateway,
-      plugins as unknown as PluginsService,
-      memory as unknown as ContextMemoryService,
-      audit as unknown as AuditService,
-      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
-    );
+  it.each([
+    [
+      'create_pretest_variant',
+      '<tool_calls>[{"tool":"kernel__create_pretest_variant","args":{"name":"v1","plugin_ids":["p1"]}}]</tool_calls>',
+    ],
+    [
+      'run_pretest_compare',
+      '<tool_calls>[{"tool":"kernel__run_pretest_compare","args":{}}]</tool_calls>',
+    ],
+  ] as [string, string][])(
+    'src-gate — source:cycle + kernel__%s DROPPED, sandbox not called, kernel_source_not_allowed audited',
+    async (_fn, toolCallText) => {
+      const llm = makeLlm(toolCallText);
+      const audit = makeAudit();
+      const plugins = makeFullPlugins('Emit tool calls.', []);
+      const sandbox = makeSandbox();
+      const memory = makeMemory();
+      const service = new AgentsService(
+        llm as unknown as LlmService,
+        sandbox as unknown as SandboxGateway,
+        plugins as unknown as PluginsService,
+        memory as unknown as ContextMemoryService,
+        audit as unknown as AuditService,
+        { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+      );
 
-    const result = await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+      const result = await service.runGovernedTurn({ source: 'cycle', context: 'run' });
 
-    // Tool call must be DROPPED — not surfaced in result
-    expect(result.tool_calls).toHaveLength(0);
-    // sandbox.callPlugin must NEVER be called for this kernel tool
-    expect(sandbox.callPlugin).not.toHaveBeenCalled();
-    // Must have audited tool_call_dropped with kernel_source_not_allowed
-    const logCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const droppedCall = logCalls.find(
-      ([arg]) =>
-        arg['event_type'] === 'tool_call_dropped' &&
-        (arg['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
-    );
-    expect(droppedCall).toBeDefined();
-  });
-
-  it('src-gate.7 end-to-end: source:cycle + LLM emitting kernel__run_pretest_compare — sandbox.callPlugin NEVER called, kernel_source_not_allowed audited', async () => {
-    const toolCallText =
-      '<tool_calls>[{"tool":"kernel__run_pretest_compare","args":{}}]</tool_calls>';
-    const llm = makeLlm(toolCallText);
-    const audit = makeAudit();
-    const plugins = makeFullPlugins('Emit tool calls.', []);
-    const sandbox = makeSandbox();
-    const memory = makeMemory();
-    const service = new AgentsService(
-      llm as unknown as LlmService,
-      sandbox as unknown as SandboxGateway,
-      plugins as unknown as PluginsService,
-      memory as unknown as ContextMemoryService,
-      audit as unknown as AuditService,
-      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
-    );
-
-    const result = await service.runGovernedTurn({ source: 'cycle', context: 'run' });
-
-    // Tool call must be DROPPED — not surfaced in result
-    expect(result.tool_calls).toHaveLength(0);
-    // sandbox.callPlugin must NEVER be called for this kernel tool
-    expect(sandbox.callPlugin).not.toHaveBeenCalled();
-    // Must have audited tool_call_dropped with kernel_source_not_allowed
-    const logCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const droppedCall = logCalls.find(
-      ([arg]) =>
-        arg['event_type'] === 'tool_call_dropped' &&
-        (arg['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
-    );
-    expect(droppedCall).toBeDefined();
-  });
+      expect(result.tool_calls).toHaveLength(0);
+      expect(sandbox.callPlugin).not.toHaveBeenCalled();
+      const droppedEvent = findAuditEvent(audit, 'tool_call_dropped');
+      expect(droppedEvent).toBeDefined();
+      expect((droppedEvent?.['meta'] as Record<string, unknown>)?.['reason']).toBe(
+        'kernel_source_not_allowed',
+      );
+    },
+  );
 });
 
 // ── F4-S2 Task 1.7/1.8 — source:'reflection' union activation ────────────────
@@ -2511,108 +2353,45 @@ describe('F4-S2 Task 1.7 — GovernedTurnInput.source union accepts reflection (
     );
   });
 
-  it('s2-1.7d (regression) — source:cycle → kernel__write_skill still ABSENT from effectiveTools', async () => {
-    // Regression guard: adding 'reflection' must NOT change cycle behavior.
-    const captured: { tools: string }[] = [];
+  it.each([
+    ['cycle', 'cycle run'],
+    ['chat', 'ask something'],
+    ['pretest', 'pretest run'],
+  ] as ['cycle' | 'chat' | 'pretest', string][])(
+    's2-1.7 (regression) — source:%s → kernel__write_skill ABSENT from effectiveTools',
+    async (source, context) => {
+      const captured: { tools: string }[] = [];
+      const llm: Partial<LlmService> = {
+        complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+          const sp = opts.system_prompt ?? '';
+          const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+          captured.push({ tools: match ? match[1] : '' });
+          return Promise.resolve({
+            text: '',
+            tool_calls: [],
+            backend: 'api',
+            skills_read: [],
+            skills_written: [],
+          } as LlmResponse);
+        }),
+      };
 
-    const llm: Partial<LlmService> = {
-      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
-        const sp = opts.system_prompt ?? '';
-        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
-        captured.push({ tools: match ? match[1] : '' });
-        return Promise.resolve({
-          text: '',
-          tool_calls: [],
-          backend: 'api',
-          skills_read: [],
-          skills_written: [],
-        } as LlmResponse);
-      }),
-    };
+      const plugins = makeFullPlugins('Use tools.', []);
+      const service = new AgentsService(
+        llm as unknown as LlmService,
+        makeSandbox() as unknown as SandboxGateway,
+        plugins as unknown as PluginsService,
+        makeMemory() as unknown as ContextMemoryService,
+        { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
+        { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+      );
 
-    const plugins = makeFullPlugins('Use tools.', []);
-    const service = new AgentsService(
-      llm as unknown as LlmService,
-      makeSandbox() as unknown as SandboxGateway,
-      plugins as unknown as PluginsService,
-      makeMemory() as unknown as ContextMemoryService,
-      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
-      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
-    );
+      await service.runGovernedTurn({ source, context });
 
-    await service.runGovernedTurn({ source: 'cycle', context: 'cycle run' });
-
-    expect(captured).toHaveLength(1);
-    expect(captured[0].tools).not.toContain('kernel__write_skill');
-  });
-
-  it('s2-1.7e (regression) — source:chat → kernel__write_skill ABSENT', async () => {
-    const captured: { tools: string }[] = [];
-
-    const llm: Partial<LlmService> = {
-      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
-        const sp = opts.system_prompt ?? '';
-        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
-        captured.push({ tools: match ? match[1] : '' });
-        return Promise.resolve({
-          text: '',
-          tool_calls: [],
-          backend: 'api',
-          skills_read: [],
-          skills_written: [],
-        } as LlmResponse);
-      }),
-    };
-
-    const plugins = makeFullPlugins('Use tools.', []);
-    const service = new AgentsService(
-      llm as unknown as LlmService,
-      makeSandbox() as unknown as SandboxGateway,
-      plugins as unknown as PluginsService,
-      makeMemory() as unknown as ContextMemoryService,
-      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
-      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
-    );
-
-    await service.runGovernedTurn({ source: 'chat', context: 'ask something' });
-
-    expect(captured).toHaveLength(1);
-    expect(captured[0].tools).not.toContain('kernel__write_skill');
-  });
-
-  it('s2-1.7f (regression) — source:pretest → kernel__write_skill ABSENT', async () => {
-    const captured: { tools: string }[] = [];
-
-    const llm: Partial<LlmService> = {
-      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
-        const sp = opts.system_prompt ?? '';
-        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
-        captured.push({ tools: match ? match[1] : '' });
-        return Promise.resolve({
-          text: '',
-          tool_calls: [],
-          backend: 'api',
-          skills_read: [],
-          skills_written: [],
-        } as LlmResponse);
-      }),
-    };
-
-    const plugins = makeFullPlugins('Use tools.', []);
-    const service = new AgentsService(
-      llm as unknown as LlmService,
-      makeSandbox() as unknown as SandboxGateway,
-      plugins as unknown as PluginsService,
-      makeMemory() as unknown as ContextMemoryService,
-      { log: jest.fn().mockResolvedValue(undefined) } as unknown as AuditService,
-      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
-    );
-
-    await service.runGovernedTurn({ source: 'pretest', context: 'pretest run' });
-
-    expect(captured).toHaveLength(1);
-    expect(captured[0].tools).not.toContain('kernel__write_skill');
-  });
+      expect(captured).toHaveLength(1);
+      expect(captured[0].tools).not.toContain('kernel__write_skill');
+    },
+  );
 });
 
 // ── F4-S2 Phase 2 — _assembleReflectionContext ────────────────────────────────
@@ -3655,94 +3434,36 @@ describe('F4-S3 Task 1.6 — _dispatchKernelTool: run_pretest_compare', () => {
 describe('F4-S3 Task 1.7 — source-gate regression: new kernel tools dropped in non-reflection turns', () => {
   const CYCLE_ID = 's3-gate-001';
 
-  it('1.7a — create_pretest_variant in cycle turn: dropped kernel_source_not_allowed', async () => {
-    const plugins = makePlugins([], []);
-    const audit = makeAudit();
-    const service = makeAgentsService(plugins, audit);
+  it.each([
+    [
+      'create_pretest_variant',
+      'cycle',
+      'kernel_source_not_allowed',
+      { name: 'x', plugin_ids: ['p1'] },
+    ],
+    ['run_pretest_compare', 'chat', 'kernel_source_not_allowed', {}],
+    ['create_pretest_variant', 'pretest', 'kernel_source_not_allowed', {}],
+    ['bogus_kernel_fn', 'reflection', 'unknown_kernel_tool', {}],
+  ] as [string, string, string, Record<string, unknown>][])(
+    '1.7 — kernel.%s in %s turn: dropped %s',
+    async (fn, source, reason, args) => {
+      const plugins = makePlugins([], []);
+      const audit = makeAudit();
+      const service = makeAgentsService(plugins, audit);
 
-    const calls: ToolCallRequest[] = [
-      {
-        plugin_id: 'kernel',
-        function: 'create_pretest_variant',
-        args: { name: 'x', plugin_ids: ['p1'] },
-      },
-    ];
+      const calls: ToolCallRequest[] = [{ plugin_id: 'kernel', function: fn, args }];
+      const result = await callValidateWithHoisted(service, CYCLE_ID, calls, [], source);
 
-    const result = await callValidateWithHoisted(service, CYCLE_ID, calls, [], 'cycle');
-
-    expect(result).toHaveLength(0);
-    expect(audit.log).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_type: 'tool_call_dropped',
-        plugin_id: 'kernel',
-        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }) as unknown,
-      }),
-    );
-  });
-
-  it('1.7b — run_pretest_compare in chat turn: dropped kernel_source_not_allowed', async () => {
-    const plugins = makePlugins([], []);
-    const audit = makeAudit();
-    const service = makeAgentsService(plugins, audit);
-
-    const calls: ToolCallRequest[] = [
-      { plugin_id: 'kernel', function: 'run_pretest_compare', args: {} },
-    ];
-
-    const result = await callValidateWithHoisted(service, CYCLE_ID, calls, [], 'chat');
-
-    expect(result).toHaveLength(0);
-    expect(audit.log).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_type: 'tool_call_dropped',
-        plugin_id: 'kernel',
-        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }) as unknown,
-      }),
-    );
-  });
-
-  it('1.7c — create_pretest_variant in pretest turn: dropped kernel_source_not_allowed', async () => {
-    const plugins = makePlugins([], []);
-    const audit = makeAudit();
-    const service = makeAgentsService(plugins, audit);
-
-    const calls: ToolCallRequest[] = [
-      { plugin_id: 'kernel', function: 'create_pretest_variant', args: {} },
-    ];
-
-    const result = await callValidateWithHoisted(service, CYCLE_ID, calls, [], 'pretest');
-
-    expect(result).toHaveLength(0);
-    expect(audit.log).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_type: 'tool_call_dropped',
-        plugin_id: 'kernel',
-        meta: expect.objectContaining({ reason: 'kernel_source_not_allowed' }) as unknown,
-      }),
-    );
-  });
-
-  it('1.7d — unknown kernel function still dropped unknown_kernel_tool (registry regression)', async () => {
-    const plugins = makePlugins([], []);
-    const audit = makeAudit();
-    const service = makeAgentsService(plugins, audit);
-
-    const calls: ToolCallRequest[] = [
-      { plugin_id: 'kernel', function: 'bogus_kernel_fn', args: {} },
-    ];
-
-    // Even in reflection turn — unknown function is dropped
-    const result = await callValidateWithHoisted(service, CYCLE_ID, calls, [], 'reflection');
-
-    expect(result).toHaveLength(0);
-    expect(audit.log).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_type: 'tool_call_dropped',
-        plugin_id: 'kernel',
-        meta: expect.objectContaining({ reason: 'unknown_kernel_tool' }) as unknown,
-      }),
-    );
-  });
+      expect(result).toHaveLength(0);
+      expect(audit.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event_type: 'tool_call_dropped',
+          plugin_id: 'kernel',
+          meta: expect.objectContaining({ reason }) as unknown,
+        }),
+      );
+    },
+  );
 
   it('1.7e — all 3 kernel tools allowed in reflection turn (registry has 3 entries)', async () => {
     const plugins = makePlugins([], []);
@@ -4194,11 +3915,8 @@ describe('F6-S1 T1 — maxTurns=1 byte-identical to pre-loop behavior (REGRESSIO
     expect(llmCallArg.context).not.toContain('[OBSERVACIONES');
 
     // NO react_iteration or react_budget_exhausted audit events
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const reactIterAudit = auditCalls.find(([a]) => a['event_type'] === 'react_iteration');
-    const exhaustAudit = auditCalls.find(([a]) => a['event_type'] === 'react_budget_exhausted');
-    expect(reactIterAudit).toBeUndefined();
-    expect(exhaustAudit).toBeUndefined();
+    expect(findAuditEvent(audit, 'react_iteration')).toBeUndefined();
+    expect(findAuditEvent(audit, 'react_budget_exhausted')).toBeUndefined();
 
     // turns_used = 1
     expect(result.turns_used).toBe(1);
@@ -4209,13 +3927,7 @@ describe('F6-S1 T1 — maxTurns=1 byte-identical to pre-loop behavior (REGRESSIO
   });
 
   it('T1.2 — maxTurns=1 + LLM emits a valid provider tool_call: tool executes (1 llm.complete, decision present), turns_used=1, NEITHER react_iteration NOR react_budget_exhausted is audited', async () => {
-    const providerTool = {
-      plugin_id: 'alpaca-provider',
-      name: 'alpaca-provider__place_order',
-      description: 'Place an order',
-      input_schema: { type: 'object', properties: {} },
-    };
-    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
     plugins.findActive.mockResolvedValue([
       { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
     ] as never);
@@ -4262,11 +3974,8 @@ describe('F6-S1 T1 — maxTurns=1 byte-identical to pre-loop behavior (REGRESSIO
     expect(result.turns_used).toBe(1);
 
     // NEITHER react_iteration NOR react_budget_exhausted must be audited
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const reactIterAudit = auditCalls.find(([a]) => a['event_type'] === 'react_iteration');
-    const exhaustAudit = auditCalls.find(([a]) => a['event_type'] === 'react_budget_exhausted');
-    expect(reactIterAudit).toBeUndefined();
-    expect(exhaustAudit).toBeUndefined();
+    expect(findAuditEvent(audit, 'react_iteration')).toBeUndefined();
+    expect(findAuditEvent(audit, 'react_budget_exhausted')).toBeUndefined();
   });
 });
 
@@ -4277,13 +3986,7 @@ describe('F6-S1 T2 — multi-iteration accumulation + observations fed forward',
     const kv = makeKv('4');
     const audit = makeAudit();
 
-    const providerTool = {
-      plugin_id: 'alpaca-provider',
-      name: 'alpaca-provider__place_order',
-      description: 'Place an order',
-      input_schema: { type: 'object', properties: {} },
-    };
-    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
     plugins.findActive.mockResolvedValue([
       { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
     ] as never);
@@ -4360,9 +4063,7 @@ describe('F6-S1 T3 — natural exit on first iteration (no tool_calls)', () => {
     expect(result.text).toBe('just a text response');
 
     // No exhaustion audit
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const exhaustAudit = auditCalls.find(([a]) => a['event_type'] === 'react_budget_exhausted');
-    expect(exhaustAudit).toBeUndefined();
+    expect(findAuditEvent(audit, 'react_budget_exhausted')).toBeUndefined();
   });
 });
 
@@ -4373,13 +4074,7 @@ describe('F6-S1 T4 — budget exhaustion: react_budget_exhausted emitted, NO gra
     const kv = makeKv('2');
     const audit = makeAudit();
 
-    const providerTool = {
-      plugin_id: 'alpaca-provider',
-      name: 'alpaca-provider__place_order',
-      description: 'Place an order',
-      input_schema: { type: 'object', properties: {} },
-    };
-    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
     plugins.findActive.mockResolvedValue([
       { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
     ] as never);
@@ -4438,13 +4133,7 @@ describe('F6-S1 T5 — control re-application: kernel dropped on non-reflection 
     const kv = makeKv('4');
     const audit = makeAudit();
 
-    const providerTool = {
-      plugin_id: 'alpaca-provider',
-      name: 'alpaca-provider__place_order',
-      description: 'Place an order',
-      input_schema: { type: 'object', properties: {} },
-    };
-    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
     plugins.findActive.mockResolvedValue([
       { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
     ] as never);
@@ -4486,14 +4175,12 @@ describe('F6-S1 T5 — control re-application: kernel dropped on non-reflection 
     });
 
     // iter2's kernel call must be dropped kernel_source_not_allowed
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const kernelDropped = auditCalls.find(
-      ([a]) =>
-        a['event_type'] === 'tool_call_dropped' &&
-        a['plugin_id'] === 'kernel' &&
-        (a['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
-    );
+    const kernelDropped = findAuditEvent(audit, 'tool_call_dropped');
     expect(kernelDropped).toBeDefined();
+    expect(kernelDropped?.['plugin_id']).toBe('kernel');
+    expect((kernelDropped?.['meta'] as Record<string, unknown>)?.['reason']).toBe(
+      'kernel_source_not_allowed',
+    );
 
     // writeSkillGuarded MUST NOT be called
     expect(
@@ -4509,12 +4196,6 @@ describe('F6-S1 T6 — control re-application: provider dropped in virtual_only 
     const kv = makeKv('4');
     const audit = makeAudit();
 
-    const providerTool = {
-      plugin_id: 'alpaca-provider',
-      name: 'alpaca-provider__place_order',
-      description: 'Place an order',
-      input_schema: { type: 'object', properties: {} },
-    };
     // Use an extra-type tool for iter1 (not dropped by virtual_only) and provider tool for iter2
     const extraTool = {
       plugin_id: 'backtester',
@@ -4522,7 +4203,7 @@ describe('F6-S1 T6 — control re-application: provider dropped in virtual_only 
       description: 'Run backtest',
       input_schema: { type: 'object', properties: {} },
     };
-    const plugins = makeFullPlugins('Use tools.', [extraTool, providerTool]);
+    const plugins = makeFullPlugins('Use tools.', [extraTool, ALPACA_PROVIDER_TOOL]);
     plugins.findActive.mockResolvedValue([
       { id: 'backtester', type: 'extra', name: 'Backtester' },
       { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
@@ -4564,14 +4245,12 @@ describe('F6-S1 T6 — control re-application: provider dropped in virtual_only 
     });
 
     // Provider tool in iter2 must be dropped virtual_mode_provider_blocked
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const providerDropped = auditCalls.find(
-      ([a]) =>
-        a['event_type'] === 'tool_call_dropped' &&
-        a['plugin_id'] === 'alpaca-provider' &&
-        (a['meta'] as Record<string, unknown>)?.['reason'] === 'virtual_mode_provider_blocked',
-    );
+    const providerDropped = findAuditEvent(audit, 'tool_call_dropped');
     expect(providerDropped).toBeDefined();
+    expect(providerDropped?.['plugin_id']).toBe('alpaca-provider');
+    expect((providerDropped?.['meta'] as Record<string, unknown>)?.['reason']).toBe(
+      'virtual_mode_provider_blocked',
+    );
 
     // sandbox.callPlugin must NOT have been called with alpaca-provider
     const alphacaCalls = callPluginMock.mock.calls.filter(
@@ -4589,25 +4268,18 @@ describe('F6-S1 T7 — _resolveMaxTurns clamp and fail-safe', () => {
     return (service as unknown as { _resolveMaxTurns: () => Promise<number> })._resolveMaxTurns();
   }
 
-  it('T7.1 — missing key (null) → 4', async () => {
-    expect(await resolveMaxTurns(makeKv(null))).toBe(4);
-  });
-
-  it('T7.2 — "abc" (invalid) → 4', async () => {
-    expect(await resolveMaxTurns(makeKv('abc'))).toBe(4);
-  });
-
-  it('T7.3 — "0" → clamped to 1', async () => {
-    expect(await resolveMaxTurns(makeKv('0'))).toBe(1);
-  });
-
-  it('T7.4 — "999" → clamped to 10', async () => {
-    expect(await resolveMaxTurns(makeKv('999'))).toBe(10);
-  });
-
-  it('T7.5 — "2" → 2', async () => {
-    expect(await resolveMaxTurns(makeKv('2'))).toBe(2);
-  });
+  it.each([
+    ['null (missing key)', null, 4],
+    ['"abc" (invalid)', 'abc', 4],
+    ['"0" → clamped to 1', '0', 1],
+    ['"999" → clamped to 10', '999', 10],
+    ['"2"', '2', 2],
+  ] as [string, string | null, number][])(
+    'T7 — kv=%s → %s (clamp/fail-safe)',
+    async (_label, kvValue, expected) => {
+      expect(await resolveMaxTurns(makeKv(kvValue))).toBe(expected);
+    },
+  );
 
   it('T7.6 — kv absent (null service) → 4', async () => {
     const plugins = makeFullPlugins(null, []);
@@ -4651,13 +4323,7 @@ describe('F6-S1 T8 — termination: loop stops at maxTurns even with LLM always 
     const kv = makeKv('3');
     const audit = makeAudit();
 
-    const providerTool = {
-      plugin_id: 'alpaca-provider',
-      name: 'alpaca-provider__place_order',
-      description: 'Place an order',
-      input_schema: { type: 'object', properties: {} },
-    };
-    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
     plugins.findActive.mockResolvedValue([
       { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
     ] as never);
@@ -4720,13 +4386,7 @@ describe('F6-S1 T9 — _composeIterationContext: context cap enforced', () => {
     const kv = makeKv('5');
     const audit = makeAudit();
 
-    const providerTool = {
-      plugin_id: 'alpaca-provider',
-      name: 'alpaca-provider__place_order',
-      description: 'Place an order',
-      input_schema: { type: 'object', properties: {} },
-    };
-    const plugins = makeFullPlugins('Use tools.', [providerTool]);
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
     plugins.findActive.mockResolvedValue([
       { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
     ] as never);
@@ -5638,8 +5298,7 @@ describe('F6-S2 PR3 — kernel__record_lesson dispatch', () => {
     expect(lesson.rationale).toBe('FOMC volatility');
 
     // audit 'lesson_recorded' must have been emitted
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const lessonAudit = auditCalls.find(([a]) => a['event_type'] === 'lesson_recorded');
+    const lessonAudit = findAuditEvent(audit, 'lesson_recorded');
     expect(lessonAudit).toBeDefined();
 
     // Decision allowed
@@ -5700,61 +5359,37 @@ describe('F6-S2 PR3 — kernel__record_lesson dispatch', () => {
     expect(sandbox_results[0]?.ok).toBe(false);
   });
 
-  it('3.5e — kernel__record_lesson from source=cycle is dropped (kernel_source_not_allowed)', async () => {
-    const audit = makeAudit();
-    const plugins = makeFullPlugins();
-    const ltm = makeLtmPr3();
-    const service = makeLtmPr3AgentsService(
-      makeLlm(''),
-      audit,
-      plugins,
-      makeSandbox(),
-      makeMemory(),
-      ltm,
-    );
+  it.each(['cycle', 'chat'])(
+    '3.5e-f — kernel__record_lesson from source=%s DROPPED (kernel_source_not_allowed)',
+    async (source) => {
+      const audit = makeAudit();
+      const plugins = makeFullPlugins();
+      const ltm = makeLtmPr3();
+      const service = makeLtmPr3AgentsService(
+        makeLlm(''),
+        audit,
+        plugins,
+        makeSandbox(),
+        makeMemory(),
+        ltm,
+      );
 
-    const tc: import('../llm/llm.service').ToolCallRequest = {
-      plugin_id: 'kernel',
-      function: 'record_lesson',
-      args: { text: 'should be dropped' },
-    };
+      const tc: import('../llm/llm.service').ToolCallRequest = {
+        plugin_id: 'kernel',
+        function: 'record_lesson',
+        args: { text: 'should be dropped' },
+      };
 
-    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'cycle');
-    // Must be dropped — source=cycle is not allowed
-    expect(valid).toHaveLength(0);
+      const valid = await callValidateWithSource(service, CYCLE_ID, [tc], source);
+      expect(valid).toHaveLength(0);
 
-    // audit tool_call_dropped with reason kernel_source_not_allowed
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const dropped = auditCalls.find(
-      ([a]) =>
-        a['event_type'] === 'tool_call_dropped' &&
-        (a['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
-    );
-    expect(dropped).toBeDefined();
-  });
-
-  it('3.5f — kernel__record_lesson from source=chat is dropped (kernel_source_not_allowed)', async () => {
-    const audit = makeAudit();
-    const plugins = makeFullPlugins();
-    const ltm = makeLtmPr3();
-    const service = makeLtmPr3AgentsService(
-      makeLlm(''),
-      audit,
-      plugins,
-      makeSandbox(),
-      makeMemory(),
-      ltm,
-    );
-
-    const tc: import('../llm/llm.service').ToolCallRequest = {
-      plugin_id: 'kernel',
-      function: 'record_lesson',
-      args: { text: 'should be dropped from chat' },
-    };
-
-    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'chat');
-    expect(valid).toHaveLength(0);
-  });
+      const dropped = findAuditEvent(audit, 'tool_call_dropped');
+      expect(dropped).toBeDefined();
+      expect((dropped?.['meta'] as Record<string, unknown>)?.['reason']).toBe(
+        'kernel_source_not_allowed',
+      );
+    },
+  );
 
   it('3.5g — control tokens in lesson text are stripped before promote() is called', async () => {
     const audit = makeAudit();
@@ -6455,11 +6090,9 @@ describe('F6-S3 PR-B B4 — _executeToolCalls debate intercept', () => {
     expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
     expect(decisions[0]?.allowed).toBe(true);
     // audit events: debate_started, debate_stance ×2, debate_consensus
+    expect(findAuditEvent(audit, 'debate_started')).toBeDefined();
+    expect(findAuditEvent(audit, 'debate_consensus')).toBeDefined();
     const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const started = auditCalls.find(([a]) => a['event_type'] === 'debate_started');
-    const consensusEvent = auditCalls.find(([a]) => a['event_type'] === 'debate_consensus');
-    expect(started).toBeDefined();
-    expect(consensusEvent).toBeDefined();
     const stanceEvents = auditCalls.filter(([a]) => a['event_type'] === 'debate_stance');
     expect(stanceEvents).toHaveLength(2);
   });
@@ -6497,9 +6130,7 @@ describe('F6-S3 PR-B B4 — _executeToolCalls debate intercept', () => {
     expect(decisions[0]?.allowed).toBe(false);
     expect(decisions[0]?.reason).toBe('debate_rejected');
     // audit debate_consensus emitted
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const consensusAudit = auditCalls.find(([a]) => a['event_type'] === 'debate_consensus');
-    expect(consensusAudit).toBeDefined();
+    expect(findAuditEvent(audit, 'debate_consensus')).toBeDefined();
   });
 
   // T5: promote_pretest + reject → _kernelPromotePretest/promote NEVER called
@@ -6638,9 +6269,7 @@ describe('F6-S3 PR-B B4 — _executeToolCalls debate intercept', () => {
     const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
 
     // debate_skipped must be audited
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const skipped = auditCalls.find(([a]) => a['event_type'] === 'debate_skipped');
-    expect(skipped).toBeDefined();
+    expect(findAuditEvent(audit, 'debate_skipped')).toBeDefined();
     // tc dispatched (fail-soft allow)
     expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
     expect(decisions[0]?.allowed).toBe(true);
@@ -6672,9 +6301,7 @@ describe('F6-S3 PR-B B4 — _executeToolCalls debate intercept', () => {
     const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
 
     // debate_skipped must be audited
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const skipped = auditCalls.find(([a]) => a['event_type'] === 'debate_skipped');
-    expect(skipped).toBeDefined();
+    expect(findAuditEvent(audit, 'debate_skipped')).toBeDefined();
     // tc NOT dispatched
     expect(sandbox.callPlugin).not.toHaveBeenCalled();
     expect(decisions[0]?.allowed).toBe(false);
@@ -6795,23 +6422,18 @@ describe('AgentsService._readGatingConfig', () => {
     expect(cfg.hideTradesWhenCbOpen).toBe(true);
   });
 
-  it('f6s4-rc2 — key not set (null) → hideTradesWhenCbOpen: true', async () => {
-    const service = makeGatingService({ 'gating.hide_trades_when_cb_open': null });
-    const cfg = await service._readGatingConfig();
-    expect(cfg.hideTradesWhenCbOpen).toBe(true);
-  });
-
-  it("f6s4-rc3 — value 'false' → hideTradesWhenCbOpen: false", async () => {
-    const service = makeGatingService({ 'gating.hide_trades_when_cb_open': 'false' });
-    const cfg = await service._readGatingConfig();
-    expect(cfg.hideTradesWhenCbOpen).toBe(false);
-  });
-
-  it("f6s4-rc4 — value 'true' → hideTradesWhenCbOpen: true", async () => {
-    const service = makeGatingService({ 'gating.hide_trades_when_cb_open': 'true' });
-    const cfg = await service._readGatingConfig();
-    expect(cfg.hideTradesWhenCbOpen).toBe(true);
-  });
+  it.each([
+    [null, true, 'key not set (null)'],
+    ['false', false, "value 'false'"],
+    ['true', true, "value 'true'"],
+  ] as [string | null, boolean, string][])(
+    'f6s4-rc — gating key %s → hideTradesWhenCbOpen: %s (%s)',
+    async (kvValue, expected) => {
+      const service = makeGatingService({ 'gating.hide_trades_when_cb_open': kvValue });
+      const cfg = await service._readGatingConfig();
+      expect(cfg.hideTradesWhenCbOpen).toBe(expected);
+    },
+  );
 
   it('f6s4-rc5 — kv.get throws → hideTradesWhenCbOpen: true (fail-safe)', async () => {
     const service = makeGatingServiceKvThrows();
@@ -6842,35 +6464,17 @@ describe('AgentsService._computeVisibleTools', () => {
     expect(visible.some((t) => t.plugin_id === 'skill-plugin')).toBe(true);
   });
 
-  it('f6s4-cv2 — CB closed → all tools visible (identity)', async () => {
-    const service = makeGatingService({
-      'scheduler:circuit_breaker': makeCbKvValue('closed'),
-    });
-    const tools = [providerTool, kernelTool];
-    const visible = await service._computeVisibleTools(tools);
-    expect(visible).toBe(tools); // same reference — byte-identical
-  });
-
-  it('f6s4-cv3 — CB half_open → all tools visible (probe allowed)', async () => {
-    const service = makeGatingService({
-      'scheduler:circuit_breaker': makeCbKvValue('half_open'),
-    });
-    const tools = [providerTool, kernelTool];
-    const visible = await service._computeVisibleTools(tools);
-    expect(visible).toBe(tools);
-  });
-
-  it('f6s4-cv4 — CB key absent → all tools visible (fail-safe: not-open)', async () => {
-    const service = makeGatingService({}); // no CB key
-    const tools = [providerTool, kernelTool];
-    const visible = await service._computeVisibleTools(tools);
-    expect(visible).toBe(tools);
-  });
-
-  it('f6s4-cv5 — CB value malformed JSON → all tools visible (fail-safe)', async () => {
-    const service = makeGatingService({
-      'scheduler:circuit_breaker': 'not-valid-json{{{',
-    });
+  it.each([
+    ['closed', makeCbKvValue('closed'), 'all tools visible (identity)'],
+    ['half_open', makeCbKvValue('half_open'), 'all tools visible (probe allowed)'],
+    ['absent', undefined, 'all tools visible (fail-safe: not-open)'],
+    ['malformed', 'not-valid-json{{{', 'all tools visible (fail-safe)'],
+  ] as [string, string | undefined, string][])('f6s4-cv — CB %s → %s', async (_label, cbValue) => {
+    const kvValues: Record<string, string | null> = {};
+    if (cbValue !== undefined) {
+      kvValues['scheduler:circuit_breaker'] = cbValue;
+    }
+    const service = makeGatingService(kvValues);
     const tools = [providerTool, kernelTool];
     const visible = await service._computeVisibleTools(tools);
     expect(visible).toBe(tools);
@@ -7073,9 +6677,7 @@ describe('AgentsService.runGovernedTurn — tool gating (F6-S4)', () => {
     expect(allowedDecisions).toHaveLength(0);
 
     // Verify _validateToolCalls emitted tool_call_dropped audit
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const dropped = auditCalls.find(([a]) => a['event_type'] === 'tool_call_dropped');
-    expect(dropped).toBeDefined();
+    expect(findAuditEvent(audit, 'tool_call_dropped')).toBeDefined();
   });
 });
 
@@ -7584,61 +7186,30 @@ describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () =
     expect(captured[0]?.tools).toContain('kernel__train_ml_model');
   });
 
-  it('6.3 — source:cycle → kernel__train_ml_model NOT in kernelTools (dropped kernel_source_not_allowed)', async () => {
-    const audit = makeAudit();
-    const sandbox = makeSandbox();
-    const mlSignalRecord = makeMlSignalRecord([]);
-    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord);
+  it.each(['cycle', 'chat', 'pretest'])(
+    '6.3-5 — source:%s → kernel__train_ml_model DROPPED (kernel_source_not_allowed)',
+    async (source) => {
+      const audit = makeAudit();
+      const sandbox = makeSandbox();
+      const mlSignalRecord = makeMlSignalRecord([]);
+      const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord);
 
-    const tc: import('../llm/llm.service').ToolCallRequest = {
-      plugin_id: 'kernel',
-      function: 'train_ml_model',
-      args: {},
-    };
+      const tc: import('../llm/llm.service').ToolCallRequest = {
+        plugin_id: 'kernel',
+        function: 'train_ml_model',
+        args: {},
+      };
 
-    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'cycle');
-    expect(valid).toHaveLength(0);
+      const valid = await callValidateWithSource(service, CYCLE_ID, [tc], source);
+      expect(valid).toHaveLength(0);
 
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const dropped = auditCalls.find(
-      ([a]) =>
-        a['event_type'] === 'tool_call_dropped' &&
-        (a['meta'] as Record<string, unknown>)?.['reason'] === 'kernel_source_not_allowed',
-    );
-    expect(dropped).toBeDefined();
-  });
-
-  it('6.4 — source:chat → kernel__train_ml_model dropped (kernel_source_not_allowed)', async () => {
-    const audit = makeAudit();
-    const sandbox = makeSandbox();
-    const mlSignalRecord = makeMlSignalRecord([]);
-    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord);
-
-    const tc: import('../llm/llm.service').ToolCallRequest = {
-      plugin_id: 'kernel',
-      function: 'train_ml_model',
-      args: {},
-    };
-
-    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'chat');
-    expect(valid).toHaveLength(0);
-  });
-
-  it('6.5 — source:pretest → kernel__train_ml_model dropped (kernel_source_not_allowed)', async () => {
-    const audit = makeAudit();
-    const sandbox = makeSandbox();
-    const mlSignalRecord = makeMlSignalRecord([]);
-    const service = makeMlTrainAgentsService(audit, sandbox, mlSignalRecord);
-
-    const tc: import('../llm/llm.service').ToolCallRequest = {
-      plugin_id: 'kernel',
-      function: 'train_ml_model',
-      args: {},
-    };
-
-    const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'pretest');
-    expect(valid).toHaveLength(0);
-  });
+      const dropped = findAuditEvent(audit, 'tool_call_dropped');
+      expect(dropped).toBeDefined();
+      expect((dropped?.['meta'] as Record<string, unknown>)?.['reason']).toBe(
+        'kernel_source_not_allowed',
+      );
+    },
+  );
 
   // ── 6.6 Happy path — rows >= 50, plugin returns 'trained' ─────────────────
 
@@ -7687,10 +7258,9 @@ describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () =
     expect(typeof stored['trained_at']).toBe('string');
 
     // audit 'ml_model_trained' with status 'trained'
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_model_trained');
+    const mlAudit = findAuditEvent(audit, 'ml_model_trained');
     expect(mlAudit).toBeDefined();
-    const mlMeta = mlAudit![0]['meta'] as Record<string, unknown>;
+    const mlMeta = mlAudit!['meta'] as Record<string, unknown>;
     expect(mlMeta['status']).toBe('trained');
     expect(mlMeta['n_samples']).toBe(60);
 
@@ -7725,10 +7295,9 @@ describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () =
     expect(kv.set).not.toHaveBeenCalled();
 
     // audit ml_model_trained with status cold_start
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_model_trained');
+    const mlAudit = findAuditEvent(audit, 'ml_model_trained');
     expect(mlAudit).toBeDefined();
-    const mlMeta = mlAudit![0]['meta'] as Record<string, unknown>;
+    const mlMeta = mlAudit!['meta'] as Record<string, unknown>;
     expect(mlMeta['status']).toBe('cold_start');
     expect(mlMeta['n_samples']).toBe(49);
 
@@ -7763,10 +7332,9 @@ describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () =
     expect(kv.set).not.toHaveBeenCalled();
 
     // audit ml_model_trained with status cold_start
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_model_trained');
+    const mlAudit = findAuditEvent(audit, 'ml_model_trained');
     expect(mlAudit).toBeDefined();
-    const mlMeta = mlAudit![0]['meta'] as Record<string, unknown>;
+    const mlMeta = mlAudit!['meta'] as Record<string, unknown>;
     expect(mlMeta['status']).toBe('cold_start');
   });
 
@@ -7819,10 +7387,9 @@ describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () =
     expect(kv.set).not.toHaveBeenCalled();
 
     // audit ml_model_trained with status error
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_model_trained');
+    const mlAudit = findAuditEvent(audit, 'ml_model_trained');
     expect(mlAudit).toBeDefined();
-    const mlMeta = mlAudit![0]['meta'] as Record<string, unknown>;
+    const mlMeta = mlAudit!['meta'] as Record<string, unknown>;
     expect(mlMeta['status']).toBe('error');
 
     // decision allowed:false with reason ml_train_failed
@@ -7878,13 +7445,9 @@ describe('ml-feature-extractor-s2 PR2 — kernel__train_ml_model dispatch', () =
     const valid = await callValidateWithSource(service, CYCLE_ID, [tc], 'reflection');
     expect(valid).toHaveLength(0);
 
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const dropped = auditCalls.find(
-      ([a]) =>
-        a['event_type'] === 'tool_call_dropped' &&
-        (a['meta'] as Record<string, unknown>)?.['reason'] === 'unknown_kernel_tool',
-    );
+    const dropped = findAuditEvent(audit, 'tool_call_dropped');
     expect(dropped).toBeDefined();
+    expect((dropped?.['meta'] as Record<string, unknown>)?.['reason']).toBe('unknown_kernel_tool');
   });
 });
 
@@ -8313,9 +7876,7 @@ describe('ml-feature-extractor-s3 Phase 4 — _runVetoLayer ML-first sort + inje
     ).resolves.toBeDefined();
 
     // cycle_fail audit emitted
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const cycleFail = auditCalls.find(([a]) => a['event_type'] === 'cycle_fail');
-    expect(cycleFail).toBeDefined();
+    expect(findAuditEvent(audit, 'cycle_fail')).toBeDefined();
   });
 });
 
@@ -8385,10 +7946,9 @@ describe('ml-feature-extractor-s3 Phase 5 — _executeCycle wiring + audit', () 
     expect(resolveCallCount).toBe(1);
 
     // audit 'ml_signals_adjusted' emitted
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_signals_adjusted');
+    const mlAudit = findAuditEvent(audit, 'ml_signals_adjusted');
     expect(mlAudit).toBeDefined();
-    const meta = mlAudit![0]['meta'] as Record<string, unknown>;
+    const meta = mlAudit!['meta'] as Record<string, unknown>;
     expect(meta['hash_match']).toBe(true);
     expect(typeof meta['n_signals']).toBe('number');
   });
@@ -8429,9 +7989,7 @@ describe('ml-feature-extractor-s3 Phase 5 — _executeCycle wiring + audit', () 
     expect(mlKvCalls).toHaveLength(0);
 
     // audit 'ml_signals_adjusted' must NOT be emitted
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_signals_adjusted');
-    expect(mlAudit).toBeUndefined();
+    expect(findAuditEvent(audit, 'ml_signals_adjusted')).toBeUndefined();
   });
 
   // 5.1-c: _mlResolveModelInjection throws (unexpected) → cycle completes; no audit; no rethrow
@@ -8472,9 +8030,7 @@ describe('ml-feature-extractor-s3 Phase 5 — _executeCycle wiring + audit', () 
     ).resolves.toBeDefined();
 
     // No ml_signals_adjusted audit
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_signals_adjusted');
-    expect(mlAudit).toBeUndefined();
+    expect(findAuditEvent(audit, 'ml_signals_adjusted')).toBeUndefined();
   });
 });
 
@@ -8711,10 +8267,9 @@ describe('ml-feature-extractor-s3 Fix 4 — ml_signals_adjusted n_signals is pre
       service as unknown as { _executeCycle: (c: string, ctx: string) => Promise<unknown> }
     )._executeCycle('cycle-nsig-001', 'test');
 
-    const auditCalls = (audit.log as jest.Mock).mock.calls as Array<[Record<string, unknown>]>;
-    const mlAudit = auditCalls.find(([a]) => a['event_type'] === 'ml_signals_adjusted');
+    const mlAudit = findAuditEvent(audit, 'ml_signals_adjusted');
     expect(mlAudit).toBeDefined();
-    const meta = mlAudit![0]['meta'] as Record<string, unknown>;
+    const meta = mlAudit!['meta'] as Record<string, unknown>;
     // ML saw 3 signals. Aggregator reduced to 1. n_signals must be 3 (pre-aggregator).
     expect(meta['n_signals']).toBe(3);
   });
@@ -9089,29 +8644,20 @@ describe('kernel__tune_plugin_param — reflection gate', () => {
     expect(captured[0].tools).toContain('kernel__tune_plugin_param');
   });
 
-  it('1.2b — source:cycle → kernel__tune_plugin_param NOT in tool schema', async () => {
-    const captured: { tools: string }[] = [];
-    const service = buildReflectionGateService(captured);
-    await service.runGovernedTurn({ source: 'cycle', context: 'cycle run' });
-    expect(captured).toHaveLength(1);
-    expect(captured[0].tools).not.toContain('kernel__tune_plugin_param');
-  });
-
-  it('1.2c — source:chat → kernel__tune_plugin_param NOT in tool schema', async () => {
-    const captured: { tools: string }[] = [];
-    const service = buildReflectionGateService(captured);
-    await service.runGovernedTurn({ source: 'chat', context: 'chat' });
-    expect(captured).toHaveLength(1);
-    expect(captured[0].tools).not.toContain('kernel__tune_plugin_param');
-  });
-
-  it('1.2d — source:pretest → kernel__tune_plugin_param NOT in tool schema', async () => {
-    const captured: { tools: string }[] = [];
-    const service = buildReflectionGateService(captured);
-    await service.runGovernedTurn({ source: 'pretest', context: 'pretest run' });
-    expect(captured).toHaveLength(1);
-    expect(captured[0].tools).not.toContain('kernel__tune_plugin_param');
-  });
+  it.each([
+    ['cycle', 'cycle run'],
+    ['chat', 'chat'],
+    ['pretest', 'pretest run'],
+  ] as ['cycle' | 'chat' | 'pretest', string][])(
+    '1.2 — source:%s → kernel__tune_plugin_param NOT in tool schema',
+    async (source, context) => {
+      const captured: { tools: string }[] = [];
+      const service = buildReflectionGateService(captured);
+      await service.runGovernedTurn({ source, context });
+      expect(captured).toHaveLength(1);
+      expect(captured[0].tools).not.toContain('kernel__tune_plugin_param');
+    },
+  );
 });
 
 // Task 1.7 — KERNEL_TOOL_REGISTRY and unknown fn drop
@@ -10001,26 +9547,23 @@ describe('_assembleReflectionContext — [TUNABLE PARAMS]', () => {
     expect(ctx).toMatch(/my-skill\.ratio\(number/);
   });
 
-  it('4.1b — no active skill plugin with config schema → section omitted entirely', async () => {
-    const service = makeAssemblerServicePR2({
-      activePlugins: [{ id: 'some-discipline', type: 'discipline' }],
-      configSchemas: {},
-    });
-
-    const ctx = await callAssembleReflectionContext(service);
-
+  it('4.1b — no active skill plugin with config schema → [TUNABLE PARAMS] omitted', async () => {
+    const ctx = await callAssembleReflectionContext(
+      makeAssemblerServicePR2({
+        activePlugins: [{ id: 'some-discipline', type: 'discipline' }],
+        configSchemas: {},
+      }),
+    );
     expect(ctx).not.toContain('[TUNABLE PARAMS]');
   });
 
-  it('4.1c — skill plugin but getConfigSchema returns null → plugin skipped, no throw, section omitted', async () => {
+  it('4.1c — skill plugin + getConfigSchema null → plugin skipped, no throw, section omitted', async () => {
     const service = makeAssemblerServicePR2({
       activePlugins: [{ id: 'my-skill', type: 'skill', config: { ratio: 0.5 } }],
-      configSchemas: {}, // no schema registered → null returned
+      configSchemas: {},
     });
-
     await expect(callAssembleReflectionContext(service)).resolves.not.toThrow();
-    const ctx = await callAssembleReflectionContext(service);
-    expect(ctx).not.toContain('[TUNABLE PARAMS]');
+    expect(await callAssembleReflectionContext(service)).not.toContain('[TUNABLE PARAMS]');
   });
 
   it('4.1d — getConfigSchema throws for one plugin → that plugin skipped, no exception escapes', async () => {
@@ -10227,7 +9770,7 @@ describe('_assembleReflectionContext — [CURRENT REGIME]', () => {
     expect(ctx).toContain('HIGH_VOL');
   });
 
-  it('4.3b — no signal with volatility_regime meta → section omitted, no error', async () => {
+  it('4.3b — signal exists but no volatility_regime meta → section omitted, no error', async () => {
     const service = makeAssemblerServicePR2({
       auditEntries: [
         { event_type: 'cycle_complete', symbol: 'AAPL', action: 'buy', meta: null },
@@ -10239,9 +9782,7 @@ describe('_assembleReflectionContext — [CURRENT REGIME]', () => {
         },
       ],
     });
-
     const ctx = await callAssembleReflectionContext(service);
-
     expect(ctx).not.toContain('[CURRENT REGIME]');
   });
 
@@ -10276,12 +9817,7 @@ describe('_assembleReflectionContext — [CURRENT REGIME]', () => {
   });
 
   it('4.3d — no audit entries at all → [CURRENT REGIME] omitted, no error', async () => {
-    const service = makeAssemblerServicePR2({
-      auditEntries: [],
-    });
-
-    const ctx = await callAssembleReflectionContext(service);
-
+    const ctx = await callAssembleReflectionContext(makeAssemblerServicePR2({ auditEntries: [] }));
     expect(ctx).not.toContain('[CURRENT REGIME]');
   });
 });
