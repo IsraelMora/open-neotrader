@@ -1,4 +1,4 @@
-# NeuroTrader
+# OpenNeoTrader
 
 Plataforma self-hosted de agentes de IA para trading. El LLM actúa como orquestador que analiza contexto textual (noticias, eventos) y ejecuta skills declarados en plugins Python. Nunca ve series de precios directamente ni ejecuta código arbitrario.
 

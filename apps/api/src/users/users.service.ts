@@ -17,7 +17,7 @@ export class UsersService {
     // Un solo usuario por instalación (local-first)
     if ((await this.db.user.count()) > 0) {
       throw new ConflictException(
-        'Ya existe un usuario en esta instalación. NeuroTrader es monousuario.',
+        'Ya existe un usuario en esta instalación. OpenNeoTrader es monousuario.',
       );
     }
     const password_hash = await bcrypt.hash(password, BCRYPT_ROUNDS);

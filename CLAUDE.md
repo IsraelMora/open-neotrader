@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-NeuroTrader (public: **open-neotrader**) is a self-hosted platform of AI trading agents. An LLM acts as an **orchestrator**: it reads textual context (news, events) and invokes whitelisted skills declared in Python plugins. By design the LLM is unconstrained at the kernel level — risk controls live in **opt-in plugins**, not hardcoded guardrails. The LLM never sees raw price series and never executes arbitrary code.
+OpenNeoTrader (public: **open-neotrader**) is a self-hosted platform of AI trading agents. An LLM acts as an **orchestrator**: it reads textual context (news, events) and invokes whitelisted skills declared in Python plugins. By design the LLM is unconstrained at the kernel level — risk controls live in **opt-in plugins**, not hardcoded guardrails. The LLM never sees raw price series and never executes arbitrary code.
 
 ## Commands
 

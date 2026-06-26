@@ -2,7 +2,7 @@
   "_meta": {
     "version": "1.0.0",
     "updated_at": "2026-06-24",
-    "description": "Catálogo oficial de plugins NeuroTrader. Añade tu propio plugin enviando un PR al repositorio."
+    "description": "Catálogo oficial de plugins OpenNeoTrader. Añade tu propio plugin enviando un PR al repositorio."
   },
   "plugins": [
     {
@@ -11,7 +11,7 @@
       "version": "1.0.0",
       "type": "skill",
       "description": "Levy (1968)/O'Neil CANSLIM: RS ponderado 4 períodos vs benchmark. Win rate ~62% en mercados alcistas.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "momentum",
         "relative-strength",
@@ -26,7 +26,7 @@
       "version": "1.0.0",
       "type": "skill",
       "description": "TTM Squeeze: Keltner + Bollinger. Detecta compresión de volatilidad antes de breakouts.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "volatility",
         "breakout",
@@ -41,7 +41,7 @@
       "version": "1.0.0",
       "type": "skill",
       "description": "Jegadeesh & Titman (1993): retorno 12m-1m como factor de momentum. Base académica sólida.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "momentum",
         "factor",
@@ -56,7 +56,7 @@
       "version": "1.0.0",
       "type": "skill",
       "description": "Reversión a 2σ del VWAP. Win rate ~62%. Ideal para intraday en activos líquidos.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "mean-reversion",
         "vwap",
@@ -71,7 +71,7 @@
       "version": "1.0.0",
       "type": "skill",
       "description": "Faber (2007) GTAA: 11 SPDRs, momentum 12m + MA 10m. Rotación táctica entre sectores.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "macro",
         "rotation",
@@ -87,7 +87,7 @@
       "version": "1.0.0",
       "type": "skill",
       "description": "NewsAPI + LLM para análisis semántico de titulares. Score compuesto -1 a +1 con fallback heurístico.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "nlp",
         "news",
@@ -103,7 +103,7 @@
       "version": "1.0.0",
       "type": "skill",
       "description": "Engle-Granger (1987): spread cointegrado market-neutral. Test ADF. Long/short por Z-Score.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "arbitrage",
         "market-neutral",
@@ -118,7 +118,7 @@
       "version": "1.0.0",
       "type": "skill",
       "description": "Ball & Brown (1968): post-earnings drift 30-60 días. large_beat → win rate ~70%.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "earnings",
         "pead",
@@ -133,7 +133,7 @@
       "version": "1.0.0",
       "type": "discipline",
       "description": "Stop inicial + trailing stop dinámico basado en ATR. Se adapta a la volatilidad actual del activo.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "stop-loss",
         "atr",
@@ -148,7 +148,7 @@
       "version": "1.0.0",
       "type": "discipline",
       "description": "Votación ponderada multi-skill: consensus signal. Pass-through para señales de pairs/pead/pyramid.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "aggregation",
         "consensus",
@@ -163,7 +163,7 @@
       "version": "1.0.0",
       "type": "discipline",
       "description": "Suprime/reduce señales en ventanas FOMC/CPI/NFP/ECB. Calendario 2026 embebido + eventos LLM.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "macro",
         "calendar",
@@ -179,7 +179,7 @@
       "version": "1.0.0",
       "type": "discipline",
       "description": "Portafolio virtual con precios reales. PnL, win rate, profit factor. Intercept live mode.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "simulation",
         "paper",
@@ -194,7 +194,7 @@
       "version": "1.0.0",
       "type": "provider",
       "description": "Datos OHLCV + quotes + órdenes via Alpaca Markets. Paper y live trading.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "provider",
         "alpaca",
@@ -209,7 +209,7 @@
       "version": "1.0.0",
       "type": "provider",
       "description": "OHLCV diario/intraday + quotes. Alternativa gratuita a Bloomberg. 500 req/hora en free tier.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "provider",
         "tiingo",
@@ -224,7 +224,7 @@
       "version": "1.0.0",
       "type": "provider",
       "description": "200+ exchanges via CCXT. Configurable por exchange. El provider más versátil para crypto.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "provider",
         "ccxt",
@@ -240,7 +240,7 @@
       "version": "1.0.0",
       "type": "provider",
       "description": "API no oficial de Yahoo Finance. Sin API key. Fallback gratuito. Ajustado por dividendos.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "provider",
         "yahoo",
@@ -256,7 +256,7 @@
       "version": "1.0.0",
       "type": "extra",
       "description": "Motor ligero de backtesting con numpy. Sharpe/Sortino/Calmar/MaxDD/WinRate/ProfitFactor + equity curve.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "backtesting",
         "performance",
@@ -271,7 +271,7 @@
       "version": "1.0.0",
       "type": "extra",
       "description": "Notificaciones de ciclos, señales y errores via Telegram Bot API. Configurable por eventos.",
-      "author": "NeuroTrader",
+      "author": "OpenNeoTrader",
       "tags": [
         "notification",
         "telegram",

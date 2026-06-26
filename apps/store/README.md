@@ -1,6 +1,6 @@
 # neurotrader-store — backend de la tienda de plugins
 
-Parte del monorepo **NeuroTrader** (`apps/store`). Permite
+Parte del monorepo **OpenNeoTrader** (`apps/store`). Permite
 publicar, explorar y votar plugins de la comunidad, de forma anónima.
 
 > **Servicio de negocio privado.** Este código vive en el monorepo para facilitar el mantenimiento,

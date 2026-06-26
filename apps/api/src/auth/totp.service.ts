@@ -3,7 +3,7 @@ import * as speakeasy from 'speakeasy';
 import * as qrcode from 'qrcode';
 import * as crypto from 'crypto';
 
-const ISSUER = 'NeuroTrader';
+const ISSUER = 'OpenNeoTrader';
 const BACKUP_CODE_COUNT = 10;
 const BACKUP_CODE_LENGTH = 8;
 

@@ -98,8 +98,8 @@ function buildCustomLlmHeaders(providerId: string, apiKey: string): Record<strin
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
   if (providerId === 'openrouter') {
-    headers['HTTP-Referer'] = 'https://neurotrader.local';
-    headers['X-Title'] = 'NeuroTrader';
+    headers['HTTP-Referer'] = 'https://openneotrader.local';
+    headers['X-Title'] = 'OpenNeoTrader';
   }
   return headers;
 }

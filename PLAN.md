@@ -1,11 +1,11 @@
-# NeuroTrader — Plan de arquitectura y refactorización
+# OpenNeoTrader — Plan de arquitectura y refactorización
 
 > **Juego de palabras:** NEUROredes (IA) + TRADER (operativa de mercados)
 > Fecha: 2026-06-14 | Estado: planificación
 
 ---
 
-## 1. ¿Qué es NeuroTrader?
+## 1. ¿Qué es OpenNeoTrader?
 
 Una **plataforma para agentes de IA especializados en trading**, no un agente único.
 
@@ -25,7 +25,7 @@ Una **plataforma para agentes de IA especializados en trading**, no un agente ú
 | **Sandbox estricto** | Python = sin red, sin escritura fuera del volumen de datos del plugin. |
 | **LLM read-only** | El LLM recibe contexto texto plano; sus "acciones" son tool calls a funciones declaradas por el plugin, no ejecución de código. |
 | **Auth real** | JWT + TOTP (@otplib), sin claves físicas cifradas. |
-| **Plugin store verificado** | Plugins y stacks con badge de verificación manual por el equipo NeuroTrader. |
+| **Plugin store verificado** | Plugins y stacks con badge de verificación manual por el equipo OpenNeoTrader. |
 | **Monorepo** | Una sola repo (Turborepo) con apps/ y packages/ bien separados. |
 
 ---
@@ -54,7 +54,7 @@ neurotrader/
 │   └── sandbox/               # Sandbox Python (FastAPI mínimo + aislamiento)
 │       ├── runner.py          # Servidor de ejecución de plugins
 │       ├── isolation.py       # Restricciones de red/fs (seccomp/nsjail)
-│       └── protocol.py        # Protocolo NeuroTrader Plugin Protocol (NTPP)
+│       └── protocol.py        # Protocolo OpenNeoTrader Plugin Protocol (NTPP)
 │
 ├── packages/
 │   ├── plugin-sdk/            # SDK Python para desarrollar plugins
@@ -137,7 +137,7 @@ agents/
 ### 4.2 apps/sandbox — Python Runner
 
 ```python
-# Protocolo: NeuroTrader Plugin Protocol (NTPP) v1
+# Protocolo: OpenNeoTrader Plugin Protocol (NTPP) v1
 # Transporte: HTTP local (Unix socket en producción)
 # El sandbox NO tiene acceso a internet (iptables DROP + --network=none en Docker)
 
@@ -232,7 +232,7 @@ Verificación manual:
   Flujo:
     Autor sube plugin a la tienda (unverified)
     Autor solicita verificación (pending)
-    Equipo NeuroTrader revisa: código, seguridad, declaraciones del manifest
+    Equipo OpenNeoTrader revisa: código, seguridad, declaraciones del manifest
     Si OK: verified (badge en la store)
     Si KO: rejected con motivo
   
@@ -240,14 +240,14 @@ Verificación manual:
     - Revisión manual del código Python del plugin
     - Comprobación de que no hace imports de red en el sandbox
     - Test de ejecución en sandbox limpio
-    - Firma del paquete con la clave de NeuroTrader
+    - Firma del paquete con la clave de OpenNeoTrader
 ```
 
 ---
 
 ## 5. Migración desde trading-test
 
-| Componente en trading-test | Destino en NeuroTrader |
+| Componente en trading-test | Destino en OpenNeoTrader |
 |----------------------------|------------------------|
 | `domain/strategy.py` | Plugin `ensemble-signals` (Python) |
 | `application/skills.py` | Plugin `skills-base` (Python) |
@@ -327,7 +327,7 @@ Verificación manual:
 - [ ] Importar `data.db` de trading-test a PostgreSQL (script de migración)
 - [ ] Migrar plugins Python con el nuevo SDK (wrapper fino sobre el código existente)
 - [ ] Validar que todos los algoritmos dan los mismos resultados
-- [ ] Tests de regresión comparando salidas trading-test vs NeuroTrader
+- [ ] Tests de regresión comparando salidas trading-test vs OpenNeoTrader
 
 ---
 
@@ -380,7 +380,7 @@ volumes:
 
 ---
 
-## 8. NeuroTrader Plugin Protocol (NTPP v1)
+## 8. OpenNeoTrader Plugin Protocol (NTPP v1)
 
 Protocolo de comunicación entre NestJS y el sandbox Python.
 

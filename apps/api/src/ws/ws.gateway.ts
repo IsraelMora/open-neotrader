@@ -126,7 +126,7 @@ export class WsGateway
         ts: new Date().toISOString(),
         userId: client.userId,
         username: client.username,
-        message: 'WebSocket NeuroTrader conectado',
+        message: 'WebSocket OpenNeoTrader conectado',
       });
       this.log.log(`WS conectado: ${client.username} (${client.userId})`);
     } catch {

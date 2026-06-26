@@ -60,7 +60,7 @@ export default function Login() {
           <div className="mx-auto flex justify-center pb-2">
             <Logo size={56} />
           </div>
-          <h1 className="text-xl font-semibold tracking-tight">NeuroTrader</h1>
+          <h1 className="text-xl font-semibold tracking-tight">OpenNeoTrader</h1>
           <p className="text-sm text-muted-foreground">
             {mode === 'login' && 'Accede al panel de control'}
             {mode === 'register' && 'Crea el operador inicial'}

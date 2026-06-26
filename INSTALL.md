@@ -1,4 +1,4 @@
-# NeuroTrader — Instalación y operación autónoma
+# OpenNeoTrader — Instalación y operación autónoma
 
 Guía para dejar el sistema operando solo en **modo paper** (sin dinero real) en minutos.
 Stack auto-contenido: `docker compose up` levanta API + panel + sandbox.

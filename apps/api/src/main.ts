@@ -38,7 +38,7 @@ async function bootstrap() {
   // ── Swagger (solo desarrollo) ──────────────────────────────────────────────
   if (process.env['NODE_ENV'] !== 'production') {
     const doc = new DocumentBuilder()
-      .setTitle('NeuroTrader API')
+      .setTitle('OpenNeoTrader API')
       .setDescription('Plataforma de agentes IA para trading — local & secure first')
       .setVersion('1.0')
       .addBearerAuth()
@@ -58,7 +58,7 @@ async function bootstrap() {
 
   await app.listen(port, host);
   const wsPort = parseInt(process.env['WS_PORT'] ?? '3001', 10);
-  log.log(`NeuroTrader API → http://${host}:${port}/api`);
+  log.log(`OpenNeoTrader API → http://${host}:${port}/api`);
   log.log(`WebSocket WS   → ws://${host}:${wsPort}/api/ws`);
   log.log(`Swagger UI      → http://${host}:${port}/api/docs`);
 }

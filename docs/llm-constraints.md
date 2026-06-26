@@ -1,8 +1,8 @@
-# NeuroTrader — Restricciones del LLM
+# OpenNeoTrader — Restricciones del LLM
 
 ## Principio fundamental: kernel neutral
 
-El LLM en NeuroTrader es un **lector y consejero**, no un ejecutor.
+El LLM en OpenNeoTrader es un **lector y consejero**, no un ejecutor.
 
 El kernel (AgentsService) es **neutral por diseño**: no impone restricciones de riesgo ni
 guardarraíles propios. La disciplina y el veto son responsabilidad exclusiva de los plugins

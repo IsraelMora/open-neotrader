@@ -1,4 +1,4 @@
-# Arquitectura de NeuroTrader
+# Arquitectura de OpenNeoTrader
 
 > **NTPP v1** — Documento de referencia arquitectónica. Refleja el estado real del código;
 > no es un documento de aspiraciones. Última revisión: 2026-06-18.
@@ -20,7 +20,7 @@
 
 ## 1. Visión general
 
-NeuroTrader es una plataforma **local-first** de agentes de trading impulsada por LLM.
+OpenNeoTrader es una plataforma **local-first** de agentes de trading impulsada por LLM.
 El principio de diseño central es **"shell + plugins"**: el núcleo (API) no decide ninguna
 estrategia de trading. Son los plugins quienes aportan señales, criterios de posicionamiento
 y reglas de disciplina. El núcleo orquesta, valida y persiste; nunca razona sobre mercados.

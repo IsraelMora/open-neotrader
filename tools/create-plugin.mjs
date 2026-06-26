@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * NeuroTrader Plugin Scaffold
+ * OpenNeoTrader Plugin Scaffold
  * Uso: node tools/create-plugin.mjs <nombre> [--type skill|provider|discipline|universe|stack|extra]
  */
 import { mkdirSync, writeFileSync, existsSync } from 'fs';
@@ -21,7 +21,7 @@ const VALID_TYPES = ['skill', 'provider', 'discipline', 'universe', 'stack', 'ex
 
 if (values.help || positionals.length === 0) {
   console.log(`
-NeuroTrader Plugin Scaffold
+OpenNeoTrader Plugin Scaffold
 ───────────────────────────
 Uso: node tools/create-plugin.mjs <nombre> [opciones]
 
@@ -243,7 +243,7 @@ def get_symbols() -> list[dict]:
 
 const README = `# ${titleCase(name)}
 
-Plugin para la plataforma [NeuroTrader](https://github.com/tu-org/neurotrader).
+Plugin para la plataforma [OpenNeoTrader](https://github.com/tu-org/neurotrader).
 
 **Tipo:** \`${type}\`
 **Autor:** ${author}
@@ -251,7 +251,7 @@ Plugin para la plataforma [NeuroTrader](https://github.com/tu-org/neurotrader).
 ## Instalación
 
 \`\`\`
-# Desde la UI de NeuroTrader: Plugins → Instalar → pega la URL del repo
+# Desde la UI de OpenNeoTrader: Plugins → Instalar → pega la URL del repo
 # O via API:
 POST /api/plugins/install
 { "source": "https://github.com/${author}/${name}.git" }

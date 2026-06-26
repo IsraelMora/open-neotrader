@@ -179,7 +179,7 @@ export class BackupService {
     let offset = 0;
 
     const magic = data.subarray(offset, offset + MAGIC.length);
-    if (!magic.equals(MAGIC)) throw new Error('Archivo no es un backup válido de NeuroTrader');
+    if (!magic.equals(MAGIC)) throw new Error('Archivo no es un backup válido de OpenNeoTrader');
     offset += MAGIC.length;
 
     const salt = data.subarray(offset, offset + SALT_BYTES);

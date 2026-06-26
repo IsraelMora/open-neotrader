@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# NeuroTrader — bootstrap de configuración autónoma (modo paper por default).
+# OpenNeoTrader — bootstrap de configuración autónoma (modo paper por default).
 # Deja el sistema operando solo: credenciales + plugins + ciclo + ejecución + scheduler.
 # Uso:
 #   API_URL=http://localhost:8080 ADMIN_USER=admin ADMIN_PASS=secreto \

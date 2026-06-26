@@ -28,7 +28,7 @@ services:
       # Auth
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET requerido en .env}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
-      TOTP_ISSUER: ${TOTP_ISSUER:-NeuroTrader}
+      TOTP_ISSUER: ${TOTP_ISSUER:-OpenNeoTrader}
       # LLM — config NO-secreta acá; defaults alineados con .env.example (OpenRouter vía
       # backend OpenAI-compatible). OPENAI_BASE_URL es imprescindible con backend=openai:
       # sin él, la key de OpenRouter apunta a api.openai.com y los modelos OpenRouter

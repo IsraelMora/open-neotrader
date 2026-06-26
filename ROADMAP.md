@@ -1,4 +1,4 @@
-# NeuroTrader — Roadmap
+# OpenNeoTrader — Roadmap
 
 > Local & Secure First · Plugin-driven · Community-grown
 

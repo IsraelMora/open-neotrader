@@ -80,7 +80,7 @@ export class TelegramService implements OnModuleInit {
   async sendTest(): Promise<{ ok: boolean; error?: string }> {
     if (!this.active) return { ok: false, error: 'Plugin not active or missing credentials' };
     try {
-      await this.send('🧪 *NeuroTrader* — Test connection OK ✓');
+      await this.send('🧪 *OpenNeoTrader* — Test connection OK ✓');
       return { ok: true };
     } catch (err) {
       return { ok: false, error: String(err) };

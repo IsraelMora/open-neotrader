@@ -1,4 +1,4 @@
-# NeuroTrader Plugin Protocol (NTPP v1)
+# OpenNeoTrader Plugin Protocol (NTPP v1)
 
 ## Estructura de un plugin
 

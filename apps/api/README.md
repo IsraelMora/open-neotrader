@@ -1,6 +1,6 @@
-# NeuroTrader API
+# OpenNeoTrader API
 
-API REST del núcleo de la plataforma NeuroTrader. Orquesta agentes de IA para trading, gestiona plugins Python en sandbox aislado y sirve de única puerta de salida a internet.
+API REST del núcleo de la plataforma OpenNeoTrader. Orquesta agentes de IA para trading, gestiona plugins Python en sandbox aislado y sirve de única puerta de salida a internet.
 
 ---
 

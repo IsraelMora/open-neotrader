@@ -56,7 +56,7 @@ export function Logo({
       {showText && (
         <div className="flex flex-col justify-center">
           <div className="text-sm font-semibold leading-tight tracking-tight font-sans">
-            NeuroTrader
+            OpenNeoTrader
           </div>
           <div className="text-[10px] text-muted-foreground leading-none mt-0.5 font-mono">
             {subtitle}

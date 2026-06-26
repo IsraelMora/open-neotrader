@@ -1,17 +1,17 @@
-# NeuroTrader Plugin Store — Verificación y Stacks
+# OpenNeoTrader Plugin Store — Verificación y Stacks
 
 ## Estados de verificación
 
 ```
 unverified  → El autor acaba de subir el plugin. Badge: ninguno.
 pending     → El autor solicitó verificación. Badge: "En revisión"
-verified    → Revisado y aprobado por el equipo NeuroTrader. Badge: ✓ Verificado
+verified    → Revisado y aprobado por el equipo OpenNeoTrader. Badge: ✓ Verificado
 rejected    → No pasó la revisión. Motivo visible para el autor, no para el público.
 ```
 
 ## Checklist de verificación manual
 
-Cuando un plugin está en estado `pending`, el revisor de NeuroTrader comprueba:
+Cuando un plugin está en estado `pending`, el revisor de OpenNeoTrader comprueba:
 
 ### Seguridad
 - [ ] No hay imports de red (`requests`, `socket`, `urllib`, `httpx`, etc.)
@@ -40,7 +40,7 @@ Cuando un plugin está en estado `pending`, el revisor de NeuroTrader comprueba:
 ## Flujo de subida y verificación
 
 ```
-Autor                          Sistema                        Revisor NeuroTrader
+Autor                          Sistema                        Revisor OpenNeoTrader
   │                               │                                │
   ├─ POST /store/plugins          │                                │
   │   { tarball, manifest }       │                                │
@@ -86,7 +86,7 @@ POST /store/plugins                          → subir plugin
 POST /store/plugins/{id}/request-verification → solicitar revisión
 PATCH /store/plugins/{id}                   → actualizar (nueva versión)
 
-# Admin NeuroTrader
+# Admin OpenNeoTrader
 GET  /admin/plugins/pending                 → cola de revisión
 GET  /admin/plugins/{id}/source             → ver código fuente (solo admin)
 POST /admin/plugins/{id}/verify             → aprobar / rechazar
