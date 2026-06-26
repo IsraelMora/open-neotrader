@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { api } from '../lib/api';
+import { fmt } from '../lib/utils';
+import { type Strategy, type Stats } from '../lib/types';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Switch } from './ui/switch';
@@ -8,23 +10,6 @@ import { useResource } from '../lib/useResource';
 import { useAction } from '../lib/useAction';
 import { Trash2, FlaskConical, Radio, Settings2 } from 'lucide-react';
 import StrategyDetail from './StrategyDetail';
-
-interface Strategy {
-  id: string;
-  name: string;
-  description: string | null;
-  config: Record<string, string>;
-  active: boolean;
-  mode: 'test' | 'live';
-}
-
-interface Stats {
-  n_points: number;
-  nav: number | null;
-  return_pct: number | null;
-  sharpe: number | null;
-  max_drawdown_pct: number | null;
-}
 
 export default function Strategies() {
   const { data, loading, error, reload } = useResource<Strategy[]>(
@@ -79,111 +64,64 @@ export default function Strategies() {
       loadingText="Cargando estrategias…"
     >
       {data && (
-        <StrategiesContent
-          items={data}
-          stats={stats}
-          name={name}
-          desc={desc}
-          busy={busy}
-          onNameChange={setName}
-          onDescChange={setDesc}
-          onCreate={create}
-          onSelect={setSelected}
-          onRun={run}
-          onReload={handleReload}
-          onLoadStats={loadStats}
-        />
+        <div className="space-y-5">
+          <Card>
+            <CardHeader
+              title="Nueva estrategia"
+              hint="Una estrategia es un perfil nombrado de la configuración del ciclo. Se crea capturando la configuración activa actual; luego la editás y la activás para que compita."
+            />
+            <CardBody>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <input
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Nombre (ej. Momentum agresivo)"
+                  className="flex-1 rounded-md border border-edge/60 bg-transparent px-3 py-2 text-[13px] text-ink outline-none focus:border-accent/50"
+                />
+                <input
+                  value={desc}
+                  onChange={(e) => setDesc(e.target.value)}
+                  placeholder="Descripción (opcional)"
+                  className="flex-1 rounded-md border border-edge/60 bg-transparent px-3 py-2 text-[13px] text-ink outline-none focus:border-accent/50"
+                />
+                <button
+                  onClick={create}
+                  disabled={busy || !name.trim()}
+                  className="rounded-md bg-accent px-4 py-2 text-[13px] font-medium text-bg disabled:opacity-50"
+                >
+                  Crear
+                </button>
+              </div>
+            </CardBody>
+          </Card>
+
+          <Card>
+            <CardHeader
+              title={`Estrategias (${data.length})`}
+              hint="Las activas compiten en paper. Modo test usa datos reales pero no opera (solo mide). 'Aplicar' vuelve esa config la del ciclo global."
+            />
+            <CardBody className="space-y-2.5">
+              {data.length === 0 && (
+                <p className="text-[12px] text-mut">
+                  Aún no hay estrategias. Creá una desde la configuración actual arriba.
+                </p>
+              )}
+              {data.map((s) => (
+                <StrategyRow
+                  key={s.id}
+                  s={s}
+                  stat={stats[s.id]}
+                  busy={busy}
+                  onSelect={setSelected}
+                  onRun={run}
+                  onReload={handleReload}
+                />
+              ))}
+            </CardBody>
+          </Card>
+        </div>
       )}
     </AsyncBoundary>
-  );
-}
-
-function StrategiesContent({
-  items,
-  stats,
-  name,
-  desc,
-  busy,
-  onNameChange,
-  onDescChange,
-  onCreate,
-  onSelect,
-  onRun,
-  onReload,
-}: {
-  items: Strategy[];
-  stats: Record<string, Stats>;
-  name: string;
-  desc: string;
-  busy: boolean;
-  onNameChange: (v: string) => void;
-  onDescChange: (v: string) => void;
-  onCreate: () => void;
-  onSelect: (id: string) => void;
-  onRun: (
-    fn: () => Promise<unknown>,
-    opts?: { success?: string; onDone?: () => void },
-  ) => Promise<boolean>;
-  onReload: () => void;
-  onLoadStats: (id: string) => void;
-}) {
-  return (
-    <div className="space-y-5">
-      <Card>
-        <CardHeader
-          title="Nueva estrategia"
-          hint="Una estrategia es un perfil nombrado de la configuración del ciclo. Se crea capturando la configuración activa actual; luego la editás y la activás para que compita."
-        />
-        <CardBody>
-          <div className="flex flex-col gap-2 sm:flex-row">
-            <input
-              value={name}
-              onChange={(e) => onNameChange(e.target.value)}
-              placeholder="Nombre (ej. Momentum agresivo)"
-              className="flex-1 rounded-md border border-edge/60 bg-transparent px-3 py-2 text-[13px] text-ink outline-none focus:border-accent/50"
-            />
-            <input
-              value={desc}
-              onChange={(e) => onDescChange(e.target.value)}
-              placeholder="Descripción (opcional)"
-              className="flex-1 rounded-md border border-edge/60 bg-transparent px-3 py-2 text-[13px] text-ink outline-none focus:border-accent/50"
-            />
-            <button
-              onClick={onCreate}
-              disabled={busy || !name.trim()}
-              className="rounded-md bg-accent px-4 py-2 text-[13px] font-medium text-bg disabled:opacity-50"
-            >
-              Crear
-            </button>
-          </div>
-        </CardBody>
-      </Card>
-
-      <Card>
-        <CardHeader
-          title={`Estrategias (${items.length})`}
-          hint="Las activas compiten en paper. Modo test usa datos reales pero no opera (solo mide). 'Aplicar' vuelve esa config la del ciclo global."
-        />
-        <CardBody className="space-y-2.5">
-          {items.length === 0 && (
-            <p className="text-[12px] text-mut">
-              Aún no hay estrategias. Creá una desde la configuración actual arriba.
-            </p>
-          )}
-          {items.map((s) => (
-            <StrategyRow
-              key={s.id}
-              s={s}
-              stat={stats[s.id]}
-              busy={busy}
-              onSelect={onSelect}
-              onRun={onRun}
-              onReload={onReload}
-            />
-          ))}
-        </CardBody>
-      </Card>
-    </div>
   );
 }
 
@@ -278,7 +216,7 @@ function StrategyRow({
             <span
               className={`rounded px-1.5 py-0.5 ${(stat.return_pct ?? 0) >= 0 ? 'bg-accent/15 text-accent' : 'bg-danger/15 text-danger'}`}
             >
-              ret {stat.return_pct}%
+              ret {fmt.pct(stat.return_pct)}
             </span>
             <span className="rounded bg-edge/40 px-1.5 py-0.5 text-mut">
               sharpe <span className="text-ink">{stat.sharpe ?? '—'}</span>

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useMemo } from 'react';
 import {
   AreaChart,
   Area,
@@ -13,40 +13,7 @@ import { Card, CardHeader, CardBody } from './ui/Card';
 import { AsyncBoundary } from './ui/AsyncBoundary';
 import { api, type JsonObject } from '../lib/api';
 import { useResource } from '../lib/useResource';
-
-// Paleta tomada del tema (globals.css). Se relee al cambiar claro/oscuro,
-// así el chart respeta el tema en vez de colores cableados.
-const VARS = [
-  '--chart-1',
-  '--chart-2',
-  '--chart-3',
-  '--chart-4',
-  '--chart-5',
-  '--primary',
-  '--info',
-];
-
-interface ThemeColors {
-  serie: string[];
-  grid: string;
-  tick: string;
-  tip: string;
-  tipBorde: string;
-  tipTexto: string;
-}
-
-function leerTema(): ThemeColors {
-  const cs = getComputedStyle(document.documentElement);
-  const v = (n: string) => cs.getPropertyValue(n).trim() || '#888';
-  return {
-    serie: VARS.map(v),
-    grid: v('--border'),
-    tick: v('--muted-foreground'),
-    tip: v('--popover'),
-    tipBorde: v('--border'),
-    tipTexto: v('--popover-foreground'),
-  };
-}
+import { useChartTheme, VARS } from '../lib/useChartTheme';
 
 interface NavPoint {
   ts: string;
@@ -101,18 +68,7 @@ export default function NavChart() {
     { pollMs: 30000 },
   );
 
-  const [tema, setTema] = useState<ThemeColors | null>(() =>
-    typeof document !== 'undefined' ? leerTema() : null,
-  );
-  const wrap = useRef<HTMLDivElement>(null);
-
-  // Reaccionar al toggle claro/oscuro (clase .dark en <html>).
-  useEffect(() => {
-    setTema(leerTema());
-    const obs = new MutationObserver(() => setTema(leerTema()));
-    obs.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
-    return () => obs.disconnect();
-  }, []);
+  const tema = useChartTheme();
 
   const { carteras, chartData } = useMemo(() => {
     const series = data?.series ?? {};
@@ -138,7 +94,7 @@ export default function NavChart() {
           emptyText="Aún se acumulan puntos de NAV (se llenan cada ciclo)."
         >
           {data && chartData.length >= 2 && tema && (
-            <div ref={wrap}>
+            <div>
               <ResponsiveContainer width="100%" height={300}>
                 <AreaChart data={chartData} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
                   <defs>

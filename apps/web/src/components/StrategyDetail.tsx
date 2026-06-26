@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../lib/api';
+import { fmt } from '../lib/utils';
+import { type Strategy, type Stats } from '../lib/types';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Switch } from './ui/switch';
@@ -7,23 +9,6 @@ import { AsyncBoundary } from './ui/AsyncBoundary';
 import { useResource } from '../lib/useResource';
 import { useAction } from '../lib/useAction';
 import { ArrowLeft, Plus, Trash2 } from 'lucide-react';
-
-interface Strategy {
-  id: string;
-  name: string;
-  description: string | null;
-  config: Record<string, string>;
-  active: boolean;
-  mode: 'test' | 'live';
-}
-
-interface Stats {
-  n_points: number;
-  nav: number | null;
-  return_pct: number | null;
-  sharpe: number | null;
-  max_drawdown_pct: number | null;
-}
 
 /** Sub-layout de configuración de UNA estrategia: editar metadatos, params, modo, stats y acciones. */
 export default function StrategyDetail({ id, onBack }: { id: string; onBack: () => void }) {
@@ -104,280 +89,210 @@ export default function StrategyDetail({ id, onBack }: { id: string; onBack: () 
       loadingText="Cargando estrategia…"
     >
       {strategy && (
-        <StrategyDetailContent
-          strategy={strategy}
-          stats={stats}
-          name={name}
-          desc={desc}
-          cfg={cfg}
-          newKey={newKey}
-          busy={busy}
-          onBack={onBack}
-          onNameChange={setName}
-          onDescChange={setDesc}
-          onNewKeyChange={setNewKey}
-          onSaveMeta={saveMeta}
-          onSaveConfig={saveConfig}
-          onSetMode={setMode}
-          onUpdateCfgValue={updateCfgValue}
-          onRemoveCfgRow={removeCfgRow}
-          onAddCfgRow={addCfgRow}
-          onRun={run}
-          onReload={handleReload}
-          id={id}
-        />
-      )}
-    </AsyncBoundary>
-  );
-}
-
-function StrategyDetailContent({
-  strategy,
-  stats,
-  name,
-  desc,
-  cfg,
-  newKey,
-  busy,
-  onBack,
-  onNameChange,
-  onDescChange,
-  onNewKeyChange,
-  onSaveMeta,
-  onSaveConfig,
-  onSetMode,
-  onUpdateCfgValue,
-  onRemoveCfgRow,
-  onAddCfgRow,
-  onRun,
-  onReload,
-  id,
-}: {
-  strategy: Strategy;
-  stats: Stats | null;
-  name: string;
-  desc: string;
-  cfg: [string, string][];
-  newKey: string;
-  busy: boolean;
-  onBack: () => void;
-  onNameChange: (v: string) => void;
-  onDescChange: (v: string) => void;
-  onNewKeyChange: (v: string) => void;
-  onSaveMeta: () => void;
-  onSaveConfig: () => void;
-  onSetMode: (mode: 'test' | 'live') => void;
-  onUpdateCfgValue: (i: number, value: string) => void;
-  onRemoveCfgRow: (i: number) => void;
-  onAddCfgRow: () => void;
-  onRun: (
-    fn: () => Promise<unknown>,
-    opts?: { success?: string; onDone?: () => void },
-  ) => Promise<boolean>;
-  onReload: () => void;
-  id: string;
-}) {
-  return (
-    <div className="space-y-5">
-      <div className="flex items-center justify-between">
-        <button onClick={onBack} className="text-[13px] text-mut hover:text-ink">
-          <ArrowLeft className="inline h-4 w-4 -mt-0.5 mr-1" />
-          Volver a estrategias
-        </button>
-        <div className="flex items-center gap-2">
-          <Badge tone={strategy.mode === 'live' ? 'danger' : 'info'}>
-            {strategy.mode === 'live' ? 'opera' : 'test'}
-          </Badge>
-          {strategy.active && <Badge tone="ok">activa</Badge>}
-        </div>
-      </div>
-
-      {/* ── Metadatos ─────────────────────────────────────────── */}
-      <Card>
-        <CardHeader title="Identidad" hint="Nombre y descripción de la estrategia." />
-        <CardBody className="space-y-2">
-          <input
-            value={name}
-            onChange={(e) => onNameChange(e.target.value)}
-            className="w-full rounded-md border border-edge/60 bg-transparent px-3 py-2 text-[13px] text-ink outline-none focus:border-accent/50"
-          />
-          <textarea
-            value={desc}
-            onChange={(e) => onDescChange(e.target.value)}
-            rows={2}
-            placeholder="Descripción"
-            className="w-full rounded-md border border-edge/60 bg-transparent px-3 py-2 text-[13px] text-ink outline-none focus:border-accent/50"
-          />
-          <button
-            onClick={onSaveMeta}
-            disabled={busy}
-            className="rounded-md bg-accent px-4 py-1.5 text-[13px] font-medium text-bg disabled:opacity-50"
-          >
-            Guardar
-          </button>
-        </CardBody>
-      </Card>
-
-      {/* ── Modo ──────────────────────────────────────────────── */}
-      <Card>
-        <CardHeader
-          title="Modo"
-          hint="Test: usa datos reales pero NO opera (solo mide). Opera: ejecuta de verdad."
-        />
-        <CardBody>
-          <div className="flex items-center gap-3">
-            <span className="text-[13px] text-ink">
-              {strategy.mode === 'live' ? 'Opera (live)' : 'Test'}
-            </span>
-            <Switch
-              checked={strategy.mode === 'live'}
-              disabled={busy}
-              onCheckedChange={() => onSetMode(strategy.mode === 'live' ? 'test' : 'live')}
-              aria-label="Alternar modo"
-            />
-            <span className="text-[12px] text-mut">
-              {strategy.mode === 'live' ? '⚠ coloca órdenes reales' : 'solo simulación / medición'}
-            </span>
+        <div className="space-y-5">
+          <div className="flex items-center justify-between">
+            <button onClick={onBack} className="text-[13px] text-mut hover:text-ink">
+              <ArrowLeft className="inline h-4 w-4 -mt-0.5 mr-1" />
+              Volver a estrategias
+            </button>
+            <div className="flex items-center gap-2">
+              <Badge tone={strategy.mode === 'live' ? 'danger' : 'info'}>
+                {strategy.mode === 'live' ? 'opera' : 'test'}
+              </Badge>
+              {strategy.active && <Badge tone="ok">activa</Badge>}
+            </div>
           </div>
-        </CardBody>
-      </Card>
 
-      {/* ── Parámetros (config bundle) ────────────────────────── */}
-      <Card>
-        <CardHeader
-          title={`Parámetros (${cfg.length})`}
-          hint="Las claves de configuración del ciclo que componen esta estrategia."
-        />
-        <CardBody className="space-y-2">
-          {cfg.map(([k, v], i) => (
-            <div key={k + i} className="flex items-center gap-2">
-              <span className="w-64 shrink-0 truncate font-mono text-[12px] text-mut" title={k}>
-                {k}
-              </span>
+          {/* ── Metadatos ─────────────────────────────────────────── */}
+          <Card>
+            <CardHeader title="Identidad" hint="Nombre y descripción de la estrategia." />
+            <CardBody className="space-y-2">
               <input
-                value={v}
-                onChange={(e) => onUpdateCfgValue(i, e.target.value)}
-                className="flex-1 rounded-md border border-edge/60 bg-transparent px-2 py-1 text-[12px] text-ink outline-none focus:border-accent/50"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                className="w-full rounded-md border border-edge/60 bg-transparent px-3 py-2 text-[13px] text-ink outline-none focus:border-accent/50"
+              />
+              <textarea
+                value={desc}
+                onChange={(e) => setDesc(e.target.value)}
+                rows={2}
+                placeholder="Descripción"
+                className="w-full rounded-md border border-edge/60 bg-transparent px-3 py-2 text-[13px] text-ink outline-none focus:border-accent/50"
               />
               <button
-                onClick={() => onRemoveCfgRow(i)}
-                className="rounded p-1 text-mut hover:bg-danger/15 hover:text-danger"
-                title="Quitar"
+                onClick={saveMeta}
+                disabled={busy}
+                className="rounded-md bg-accent px-4 py-1.5 text-[13px] font-medium text-bg disabled:opacity-50"
               >
-                <Trash2 className="h-4 w-4" />
+                Guardar
               </button>
-            </div>
-          ))}
-          <div className="flex items-center gap-2 pt-1">
-            <input
-              value={newKey}
-              onChange={(e) => onNewKeyChange(e.target.value)}
-              placeholder="nueva.clave (ej. execution.max_position_pct)"
-              className="flex-1 rounded-md border border-edge/60 bg-transparent px-2 py-1 text-[12px] text-ink outline-none focus:border-accent/50"
+            </CardBody>
+          </Card>
+
+          {/* ── Modo ──────────────────────────────────────────────── */}
+          <Card>
+            <CardHeader
+              title="Modo"
+              hint="Test: usa datos reales pero NO opera (solo mide). Opera: ejecuta de verdad."
             />
-            <button
-              onClick={onAddCfgRow}
-              className="rounded-md border border-edge px-2 py-1 text-[12px] text-mut hover:text-ink"
-            >
-              <Plus className="inline h-3 w-3 -mt-0.5 mr-1" />
-              Añadir
-            </button>
-          </div>
-          <button
-            onClick={onSaveConfig}
-            disabled={busy}
-            className="mt-1 rounded-md bg-accent px-4 py-1.5 text-[13px] font-medium text-bg disabled:opacity-50"
-          >
-            Guardar parámetros
-          </button>
-        </CardBody>
-      </Card>
+            <CardBody>
+              <div className="flex items-center gap-3">
+                <span className="text-[13px] text-ink">
+                  {strategy.mode === 'live' ? 'Opera (live)' : 'Test'}
+                </span>
+                <Switch
+                  checked={strategy.mode === 'live'}
+                  disabled={busy}
+                  onCheckedChange={() => setMode(strategy.mode === 'live' ? 'test' : 'live')}
+                  aria-label="Alternar modo"
+                />
+                <span className="text-[12px] text-mut">
+                  {strategy.mode === 'live'
+                    ? '⚠ coloca órdenes reales'
+                    : 'solo simulación / medición'}
+                </span>
+              </div>
+            </CardBody>
+          </Card>
 
-      {/* ── Rendimiento ───────────────────────────────────────── */}
-      <Card>
-        <CardHeader
-          title="Rendimiento"
-          hint="Calculado desde los NAV snapshots de esta estrategia."
-        />
-        <CardBody>
-          {stats && stats.n_points > 0 ? (
-            <div className="flex flex-wrap gap-3 text-[13px]">
-              <span>
-                NAV <span className="text-ink">{stats.nav}</span>
-              </span>
-              <span className={(stats.return_pct ?? 0) >= 0 ? 'text-accent' : 'text-danger'}>
-                Retorno {stats.return_pct}%
-              </span>
-              <span>Sharpe {stats.sharpe ?? '—'}</span>
-              <span>maxDD {stats.max_drawdown_pct}%</span>
-              <span className="text-mut">{stats.n_points} puntos</span>
-            </div>
-          ) : (
-            <p className="text-[12px] text-mut">
-              Aún sin datos de NAV. Se acumulan a medida que la estrategia corre ciclos (aplicala al
-              ciclo o activala para que compita).
-            </p>
-          )}
-        </CardBody>
-      </Card>
+          {/* ── Parámetros (config bundle) ────────────────────────── */}
+          <Card>
+            <CardHeader
+              title={`Parámetros (${cfg.length})`}
+              hint="Las claves de configuración del ciclo que componen esta estrategia."
+            />
+            <CardBody className="space-y-2">
+              {cfg.map(([k, v], i) => (
+                <div key={k + i} className="flex items-center gap-2">
+                  <span className="w-64 shrink-0 truncate font-mono text-[12px] text-mut" title={k}>
+                    {k}
+                  </span>
+                  <input
+                    value={v}
+                    onChange={(e) => updateCfgValue(i, e.target.value)}
+                    className="flex-1 rounded-md border border-edge/60 bg-transparent px-2 py-1 text-[12px] text-ink outline-none focus:border-accent/50"
+                  />
+                  <button
+                    onClick={() => removeCfgRow(i)}
+                    className="rounded p-1 text-mut hover:bg-danger/15 hover:text-danger"
+                    title="Quitar"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+              <div className="flex items-center gap-2 pt-1">
+                <input
+                  value={newKey}
+                  onChange={(e) => setNewKey(e.target.value)}
+                  placeholder="nueva.clave (ej. execution.max_position_pct)"
+                  className="flex-1 rounded-md border border-edge/60 bg-transparent px-2 py-1 text-[12px] text-ink outline-none focus:border-accent/50"
+                />
+                <button
+                  onClick={addCfgRow}
+                  className="rounded-md border border-edge px-2 py-1 text-[12px] text-mut hover:text-ink"
+                >
+                  <Plus className="inline h-3 w-3 -mt-0.5 mr-1" />
+                  Añadir
+                </button>
+              </div>
+              <button
+                onClick={saveConfig}
+                disabled={busy}
+                className="mt-1 rounded-md bg-accent px-4 py-1.5 text-[13px] font-medium text-bg disabled:opacity-50"
+              >
+                Guardar parámetros
+              </button>
+            </CardBody>
+          </Card>
 
-      {/* ── Acciones ──────────────────────────────────────────── */}
-      <Card>
-        <CardHeader title="Acciones" />
-        <CardBody className="flex flex-wrap gap-2">
-          <button
-            onClick={() =>
-              void onRun(() => api.strategySetActive(id, !strategy.active), {
-                success: strategy.active ? '✓ Desactivada.' : '✓ Activada.',
-                onDone: onReload,
-              })
-            }
-            disabled={busy}
-            className="rounded-md border border-edge px-3 py-1.5 text-[13px] text-ink hover:bg-edge/30"
-          >
-            {strategy.active ? 'Desactivar' : 'Activar (competir)'}
-          </button>
-          <button
-            onClick={() =>
-              void onRun(() => api.strategyApply(id), {
-                success: '✓ Aplicada al ciclo.',
-                onDone: onReload,
-              })
-            }
-            disabled={busy}
-            className="rounded-md border border-edge px-3 py-1.5 text-[13px] text-ink hover:bg-edge/30"
-          >
-            Aplicar al ciclo
-          </button>
-          <button
-            onClick={() =>
-              void onRun(() => api.strategyPublish(id), {
-                success: '✓ Publicada en tienda.',
-                onDone: onReload,
-              })
-            }
-            disabled={busy}
-            className="rounded-md border border-edge px-3 py-1.5 text-[13px] text-ink hover:bg-edge/30"
-          >
-            Publicar en tienda
-          </button>
-          <button
-            onClick={() =>
-              void onRun(
-                async () => {
-                  await api.strategyDelete(id);
-                  onBack();
-                },
-                { success: '✓ Eliminada.' },
-              )
-            }
-            disabled={busy}
-            className="rounded-md border border-danger/40 px-3 py-1.5 text-[13px] text-danger hover:bg-danger/15"
-          >
-            Eliminar
-          </button>
-        </CardBody>
-      </Card>
-    </div>
+          {/* ── Rendimiento ───────────────────────────────────────── */}
+          <Card>
+            <CardHeader
+              title="Rendimiento"
+              hint="Calculado desde los NAV snapshots de esta estrategia."
+            />
+            <CardBody>
+              {stats && stats.n_points > 0 ? (
+                <div className="flex flex-wrap gap-3 text-[13px]">
+                  <span>
+                    NAV <span className="text-ink">{stats.nav}</span>
+                  </span>
+                  <span className={(stats.return_pct ?? 0) >= 0 ? 'text-accent' : 'text-danger'}>
+                    Retorno {fmt.pct(stats.return_pct)}
+                  </span>
+                  <span>Sharpe {stats.sharpe ?? '—'}</span>
+                  <span>maxDD {stats.max_drawdown_pct}%</span>
+                  <span className="text-mut">{stats.n_points} puntos</span>
+                </div>
+              ) : (
+                <p className="text-[12px] text-mut">
+                  Aún sin datos de NAV. Se acumulan a medida que la estrategia corre ciclos
+                  (aplicala al ciclo o activala para que compita).
+                </p>
+              )}
+            </CardBody>
+          </Card>
+
+          {/* ── Acciones ──────────────────────────────────────────── */}
+          <Card>
+            <CardHeader title="Acciones" />
+            <CardBody className="flex flex-wrap gap-2">
+              <button
+                onClick={() =>
+                  void run(() => api.strategySetActive(id, !strategy.active), {
+                    success: strategy.active ? '✓ Desactivada.' : '✓ Activada.',
+                    onDone: handleReload,
+                  })
+                }
+                disabled={busy}
+                className="rounded-md border border-edge px-3 py-1.5 text-[13px] text-ink hover:bg-edge/30"
+              >
+                {strategy.active ? 'Desactivar' : 'Activar (competir)'}
+              </button>
+              <button
+                onClick={() =>
+                  void run(() => api.strategyApply(id), {
+                    success: '✓ Aplicada al ciclo.',
+                    onDone: handleReload,
+                  })
+                }
+                disabled={busy}
+                className="rounded-md border border-edge px-3 py-1.5 text-[13px] text-ink hover:bg-edge/30"
+              >
+                Aplicar al ciclo
+              </button>
+              <button
+                onClick={() =>
+                  void run(() => api.strategyPublish(id), {
+                    success: '✓ Publicada en tienda.',
+                    onDone: handleReload,
+                  })
+                }
+                disabled={busy}
+                className="rounded-md border border-edge px-3 py-1.5 text-[13px] text-ink hover:bg-edge/30"
+              >
+                Publicar en tienda
+              </button>
+              <button
+                onClick={() =>
+                  void run(
+                    async () => {
+                      await api.strategyDelete(id);
+                      onBack();
+                    },
+                    { success: '✓ Eliminada.' },
+                  )
+                }
+                disabled={busy}
+                className="rounded-md border border-danger/40 px-3 py-1.5 text-[13px] text-danger hover:bg-danger/15"
+              >
+                Eliminar
+              </button>
+            </CardBody>
+          </Card>
+        </div>
+      )}
+    </AsyncBoundary>
   );
 }

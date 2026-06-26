@@ -1,19 +1,13 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api, type JsonObject } from '../lib/api';
 import { useResource } from '../lib/useResource';
 import { useAction } from '../lib/useAction';
+import { TIPO_TONE } from '../lib/constants';
 import { AsyncBoundary } from './ui/AsyncBoundary';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { SearchInput } from './SearchInput';
 import { Store as StoreIcon, Download, ThumbsUp, ThumbsDown, Flag } from 'lucide-react';
-
-const TIPO_TONE: Record<string, string> = {
-  universe: 'info',
-  skill: 'ok',
-  preset: 'warn',
-  'discipline-profile': 'mut',
-};
 
 const TIPOS = ['', 'universe', 'skill', 'preset', 'discipline-profile'];
 
@@ -55,9 +49,11 @@ function IdentityCard() {
   const { busy: guardandoNombre, run } = useAction();
   const [displayName, setDisplayName] = useState('');
 
-  if (identity && displayName === '' && identity.display_name) {
-    setDisplayName(identity.display_name);
-  }
+  useEffect(() => {
+    if (identity?.display_name) {
+      setDisplayName((prev) => (prev === '' ? (identity.display_name ?? '') : prev));
+    }
+  }, [identity]);
 
   const guardarNombre = () =>
     run(() => saveDisplayName(displayName.trim(), reload), {

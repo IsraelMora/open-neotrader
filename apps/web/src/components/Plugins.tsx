@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api, type JsonObject } from '../lib/api';
 import { useResource } from '../lib/useResource';
 import { useAction } from '../lib/useAction';
+import { TIPO_TONE } from '../lib/constants';
 import { AsyncBoundary } from './ui/AsyncBoundary';
 import { Card, CardHeader, CardBody } from './ui/Card';
 import { Badge } from './ui/Badge';
@@ -9,13 +10,6 @@ import { Switch } from './ui/switch';
 import { SearchInput } from './SearchInput';
 import { fuzzyFilter } from '../lib/fuzzy';
 import { Puzzle, Trash2, Plus } from 'lucide-react';
-
-const TIPO_TONE: Record<string, string> = {
-  universe: 'info',
-  skill: 'ok',
-  preset: 'warn',
-  'discipline-profile': 'mut',
-};
 
 interface FieldSpec {
   key: string;

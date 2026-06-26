@@ -35,6 +35,20 @@ export const auth = {
 //   afterResponse  → handle 401 (clear token + redirect)
 //   beforeError    → unwrap JSON error body into Error.message
 
+async function unwrapJsonError(error: {
+  response: Response;
+  message: string;
+}): Promise<typeof error> {
+  try {
+    const body = (await error.response.clone().json()) as Record<string, unknown>;
+    error.message =
+      (body['message'] as string) ?? (body['detail'] as string) ?? error.response.statusText;
+  } catch {
+    /* response not JSON — keep default message */
+  }
+  return error;
+}
+
 export const client: KyInstance = ky.create({
   // Root-anchored: sin esto, ky resuelve 'api/...' contra la ruta actual y en páginas
   // con barra final (p.ej. /login/) produce /login/api/... → 405. Con prefix '/' (ky v2;
@@ -59,18 +73,7 @@ export const client: KyInstance = ky.create({
         return response;
       },
     ],
-    beforeError: [
-      async ({ error }) => {
-        try {
-          const body = (await error.response.clone().json()) as Record<string, unknown>;
-          error.message =
-            (body['message'] as string) ?? (body['detail'] as string) ?? error.response.statusText;
-        } catch {
-          /* response not JSON — keep default message */
-        }
-        return error;
-      },
-    ],
+    beforeError: [unwrapJsonError],
   },
 });
 
@@ -78,17 +81,7 @@ export const client: KyInstance = ky.create({
 const publicClient: KyInstance = ky.create({
   prefix: '/', // mismo anclaje a raíz que `client` (ky v2; evita /login/api/... → 405)
   hooks: {
-    beforeError: [
-      async ({ error }) => {
-        try {
-          const body = (await error.response.clone().json()) as Record<string, unknown>;
-          error.message = (body['message'] as string) ?? error.response.statusText;
-        } catch {
-          /* */
-        }
-        return error;
-      },
-    ],
+    beforeError: [unwrapJsonError],
   },
 });
 
