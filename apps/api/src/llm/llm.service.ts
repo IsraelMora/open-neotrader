@@ -93,6 +93,17 @@ export interface CustomLlmProvider {
 
 // Sin presets — el usuario define sus propios providers via POST /llm/providers
 
+/** Arma los headers para un provider custom OpenAI-compatible (auth + referer de OpenRouter). */
+function buildCustomLlmHeaders(providerId: string, apiKey: string): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  if (providerId === 'openrouter') {
+    headers['HTTP-Referer'] = 'https://neurotrader.local';
+    headers['X-Title'] = 'NeuroTrader';
+  }
+  return headers;
+}
+
 /** Abstracción multi-backend del LLM: Anthropic API, OpenAI, Gemini, Claude subscription y providers custom OpenAI-compatible. */
 @Injectable()
 export class LlmService implements OnModuleInit {
@@ -538,16 +549,7 @@ export class LlmService implements OnModuleInit {
     const model =
       this._model !== 'claude-haiku-4-5-20251001' ? this._model : provider.default_model;
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-
-    // OpenRouter requiere un header de referer
-    if (provider.id === 'openrouter') {
-      headers['HTTP-Referer'] = 'https://neurotrader.local';
-      headers['X-Title'] = 'NeuroTrader';
-    }
+    const headers = buildCustomLlmHeaders(provider.id, apiKey);
 
     const hasTools = req.tools && req.tools.length > 0;
     const requestBody: Record<string, unknown> = {
