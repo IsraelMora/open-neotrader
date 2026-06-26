@@ -23,7 +23,8 @@ export default function Providers() {
     api
       .plugins()
       .then((d) => {
-        const all = d as unknown as Provider[];
+        // /api/plugins devuelve { plugins: [...] }, no un array directo.
+        const all = ((d as { plugins?: Provider[] }).plugins ?? []) as Provider[];
         setProvs(all.filter((p) => p.type === 'provider'));
       })
       .catch((e: unknown) =>

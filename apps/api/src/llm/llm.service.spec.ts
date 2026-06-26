@@ -383,6 +383,25 @@ describe('LlmService — persistencia de config en KV', () => {
     expect(svc.getConfig().model).toBe('vendor/model:free');
   });
 
+  it('onModuleInit desenvuelve valores KV JSON-encoded ("openai") — bug de doble encoding', async () => {
+    // El panel guarda con JSON.stringify → KV puede tener '"openai"' (con comillas).
+    const kv = {
+      get: jest.fn((k: string) =>
+        Promise.resolve(
+          ({ 'llm.backend': '"openai"', 'llm.model': '"vendor/x:free"' } as Record<string, string>)[
+            k
+          ] ?? null,
+        ),
+      ),
+      set: jest.fn().mockResolvedValue(undefined),
+    } as unknown as import('../common/kv.service').KvService;
+    const svc = new LlmService(makeConfig({ OPENAI_API_KEY: 'k' }), makePlugins(), kv);
+    await svc.onModuleInit();
+    expect(svc.getConfig().backend).toBe('openai'); // sin comillas
+    expect(svc.getConfig().model).toBe('vendor/x:free');
+    expect(svc.getReadiness().credentialPresent).toBe(true); // openai resuelve, no cae a anthropic
+  });
+
   it('patchConfig persiste model+backend en KV', () => {
     const set = jest.fn().mockResolvedValue(undefined);
     const kv = {

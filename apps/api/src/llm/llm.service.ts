@@ -92,6 +92,21 @@ export interface CustomLlmProvider {
 
 // Sin presets — el usuario define sus propios providers via POST /llm/providers
 
+/**
+ * Desenvuelve un valor de KV que puede venir crudo ('openai') o JSON-encoded ('"openai"').
+ * El panel guarda config con JSON.stringify (saveConfig) mientras que KvService.set guarda
+ * crudo → sin esto, leer 'llm.backend' podía devolver '"openai"' (con comillas) y no matchear.
+ */
+function unwrapKv(v: string | null): string | null {
+  if (v == null) return v;
+  try {
+    const parsed: unknown = JSON.parse(v);
+    return typeof parsed === 'string' ? parsed : v;
+  } catch {
+    return v;
+  }
+}
+
 /** Abstracción multi-backend del LLM: Anthropic API, OpenAI, Gemini, Claude subscription y providers custom OpenAI-compatible. */
 @Injectable()
 export class LlmService implements OnModuleInit {
@@ -118,9 +133,11 @@ export class LlmService implements OnModuleInit {
   async onModuleInit(): Promise<void> {
     try {
       const [b, m] = await Promise.all([this.kv.get('llm.backend'), this.kv.get('llm.model')]);
-      if (b) this._backend = b as LlmBackend;
-      if (m) this._model = m;
-      if (b || m) {
+      const bb = unwrapKv(b);
+      const mm = unwrapKv(m);
+      if (bb) this._backend = bb as LlmBackend;
+      if (mm) this._model = mm;
+      if (bb || mm) {
         this.log.log(`LLM config restaurada de KV: backend=${this._backend} model=${this._model}`);
       }
     } catch (e) {
