@@ -2421,46 +2421,7 @@ export class AgentsService {
         const res = await this.sandbox.callPlugin(tc.plugin_id, tc.function, tc.args);
         sandbox_results.push({ plugin_id: tc.plugin_id, function: tc.function, ...res });
 
-        const args = tc.args;
-        if (typeof args['symbol'] === 'string' && typeof args['action'] === 'string') {
-          const symbol = args['symbol'];
-          const action = args['action'];
-          signalsEmitted.push({ symbol, action });
-          await this.audit.log({
-            cycle_id,
-            event_type: 'signal',
-            plugin_id: tc.plugin_id,
-            symbol,
-            action,
-            sandbox_ok: res.ok,
-          });
-
-          // HITL: a successful `decision.emit_trade_intent` becomes a persisted
-          // pending TradeIntent (paper-only) awaiting human approval. Fail-soft —
-          // recording must NEVER break the cycle, and is a no-op when the service
-          // is not injected.
-          if (
-            this.tradeIntent &&
-            res.ok &&
-            tc.plugin_id === 'decision' &&
-            tc.function === 'emit_trade_intent'
-          ) {
-            try {
-              await this.tradeIntent.recordIntent({
-                cycle_id,
-                symbol,
-                action,
-                confidence: Number(args['confidence']) || 0,
-                rationale: typeof args['rationale'] === 'string' ? args['rationale'] : '',
-                timeframe: typeof args['timeframe'] === 'string' ? args['timeframe'] : undefined,
-              });
-            } catch (e: unknown) {
-              this.log.warn(
-                `recordIntent falló (no bloquea el ciclo): ${e instanceof Error ? e.message : String(e)}`,
-              );
-            }
-          }
-        }
+        await this._recordSignalAndIntent(cycle_id, tc, res, signalsEmitted);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         decisions.push({ ...tc, allowed: false, reason: msg });
@@ -2476,6 +2437,52 @@ export class AgentsService {
     }
 
     return { decisions, sandbox_results, signalsEmitted };
+  }
+
+  /**
+   * Registra la señal emitida por un tool call (audit) y, si es un emit_trade_intent
+   * exitoso de `decision`, persiste el TradeIntent pendiente (HITL, paper-only). Fail-soft:
+   * recordIntent nunca rompe el ciclo y es no-op si tradeIntent no está inyectado.
+   */
+  private async _recordSignalAndIntent(
+    cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    res: { ok: boolean },
+    signalsEmitted: { symbol: string; action: string }[],
+  ): Promise<void> {
+    const args = tc.args;
+    if (typeof args['symbol'] !== 'string' || typeof args['action'] !== 'string') return;
+    const symbol = args['symbol'];
+    const action = args['action'];
+    signalsEmitted.push({ symbol, action });
+    await this.audit.log({
+      cycle_id,
+      event_type: 'signal',
+      plugin_id: tc.plugin_id,
+      symbol,
+      action,
+      sandbox_ok: res.ok,
+    });
+
+    const ti = this.tradeIntent;
+    const isTradeIntent =
+      !!ti && res.ok && tc.plugin_id === 'decision' && tc.function === 'emit_trade_intent';
+    if (!ti || !isTradeIntent) return;
+
+    try {
+      await ti.recordIntent({
+        cycle_id,
+        symbol,
+        action,
+        confidence: Number(args['confidence']) || 0,
+        rationale: typeof args['rationale'] === 'string' ? args['rationale'] : '',
+        timeframe: typeof args['timeframe'] === 'string' ? args['timeframe'] : undefined,
+      });
+    } catch (e: unknown) {
+      this.log.warn(
+        `recordIntent falló (no bloquea el ciclo): ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
 
   /**
