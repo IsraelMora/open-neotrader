@@ -107,6 +107,18 @@ export class PanelController {
     return this.svc.getPortfolios();
   }
 
+  @Get('trades')
+  @ApiOperation({ summary: 'Trades ejecutados (Operaciones)' })
+  trades(@Query('limit') limit?: string) {
+    return this.svc.getTrades(limit ? Number(limit) : undefined);
+  }
+
+  @Get('nav-history')
+  @ApiOperation({ summary: 'Series de NAV por estrategia (curva de competencia)' })
+  navHistory() {
+    return this.svc.getNavHistory();
+  }
+
   // ── Skills ────────────────────────────────────────────────────────────────
 
   @Get('skills')

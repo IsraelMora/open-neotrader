@@ -154,6 +154,51 @@ export class PanelService {
     );
   }
 
+  // ── Operaciones (trades ejecutados) ────────────────────────────────────────
+
+  /** Trades ejecutados (desde trade_intents status=executed) para la pantalla Operaciones. */
+  async getTrades(limit = 200): Promise<{ trades: unknown[] }> {
+    const rows = await this.db.tradeIntent.findMany({
+      where: { status: 'executed' },
+      orderBy: { decided_at: 'desc' },
+      take: limit,
+    });
+    const trades = rows.map((r) => ({
+      ts: (r.decided_at ?? r.created_at).toISOString(),
+      cartera: r.mode || 'paper',
+      symbol: r.symbol,
+      lado: r.action,
+      valor: (r.fill_price ?? 0) * (r.quantity ?? 0),
+      precio: r.fill_price ?? 0,
+      comision: 0,
+    }));
+    return { trades };
+  }
+
+  // ── NAV history (competencia de estrategias) ───────────────────────────────
+
+  /** Series de NAV por estrategia (para la curva de competencia del Dashboard). */
+  async getNavHistory(
+    limit = 1000,
+  ): Promise<{ series: Record<string, { ts: string; nav: number }[]> }> {
+    const rows = await this.db.navSnapshot.findMany({
+      where: { strategy_id: { not: null } },
+      orderBy: { ts: 'asc' },
+      take: limit,
+      select: { ts: true, equity: true, strategy_id: true },
+    });
+    const strats = await this.db.strategy.findMany({ select: { id: true, name: true } });
+    const nameById: Record<string, string> = {};
+    for (const s of strats) nameById[s.id] = s.name;
+    const series: Record<string, { ts: string; nav: number }[]> = {};
+    for (const r of rows) {
+      const key = r.strategy_id ? (nameById[r.strategy_id] ?? r.strategy_id) : 'desconocida';
+      if (!series[key]) series[key] = [];
+      series[key].push({ ts: r.ts.toISOString(), nav: r.equity });
+    }
+    return { series };
+  }
+
   // ── Notifications ─────────────────────────────────────────────────────────
 
   /** Agrega notificaciones del sistema (sandbox caído) y las de plugins (clave 'notifications'). */
