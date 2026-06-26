@@ -14,6 +14,7 @@ import {
   SidebarTrigger,
 } from './ui/sidebar';
 import { Separator } from './ui/separator';
+import { ToastProvider } from './ui/Toast';
 import {
   LayoutDashboard,
   Bell,
@@ -150,66 +151,68 @@ export default function AppShell({
   }
 
   return (
-    <SidebarProvider>
-      <Sidebar>
-        <SidebarHeader>
-          <div className="px-2 py-2">
-            <Logo showText size={36} subtitle="trading · paper" />
-          </div>
-        </SidebarHeader>
-        <SidebarContent>
-          {GRUPOS.map((g) => (
-            <SidebarGroup key={g.label}>
-              <SidebarGroupLabel>{g.label}</SidebarGroupLabel>
-              <SidebarGroupContent>
-                <SidebarMenu>
-                  {g.items.map((n) => (
-                    <SidebarMenuItem key={n.href}>
-                      <SidebarMenuButton asChild isActive={activo === norm(n.href)}>
-                        <a href={n.href}>
-                          <n.icon className="h-4 w-4" />
-                          <span>{n.label}</span>
-                        </a>
-                      </SidebarMenuButton>
-                    </SidebarMenuItem>
-                  ))}
-                </SidebarMenu>
-              </SidebarGroupContent>
-            </SidebarGroup>
-          ))}
-        </SidebarContent>
-        <SidebarFooter>
-          <div className="flex items-center justify-between px-2 py-1.5">
-            <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-              <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
-              sistema operativo
+    <ToastProvider>
+      <SidebarProvider>
+        <Sidebar>
+          <SidebarHeader>
+            <div className="px-2 py-2">
+              <Logo showText size={36} subtitle="trading · paper" />
             </div>
-            <button
-              onClick={logout}
-              className="text-[11px] text-muted-foreground hover:text-foreground transition-colors"
-              title="Cerrar sesión"
-            >
-              Salir
-            </button>
+          </SidebarHeader>
+          <SidebarContent>
+            {GRUPOS.map((g) => (
+              <SidebarGroup key={g.label}>
+                <SidebarGroupLabel>{g.label}</SidebarGroupLabel>
+                <SidebarGroupContent>
+                  <SidebarMenu>
+                    {g.items.map((n) => (
+                      <SidebarMenuItem key={n.href}>
+                        <SidebarMenuButton asChild isActive={activo === norm(n.href)}>
+                          <a href={n.href}>
+                            <n.icon className="h-4 w-4" />
+                            <span>{n.label}</span>
+                          </a>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    ))}
+                  </SidebarMenu>
+                </SidebarGroupContent>
+              </SidebarGroup>
+            ))}
+          </SidebarContent>
+          <SidebarFooter>
+            <div className="flex items-center justify-between px-2 py-1.5">
+              <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
+                sistema operativo
+              </div>
+              <button
+                onClick={logout}
+                className="text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+                title="Cerrar sesión"
+              >
+                Salir
+              </button>
+            </div>
+          </SidebarFooter>
+        </Sidebar>
+        <SidebarInset>
+          <header className="sticky top-0 z-20 flex items-center justify-between border-b border-border bg-background/75 px-4 py-3 backdrop-blur-xl">
+            <div className="flex items-center gap-2">
+              <SidebarTrigger />
+              <Separator orientation="vertical" className="h-5" />
+              <h1 className="text-base font-semibold tracking-tight">{title}</h1>
+            </div>
+            <div className="flex items-center gap-3">
+              <span className="text-[11px] text-muted-foreground num hidden sm:block" id="clock" />
+              <ThemeSwitcher />
+            </div>
+          </header>
+          <div className="p-6 max-w-[1400px]">
+            <Contenido />
           </div>
-        </SidebarFooter>
-      </Sidebar>
-      <SidebarInset>
-        <header className="sticky top-0 z-20 flex items-center justify-between border-b border-border bg-background/75 px-4 py-3 backdrop-blur-xl">
-          <div className="flex items-center gap-2">
-            <SidebarTrigger />
-            <Separator orientation="vertical" className="h-5" />
-            <h1 className="text-base font-semibold tracking-tight">{title}</h1>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-[11px] text-muted-foreground num hidden sm:block" id="clock" />
-            <ThemeSwitcher />
-          </div>
-        </header>
-        <div className="p-6 max-w-[1400px]">
-          <Contenido />
-        </div>
-      </SidebarInset>
-    </SidebarProvider>
+        </SidebarInset>
+      </SidebarProvider>
+    </ToastProvider>
   );
 }
