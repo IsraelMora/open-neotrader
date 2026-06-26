@@ -16,7 +16,8 @@ import {
 
 /** Token de inyección para configurar la ventana anti-replay en milisegundos. */
 export const SIGNATURE_WINDOW_MS = 'SIGNATURE_WINDOW_MS';
-const DEFAULT_WINDOW_MS = 300_000;
+/** Ventana anti-replay por defecto: 5 minutos en milisegundos. */
+export const DEFAULT_WINDOW_MS = 300_000;
 
 interface SignedRequest {
   headers: Record<string, string>;

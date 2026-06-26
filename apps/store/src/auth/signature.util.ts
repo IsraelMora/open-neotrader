@@ -1,10 +1,4 @@
-import {
-  createHash,
-  createPublicKey,
-  verify,
-  sign,
-  KeyObject,
-} from 'node:crypto';
+import { createHash, createPublicKey, verify } from 'node:crypto';
 
 /**
  * Deriva el identificador de publisher a partir de su clave pública.
@@ -43,19 +37,6 @@ export function buildSignedMessage(
  */
 export function sha256Hex(body: string): string {
   return createHash('sha256').update(body, 'utf8').digest('hex');
-}
-
-/**
- * Firma un mensaje con la clave privada indicada usando el algoritmo Ed25519.
- *
- * @param privateKey - Clave privada como `KeyObject` de Node.js.
- * @param message    - Mensaje canónico a firmar.
- * @returns Firma en base64.
- */
-export function signMessage(privateKey: KeyObject, message: string): string {
-  return sign(null, Buffer.from(message, 'utf8'), privateKey).toString(
-    'base64',
-  );
 }
 
 /**

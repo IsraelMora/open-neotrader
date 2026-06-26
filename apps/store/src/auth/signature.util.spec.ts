@@ -3,8 +3,8 @@ import {
   publisherIdFromPublicKey,
   buildSignedMessage,
   verifySignature,
-  signMessage,
 } from './signature.util';
+import { signMessage } from './__test-helpers__/sign';
 
 function newKeys() {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519');

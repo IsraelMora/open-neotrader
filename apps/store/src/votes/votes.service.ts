@@ -27,11 +27,7 @@ export class VotesService {
       where: { id: pluginId },
     });
     if (!plugin) throw new NotFoundException('plugin no encontrado');
-    await this.prisma.publisher.upsert({
-      where: { id: voterId },
-      create: { id: voterId, publicKey: voterKey },
-      update: {},
-    });
+    await this.ensurePublisher(voterId, voterKey);
     await this.prisma.vote.upsert({
       where: { pluginId_voterId: { pluginId, voterId } },
       create: { pluginId, voterId, kind },
@@ -61,11 +57,7 @@ export class VotesService {
       where: { id: pluginId },
     });
     if (!plugin) throw new NotFoundException('plugin no encontrado');
-    await this.prisma.publisher.upsert({
-      where: { id: reporterId },
-      create: { id: reporterId, publicKey: reporterKey },
-      update: {},
-    });
+    await this.ensurePublisher(reporterId, reporterKey);
     // Idempotente por (plugin, reportante): un replay o reenvío no crea
     // reportes duplicados; solo actualiza el motivo.
     await this.prisma.report.upsert({
@@ -74,5 +66,13 @@ export class VotesService {
       update: { reason },
     });
     return { ok: true };
+  }
+
+  private async ensurePublisher(id: string, publicKey: string): Promise<void> {
+    await this.prisma.publisher.upsert({
+      where: { id },
+      create: { id, publicKey },
+      update: {},
+    });
   }
 }

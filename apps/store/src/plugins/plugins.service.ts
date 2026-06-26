@@ -44,11 +44,7 @@ export class PluginsService {
     const payload = Buffer.from(payloadBase64, 'base64');
     const checksum = createHash('sha256').update(payload).digest('hex');
 
-    await this.prisma.publisher.upsert({
-      where: { id: publisherId },
-      create: { id: publisherId, publicKey },
-      update: {},
-    });
+    await this.ensurePublisher(publisherId, publicKey);
 
     const plugin = await this.prisma.plugin.upsert({
       where: { publisherId_manifestId: { publisherId, manifestId: m.id } },
@@ -147,15 +143,13 @@ export class PluginsService {
       },
     });
     if (!plugin) throw new NotFoundException('plugin no encontrado');
-    const likes = await this.prisma.vote.count({
-      where: { pluginId: plugin.id, kind: 'like' },
-    });
-    const dislikes = await this.prisma.vote.count({
-      where: { pluginId: plugin.id, kind: 'dislike' },
-    });
-    const reports = await this.prisma.report.count({
-      where: { pluginId: plugin.id },
-    });
+    const [likes, dislikes, reports] = await Promise.all([
+      this.prisma.vote.count({ where: { pluginId: plugin.id, kind: 'like' } }),
+      this.prisma.vote.count({
+        where: { pluginId: plugin.id, kind: 'dislike' },
+      }),
+      this.prisma.report.count({ where: { pluginId: plugin.id } }),
+    ]);
     return { ...plugin, counts: { likes, dislikes, reports } };
   }
 
@@ -180,5 +174,13 @@ export class PluginsService {
       payloadBase64: Buffer.from(v.payload).toString('base64'),
       checksum: v.checksum,
     };
+  }
+
+  private async ensurePublisher(id: string, publicKey: string): Promise<void> {
+    await this.prisma.publisher.upsert({
+      where: { id },
+      create: { id, publicKey },
+      update: {},
+    });
   }
 }

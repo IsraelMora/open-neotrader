@@ -4,13 +4,13 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { generateKeyPairSync, KeyObject } from 'node:crypto';
-import { SignatureGuard } from './signature.guard';
+import { SignatureGuard, DEFAULT_WINDOW_MS } from './signature.guard';
 import {
   buildSignedMessage,
-  signMessage,
   sha256Hex,
   publisherIdFromPublicKey,
 } from './signature.util';
+import { signMessage } from './__test-helpers__/sign';
 
 interface KeyPair {
   pub: string;
@@ -56,7 +56,7 @@ function signedHeaders(k: KeyPair, body: unknown, ts = String(Date.now())) {
 }
 
 describe('SignatureGuard', () => {
-  const guard = new SignatureGuard(300_000);
+  const guard = new SignatureGuard(DEFAULT_WINDOW_MS);
 
   it('acepta una firma válida y fija req.publisherId', () => {
     const k = keys();

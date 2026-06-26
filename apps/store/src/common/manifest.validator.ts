@@ -35,8 +35,6 @@ const REQUIRED_PLUGIN_FIELDS = [
   'description',
 ] as const;
 
-type PluginBlock = Record<string, unknown>;
-
 function isNonNullObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
@@ -53,13 +51,13 @@ function requireStringField(
   return val;
 }
 
-function extractPluginBlock(data: TomlTable): PluginBlock {
+function extractRecord(data: TomlTable): Record<string, unknown> {
   const meta = data['plugin'];
   if (!isNonNullObject(meta)) throw new ManifestError('falta [plugin]');
   return meta;
 }
 
-function validatePluginFields(meta: PluginBlock): void {
+function validatePluginFields(meta: Record<string, unknown>): void {
   for (const c of REQUIRED_PLUGIN_FIELDS) {
     requireStringField(meta, c, '[plugin]');
   }
@@ -121,7 +119,7 @@ export function parseAndValidateManifest(text: string): Manifest {
     throw new ManifestError(`TOML inválido: ${(e as Error).message}`);
   }
 
-  const meta = extractPluginBlock(data);
+  const meta = extractRecord(data);
   validatePluginFields(meta);
 
   const id = meta['id'] as string;
@@ -202,9 +200,14 @@ function validateDisciplineProfile(payload: Record<string, unknown>): void {
   }
 }
 
+const PAYLOAD_VALIDATORS: Record<string, (p: Record<string, unknown>) => void> =
+  {
+    universe: validateUniverse,
+    skill: validateSkill,
+    preset: validatePreset,
+    'discipline-profile': validateDisciplineProfile,
+  };
+
 function validatePayload(type: string, payload: Record<string, unknown>): void {
-  if (type === 'universe') return validateUniverse(payload);
-  if (type === 'skill') return validateSkill(payload);
-  if (type === 'preset') return validatePreset(payload);
-  if (type === 'discipline-profile') return validateDisciplineProfile(payload);
+  PAYLOAD_VALIDATORS[type]?.(payload);
 }
