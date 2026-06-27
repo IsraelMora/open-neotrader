@@ -33,7 +33,7 @@ const path = Astro.url.pathname;
     </script>
   </head>
   <body class="font-sans antialiased">
-    <AppShell client:load title={title} path={path} page={page} />
+    <AppShell client:only="react" title={title} path={path} page={page} />
     <script>
       const upd = () => {
         const c = document.getElementById('clock');
