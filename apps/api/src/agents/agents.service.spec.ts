@@ -584,14 +584,14 @@ describe('AgentsService.runGovernedTurn — no-decision-plugin (source: chat)', 
   });
 });
 
-describe('AgentsService.runGovernedTurn — valid tool call dispatched (source: chat)', () => {
-  it('dispatches a valid tool call and includes it in result; audits chat_turn', async () => {
+describe('AgentsService.runGovernedTurn — chat is read-only: tool calls NOT dispatched (source: chat)', () => {
+  it('does NOT dispatch tool calls for chat even when LLM emits one; result.tool_calls is empty; audits chat_turn', async () => {
     const toolCallText =
       '<tool_calls>[{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","qty":1}}]</tool_calls>';
     const llm = makeLlm(toolCallText);
     const audit = makeAudit();
     const plugins = makeFullPlugins('Emit tool calls as JSON.', [ALPACA_PROVIDER_TOOL]);
-    // Plugin must appear active.
+    // Plugin is active in the DB but chat mode must ignore it (effectiveTools=[]).
     plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
     const sandbox = makeSandbox();
     const memory = makeMemory();
@@ -602,14 +602,13 @@ describe('AgentsService.runGovernedTurn — valid tool call dispatched (source: 
       context: 'Buy AAPL',
     });
 
-    // The validated call must have been dispatched.
-    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+    // Chat is read-only: sandbox must NOT be called.
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
 
-    // Result must include the dispatched tool_call.
-    expect(result.tool_calls).toHaveLength(1);
-    expect(result.tool_calls[0].plugin_id).toBe('alpaca-provider');
+    // Result tool_calls must be empty (all dropped — no effectiveTools for chat).
+    expect(result.tool_calls).toEqual([]);
 
-    // chat_turn audit must be present.
+    // chat_turn audit must still be present.
     expect(findAuditEvent(audit, 'chat_turn')).toBeDefined();
   });
 });
@@ -700,7 +699,8 @@ describe('AgentsService.runGovernedTurn — signalsEmitted in result', () => {
     const memory = makeMemory();
     const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
 
-    const result = await service.runGovernedTurn({ source: 'chat', context: 'Buy AAPL' });
+    // Use 'cycle' source — signalsEmitted tracking is cycle-path coverage (chat is read-only).
+    const result = await service.runGovernedTurn({ source: 'cycle', context: 'Buy AAPL' });
 
     // signalsEmitted must be present and contain the AAPL buy signal.
     expect(result.signalsEmitted).toBeDefined();
@@ -768,7 +768,8 @@ describe('AgentsService.runGovernedTurn — decision → TradeIntent (HITL)', ()
       tradeIntent, // tradeIntent (the @Optional() dep under test)
     );
 
-    await service.runGovernedTurn({ source: 'chat', context: 'Decide on AAPL' });
+    // Use 'cycle' source — HITL wiring is a cycle-path concern (chat is read-only).
+    await service.runGovernedTurn({ source: 'cycle', context: 'Decide on AAPL' });
 
     expect(tradeIntent.recordIntent).toHaveBeenCalledTimes(1);
     expect(tradeIntent.recordIntent).toHaveBeenCalledWith(
@@ -10137,5 +10138,80 @@ describe('AgentsService._runSingleIteration — native tool_calls vs text fallba
     expect(result.tool_calls).toHaveLength(1);
     expect(result.tool_calls[0].plugin_id).toBe('decision');
     expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Chat mode behavioral fix — read-only with no decision prompt and no tools ──
+
+describe('runGovernedTurn chat mode', () => {
+  const CHAT_DECISION_PROMPT = 'Evaluá las señales y emitir tool calls.';
+  const CHAT_PROVIDER_TOOL = {
+    plugin_id: 'alpaca-provider',
+    name: 'alpaca-provider__place_order',
+    description: 'Place an order',
+    input_schema: { type: 'object', properties: {} },
+  };
+
+  function makeChatTestLlm(): Partial<LlmService> {
+    return {
+      complete: jest.fn().mockResolvedValue({
+        text: 'Acá está la información de tu cartera.',
+        tool_calls: [],
+        backend: 'api' as const,
+        skills_read: [],
+        skills_written: [],
+      } satisfies LlmResponse),
+    };
+  }
+
+  it('(a) system_prompt omits [DECISION] and [TOOL SCHEMA] and includes the CHAT_SYSTEM_PROMPT marker', async () => {
+    const llm = makeChatTestLlm();
+    const plugins = makeFullPlugins(CHAT_DECISION_PROMPT, [CHAT_PROVIDER_TOOL]);
+    plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
+    const service = makeFullAgentsService(llm, makeAudit(), plugins, makeSandbox(), makeMemory());
+
+    await service.runGovernedTurn({ source: 'chat', context: 'hola' });
+
+    expect(llm.complete).toHaveBeenCalledTimes(1);
+    const completeCalls = (llm.complete as jest.Mock).mock.calls as Array<
+      [{ system_prompt?: string }]
+    >;
+    const sp = completeCalls[0][0].system_prompt ?? '';
+    expect(sp).not.toContain('[DECISION]');
+    expect(sp).not.toContain('[TOOL SCHEMA]');
+    // 'solo lectura' is a stable substring from CHAT_SYSTEM_PROMPT
+    expect(sp).toContain('solo lectura');
+  });
+
+  it('(b) llm.complete is called with tools: []', async () => {
+    const llm = makeChatTestLlm();
+    const plugins = makeFullPlugins(CHAT_DECISION_PROMPT, [CHAT_PROVIDER_TOOL]);
+    plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
+    const service = makeFullAgentsService(llm, makeAudit(), plugins, makeSandbox(), makeMemory());
+
+    await service.runGovernedTurn({ source: 'chat', context: 'hola' });
+
+    const bCalls = (llm.complete as jest.Mock).mock.calls as Array<[{ tools: unknown[] }]>;
+    expect(bCalls[0][0].tools).toEqual([]);
+  });
+
+  it('(c) regression: source=cycle passes [DECISION] and non-empty tools to llm.complete', async () => {
+    const llm = makeChatTestLlm();
+    const plugins = makeFullPlugins(CHAT_DECISION_PROMPT, [CHAT_PROVIDER_TOOL]);
+    plugins.findActive.mockResolvedValue([{ id: 'alpaca-provider', type: 'provider' }] as never);
+    const service = makeFullAgentsService(llm, makeAudit(), plugins, makeSandbox(), makeMemory());
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'run' });
+
+    const cCalls = (llm.complete as jest.Mock).mock.calls as Array<
+      [
+        {
+          system_prompt?: string;
+          tools: unknown[];
+        },
+      ]
+    >;
+    expect(cCalls[0][0].system_prompt).toContain('[DECISION]');
+    expect(cCalls[0][0].tools.length).toBeGreaterThan(0);
   });
 });

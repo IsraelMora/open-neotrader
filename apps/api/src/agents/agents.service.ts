@@ -312,6 +312,15 @@ const KERNEL_TOOL_REGISTRY: Set<string> = new Set([
 /** Plugin id of the ML discipline — used for opt-in injection and ML-first sort. */
 const ML_PLUGIN_ID = 'ml-feature-extractor';
 
+/**
+ * Prompt de sistema para turnos de chat interactivo (source='chat').
+ * El asistente actúa en modo solo lectura: responde preguntas sobre el estado
+ * del sistema pero NO emite tool calls ni ejecuta trades.
+ * No incluye el bloque [DECISION] ni el esquema de herramientas.
+ */
+const CHAT_SYSTEM_PROMPT =
+  'Sos el asistente de solo lectura de OpenNeoTrader. Respondé preguntas sobre carteras, decisiones, vetos, evidencia y configuración con respuestas claras y concisas. No operás ni ejecutás trades, y NO debés emitir bloques <tool_calls> ni llamadas a herramientas en formato JSON. Si no tenés el dato, decilo sin rodeos. Respondé en el idioma del usuario.';
+
 /** Orquesta el ciclo completo del agente: memoria, hooks de plugins, capa de veto, LLM y ejecución de tool calls. */
 @Injectable()
 export class AgentsService {
@@ -630,6 +639,11 @@ export class AgentsService {
   async runGovernedTurn(input: GovernedTurnInput): Promise<GovernedTurnResult> {
     const cycle_id = input.cycle_id ?? randomUUID();
 
+    // ── Chat mode: read-only assistant, no trading brain ─────────────────────
+    // When source === 'chat', the governed turn acts as a pure conversational assistant:
+    // no decision prompt, no tool schema, no effective tools. The cycle path is unchanged.
+    const isChat = input.source === 'chat';
+
     // ── Hoist ONCE — tool schema, decision prompt, and active plugins fixed per governed turn ──
     const providerTools = await this.plugins.getProviderTools();
     const kernelTools =
@@ -644,14 +658,30 @@ export class AgentsService {
             KERNEL_TUNE_PLUGIN_PARAM_TOOL,
           ]
         : [];
-    const effectiveTools = [...providerTools, ...kernelTools];
-    // F6-s4: compute visibleTools ONCE per governed turn (pre-inference gate).
-    // visibleTools is used for [TOOL SCHEMA] only; _validateToolCalls keeps effectiveTools (defense in depth).
-    // When nothing is hidden, _computeVisibleTools returns the same array reference → byte-identical schema.
-    const visibleTools = await this._computeVisibleTools(effectiveTools, input.virtual_only);
-    // Hoisted ONCE per governed turn — avoids N DB round-trips for a value that is
-    // constant for the lifetime of this turn (decision prompt does not change mid-loop).
-    const decisionPrompt = await this.plugins.getActiveDecisionPrompt();
+
+    // Chat uses empty tools and a null decision prompt so _runSingleIteration never
+    // injects [DECISION]/[TOOL SCHEMA]. Non-chat keeps the full trading-brain setup.
+    let effectiveTools: import('../plugins/plugins.service').ProviderTool[];
+    let visibleTools: import('../plugins/plugins.service').ProviderTool[];
+    let decisionPrompt: string | null;
+    let turnSystemPrompt: string | undefined;
+    if (isChat) {
+      effectiveTools = [];
+      visibleTools = [];
+      decisionPrompt = null;
+      // Use caller override when provided; otherwise inject the read-only chat prompt.
+      turnSystemPrompt = input.system_prompt ?? CHAT_SYSTEM_PROMPT;
+    } else {
+      effectiveTools = [...providerTools, ...kernelTools];
+      // F6-s4: compute visibleTools ONCE per governed turn (pre-inference gate).
+      // visibleTools is used for [TOOL SCHEMA] only; _validateToolCalls keeps effectiveTools (defense in depth).
+      // When nothing is hidden, _computeVisibleTools returns the same array reference → byte-identical schema.
+      visibleTools = await this._computeVisibleTools(effectiveTools, input.virtual_only);
+      // Hoisted ONCE per governed turn — avoids N DB round-trips for a value that is
+      // constant for the lifetime of this turn (decision prompt does not change mid-loop).
+      decisionPrompt = await this.plugins.getActiveDecisionPrompt();
+      turnSystemPrompt = input.system_prompt;
+    }
     const maxTurns = await this._resolveMaxTurns();
 
     // ── Accumulators ─────────────────────────────────────────────────────────
@@ -671,7 +701,7 @@ export class AgentsService {
         cycle_id,
         source: input.source,
         context: iterContext,
-        system_prompt: input.system_prompt,
+        system_prompt: turnSystemPrompt,
         effectiveTools,
         visibleTools,
         _activePlugins: input._activePlugins,
