@@ -1,4 +1,4 @@
-import { parseToolCalls } from './kernel-parser';
+import { parseToolCalls, stripToolCallBlocks } from './kernel-parser';
 
 describe('parseToolCalls', () => {
   // ── Fenced ```json block ─────────────────────────────────────────────────────
@@ -206,5 +206,73 @@ describe('parseToolCalls', () => {
     const auditFn = jest.fn();
     expect(parseToolCalls('', auditFn)).toEqual([]);
     expect(auditFn).not.toHaveBeenCalled();
+  });
+});
+
+describe('stripToolCallBlocks', () => {
+  // 1. Prose + block → prose only (trimmed)
+  it('removes a <tool_calls> block and preserves surrounding prose', () => {
+    const input = 'Listo.\n<tool_calls>[{"tool":"x__y","args":{}}]</tool_calls>';
+    expect(stripToolCallBlocks(input)).toBe('Listo.');
+  });
+
+  // 2. Block-only → empty string ("hola" bug case)
+  it('returns "" when the input is only a <tool_calls>[]</tool_calls> block', () => {
+    expect(stripToolCallBlocks('<tool_calls>[]</tool_calls>')).toBe('');
+  });
+
+  // 3. Case-insensitive
+  it('removes <TOOL_CALLS>...</TOOL_CALLS> (uppercase tags)', () => {
+    const input = 'Ok.\n<TOOL_CALLS>[{"tool":"a__b","args":{}}]</TOOL_CALLS>';
+    expect(stripToolCallBlocks(input)).toBe('Ok.');
+  });
+
+  // 4. Multiple blocks removed (each removal leaves \n on each side → \n\n paragraph break;
+  //    rule 9 only collapses 3+ newlines to 2, so double newlines remain)
+  it('removes multiple <tool_calls> blocks in one pass', () => {
+    const input =
+      'First.\n<tool_calls>[{"tool":"a__b","args":{}}]</tool_calls>\nMiddle.\n<tool_calls>[]</tool_calls>\nEnd.';
+    expect(stripToolCallBlocks(input)).toBe('First.\n\nMiddle.\n\nEnd.');
+  });
+
+  // 5. Multiline JSON inside block
+  it('removes blocks with multiline JSON content', () => {
+    const block = `<tool_calls>[\n  {\n    "tool": "a__b",\n    "args": {}\n  }\n]</tool_calls>`;
+    const input = `Thinking...\n${block}`;
+    expect(stripToolCallBlocks(input)).toBe('Thinking...');
+  });
+
+  // 6. Plain prose unchanged
+  it('returns plain prose unchanged (modulo trim)', () => {
+    const input = 'Just a regular answer with no tool calls.';
+    expect(stripToolCallBlocks(input)).toBe(input);
+  });
+
+  // 7. Does NOT strip ```json code fences (data-loss guard)
+  it('does NOT strip a legitimate ```json code fence', () => {
+    const input = 'Here is an example:\n```json\n[{"key": "value"}]\n```\nThat\'s how it works.';
+    expect(stripToolCallBlocks(input)).toBe(input);
+  });
+
+  // 8a. Empty string → ""
+  it('returns "" on empty string input', () => {
+    expect(stripToolCallBlocks('')).toBe('');
+  });
+
+  // 8b. Null/undefined defensively handled
+  it('handles null input without throwing', () => {
+    expect(() => stripToolCallBlocks(null as unknown as string)).not.toThrow();
+    expect(stripToolCallBlocks(null as unknown as string)).toBe('');
+  });
+
+  it('handles undefined input without throwing', () => {
+    expect(() => stripToolCallBlocks(undefined as unknown as string)).not.toThrow();
+    expect(stripToolCallBlocks(undefined as unknown as string)).toBe('');
+  });
+
+  // 9. Collapses excess blank lines and trims
+  it('collapses 3+ consecutive newlines to 2 and trims the result', () => {
+    const input = 'Line A.\n\n\n\n<tool_calls>[]</tool_calls>\n\n\nLine B.';
+    expect(stripToolCallBlocks(input)).toBe('Line A.\n\nLine B.');
   });
 });

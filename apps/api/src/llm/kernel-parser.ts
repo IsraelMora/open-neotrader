@@ -80,6 +80,23 @@ function normalizeEntry(entry: RawEntry): ToolCallRequest | null {
   return null;
 }
 
+// ── Display text sanitization ─────────────────────────────────────────────────
+
+const TOOL_CALLS_BLOCK = /<tool_calls>[\s\S]*?<\/tool_calls>/gi;
+
+/**
+ * Removes <tool_calls>...</tool_calls> protocol blocks from display/storage text.
+ * Counterpart to parseToolCalls — keep the recognized delimiter in sync.
+ * Intentionally does NOT touch ```json fences or bare arrays (legit chat content).
+ */
+export function stripToolCallBlocks(text: string): string {
+  if (!text) return text ?? '';
+  return text
+    .replace(TOOL_CALLS_BLOCK, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**

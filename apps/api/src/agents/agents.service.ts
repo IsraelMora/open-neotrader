@@ -31,7 +31,7 @@ import { TradeIntentService } from '../trade-intent/trade-intent.service';
 import type { LlmResponse } from '../llm/llm.service';
 import type { DebateConsensus } from './debate.types';
 import type { ConfigFieldSpec } from '../plugins/manifest';
-import { parseToolCalls } from '../llm/kernel-parser';
+import { parseToolCalls, stripToolCallBlocks } from '../llm/kernel-parser';
 import { sanitizeText } from './sanitize.util';
 
 /**
@@ -530,6 +530,10 @@ export class AgentsService {
     if (!llmResponse.tool_calls || llmResponse.tool_calls.length === 0) {
       llmResponse.tool_calls = parseToolCalls(llmResponse.text, auditFn);
     }
+    // Strip the <tool_calls>...</tool_calls> delimiter from the display text now
+    // that tool_calls is fully populated. Must come AFTER parseToolCalls so trade
+    // execution is never affected.
+    llmResponse.text = stripToolCallBlocks(llmResponse.text);
 
     const skills_read = llmResponse.skills_read ?? [];
     const skills_written = llmResponse.skills_written ?? [];
