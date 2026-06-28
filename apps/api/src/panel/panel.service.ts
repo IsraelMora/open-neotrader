@@ -327,11 +327,18 @@ export class PanelService {
   }
 
   // ── Skills ────────────────────────────────────────────────────────────────
-  // Solo lee metadatos de plugins tipo skill — la plataforma no gestiona skills manualmente.
+  // Exposes LLM-callable skill functions from active plugins as a structured list.
 
-  /** Devuelve los metadatos de plugins tipo skill activos (nombre y descripción para el LLM). */
+  /** Returns the list of LLM-callable tools from active plugins as { from_plugins, n_plugins }. */
   async getSkills() {
-    return this.plugins.getSkillsMetadata();
+    const tools = await this.plugins.getProviderTools();
+    const fromPlugins = tools.map((t) => {
+      const sep = t.name.indexOf('__');
+      const fn = sep >= 0 ? t.name.slice(sep + 2) : t.name;
+      return { name: fn, plugin: t.plugin_id, key: `${t.plugin_id}.${fn}` };
+    });
+    const nPlugins = new Set(tools.map((t) => t.plugin_id)).size;
+    return { from_plugins: fromPlugins, n_plugins: nPlugins };
   }
 
   // ── Plugins activos por tipo ───────────────────────────────────────────────

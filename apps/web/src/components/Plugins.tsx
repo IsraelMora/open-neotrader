@@ -235,7 +235,7 @@ function PluginsList({ plugins, reload }: { plugins: Plugin[]; reload: () => voi
       <Card>
         <CardHeader
           title="Instalar plugin"
-          hint="Ruta local a la carpeta del plugin (debe contener manifest.json válido)."
+          hint="Ruta local a la carpeta del plugin (debe contener manifest.toml válido)."
         />
         <CardBody>
           <div className="flex gap-2 items-center flex-wrap">

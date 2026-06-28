@@ -1440,6 +1440,132 @@ describe('F3-s4 — findAll() surfaces trust_score + badge per plugin', () => {
   });
 });
 
+// ── Bug 5: findAll() includes config_spec from manifest ──────────────────────
+
+describe('findAll() — config_spec populated from manifest config section', () => {
+  beforeEach(() => jest.restoreAllMocks());
+
+  function makeFindAllSvcForSchema(
+    rows: Plugin[],
+    manifestConfig: PluginManifest['config'],
+  ): PluginsService {
+    const db = {
+      plugin: {
+        findUnique: jest.fn(),
+        findMany: jest.fn().mockResolvedValue(rows),
+        findFirst: jest.fn(),
+        create: jest.fn(),
+        update: jest.fn(),
+        delete: jest.fn(),
+      },
+    } as unknown as PrismaService;
+    const events = { emit: jest.fn() } as unknown as PluginEventsService;
+    const cfg = {
+      get: jest.fn().mockReturnValue('/var/plugins'),
+    } as unknown as ConfigService;
+    const kv = { get: jest.fn().mockResolvedValue(null) } as unknown as KvService;
+    const svc = new PluginsService(db, events, cfg, kv);
+    svc.getManifest = jest.fn().mockReturnValue(
+      manifestConfig
+        ? {
+            plugin: { id: rows[0]?.id ?? 'p', name: 'P', version: '1.0.0', type: 'skill' },
+            config: manifestConfig,
+          }
+        : null,
+    );
+    return svc;
+  }
+
+  it('returns config_spec with transformed fields when manifest declares [config]', async () => {
+    const rows = [
+      {
+        id: 'my-plugin',
+        name: 'My Plugin',
+        description: null,
+        version: '1.0.0',
+        type: 'skill',
+        active: false,
+        verification: 'unverified',
+        author: null,
+        source_url: null,
+        git_url: null,
+        stack_plugins: null,
+        skills: null,
+        symbols: null,
+        config: null,
+        installed_path: '/plugins/my-plugin',
+        scan_result: null,
+        smoke_test_result: null,
+        reputation_score: null,
+        reputation_detail: null,
+        trust_score: null,
+        content_checksum: null,
+        votes_net: 0,
+        installed_at: new Date(),
+        updated_at: new Date(),
+      } as Plugin,
+    ];
+    const svc = makeFindAllSvcForSchema(rows, {
+      risk_level: { type: 'number', label: 'Risk Level', default: 5 },
+      mode: { type: 'string', enum: ['fast', 'slow'], label: 'Mode' },
+      verbose: { type: 'boolean', label: 'Verbose' },
+    });
+
+    const plugins = await svc.findAll();
+
+    expect(plugins[0].config_spec).toEqual({
+      form: {
+        fields: [
+          expect.objectContaining({ key: 'risk_level', label: 'Risk Level', type: 'number' }),
+          expect.objectContaining({
+            key: 'mode',
+            label: 'Mode',
+            type: 'select',
+            options: ['fast', 'slow'],
+          }),
+          expect.objectContaining({ key: 'verbose', label: 'Verbose', type: 'bool' }),
+        ],
+      },
+    });
+  });
+
+  it('returns config_spec as undefined when manifest has no config section', async () => {
+    const rows = [
+      {
+        id: 'bare-plugin',
+        name: 'Bare',
+        description: null,
+        version: '1.0.0',
+        type: 'skill',
+        active: false,
+        verification: 'unverified',
+        author: null,
+        source_url: null,
+        git_url: null,
+        stack_plugins: null,
+        skills: null,
+        symbols: null,
+        config: null,
+        installed_path: null,
+        scan_result: null,
+        smoke_test_result: null,
+        reputation_score: null,
+        reputation_detail: null,
+        trust_score: null,
+        content_checksum: null,
+        votes_net: 0,
+        installed_at: new Date(),
+        updated_at: new Date(),
+      } as Plugin,
+    ];
+    const svc = makeFindAllSvcForSchema(rows, undefined);
+
+    const plugins = await svc.findAll();
+
+    expect(plugins[0].config_spec).toBeUndefined();
+  });
+});
+
 // ── Task 4.5: "nothing blocks" guard tests ────────────────────────────────────
 
 describe('F3-s4 — "nothing blocks" guard tests (AC-14)', () => {

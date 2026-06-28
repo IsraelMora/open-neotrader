@@ -34,8 +34,8 @@ function PluginSkill({ s }: { s: PluginSkillItem }) {
 }
 
 export default function Skills() {
-  const { data, loading, error, reload } = useResource<SkillsData>(
-    () => api.skills() as unknown as Promise<SkillsData>,
+  const { data, loading, error, reload } = useResource<SkillsData>(() =>
+    api.skills().then((d) => d as SkillsData),
   );
   const [q, setQ] = useState('');
 

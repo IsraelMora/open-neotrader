@@ -280,6 +280,21 @@ function parseSkillMd(content: string): { name: string; description: string; bod
   return { name, description, body };
 }
 
+// ── Config spec shape surfaced by the REST API ────────────────────────────────
+
+/** Config form spec derived from manifest.toml [config]. Matches the UI FieldSpec contract. */
+export interface PluginConfigSpec {
+  form?: {
+    fields?: Array<{
+      key: string;
+      label?: string;
+      type?: string;
+      default?: unknown;
+      options?: string[];
+    }>;
+  };
+}
+
 // ── Hydrated Plugin type ──────────────────────────────────────────────────────
 export type HydratedPlugin = Omit<Plugin, 'skills' | 'stack_plugins' | 'symbols' | 'config'> & {
   skills: string[] | null;
@@ -291,6 +306,8 @@ export type HydratedPlugin = Omit<Plugin, 'skills' | 'stack_plugins' | 'symbols'
   // badge is optional because it is only present in findAll() and getTrustReport() outputs.
   trust_score: number | null;
   badge?: boolean;
+  /** Config form spec derived from manifest.toml [config] — only present in findAll() output. */
+  config_spec?: PluginConfigSpec;
 };
 
 function hydrate(p: Plugin): HydratedPlugin {
@@ -301,6 +318,13 @@ function hydrate(p: Plugin): HydratedPlugin {
     symbols: j<string[]>(p.symbols),
     config: j<Record<string, unknown>>(p.config),
   };
+}
+
+/** Maps a manifest ConfigFieldSpec type to the UI FieldSpec type token. */
+function resolveConfigFieldType(spec: ConfigFieldSpec): string {
+  if (spec.enum?.length) return 'select';
+  if (spec.type === 'boolean') return 'bool';
+  return spec.type;
 }
 
 /** Gestiona el ciclo de vida completo de los plugins: instalación git, activación/desactivación, config, skills y tools. */
@@ -401,7 +425,22 @@ export class PluginsService implements OnApplicationBootstrap {
         weights,
         threshold,
       );
-      return { ...hydrated, trust_score, badge };
+      // Bug 5: derive config_spec from manifest [config] so the UI form can render fields.
+      const manifest = this.getManifest(p.installed_path);
+      const configSpec: PluginConfigSpec | undefined = manifest?.config
+        ? {
+            form: {
+              fields: Object.entries(manifest.config).map(([key, spec]) => ({
+                key,
+                label: spec.label,
+                type: resolveConfigFieldType(spec),
+                default: spec.default,
+                options: spec.enum,
+              })),
+            },
+          }
+        : undefined;
+      return { ...hydrated, trust_score, badge, config_spec: configSpec };
     });
   }
 
