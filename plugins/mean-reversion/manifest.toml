@@ -83,9 +83,6 @@ default     = true
 label       = "Use RSI confirmation"
 description = "When true, entry signals also require RSI in oversold/overbought zone."
 
-[skills]
-tools = ["mean-reversion.analyze"]
-
 [hooks]
 on_cycle = "hooks/cycle.py"
 

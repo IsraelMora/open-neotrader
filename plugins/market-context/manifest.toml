@@ -65,9 +65,3 @@ max         = 504
 label       = "Volatility percentile lookback days"
 description = "Number of days for computing historical realized volatility percentile."
 
-# ── LLM-callable skills (union of both sources) ───────────────────────────────
-[skills]
-get_market_breadth      = "scripts/market_breadth.py"
-check_breadth_divergence = "scripts/market_breadth.py"
-get_volatility_regime   = "scripts/regime.py"
-detect_regime           = "scripts/regime.py"
