@@ -67,6 +67,12 @@ Browser → nginx (apps/web) ── /        → Astro static panel
 - API keys flow only via env passthrough (`.env`, gitignored) — never baked into the image or committed. `.env.example` must stay credential-free.
 - Plugins are baked into the image at `/plugins`; runtime installs (`POST /api/plugins/install`) write there too (hence `chown node:node /plugins` in the Dockerfile).
 
+### Risk kernel & real-money mode
+
+Risk is **safe by default** (opt-out, not opt-in): `TradeIntentService` enforces a kernel floor regardless of active plugins — a max-drawdown halt (from the paper portfolio's own high-water-mark) and a per-trade size ceiling (`max_position_pct`), on both the autonomous and human-approval paths. `exit`/`hold` always bypass every gate (a position must always be closeable). Plugins can only add MORE restriction on top. Real execution is additionally gated: `_effectiveMode` returns `real` only when `policy.real` + `broker_plugin_id` + the applied strategy has a recent `ROBUSTO` walk-forward verdict (`execution.walk_forward_max_age_days`); any failure demotes to paper (never blocks it). Persisting a walk-forward verdict requires TOTP.
+
+**Paper mode is the supported, production-ready path.** **Real-money mode is EXPERIMENTAL.** Known limitations (deferred, need a dedicated design): real fills are not tracked in a local position ledger (the paper `Portfolio` row is never mutated in real mode), so the kernel's drawdown/sizing currently anchor to the paper-sized account, and real positions rely on best-effort broker lookups. Exit routing already closes a real position wherever it lives (broker lookup, fail-loud on error) and exits are never dropped by the tool-call cap, the debate gate, or cosmetic `confidence`/`rationale` validation — but full real-account accounting is a follow-up. Do not run real money beyond careful evaluation.
+
 ### Sandbox protocol (`apps/sandbox/runner.py`)
 
 stdin→stdout JSON. Commands: `list_plugins`, `call_plugin` (only functions declared in `manifest.toml [skills]`), `run_cycle`. Always replies `{"ok": true, "result": ...}` or `{"ok": false, "error": "..."}`. `runner.py` lazy-imports `isolation.py` / `analyzer.py`.
