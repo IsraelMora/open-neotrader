@@ -48,6 +48,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # pnpm 9 blocks native build scripts by default, so on a cold pnpm cache
+      # bcrypt/better-sqlite3 ship no compiled binary and the real-module-boot
+      # tests (which load AuthModule → bcrypt) fail with "Cannot find bcrypt_lib.node".
+      # Force the native builds so CI is deterministic regardless of cache warmth.
+      - name: Rebuild native modules (bcrypt, better-sqlite3)
+        run: pnpm --filter=@neurotrader/api rebuild bcrypt better-sqlite3
+
       - name: Generate Prisma client (api)
         run: pnpm --filter=@neurotrader/api exec prisma generate
 
