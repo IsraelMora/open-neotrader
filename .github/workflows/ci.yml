@@ -57,6 +57,13 @@ jobs:
       - name: Apply migrations to fresh test DB (api)
         run: pnpm --filter=@neurotrader/api exec prisma migrate deploy
 
+      # The api's ConfigModule reads apps/api/.env (envFilePath default), which is how
+      # JWT_SECRET is provided locally. Real-module-compile tests getOrThrow('JWT_SECRET'),
+      # so create a throwaway .env for CI (gitignored; never a real secret).
+      - name: Create CI .env for apps/api
+        run: |
+          printf 'JWT_SECRET=ci-test-only-not-a-real-secret\nDATABASE_URL=%s\n' "$DATABASE_URL" > apps/api/.env
+
       - name: Lint
         run: pnpm lint
 
