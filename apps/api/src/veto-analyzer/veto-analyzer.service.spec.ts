@@ -23,6 +23,7 @@ function makeDecision(overrides: Partial<VetoDecisionRow> = {}): VetoDecisionRow
     id: 'd1',
     ts: new Date('2024-01-01T00:00:00.000Z'),
     symbol: 'AAPL',
+    source_plugin: 'momentum',
     verdict: 'blocked',
     proposed_action: 'long',
     proposed_qty: 10,
@@ -658,5 +659,140 @@ describe('VetoAnalyzerService.getMetrics', () => {
     expect(report.net_value).toBe(0);
     expect(report.evaluated_count).toBe(0);
     expect(report.counts_by_verdict).toEqual({ approved: 0, blocked: 0, modified: 0 });
+  });
+});
+
+// ── getPluginValue: per-plugin raw signal value attribution ────────────────────
+
+describe('VetoAnalyzerService.getPluginValue', () => {
+  function pluginRow(overrides: Partial<VetoDecisionRow> = {}): VetoDecisionRow {
+    return makeDecision({
+      cf_pnl: 10,
+      cf_method: 'fixed_horizon:5:1d:costbps10:v1',
+      cf_evaluated_at: new Date('2024-01-10T00:00:00.000Z'),
+      ...overrides,
+    });
+  }
+
+  it('groups by source_plugin, computing net_value/wins/win_rate/avg_cf_pnl, sorted best net_value first', async () => {
+    const rows = [
+      pluginRow({ id: 'a1', source_plugin: 'momentum', verdict: 'approved', cf_pnl: 100 }),
+      pluginRow({ id: 'a2', source_plugin: 'momentum', verdict: 'blocked', cf_pnl: -40 }),
+      pluginRow({ id: 'b1', source_plugin: 'mean-revert', verdict: 'modified', cf_pnl: -10 }),
+      pluginRow({ id: 'b2', source_plugin: 'mean-revert', verdict: 'approved', cf_pnl: -5 }),
+    ];
+    const prisma = makePrisma(rows);
+    const gateway = makeGateway([]);
+    const svc = makeService(prisma, gateway);
+
+    const report = await svc.getPluginValue();
+
+    expect(report.plugins).toHaveLength(2);
+    // momentum: net_value = 100 - 40 = 60, wins = 1, evaluated_count = 2, win_rate = 0.5
+    const momentum = report.plugins.find((p) => p.source_plugin === 'momentum');
+    expect(momentum).toBeDefined();
+    expect(momentum?.net_value).toBeCloseTo(60, 6);
+    expect(momentum?.wins).toBe(1);
+    expect(momentum?.evaluated_count).toBe(2);
+    expect(momentum?.win_rate).toBeCloseTo(0.5, 6);
+    expect(momentum?.avg_cf_pnl).toBeCloseTo(30, 6);
+
+    // mean-revert: net_value = -10 + -5 = -15, wins = 0
+    const meanRevert = report.plugins.find((p) => p.source_plugin === 'mean-revert');
+    expect(meanRevert?.net_value).toBeCloseTo(-15, 6);
+    expect(meanRevert?.wins).toBe(0);
+
+    // Sorted best net_value first: momentum (60) before mean-revert (-15).
+    expect(report.plugins[0].source_plugin).toBe('momentum');
+    expect(report.plugins[1].source_plugin).toBe('mean-revert');
+
+    expect(report.totals.evaluated_count).toBe(4);
+    expect(report.totals.net_value).toBeCloseTo(45, 6);
+  });
+
+  it('rows with terminal non-evaluated cf_method (unsupported_action/insufficient_data/invalid_ref_price) are excluded', async () => {
+    const rows = [
+      pluginRow({ id: 'a1', source_plugin: 'momentum', cf_pnl: 50 }),
+      pluginRow({
+        id: 'u1',
+        source_plugin: 'momentum',
+        cf_pnl: null,
+        cf_method: 'unsupported_action',
+      }),
+      pluginRow({
+        id: 'u2',
+        source_plugin: 'momentum',
+        cf_pnl: null,
+        cf_method: 'insufficient_data',
+      }),
+      pluginRow({
+        id: 'u3',
+        source_plugin: 'momentum',
+        cf_pnl: null,
+        cf_method: 'invalid_ref_price',
+      }),
+    ];
+    const prisma = makePrisma(rows);
+    const gateway = makeGateway([]);
+    const svc = makeService(prisma, gateway);
+
+    const report = await svc.getPluginValue();
+
+    expect(report.plugins).toHaveLength(1);
+    expect(report.plugins[0].evaluated_count).toBe(1);
+    expect(report.plugins[0].net_value).toBeCloseTo(50, 6);
+    expect(report.totals.evaluated_count).toBe(1);
+  });
+
+  it('supports an optional { from, to } time window filter forwarded to the query', async () => {
+    const prisma = makePrisma([pluginRow({ source_plugin: 'momentum' })]);
+    const gateway = makeGateway([]);
+    const svc = makeService(prisma, gateway);
+
+    const from = new Date('2024-01-01T00:00:00.000Z');
+    const to = new Date('2024-01-31T00:00:00.000Z');
+    await svc.getPluginValue({ from, to });
+
+    const findManyArgs = (
+      (prisma.vetoDecision.findMany as jest.Mock).mock.calls[0] as unknown[]
+    )[0] as {
+      where: { ts?: { gte?: Date; lte?: Date } };
+    };
+    expect(findManyArgs.where.ts?.gte).toEqual(from);
+    expect(findManyArgs.where.ts?.lte).toEqual(to);
+  });
+
+  it('no evaluated rows at all → empty plugins array, zeroed totals, no NaN', async () => {
+    const prisma = makePrisma([]);
+    const gateway = makeGateway([]);
+    const svc = makeService(prisma, gateway);
+
+    const report = await svc.getPluginValue();
+
+    expect(report.plugins).toEqual([]);
+    expect(report.totals.evaluated_count).toBe(0);
+    expect(report.totals.net_value).toBe(0);
+    expect(report.totals.wins).toBe(0);
+    expect(report.totals.win_rate).toBe(0);
+    expect(report.totals.avg_cf_pnl).toBe(0);
+    expect(Number.isNaN(report.totals.win_rate)).toBe(false);
+    expect(Number.isNaN(report.totals.avg_cf_pnl)).toBe(false);
+  });
+
+  it('null/blank source_plugin rows are bucketed under "unknown", not dropped', async () => {
+    const rows = [
+      pluginRow({ id: 'n1', source_plugin: '', cf_pnl: 20 }),
+      pluginRow({ id: 'n2', source_plugin: 'momentum', cf_pnl: 5 }),
+    ];
+    const prisma = makePrisma(rows);
+    const gateway = makeGateway([]);
+    const svc = makeService(prisma, gateway);
+
+    const report = await svc.getPluginValue();
+
+    const unknown = report.plugins.find((p) => p.source_plugin === 'unknown');
+    expect(unknown).toBeDefined();
+    expect(unknown?.net_value).toBeCloseTo(20, 6);
+    expect(report.totals.evaluated_count).toBe(2);
   });
 });

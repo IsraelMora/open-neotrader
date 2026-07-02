@@ -23,6 +23,7 @@ export interface VetoDecisionRow {
   id: string;
   ts: Date;
   symbol: string;
+  source_plugin: string;
   verdict: string;
   proposed_action: string;
   proposed_qty: number;
@@ -88,6 +89,33 @@ export interface VetoMetricsReport {
   profits_forgone: number;
   /** Net value contribution summed per discipline (only decisions with a discipline set). */
   by_discipline: Record<string, number>;
+}
+
+export interface PluginValueEntry {
+  source_plugin: string;
+  evaluated_count: number;
+  /** Sum of cf_pnl across this plugin's evaluated rows — see PluginValueReport doc re: counterfactual semantics. */
+  net_value: number;
+  wins: number;
+  win_rate: number;
+  avg_cf_pnl: number;
+}
+
+/**
+ * Per-plugin raw signal value attribution: "did THIS PLUGIN's proposed signal make money net
+ * of cost", using cf_pnl for ALL evaluated rows regardless of verdict (approved/blocked/modified
+ * all count equally here). This is DELIBERATELY different from VetoMetricsReport, which measures
+ * whether the veto LAYER's intervention (blocking/modifying) added value — this report instead
+ * measures the plugin's raw signal quality, independent of what the veto layer decided to do
+ * with it.
+ *
+ * IMPORTANT: cf_pnl is a COUNTERFACTUAL value computed from OHLCV mark-to-market (see backfill()
+ * doc), NOT actual executed fills — this report is honest about that, it is not claiming real P&L.
+ */
+export interface PluginValueReport {
+  /** Sorted by net_value descending (best-performing plugin first). */
+  plugins: PluginValueEntry[];
+  totals: Omit<PluginValueEntry, 'source_plugin'>;
 }
 
 const DEFAULT_HORIZON_BARS = 5;
@@ -206,6 +234,26 @@ function computeNetUnitReturn(
 
 function buildCfMethod(opts: ResolvedBackfillOptions): string {
   return `fixed_horizon:${opts.horizonBars}:${opts.timeframe}:costbps${opts.costBps}:v1`;
+}
+
+/** Terminal cf_method values that mean "not a real evaluation" — never counted as evaluated. */
+const TERMINAL_NON_EVALUATED_METHODS = new Set([
+  'unsupported_action',
+  'insufficient_data',
+  'invalid_ref_price',
+]);
+
+/** Bucket key used for rows with a missing/blank source_plugin — see getPluginValue doc. */
+const UNKNOWN_PLUGIN_KEY = 'unknown';
+
+function emptyPluginValueEntry(source_plugin: string): PluginValueEntry {
+  return { source_plugin, evaluated_count: 0, net_value: 0, wins: 0, win_rate: 0, avg_cf_pnl: 0 };
+}
+
+/** Finalizes win_rate/avg_cf_pnl from accumulated sums, guarding divide-by-zero (never NaN). */
+function finalizePluginValueEntry(entry: PluginValueEntry): void {
+  entry.win_rate = entry.evaluated_count > 0 ? entry.wins / entry.evaluated_count : 0;
+  entry.avg_cf_pnl = entry.evaluated_count > 0 ? entry.net_value / entry.evaluated_count : 0;
 }
 
 @Injectable()
@@ -416,5 +464,85 @@ export class VetoAnalyzerService {
       return executedPnl - cfPnl;
     }
     return 0;
+  }
+
+  /**
+   * Per-plugin raw signal value attribution — see PluginValueReport doc for full semantics.
+   * Unlike getMetrics/_contributionFor (which measure the veto LAYER's intervention value),
+   * this accumulates cf_pnl itself for EVERY evaluated row regardless of verdict: an approved
+   * signal's cf_pnl is exactly what happened, a blocked/modified signal's cf_pnl is what WOULD
+   * have happened had the plugin's proposal been followed as-is — both answer "was the plugin's
+   * raw signal profitable", not "did the veto layer add value".
+   */
+  async getPluginValue(window?: MetricsWindow): Promise<PluginValueReport> {
+    const rows = (await this.db.vetoDecision.findMany({
+      where: this._buildPluginValueWhere(window),
+    })) as VetoDecisionRow[];
+
+    const byPlugin = new Map<string, PluginValueEntry>();
+    for (const row of rows) {
+      this._accumulatePluginRow(row, byPlugin);
+    }
+
+    const plugins = [...byPlugin.values()];
+    for (const entry of plugins) finalizePluginValueEntry(entry);
+    plugins.sort((a, b) => b.net_value - a.net_value);
+
+    const totals = emptyPluginValueEntry(UNKNOWN_PLUGIN_KEY);
+    for (const entry of plugins) {
+      totals.evaluated_count += entry.evaluated_count;
+      totals.net_value += entry.net_value;
+      totals.wins += entry.wins;
+    }
+    finalizePluginValueEntry(totals);
+
+    const totalsReport: Omit<PluginValueEntry, 'source_plugin'> = {
+      evaluated_count: totals.evaluated_count,
+      net_value: totals.net_value,
+      wins: totals.wins,
+      win_rate: totals.win_rate,
+      avg_cf_pnl: totals.avg_cf_pnl,
+    };
+    return { plugins, totals: totalsReport };
+  }
+
+  /**
+   * Where-clause for getPluginValue: only rows with a REAL fixed_horizon evaluation count
+   * (cf_method not null AND not one of the terminal non-evaluated markers). Distinct from
+   * _buildMetricsWhere (which only checks `cf_method: { not: null }`) because getMetrics'
+   * _accumulateRow already special-cases the terminal methods itself — this method instead
+   * excludes them at the query level since getPluginValue has no separate counters for them.
+   */
+  private _buildPluginValueWhere(window?: MetricsWindow): Record<string, unknown> {
+    return {
+      cf_method: { not: null, notIn: [...TERMINAL_NON_EVALUATED_METHODS] },
+      ...(window?.from || window?.to
+        ? {
+            ts: {
+              ...(window?.from ? { gte: window.from } : {}),
+              ...(window?.to ? { lte: window.to } : {}),
+            },
+          }
+        : {}),
+    };
+  }
+
+  /** Folds a single already-evaluated row into the running per-plugin map — mutates byPlugin. */
+  private _accumulatePluginRow(
+    row: VetoDecisionRow,
+    byPlugin: Map<string, PluginValueEntry>,
+  ): void {
+    if (row.cf_pnl === null) return; // defensive: should already be excluded by the where clause
+
+    // Rows with a missing/blank source_plugin are bucketed under "unknown" rather than dropped,
+    // so their counterfactual P&L still shows up in the report instead of silently vanishing.
+    const key =
+      row.source_plugin && row.source_plugin.trim() !== '' ? row.source_plugin : UNKNOWN_PLUGIN_KEY;
+
+    const entry = byPlugin.get(key) ?? emptyPluginValueEntry(key);
+    entry.evaluated_count += 1;
+    entry.net_value += row.cf_pnl;
+    if (row.cf_pnl > 0) entry.wins += 1;
+    byPlugin.set(key, entry);
   }
 }

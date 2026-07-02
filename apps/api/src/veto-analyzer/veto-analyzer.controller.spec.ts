@@ -13,7 +13,9 @@ import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 import { VetoBackfillDto } from './dto/veto-backfill.dto';
 import type { VetoAnalyzerService } from './veto-analyzer.service';
 
-function makeVetoAnalyzer(): jest.Mocked<Pick<VetoAnalyzerService, 'getMetrics' | 'backfill'>> {
+function makeVetoAnalyzer(): jest.Mocked<
+  Pick<VetoAnalyzerService, 'getMetrics' | 'backfill' | 'getPluginValue'>
+> {
   return {
     getMetrics: jest.fn().mockResolvedValue({
       net_value: 0,
@@ -30,6 +32,10 @@ function makeVetoAnalyzer(): jest.Mocked<Pick<VetoAnalyzerService, 'getMetrics' 
       insufficientData: 0,
       unsupportedAction: 0,
       errors: 0,
+    }),
+    getPluginValue: jest.fn().mockResolvedValue({
+      plugins: [],
+      totals: { evaluated_count: 0, net_value: 0, wins: 0, win_rate: 0, avg_cf_pnl: 0 },
     }),
   };
 }
@@ -81,6 +87,37 @@ describe('VetoAnalyzerController', () => {
 
   it('GET / route has no TotpRequiredGuard (relies on the global JwtAuthGuard only)', () => {
     const guards = Reflect.getMetadata('__guards__', controllerProto['getMetrics']) as
+      | unknown[]
+      | undefined;
+    expect(guards ?? []).not.toContain(TotpRequiredGuard);
+  });
+
+  it('GET /plugin-value delegates to vetoAnalyzer.getPluginValue() with no window when no query params', async () => {
+    const svc = makeVetoAnalyzer();
+    const controller = new VetoAnalyzerController(svc as unknown as VetoAnalyzerService);
+
+    await controller.getPluginValue({});
+
+    expect(svc.getPluginValue).toHaveBeenCalledWith({ from: undefined, to: undefined });
+  });
+
+  it('GET /plugin-value parses from/to query strings into Date objects', async () => {
+    const svc = makeVetoAnalyzer();
+    const controller = new VetoAnalyzerController(svc as unknown as VetoAnalyzerService);
+
+    await controller.getPluginValue({
+      from: '2024-01-01T00:00:00.000Z',
+      to: '2024-01-31T00:00:00.000Z',
+    });
+
+    expect(svc.getPluginValue).toHaveBeenCalledWith({
+      from: new Date('2024-01-01T00:00:00.000Z'),
+      to: new Date('2024-01-31T00:00:00.000Z'),
+    });
+  });
+
+  it('GET /plugin-value route has no TotpRequiredGuard (read-only aggregate, JwtAuthGuard only)', () => {
+    const guards = Reflect.getMetadata('__guards__', controllerProto['getPluginValue']) as
       | unknown[]
       | undefined;
     expect(guards ?? []).not.toContain(TotpRequiredGuard);
