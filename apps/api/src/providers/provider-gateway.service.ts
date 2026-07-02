@@ -692,16 +692,23 @@ export class ProviderGatewayService implements OnModuleInit {
     return this.normalizeOrderStatus(manifest, raw);
   }
 
-  /** Obtiene el estado normalizado de una orden por su client_order_id (idempotencia). */
+  /**
+   * Obtiene el estado normalizado de una orden por su client_order_id (idempotencia).
+   * Returns `null` specifically on a CONFIRMED 404 (the broker has no record of this
+   * client_order_id — e.g. the process crashed before the broker ever received the
+   * order). All other errors (401, 500, network failures, timeouts, ...) still throw —
+   * a lookup failure must never be silently mistaken for "broker never received it".
+   */
   async getOrderByClientId(
     pluginId: string | null,
     clientOrderId: string,
-  ): Promise<OrderStatusResult> {
+  ): Promise<OrderStatusResult | null> {
     const manifest = this.resolveManifest(pluginId);
     this.assertAlpacaFormat(manifest, 'getOrderByClientId');
-    const raw = await this.fetchOrderEndpoint(manifest, 'order_by_client_id', {
+    const raw = await this.fetchOrderEndpointOrNullOn404(manifest, 'order_by_client_id', {
       client_order_id: clientOrderId,
     });
+    if (raw === null) return null;
     return this.normalizeOrderStatus(manifest, raw);
   }
 
@@ -765,6 +772,34 @@ export class ProviderGatewayService implements OnModuleInit {
       headers,
       signal: AbortSignal.timeout(10_000),
     });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(
+        `${manifest.plugin.id} ${endpointKey} HTTP ${res.status}: ${body.slice(0, 200)}`,
+      );
+    }
+    return res.json();
+  }
+
+  /**
+   * Same as fetchOrderEndpoint, but a CONFIRMED 404 resolves to `null` instead of
+   * throwing — used by getOrderByClientId so callers can distinguish "broker never
+   * received this order" from "the lookup itself failed" (which still throws).
+   */
+  private async fetchOrderEndpointOrNullOn404(
+    manifest: ProviderManifest,
+    endpointKey: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    const url = this.buildRequestUrl(manifest, endpointKey, params);
+    const headers = this.buildAuthHeaders(manifest);
+    const res = await globalThis.fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (res.status === 404) {
+      return null;
+    }
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(

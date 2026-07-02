@@ -33,6 +33,7 @@ import { BacktestModule } from './backtest/backtest.module';
 import { TradeIntentModule } from './trade-intent/trade-intent.module';
 import { StrategyModule } from './strategy/strategy.module';
 import { VetoAnalyzerModule } from './veto-analyzer/veto-analyzer.module';
+import { RealOrderModule } from './real-order/real-order.module';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard';
 import { CorrelationMiddleware } from './common/correlation.middleware';
 
@@ -79,6 +80,7 @@ import { CorrelationMiddleware } from './common/correlation.middleware';
     TradeIntentModule,
     StrategyModule,
     VetoAnalyzerModule,
+    RealOrderModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: JwtAuthGuard },

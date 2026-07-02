@@ -649,7 +649,34 @@ describe('ProviderGatewayService — order lifecycle', () => {
 
     const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('https://api.alpaca.markets/v2/orders:by_client_order_id=nt-xyz-789');
-    expect(result.broker_order_id).toBe('broker-abc-123');
+    expect(result).not.toBeNull();
+    expect(result?.broker_order_id).toBe('broker-abc-123');
+  });
+
+  it('getOrderByClientId returns null on a CONFIRMED 404 (broker never received the order) instead of throwing', async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: jest.fn().mockResolvedValue({}),
+      text: jest.fn().mockResolvedValue('order not found'),
+    });
+
+    const svc = makeAlpacaService();
+    const result = await svc.getOrderByClientId('alpaca', 'nt-missing-1');
+
+    expect(result).toBeNull();
+  });
+
+  it('getOrderByClientId still throws (does not swallow) on non-404 errors like 401/500', async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: jest.fn().mockResolvedValue({}),
+      text: jest.fn().mockResolvedValue('internal error'),
+    });
+
+    const svc = makeAlpacaService();
+    await expect(svc.getOrderByClientId('alpaca', 'nt-err-1')).rejects.toThrow();
   });
 
   it('listOrders builds the list URL with status filter and normalizes every entry', async () => {

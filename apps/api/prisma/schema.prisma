@@ -275,6 +275,13 @@ model TradeIntent {
 // Real-money order tracking — one row per broker order submitted for a TradeIntent
 // executed in real mode. Tracks the full lifecycle (submit → poll → fill/error) so
 // the fill price/qty used for accounting comes from the broker, not a pre-order quote.
+//
+// One-active-order-per-intent invariant (DB-enforced): at most one row per
+// trade_intent_id may have a status outside {filled, canceled, rejected, expired,
+// submit_failed} at any time. Prisma's DSL cannot express a partial unique index, so
+// this is a raw-SQL constraint added in
+// prisma/migrations/0016_real_order_active_intent_unique/migration.sql — see
+// RealOrderService.submit() for the matching app-level guard + P2002 race handling.
 model RealOrder {
   id                 String    @id @default(cuid())
   trade_intent_id    String
