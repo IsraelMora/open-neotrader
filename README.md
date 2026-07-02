@@ -27,20 +27,27 @@ Browser
 
 ## Inicio rápido (Docker)
 
+> `docker-compose.yml` no publica ningún puerto al host a propósito (`expose:` solo):
+> está pensado para correr detrás de un reverse proxy (Traefik/Dokploy). Para evaluar
+> localmente sin proxy, copiá el override de ejemplo antes de levantar.
+
 ```bash
 # 1. Variables de entorno
 cp .env.example .env
 # Editar .env: JWT_SECRET + un LLM (OpenRouter free o Anthropic) — ver .env.example
 
-# 2. Levantar
+# 2. Habilitar puertos locales (solo para evaluación; NO usar así en producción)
+cp compose.override.yml.example compose.override.yml
+
+# 3. Levantar
 docker compose up -d
 
-# 3. Configurar autónomo (un comando) — ver INSTALL.md para el detalle
+# 4. Configurar autónomo (un comando) — ver INSTALL.md para el detalle
 #   API_URL=http://localhost:8080 ADMIN_USER=admin ADMIN_PASS=... LLM_API_KEY=sk-or-v1-... \
 #   bash scripts/setup.sh
 
 # Panel en http://localhost:8080
-# API docs en http://localhost:3000/api/docs (solo dev)
+# API docs en http://localhost:3000/api/docs (solo con compose.override.yml, no expuesto en producción)
 ```
 
 ## .env.example

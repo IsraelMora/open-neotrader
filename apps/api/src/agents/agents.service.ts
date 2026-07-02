@@ -27,8 +27,10 @@ import {
   SkillContribution,
 } from '../ml-signal-record/ml-signal-record.service';
 import { TradeIntentService } from '../trade-intent/trade-intent.service';
+import { PrismaService } from '../prisma/prisma.service';
 
 import type { LlmResponse } from '../llm/llm.service';
+import type { Prisma } from '@prisma/client';
 import type { DebateConsensus } from './debate.types';
 import type { ConfigFieldSpec } from '../plugins/manifest';
 import { parseToolCalls, stripToolCallBlocks } from '../llm/kernel-parser';
@@ -123,6 +125,9 @@ export interface VetoSummary {
   signals_vetoed: number;
   veto_reasons: string[];
   discipline_plugins: string[];
+  // CRIT-2: true when at least one discipline hook failed this cycle and its veto was
+  // treated as fail-safe (pending signals dropped rather than passed through silently).
+  veto_degraded: boolean;
 }
 
 /**
@@ -144,6 +149,18 @@ export interface ReflectionTurnResult {
  * Overridable via KV key 'react.max_turns'. Clamped 1..10 at parse time.
  */
 const REACT_MAX_TURNS_DEFAULT = 4;
+
+/**
+ * Anti-amplification hard cap: maximum number of tool calls EXECUTED per cycle,
+ * counted across ALL ReAct iterations (not per-turn). This is the invariant
+ * documented in README.md / CLAUDE.md as "max 3 tool calls per cycle".
+ * Overridable via KV key 'react.max_tool_calls'. Clamped 1..20 at parse time
+ * (same clamp style as REACT_MAX_TURNS_DEFAULT's 1..10; the ceiling is higher here
+ * because this axis bounds total EXECUTED calls across up to 10 turns, not turns
+ * themselves — 20 still keeps amplification bounded while allowing legitimate
+ * multi-tool cycles room to breathe).
+ */
+const REACT_MAX_TOOL_CALLS_DEFAULT = 3;
 
 // ── Kernel tool constants (Phase 3.6) ─────────────────────────────────────────
 
@@ -369,6 +386,11 @@ export class AgentsService {
     // cycle behaves exactly as before (decisions only recorded in audit/memory).
     @Optional()
     private readonly tradeIntent?: TradeIntentService,
+    // PrismaService injected @Optional() — used only by the veto decision ledger
+    // (_persistVetoDecisions). Absent → ledger writes are skipped (fail-soft);
+    // the veto gate itself never depends on this.
+    @Optional()
+    private readonly prisma?: PrismaService,
   ) {}
 
   /**
@@ -407,6 +429,19 @@ export class AgentsService {
     const n = raw === null ? REACT_MAX_TURNS_DEFAULT : Number(raw);
     const v = Number.isFinite(n) ? Math.trunc(n) : REACT_MAX_TURNS_DEFAULT;
     return Math.min(10, Math.max(1, v));
+  }
+
+  /**
+   * Resolves the per-cycle TOTAL tool-call execution ceiling from KV (anti-amplification).
+   * Reads 'react.max_tool_calls', parses with Number(), applies fail-safe and clamp 1..20.
+   * Absent/invalid/kv-unavailable → REACT_MAX_TOOL_CALLS_DEFAULT (3).
+   * Mirrors _resolveMaxTurns exactly, on a separate KV key and clamp range.
+   */
+  private async _resolveMaxToolCalls(): Promise<number> {
+    const raw = this.kv ? await this.kv.get('react.max_tool_calls') : null;
+    const n = raw === null ? REACT_MAX_TOOL_CALLS_DEFAULT : Number(raw);
+    const v = Number.isFinite(n) ? Math.trunc(n) : REACT_MAX_TOOL_CALLS_DEFAULT;
+    return Math.min(20, Math.max(1, v));
   }
 
   /**
@@ -487,6 +522,11 @@ export class AgentsService {
     virtual_only?: boolean;
     /** Pre-resolved decision prompt (hoisted once per governed turn — avoids N DB round-trips). */
     decisionPrompt: string | null;
+    /**
+     * C2: remaining anti-amplification budget for the WHOLE cycle (not per-turn) —
+     * total tool calls this iteration may EXECUTE. Threaded across turns by the caller.
+     */
+    toolCallBudget: number;
   }): Promise<{
     text: string;
     tool_calls: import('../llm/llm.service').ToolCallRequest[];
@@ -497,6 +537,7 @@ export class AgentsService {
     skills_read: string[];
     skills_written: string[];
     hadToolCalls: boolean;
+    executedCount: number;
   }> {
     const { cycle_id, source, effectiveTools, visibleTools, decisionPrompt } = args;
 
@@ -558,10 +599,8 @@ export class AgentsService {
       args.virtual_only,
       source,
     );
-    const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
-      cycle_id,
-      validatedCalls,
-    );
+    const { decisions, sandbox_results, signalsEmitted, executedCount } =
+      await this._executeToolCalls(cycle_id, validatedCalls, args.toolCallBudget);
 
     // hadToolCalls is measured on post-validation calls (not raw parsed calls).
     // An all-dropped iteration counts as no valid intent → natural exit (safe direction).
@@ -615,6 +654,7 @@ export class AgentsService {
       skills_read,
       skills_written,
       hadToolCalls,
+      executedCount,
     };
   }
 
@@ -683,6 +723,10 @@ export class AgentsService {
       turnSystemPrompt = input.system_prompt;
     }
     const maxTurns = await this._resolveMaxTurns();
+    // C2: anti-amplification — total tool calls EXECUTED across the whole cycle,
+    // counted across every turn (not per-turn). See REACT_MAX_TOOL_CALLS_DEFAULT.
+    const maxToolCalls = await this._resolveMaxToolCalls();
+    let toolCallsExecuted = 0;
 
     // ── Accumulators ─────────────────────────────────────────────────────────
     const allDecisions: Decision[] = [];
@@ -697,6 +741,7 @@ export class AgentsService {
     while (turn < maxTurns) {
       turn++;
       const iterContext = this._composeIterationContext(input.context, observations);
+      const toolCallBudget = Math.max(0, maxToolCalls - toolCallsExecuted);
       last = await this._runSingleIteration({
         cycle_id,
         source: input.source,
@@ -707,7 +752,9 @@ export class AgentsService {
         _activePlugins: input._activePlugins,
         virtual_only: input.virtual_only,
         decisionPrompt,
+        toolCallBudget,
       });
+      toolCallsExecuted += last.executedCount;
 
       // Accumulate results
       allDecisions.push(...last.decisions);
@@ -752,6 +799,14 @@ export class AgentsService {
           });
         }
         break; // SAFE DEFAULT — stop, no grace call
+      }
+
+      // TOOL-CALL CAP REACHED — anti-amplification ceiling hit for the whole cycle.
+      // _executeToolCalls already audited 'tool_call_cap_reached' if any calls were
+      // dropped this iteration. Stop the loop now — no point calling the LLM again
+      // for a turn that can never execute another tool call.
+      if (toolCallsExecuted >= maxToolCalls) {
+        break;
       }
     }
 
@@ -1401,6 +1456,7 @@ export class AgentsService {
   ): Promise<{ vetoCtx: Record<string, unknown>; vetoSummary: VetoSummary }> {
     let vetoCtx: Record<string, unknown> = { ...hookCtx, pending_signals: pendingSignals };
     const vetoReasons: string[] = [];
+    let vetoDegraded = false;
 
     // D1: Stable sort — ML plugin always runs first, others keep relative order.
     // This is structural and DB-order-independent (AC-S3-6/7).
@@ -1425,17 +1481,34 @@ export class AgentsService {
 
       if (discResult.ok && discResult.result) {
         const updated = discResult.result as Record<string, unknown>;
+        // CRIT-1 fix: the real Python hook contract (plugins/*/hooks/cycle.py) returns
+        // { signals, logs } — there is no `pending_signals` key on the raw result.
+        // `updated['pending_signals']` is kept as a fallback ONLY for callers/mocks that
+        // still echo the older `pending_signals` contract; production hooks use `signals`.
+        // Without this remap, vetoCtx = updated would silently drop every approved
+        // signal (approvedSignals reads vetoCtx['pending_signals'], which would be
+        // undefined) whenever a discipline plugin is active.
+        const updatedSignals: unknown[] | undefined =
+          (updated['signals'] as unknown[] | undefined) ??
+          (updated['pending_signals'] as unknown[] | undefined);
         // D2/Fix2: strip model_blob + feature_names from the ML plugin's echoed ctx
-        // before propagating to vetoCtx. The real Python hook returns the full ctx
-        // (including injected fields), so we must remove them here to prevent leakage
-        // to downstream plugins (aggregator etc.).
+        // before propagating to vetoCtx, so injected fields never leak to downstream
+        // plugins (aggregator etc.).
         if (disc.id === ML_PLUGIN_ID) {
           const stripped = { ...updated };
           delete stripped['model_blob'];
           delete stripped['feature_names'];
-          vetoCtx = stripped;
+          vetoCtx = {
+            ...vetoCtx,
+            ...stripped,
+            pending_signals: updatedSignals ?? vetoCtx['pending_signals'],
+          };
         } else {
-          vetoCtx = updated;
+          vetoCtx = {
+            ...vetoCtx,
+            ...updated,
+            pending_signals: updatedSignals ?? vetoCtx['pending_signals'],
+          };
         }
         const reasons = (updated['veto_reasons'] as string[] | undefined) ?? [];
         vetoReasons.push(...reasons.map((r) => `[${disc.name}] ${r}`));
@@ -1447,8 +1520,18 @@ export class AgentsService {
           event_type: 'cycle_fail',
           plugin_id: disc.id,
           error: discResult.error,
-          meta: { stage: 'veto_hook' },
+          meta: { stage: 'veto_hook', degraded: true },
         });
+        // CRIT-2 fix: fail-SAFE, not fail-open. A discipline hook is a safety layer —
+        // if it fails to run, we cannot know whether it would have approved, rescaled,
+        // or blocked the pending signals. Treat the failure as an effective veto of
+        // everything currently pending, and mark the cycle as veto-degraded so callers
+        // can surface/alert on it (mirrors the existing cycle_fail audit-entry pattern).
+        vetoCtx = { ...vetoCtx, pending_signals: [] };
+        vetoReasons.push(
+          `[${disc.name}] hook failed — fail-safe: signals dropped (${discResult.error})`,
+        );
+        vetoDegraded = true;
       }
     }
 
@@ -1462,6 +1545,7 @@ export class AgentsService {
       signals_vetoed: pendingSignals.length - approvedSignals.length,
       veto_reasons: vetoReasons,
       discipline_plugins: disciplinePlugins.map((p: HydratedPlugin) => p.id),
+      veto_degraded: vetoDegraded,
     };
 
     if (vetoSummary.signals_vetoed > 0) {
@@ -1473,7 +1557,247 @@ export class AgentsService {
       });
     }
 
+    await this._persistVetoDecisions(cycle_id, pendingSignals, vetoCtx, vetoReasons);
+
     return { vetoCtx, vetoSummary };
+  }
+
+  /**
+   * Resolves the source plugin id off a signal object. Mirrors _mlCaptureSignals'
+   * resolution order (plugin_id, falling back to source) — the real field name
+   * emitted by strategy/skill plugins, confirmed against signal-aggregator's
+   * aggregator.py (`plugin_id = s.get("plugin_id") or s.get("type", "unknown")`).
+   */
+  private _resolveSignalSource(sig: Record<string, unknown>): string {
+    const rawPluginId = sig['plugin_id'];
+    if (typeof rawPluginId === 'string') return rawPluginId;
+    const rawSource = sig['source'];
+    if (typeof rawSource === 'string') return rawSource;
+    return '';
+  }
+
+  /**
+   * Finds the final approved-signal counterpart for an original signal. Prefers an
+   * exact symbol+source match (multiple plugins can signal the same symbol in one
+   * cycle); falls back to a symbol-only match since some discipline hooks return
+   * trimmed signal dicts that don't echo plugin_id/source back (e.g. signal-aggregator's
+   * consensus_signal, which carries no plugin_id/source at all).
+   * `exact: true` only when the match was resolved via symbol+source — a symbol-only
+   * fallback match is inherently ambiguous when more than one proposed signal shares
+   * that symbol, since the same matched object could be the transformed result of any
+   * of them (or all of them, merged).
+   */
+  private _findVetoMatch(
+    approvedList: Record<string, unknown>[],
+    symbol: string,
+    sourcePlugin: string,
+  ): { match: Record<string, unknown> | undefined; exact: boolean } {
+    const exactMatch = approvedList.find(
+      (s) => s['symbol'] === symbol && this._resolveSignalSource(s) === sourcePlugin,
+    );
+    if (exactMatch) return { match: exactMatch, exact: true };
+    return {
+      match: approvedList.find((s) => s['symbol'] === symbol),
+      exact: false,
+    };
+  }
+
+  /**
+   * Extracts the EFFECTIVE quantity of a signal, checking in priority:
+   * 1. Nested sizing sub-objects — position-sizing/hooks/cycle.py returns
+   *    {**sig, "fixed"|"kelly"|"volatility": {"shares": N, ...}}; the real
+   *    resized qty lives there, while the top-level `qty` is left UNCHANGED.
+   * 2. A top-level `shares` field (some hooks flatten it directly).
+   * 3. A top-level `qty` field (the original proposed-signal shape).
+   * Returns null when none of the above are present — i.e. the effective qty
+   * is genuinely unrecoverable from this signal shape (e.g. signal-aggregator's
+   * consensus_signal, which carries no qty/shares field at all).
+   */
+  private _extractEffectiveQty(sig: Record<string, unknown>): number | null {
+    for (const key of ['fixed', 'kelly', 'volatility']) {
+      const nested = sig[key];
+      if (nested && typeof nested === 'object') {
+        const shares = (nested as Record<string, unknown>)['shares'];
+        if (typeof shares === 'number') return shares;
+      }
+    }
+    const shares = sig['shares'];
+    if (typeof shares === 'number') return shares;
+    const qty = sig['qty'];
+    if (typeof qty === 'number') return qty;
+    return null;
+  }
+
+  /**
+   * Pure diff of one proposed signal against its (possibly absent) approved
+   * counterpart. The ledger must NEVER report "approved" (unchanged) unless it
+   * can actually verify the effective qty is unchanged — when it's unrecoverable
+   * on either side, or the match is ambiguous (symbol-only fallback with more
+   * than one candidate), the honest label is "modified", never "approved".
+   */
+  private _resolveVetoVerdict(
+    proposedAction: string,
+    proposedSignal: Record<string, unknown>,
+    match: Record<string, unknown> | undefined,
+    matchIsAmbiguous: boolean,
+  ): {
+    verdict: 'approved' | 'blocked' | 'modified';
+    approvedAction: string | null;
+    approvedQty: number | null;
+  } {
+    if (!match || match['action'] === 'cancelled') {
+      return { verdict: 'blocked', approvedAction: null, approvedQty: null };
+    }
+    const matchAction = typeof match['action'] === 'string' ? match['action'] : proposedAction;
+    const matchQty = this._extractEffectiveQty(match);
+
+    if (matchIsAmbiguous) {
+      // The matched object could correspond to more than one proposed signal
+      // (e.g. signal-aggregator merging several proposals into one consensus
+      // object) — it was merged/transformed, so "modified" is the honest label.
+      return { verdict: 'modified', approvedAction: matchAction, approvedQty: matchQty };
+    }
+
+    const proposedQty = this._extractEffectiveQty(proposedSignal);
+    const qtyKnownAndUnchanged =
+      proposedQty !== null && matchQty !== null && proposedQty === matchQty;
+
+    if (matchAction === proposedAction && qtyKnownAndUnchanged) {
+      return { verdict: 'approved', approvedAction: null, approvedQty: null };
+    }
+    return { verdict: 'modified', approvedAction: matchAction, approvedQty: matchQty };
+  }
+
+  /**
+   * Builds the VetoDecision.create() data payload for a single proposed signal.
+   * `symbolCounts` is the per-symbol count across ALL original proposed signals in
+   * this cycle — used to detect the signal-aggregator collision case, where a
+   * symbol-only fallback match could correspond to more than one proposed signal.
+   */
+  private _buildVetoDecisionData(
+    cycle_id: string,
+    rawSignal: Record<string, unknown>,
+    vetoCtx: Record<string, unknown>,
+    discipline: string | null,
+    rationale: string | null,
+    symbolCounts: Map<string, number>,
+  ): Prisma.VetoDecisionCreateInput {
+    const symbol = typeof rawSignal['symbol'] === 'string' ? rawSignal['symbol'] : '';
+    const sourcePlugin = this._resolveSignalSource(rawSignal);
+    const proposedAction = typeof rawSignal['action'] === 'string' ? rawSignal['action'] : '';
+    const proposedQty = typeof rawSignal['qty'] === 'number' ? rawSignal['qty'] : 0;
+    const approvedList =
+      (vetoCtx['pending_signals'] as Record<string, unknown>[] | undefined) ?? [];
+    const { match, exact } = this._findVetoMatch(approvedList, symbol, sourcePlugin);
+    // A fallback (non-exact) match is ambiguous when more than one proposed signal
+    // shares this symbol AND the matched object itself cannot be attributed to a
+    // single source (no resolvable plugin_id/source) — e.g. signal-aggregator's
+    // consensus_signal collapsing several proposals into one object.
+    const matchIsAmbiguous =
+      !exact &&
+      (symbolCounts.get(symbol) ?? 0) > 1 &&
+      (!match || this._resolveSignalSource(match) === '');
+    const { verdict, approvedAction, approvedQty } = this._resolveVetoVerdict(
+      proposedAction,
+      rawSignal,
+      match,
+      matchIsAmbiguous,
+    );
+
+    return {
+      cycle_id,
+      symbol,
+      source_plugin: sourcePlugin,
+      signal_confidence:
+        typeof rawSignal['confidence'] === 'number' ? rawSignal['confidence'] : null,
+      proposed_action: proposedAction,
+      proposed_qty: proposedQty,
+      verdict,
+      approved_action: approvedAction,
+      approved_qty: approvedQty,
+      discipline: verdict === 'approved' ? null : discipline,
+      rationale: verdict === 'approved' ? null : rationale,
+      ref_price: typeof vetoCtx['ref_price'] === 'number' ? vetoCtx['ref_price'] : null,
+      regime_tags: Array.isArray(vetoCtx['regime_tags'])
+        ? JSON.stringify(vetoCtx['regime_tags'])
+        : null,
+      portfolio_drawdown_pct:
+        typeof vetoCtx['portfolio_drawdown_pct'] === 'number'
+          ? vetoCtx['portfolio_drawdown_pct']
+          : null,
+      // The raw proposed signal AND the raw matched discipline output (or an explicit
+      // null when no match) are both stored so an offline analyzer can recompute the
+      // true verdict/qty with full plugin-shape knowledge — that is the real source of
+      // truth; the live `verdict` above is only a best-effort label.
+      context_snapshot: JSON.stringify({
+        signal: rawSignal,
+        match: match ?? null,
+        market: {
+          portfolio_value: vetoCtx['portfolio_value'],
+          positions: vetoCtx['positions'],
+          portfolio: vetoCtx['portfolio'],
+        },
+      }),
+    };
+  }
+
+  /** Extracts the unique discipline names tagged in vetoReasons entries (`[Name] ...`). */
+  private _extractVetoDisciplines(vetoReasons: string[]): string | null {
+    if (vetoReasons.length === 0) return null;
+    const names = new Set<string>();
+    for (const reason of vetoReasons) {
+      const matched = /^\[(.+?)\]/.exec(reason)?.[1];
+      if (matched) names.add(matched);
+    }
+    return names.size > 0 ? [...names].join(',') : null;
+  }
+
+  /**
+   * Immutable veto decision ledger — one row per signal that was in the ORIGINAL
+   * pendingSignals input to _runVetoLayer, diffed against the FINAL approved set.
+   * Fail-soft PER ROW: a DB write failure on one signal must never affect the
+   * trading cycle NOR suppress the ledger rows for the OTHER signals in the same
+   * cycle (unlike the veto gate itself, which is a hard safety gate). Matches
+   * AuditService.log's direct PrismaService.create style — no new abstraction/
+   * repository layer.
+   */
+  private async _persistVetoDecisions(
+    cycle_id: string,
+    originalSignals: unknown[],
+    vetoCtx: Record<string, unknown>,
+    vetoReasons: string[],
+  ): Promise<void> {
+    if (!this.prisma || originalSignals.length === 0) return;
+    const prisma = this.prisma;
+    const rationale = vetoReasons.length > 0 ? vetoReasons.join('; ') : null;
+    const discipline = this._extractVetoDisciplines(vetoReasons);
+
+    const signals = originalSignals as Record<string, unknown>[];
+    const symbolCounts = new Map<string, number>();
+    for (const s of signals) {
+      const symbol = typeof s['symbol'] === 'string' ? s['symbol'] : '';
+      symbolCounts.set(symbol, (symbolCounts.get(symbol) ?? 0) + 1);
+    }
+
+    for (const rawSignal of signals) {
+      try {
+        const data = this._buildVetoDecisionData(
+          cycle_id,
+          rawSignal,
+          vetoCtx,
+          discipline,
+          rationale,
+          symbolCounts,
+        );
+        await prisma.vetoDecision.create({ data });
+      } catch (e) {
+        this.log.warn(
+          `[veto-ledger] persist failed for cycle ${cycle_id}, symbol ${String(
+            rawSignal['symbol'],
+          )} — decision not recorded: ${e}`,
+        );
+      }
+    }
   }
 
   /**
@@ -2323,6 +2647,17 @@ export class AgentsService {
     tc: import('../llm/llm.service').ToolCallRequest,
     equityPctThreshold: number,
   ): Promise<boolean> {
+    // Fast path — an 'exit' emit_trade_intent is NEVER high-impact: closing a position
+    // must never be routed through the debate gate, where a 'reject' consensus would drop
+    // it and violate the "a position can ALWAYS be closed" invariant. Zero I/O cost.
+    if (
+      tc.plugin_id === 'decision' &&
+      tc.function === 'emit_trade_intent' &&
+      tc.args['action'] === 'exit'
+    ) {
+      return false;
+    }
+
     // Fast path — promote_pretest is always high-impact; zero I/O cost.
     if (tc.plugin_id === 'kernel' && tc.function === 'promote_pretest') return true;
 
@@ -2422,19 +2757,55 @@ export class AgentsService {
     return false; // approved → fall through to normal dispatch
   }
 
+  /**
+   * Stable-partitions `toolCalls` so that `emit_trade_intent` calls with `args.action ===
+   * 'exit'` come first, preserving relative order within each partition. This guarantees
+   * an exit is never among the calls dropped by the anti-amplification cap in
+   * `_executeToolCalls` (unless budget is 0) — mirrors the "a position can ALWAYS be
+   * closed" invariant enforced elsewhere (e.g. the notional-ceiling exemption for exits
+   * in trade-intent.service.ts).
+   */
+  private _prioritizeExits(
+    toolCalls: import('../llm/llm.service').ToolCallRequest[],
+  ): import('../llm/llm.service').ToolCallRequest[] {
+    const isExit = (tc: import('../llm/llm.service').ToolCallRequest): boolean =>
+      tc.plugin_id === 'decision' &&
+      tc.function === 'emit_trade_intent' &&
+      tc.args['action'] === 'exit';
+    const exits = toolCalls.filter(isExit);
+    const rest = toolCalls.filter((tc) => !isExit(tc));
+    return [...exits, ...rest];
+  }
+
+  /**
+   * Dispatches validated tool_calls, enforcing the anti-amplification cap: at most
+   * `budget` calls are EXECUTED (dispatched to the sandbox/kernel) — this is the
+   * remaining allowance for the WHOLE cycle, not just this iteration (the caller
+   * threads it across ReAct turns). Calls beyond `budget` are never dispatched;
+   * they are audited once as 'tool_call_cap_reached' (cycle id + how many were
+   * skipped) and silently omitted from decisions/sandbox_results — never a crash,
+   * never a silent drop with no trace.
+   */
   private async _executeToolCalls(
     cycle_id: string,
     toolCalls: import('../llm/llm.service').ToolCallRequest[],
+    budget: number,
   ): Promise<{
     decisions: Decision[];
     sandbox_results: SandboxResult[];
     signalsEmitted: { symbol: string; action: string }[];
+    executedCount: number;
   }> {
     const decisions: Decision[] = [];
     const sandbox_results: SandboxResult[] = [];
     const signalsEmitted: { symbol: string; action: string }[] = [];
 
-    for (const tc of toolCalls) {
+    const safeBudget = Math.max(0, budget);
+    const prioritized = this._prioritizeExits(toolCalls);
+    const toExecute = prioritized.slice(0, safeBudget);
+    const droppedByCap = prioritized.length - toExecute.length;
+
+    for (const tc of toExecute) {
       try {
         // ── DEBATE GATE — additive; short-circuits to byte-identical legacy path when off.
         // Fully nested under `if (this.debate)` — when @Optional resolves to undefined
@@ -2470,7 +2841,55 @@ export class AgentsService {
       }
     }
 
-    return { decisions, sandbox_results, signalsEmitted };
+    if (droppedByCap > 0) {
+      this.log.warn(
+        `Anti-amplification cap reached [${cycle_id}]: ${String(droppedByCap)} tool call(s) skipped (budget=${String(safeBudget)})`,
+      );
+      await this.audit.log({
+        cycle_id,
+        event_type: 'tool_call_cap_reached',
+        meta: {
+          budget: safeBudget,
+          executed: toExecute.length,
+          dropped: droppedByCap,
+          dropped_calls: prioritized.slice(safeBudget).map((c) => `${c.plugin_id}.${c.function}`),
+        },
+      });
+    }
+
+    return { decisions, sandbox_results, signalsEmitted, executedCount: toExecute.length };
+  }
+
+  /**
+   * Normalizes confidence/rationale before forwarding to TradeIntentService.recordIntent.
+   *
+   * "exit"/"hold" only need symbol+action to act (close a position / do nothing).
+   * decision.plugin.py already relaxes its OWN validation for these two actions (clamps
+   * confidence, defaults rationale) — but _recordSignalAndIntent forwards the RAW args
+   * the LLM sent (tc.args), not the plugin's sanitized output. Without this mirroring
+   * clamp, TradeIntentService.recordIntent's OWN [0,1] confidence check would still
+   * throw on a cosmetically malformed exit, and the caller's catch would silently drop
+   * it — a real position could then never be closed over a typo'd confidence.
+   * "long"/"short" stay unclamped: entry validation must remain strict.
+   */
+  private _normalizeIntentConfidenceRationale(
+    action: string,
+    args: Record<string, unknown>,
+  ): { confidence: number; rationale: string } {
+    const rawConfidence = Number(args['confidence']);
+    const rationaleArg = typeof args['rationale'] === 'string' ? args['rationale'] : '';
+
+    if (action !== 'exit' && action !== 'hold') {
+      return {
+        confidence: Number.isFinite(rawConfidence) ? rawConfidence : 0,
+        rationale: rationaleArg,
+      };
+    }
+
+    const confidence = Math.max(0, Math.min(1, Number.isFinite(rawConfidence) ? rawConfidence : 1));
+    const defaultRationale = action === 'exit' ? 'position close' : 'hold — no position change';
+    const rationale = rationaleArg.trim() ? rationaleArg : defaultRationale;
+    return { confidence, rationale };
   }
 
   /**
@@ -2503,13 +2922,15 @@ export class AgentsService {
       !!ti && res.ok && tc.plugin_id === 'decision' && tc.function === 'emit_trade_intent';
     if (!ti || !isTradeIntent) return;
 
+    const { confidence, rationale } = this._normalizeIntentConfidenceRationale(action, args);
+
     try {
       await ti.recordIntent({
         cycle_id,
         symbol,
         action,
-        confidence: Number(args['confidence']) || 0,
-        rationale: typeof args['rationale'] === 'string' ? args['rationale'] : '',
+        confidence,
+        rationale,
         timeframe: typeof args['timeframe'] === 'string' ? args['timeframe'] : undefined,
       });
     } catch (e: unknown) {

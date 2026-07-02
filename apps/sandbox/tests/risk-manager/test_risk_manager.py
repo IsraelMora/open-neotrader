@@ -15,18 +15,17 @@ Four layers tested in isolation plus combined pass-through:
 
 from __future__ import annotations
 
-import math
 import os
 import sys
-
-import pytest
 
 
 # Load THIS plugin's cycle.py under a unique module name (every plugin's hook is
 # named cycle.py → a bare `from cycle import` collides via sys.modules across the
 # full pytest session, the same way runner.py avoids it with unique spec names).
 def _load_on_cycle(_plugin):
-    import importlib.util as _ilu, os as _os, sys as _sys
+    import importlib.util as _ilu
+    import os as _os
+    import sys as _sys
     _root = _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "..", "plugins", _plugin)
     _sc = _os.path.join(_root, "scripts")
     if _sc not in _sys.path:
@@ -57,11 +56,12 @@ sys.path.insert(0, _PLUGIN_HOOKS)
 #  1. Pure-math helpers in scripts/
 #  2. The orchestrating on_cycle hook in hooks/cycle.py
 from risk_manager_core import (  # noqa: E402
-    apply_exposure_layer,
     apply_concentration_layer,
     apply_correlation_layer,
     apply_drawdown_layer,
+    apply_exposure_layer,
 )
+
 pass  # on_cycle: module-level
 
 

@@ -207,3 +207,31 @@ describe('StrategyService', () => {
     expect(series['a'][1].equity).toBe(105);
   });
 });
+
+describe('StrategyService — recordWalkForward (walk-forward gate)', () => {
+  it('persists verdict + walk_forward_checked_at on the matching Strategy row', async () => {
+    const { db, strategy } = makePrisma();
+    strategy.update.mockResolvedValue({ ...ROW, walk_forward_verdict: 'ROBUSTO' });
+    const svc = new StrategyService(db, makeKv(), makeStore().store);
+
+    await svc.recordWalkForward('s1', 'ROBUSTO');
+
+    expect(strategy.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 's1' },
+        data: expect.objectContaining({
+          walk_forward_verdict: 'ROBUSTO',
+          walk_forward_checked_at: expect.any(Date) as Date,
+        }) as Record<string, unknown>,
+      }),
+    );
+  });
+
+  it('is fail-soft: does not throw when the strategy row does not exist', async () => {
+    const { db, strategy } = makePrisma();
+    strategy.update.mockRejectedValue(Object.assign(new Error('not found'), { code: 'P2025' }));
+    const svc = new StrategyService(db, makeKv(), makeStore().store);
+
+    await expect(svc.recordWalkForward('missing-id', 'SOBREAJUSTADO')).resolves.toBeUndefined();
+  });
+});

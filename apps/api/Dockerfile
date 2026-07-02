@@ -33,6 +33,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip curl gosu \
     && rm -rf /var/lib/apt/lists/*
 
+# `unshare` (util-linux) is required at runtime for netns-detect.ts to spawn
+# the sandbox subprocess under `unshare -rn` (see SANDBOX_NETNS_ISOLATION).
+# util-linux already ships as an essential package on node:22-slim (Debian),
+# so no extra apt-get install is needed here — this only asserts the binary
+# is actually present, failing the build loudly instead of failing silently
+# at runtime. We deliberately do NOT run `unshare -rn true` here: userns
+# support in the build environment may differ from the container runtime and
+# would produce a false build failure.
+RUN command -v unshare
+
 # Plugin SDK + sandbox deps
 COPY packages/plugin-sdk /opt/plugin-sdk
 COPY apps/sandbox/requirements.txt /tmp/sandbox-requirements.txt

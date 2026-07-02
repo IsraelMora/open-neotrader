@@ -5,6 +5,9 @@ import { ExecutionController } from './execution.controller';
 import { PrismaModule } from '../prisma/prisma.module';
 import { ProvidersModule } from '../providers/providers.module';
 import { AuthModule } from '../auth/auth.module';
+import { AuditModule } from '../audit/audit.module';
+import { RealOrderModule } from '../real-order/real-order.module';
+import { RealReconciliationModule } from '../real-reconciliation/real-broker-reconciliation.module';
 import { KvService } from '../common/kv.service';
 
 @Module({
@@ -13,6 +16,15 @@ import { KvService } from '../common/kv.service';
     ProvidersModule,
     // AuthModule exports TotpRequiredGuard used in TradeIntentController
     AuthModule,
+    // AuditModule exports AuditService — records walk-forward gate real→paper demotions
+    AuditModule,
+    // RealOrderModule exports RealOrderService — idempotent, crash-safe real-order submission
+    RealOrderModule,
+    // RealReconciliationModule exports RealBrokerReconciliationService — _executeReal fires
+    // fastPollOrder fire-and-forget after a successful real submit. This module only depends
+    // on PrismaModule + ProvidersModule (+ its own KvService), never on TradeIntentModule, so
+    // this import does not create a circular module dependency.
+    RealReconciliationModule,
   ],
   providers: [TradeIntentService, KvService],
   controllers: [TradeIntentController, ExecutionController],

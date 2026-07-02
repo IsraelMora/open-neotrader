@@ -35,6 +35,13 @@ export class SnapshotController {
     return this.svc.getEquityCurve(limit);
   }
 
+  @Get('real-equity-curve')
+  @ApiOperation({ summary: 'Real-money equity curve como [{ts, equity, hwm}] para gráficos' })
+  @ApiQuery({ name: 'limit', required: false })
+  realEquityCurve(@Query('limit', new DefaultValuePipe(252), ParseIntPipe) limit: number) {
+    return this.svc.getRealEquityCurve(limit);
+  }
+
   @Get('stats')
   @ApiOperation({ summary: 'Estadísticas del NAV histórico (retorno total, fechas)' })
   stats() {

@@ -91,7 +91,11 @@ class TestRunHappyPath:
             _context=_make_ctx(),
         )
         metrics = result["metrics"]
-        for key in ("total_return_pct", "sharpe_ratio", "max_drawdown_pct", "win_rate_pct", "profit_factor"):
+        expected_keys = (
+            "total_return_pct", "sharpe_ratio", "max_drawdown_pct",
+            "win_rate_pct", "profit_factor",
+        )
+        for key in expected_keys:
             assert key in metrics, f"Missing metric: {key}"
 
     def test_result_has_equity_curve(self, plugin):

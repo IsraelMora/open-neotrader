@@ -15,6 +15,8 @@ export type AlertType =
   | 'CORRELATION_SPIKE'
   | 'VOLUME_ANOMALY'
   | 'MACRO_EVENT'
+  | 'RECONCILIATION_HALTED'
+  | 'BROKER_DRIFT'
   | 'CUSTOM';
 
 export type AlertSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';

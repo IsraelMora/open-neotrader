@@ -13,8 +13,8 @@ Covers:
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 
 # Insert the plugin scripts directory so we can import analyze directly.
 PLUGIN_SCRIPTS = os.path.join(
@@ -23,7 +23,6 @@ PLUGIN_SCRIPTS = os.path.join(
 )
 sys.path.insert(0, os.path.abspath(PLUGIN_SCRIPTS))
 
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -283,12 +282,10 @@ class TestNoLookahead:
         """
         from trend_following import analyze
 
-        # Build a downtrend prefix followed by an uptrend suffix
+        # Build a downtrend prefix
         down_bars = _bars_trending_down(n=80)
-        up_bars = _bars_trending_up(n=40)
 
         prefix = down_bars  # 80 bars — enough to get a signal
-        full = down_bars + up_bars  # 120 bars (40 future bars appended)
 
         # analyze must only look at bars it receives; slicing is done by the caller
         result_prefix = analyze(prefix, DEFAULT_CONFIG)

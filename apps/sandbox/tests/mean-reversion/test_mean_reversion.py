@@ -10,8 +10,8 @@ Synthetic series only — no external data.
 from __future__ import annotations
 
 import math
-import sys
 import os
+import sys
 
 import pytest
 
@@ -32,10 +32,11 @@ sys.path.insert(
 
 from mean_reversion import analyze  # noqa: E402
 
-
 # ── Synthetic series builders ─────────────────────────────────────────────────
 
-def _ou_series(n: int = 100, theta: float = 0.3, mu: float = 100.0, sigma: float = 1.0, seed: int = 42) -> list[float]:
+def _ou_series(
+    n: int = 100, theta: float = 0.3, mu: float = 100.0, sigma: float = 1.0, seed: int = 42
+) -> list[float]:
     """
     Generate a discrete Ornstein-Uhlenbeck process.
 
@@ -55,7 +56,9 @@ def _ou_series(n: int = 100, theta: float = 0.3, mu: float = 100.0, sigma: float
     return prices
 
 
-def _ou_series_pushed_low(n: int = 100, mu: float = 100.0, entry_z: float = 2.0, seed: int = 42) -> list[float]:
+def _ou_series_pushed_low(
+    n: int = 100, mu: float = 100.0, entry_z: float = 2.0, seed: int = 42
+) -> list[float]:
     """
     Generate an OU series and force the last price to be well below mean
     so that z <= -entry_z after a 20-bar lookback window.
@@ -71,7 +74,9 @@ def _ou_series_pushed_low(n: int = 100, mu: float = 100.0, entry_z: float = 2.0,
     return prices
 
 
-def _ou_series_pushed_high(n: int = 100, mu: float = 100.0, entry_z: float = 2.0, seed: int = 99) -> list[float]:
+def _ou_series_pushed_high(
+    n: int = 100, mu: float = 100.0, entry_z: float = 2.0, seed: int = 99
+) -> list[float]:
     """Same but pushed high so z >= +entry_z."""
     prices = _ou_series(n=n, theta=0.3, mu=mu, sigma=1.0, seed=seed)
     window = prices[-20:]
@@ -82,7 +87,9 @@ def _ou_series_pushed_high(n: int = 100, mu: float = 100.0, entry_z: float = 2.0
     return prices
 
 
-def _ou_series_near_mean(n: int = 100, mu: float = 100.0, exit_z: float = 0.5, seed: int = 7) -> list[float]:
+def _ou_series_near_mean(
+    n: int = 100, mu: float = 100.0, exit_z: float = 0.5, seed: int = 7
+) -> list[float]:
     """OU series with last price very close to the rolling mean — inside exit zone."""
     prices = _ou_series(n=n, theta=0.5, mu=mu, sigma=0.5, seed=seed)
     # Force last price to exactly the window mean (z ≈ 0)
@@ -92,7 +99,9 @@ def _ou_series_near_mean(n: int = 100, mu: float = 100.0, exit_z: float = 0.5, s
     return prices
 
 
-def _trending_series(n: int = 100, drift: float = 2.0, sigma: float = 0.5, seed: int = 13) -> list[float]:
+def _trending_series(
+    n: int = 100, drift: float = 2.0, sigma: float = 0.5, seed: int = 13
+) -> list[float]:
     """
     Strong random walk with positive drift — clearly non-stationary.
 
@@ -221,7 +230,7 @@ class TestMeanReversionAnalyze:
 
         N = 80
         result_prefix = analyze(bars[:N], DEFAULT_CONFIG)
-        result_extended = analyze(bars[:N + 10], DEFAULT_CONFIG)
+        analyze(bars[:N + 10], DEFAULT_CONFIG)  # exercised for no-lookahead check below
 
         # The first result (computed on N bars) must not be affected by bars N+1..N+10
         # We verify by computing on the prefix independently; if there's lookahead,

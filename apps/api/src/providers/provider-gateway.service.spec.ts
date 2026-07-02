@@ -68,6 +68,11 @@ function makeAlpacaManifest(): ProviderManifestShape {
       endpoints: {
         quote: '{base_url}/v2/stocks/{symbol}/quotes/latest',
         ohlcv: '{base_url}/v2/stocks/{symbol}/bars?timeframe={tf}&limit={limit}&start={start_date}',
+        orders: '{base_url}/v2/orders',
+        order_status: '{base_url}/v2/orders/{broker_order_id}',
+        order_by_client_id: '{base_url}/v2/orders:by_client_order_id={client_order_id}',
+        cancel_order: '{base_url}/v2/orders/{broker_order_id}',
+        list_orders: '{base_url}/v2/orders?status={status}',
       },
     },
   };
@@ -550,5 +555,224 @@ describe('ProviderGatewayService — getOhlcv cache integration', () => {
 
     expect(result).toHaveLength(3); // 5 fetched → sliced to 3
     expect(result[result.length - 1].close).toBe(5); // keeps the LAST (most recent) bars
+  });
+});
+
+// ── Order lifecycle (getOrderStatus / getOrderByClientId / cancelOrder / listOrders) ──
+
+describe('ProviderGatewayService — order lifecycle', () => {
+  const ALPACA_ORDER_RAW = {
+    id: 'broker-abc-123',
+    client_order_id: 'nt-xyz-789',
+    status: 'partially_filled',
+    filled_qty: '3',
+    filled_avg_price: '101.5',
+  };
+
+  it('getOrderStatus builds the correct URL and auth headers, and normalizes the response', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: jest.fn().mockResolvedValue(ALPACA_ORDER_RAW),
+      text: jest.fn().mockResolvedValue(''),
+    });
+
+    const svc = makeAlpacaService();
+    const result = await svc.getOrderStatus('alpaca', 'broker-abc-123');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://api.alpaca.markets/v2/orders/broker-abc-123');
+    expect((init.headers as Record<string, string>)['APCA-API-KEY-ID']).toBe('k1');
+    expect((init.headers as Record<string, string>)['APCA-API-SECRET-KEY']).toBe('s1');
+
+    expect(result).toEqual({
+      broker_order_id: 'broker-abc-123',
+      client_order_id: 'nt-xyz-789',
+      status: 'partially_filled',
+      filled_qty: 3,
+      filled_avg_price: 101.5,
+      raw: ALPACA_ORDER_RAW,
+    });
+  });
+
+  it('getOrderStatus normalizes a null filled_avg_price to null (unfilled order)', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: jest.fn().mockResolvedValue({
+        id: 'broker-new-1',
+        client_order_id: null,
+        status: 'new',
+        filled_qty: '0',
+        filled_avg_price: null,
+      }),
+      text: jest.fn().mockResolvedValue(''),
+    });
+
+    const svc = makeAlpacaService();
+    const result = await svc.getOrderStatus('alpaca', 'broker-new-1');
+
+    expect(result.filled_qty).toBe(0);
+    expect(result.filled_avg_price).toBeNull();
+    expect(result.client_order_id).toBeNull();
+  });
+
+  it('getOrderStatus throws (fails loudly) on an unparsable numeric field instead of leaking NaN', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: jest.fn().mockResolvedValue({
+        id: 'broker-bad-1',
+        client_order_id: null,
+        status: 'new',
+        filled_qty: 'not-a-number',
+        filled_avg_price: null,
+      }),
+      text: jest.fn().mockResolvedValue(''),
+    });
+
+    const svc = makeAlpacaService();
+    await expect(svc.getOrderStatus('alpaca', 'broker-bad-1')).rejects.toThrow();
+  });
+
+  it('getOrderByClientId builds the by-client-order-id URL and normalizes the response', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: jest.fn().mockResolvedValue(ALPACA_ORDER_RAW),
+      text: jest.fn().mockResolvedValue(''),
+    });
+
+    const svc = makeAlpacaService();
+    const result = await svc.getOrderByClientId('alpaca', 'nt-xyz-789');
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://api.alpaca.markets/v2/orders:by_client_order_id=nt-xyz-789');
+    expect(result).not.toBeNull();
+    expect(result?.broker_order_id).toBe('broker-abc-123');
+  });
+
+  it('getOrderByClientId returns null on a CONFIRMED 404 (broker never received the order) instead of throwing', async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: jest.fn().mockResolvedValue({}),
+      text: jest.fn().mockResolvedValue('order not found'),
+    });
+
+    const svc = makeAlpacaService();
+    const result = await svc.getOrderByClientId('alpaca', 'nt-missing-1');
+
+    expect(result).toBeNull();
+  });
+
+  it('getOrderByClientId still throws (does not swallow) on non-404 errors like 401/500', async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: jest.fn().mockResolvedValue({}),
+      text: jest.fn().mockResolvedValue('internal error'),
+    });
+
+    const svc = makeAlpacaService();
+    await expect(svc.getOrderByClientId('alpaca', 'nt-err-1')).rejects.toThrow();
+  });
+
+  it('listOrders builds the list URL with status filter and normalizes every entry', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: jest
+        .fn()
+        .mockResolvedValue([
+          ALPACA_ORDER_RAW,
+          { ...ALPACA_ORDER_RAW, id: 'broker-abc-124', filled_qty: '0', filled_avg_price: null },
+        ]),
+      text: jest.fn().mockResolvedValue(''),
+    });
+
+    const svc = makeAlpacaService();
+    const result = await svc.listOrders('alpaca', { status: 'open' });
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://api.alpaca.markets/v2/orders?status=open');
+    expect(result).toHaveLength(2);
+    expect(result[0].broker_order_id).toBe('broker-abc-123');
+    expect(result[1].filled_avg_price).toBeNull();
+  });
+
+  it('cancelOrder sends a DELETE request to the cancel_order endpoint', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 204,
+      text: jest.fn().mockResolvedValue(''),
+    });
+
+    const svc = makeAlpacaService();
+    await svc.cancelOrder('alpaca', 'broker-abc-123');
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://api.alpaca.markets/v2/orders/broker-abc-123');
+    expect(init.method).toBe('DELETE');
+  });
+
+  it('cancelOrder treats HTTP 404 (already gone) as a no-op success, not a throw', async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 404,
+      text: jest.fn().mockResolvedValue('order not found'),
+    });
+
+    const svc = makeAlpacaService();
+    await expect(svc.cancelOrder('alpaca', 'broker-missing')).resolves.toBeUndefined();
+  });
+
+  it('cancelOrder treats HTTP 422 (already filled/canceled) as a no-op success, not a throw', async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 422,
+      text: jest.fn().mockResolvedValue('order already filled'),
+    });
+
+    const svc = makeAlpacaService();
+    await expect(svc.cancelOrder('alpaca', 'broker-filled')).resolves.toBeUndefined();
+  });
+
+  it('cancelOrder still throws on an unexpected error status (e.g. 500)', async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 500,
+      text: jest.fn().mockResolvedValue('internal error'),
+    });
+
+    const svc = makeAlpacaService();
+    await expect(svc.cancelOrder('alpaca', 'broker-x')).rejects.toThrow(/500/);
+  });
+});
+
+// ── placeOrder client_order_id threading ──────────────────────────────────────
+
+describe('ProviderGatewayService — placeOrder client_order_id', () => {
+  it('includes client_order_id in the Alpaca POST body when provided', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: jest.fn().mockResolvedValue({ id: 'broker-new', status: 'accepted' }),
+      text: jest.fn().mockResolvedValue(''),
+    });
+
+    const svc = makeAlpacaService();
+    await svc.placeOrder('alpaca', {
+      symbol: 'AAPL',
+      qty: 1,
+      side: 'buy',
+      type: 'market',
+      clientOrderId: 'nt-test-id-1',
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body['client_order_id']).toBe('nt-test-id-1');
   });
 });

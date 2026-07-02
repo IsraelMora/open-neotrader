@@ -9,10 +9,14 @@ import json
 import sys
 
 
-def main():
-    raw = sys.stdin.read().strip()
-    ctx: dict = json.loads(raw) if raw else {}
-    config: dict = ctx.get("__plugin_config__", {})
+def _analyze_symbols(ctx: dict) -> list[dict]:
+    """
+    Shared core: scans ctx for OHLCV/price data and returns the list of NEW
+    wyckoff signals detected this cycle (Spring/Upthrust/SOS/SOW above
+    phase_confidence). Does not touch ctx["pending_signals"] — callers decide
+    how to combine (on_cycle contract wants only the NEW signals).
+    """
+    config: dict = ctx.get("config", {})
 
     # Espera ohlcv_history: dict[symbol, {"highs": [...], "lows": [...],
     #                                      "closes": [...], "volumes": [...]}]
@@ -20,11 +24,11 @@ def main():
     # Alternativa: price_history + volume_history
     price_history: dict = ctx.get("price_history", {})
     volume_history: dict = ctx.get("volume_history", {})
-    pending: list = list(ctx.get("pending_signals", []))
     phase_confidence = float(config.get("phase_confidence", 0.6))
 
     from wyckoff import analyze
 
+    new_signals: list[dict] = []
     symbols = set(ohlcv.keys()) | set(price_history.keys())
     for symbol in symbols:
         try:
@@ -53,7 +57,7 @@ def main():
             )
 
             if result.signal in ("buy", "sell") and result.confidence >= phase_confidence:
-                pending.append(
+                new_signals.append(
                     {
                         "source": "wyckoff-volume",
                         "symbol": symbol,
@@ -77,6 +81,22 @@ def main():
         except Exception:
             pass  # No interrumpir el ciclo si un símbolo falla
 
+    return new_signals
+
+
+def on_cycle(ctx: dict) -> dict:
+    """Cycle hook entrypoint expected by runner.py's on_cycle(ctx) dispatch."""
+    new_signals = _analyze_symbols(ctx)
+    logs = [{"level": "info", "msg": f"[wyckoff-volume] {len(new_signals)} señal(es) detectada(s)"}]
+    return {"signals": new_signals, "logs": logs}
+
+
+def main():
+    """Standalone CLI entrypoint (stdin/stdout JSON) — kept for manual/ad-hoc use."""
+    raw = sys.stdin.read().strip()
+    ctx: dict = json.loads(raw) if raw else {}
+    pending: list = list(ctx.get("pending_signals", []))
+    pending.extend(_analyze_symbols(ctx))
     ctx["pending_signals"] = pending
     print(json.dumps(ctx))
 

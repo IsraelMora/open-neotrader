@@ -30,17 +30,26 @@ def gen():
 # ---------------------------------------------------------------------------
 class TestNormalizeBars:
     def test_strips_time_from_ts(self, gen):
-        raw = [{"ts": "2024-01-15T00:00:00Z", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000}]
+        raw = [{
+            "ts": "2024-01-15T00:00:00Z", "open": 100.0, "high": 101.0,
+            "low": 99.0, "close": 100.5, "volume": 1000,
+        }]
         result = gen.normalize_bars(raw)
         assert result[0]["date"] == "2024-01-15"
 
     def test_strips_time_offset_variant(self, gen):
-        raw = [{"ts": "2024-03-01T09:30:00-05:00", "open": 50.0, "high": 51.0, "low": 49.0, "close": 50.5, "volume": 500}]
+        raw = [{
+            "ts": "2024-03-01T09:30:00-05:00", "open": 50.0, "high": 51.0,
+            "low": 49.0, "close": 50.5, "volume": 500,
+        }]
         result = gen.normalize_bars(raw)
         assert result[0]["date"] == "2024-03-01"
 
     def test_coerces_numeric_fields_to_float(self, gen):
-        raw = [{"ts": "2024-01-02T00:00:00Z", "open": "10", "high": "11", "low": "9", "close": "10.5", "volume": "200"}]
+        raw = [{
+            "ts": "2024-01-02T00:00:00Z", "open": "10", "high": "11",
+            "low": "9", "close": "10.5", "volume": "200",
+        }]
         result = gen.normalize_bars(raw)
         bar = result[0]
         for field in ("open", "high", "low", "close", "volume"):
@@ -51,10 +60,15 @@ class TestNormalizeBars:
 
     def test_no_ts_key_raises_key_error(self, gen):
         with pytest.raises(KeyError):
-            gen.normalize_bars([{"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100}])
+            gen.normalize_bars([
+                {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100}
+            ])
 
     def test_output_has_no_ts_key(self, gen):
-        raw = [{"ts": "2024-01-02T00:00:00Z", "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100}]
+        raw = [{
+            "ts": "2024-01-02T00:00:00Z", "open": 1.0, "high": 2.0,
+            "low": 0.5, "close": 1.5, "volume": 100,
+        }]
         result = gen.normalize_bars(raw)
         assert "ts" not in result[0]
         assert "date" in result[0]
@@ -144,12 +158,16 @@ class TestTrendFollowing:
     STRATEGY = "trend-following"
 
     def test_accelerating_uptrend_yields_long(self, gen):
-        result = gen.generate_signals(self.STRATEGY, make_accelerating_uptrend(140), {"symbol": "AAPL"})
+        result = gen.generate_signals(
+            self.STRATEGY, make_accelerating_uptrend(140), {"symbol": "AAPL"}
+        )
         assert any(s["action"] == "long" for s in result), "accelerating uptrend should go long"
 
     def test_no_signal_before_min_bars(self, gen):
         # min_bars = senkou_b(52)+kijun(26)=78 → 60 bars produce nothing
-        result = gen.generate_signals(self.STRATEGY, make_accelerating_uptrend(60), {"symbol": "AAPL"})
+        result = gen.generate_signals(
+            self.STRATEGY, make_accelerating_uptrend(60), {"symbol": "AAPL"}
+        )
         assert result == []
 
     def test_no_lookahead(self, gen):

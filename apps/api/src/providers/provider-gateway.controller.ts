@@ -3,21 +3,26 @@ import {
   Get,
   Post,
   Delete,
-  Body,
   Query,
   Param,
   ParseIntPipe,
   DefaultValuePipe,
   HttpCode,
   HttpStatus,
-  UseGuards,
 } from '@nestjs/common';
 import { ProviderGatewayService } from './provider-gateway.service';
 import { OhlcvCacheService } from './ohlcv-cache.service';
-import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
-import { PlaceOrderDto } from './dto/place-order.dto';
 
-/** Endpoints de acceso a datos de mercado y operaciones: OHLCV, cotizaciones, noticias, portfolio y órdenes. */
+/**
+ * Endpoints de acceso a datos de mercado y operaciones: OHLCV, cotizaciones, noticias y portfolio.
+ *
+ * C1: there is intentionally NO raw order-placement route here. `ProviderGatewayService.placeOrder()`
+ * talks to the real broker and must only ever be called from TradeIntentService.approve()/autoProcess(),
+ * which enforces _effectiveMode (paper/real gate), risk gates, the per-order notional ceiling, and
+ * HITL approval before ever reaching the broker. A former `POST /:pluginId/orders` route here called
+ * gateway.placeOrder() directly (TOTP-only) and bypassed all of that — removed, no legitimate caller
+ * existed for it anywhere in the monorepo.
+ */
 @Controller('providers')
 export class ProviderGatewayController {
   constructor(
@@ -102,19 +107,5 @@ export class ProviderGatewayController {
   @Get('default/portfolio')
   async portfolioDefault() {
     return this.gateway.getPortfolio(null);
-  }
-
-  /** Ejecutar orden: POST /providers/:pluginId/orders */
-  @UseGuards(TotpRequiredGuard)
-  @Post(':pluginId/orders')
-  async placeOrder(@Param('pluginId') pluginId: string, @Body() dto: PlaceOrderDto) {
-    return this.gateway.placeOrder(pluginId, {
-      symbol: dto.symbol,
-      qty: dto.qty,
-      side: dto.side,
-      type: dto.type,
-      limitPrice: dto.limit_price,
-      timeInForce: dto.time_in_force,
-    });
   }
 }

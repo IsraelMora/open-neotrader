@@ -11,7 +11,6 @@ Synthetic daily OHLCV bars format: {date, open, high, low, close, volume}
 from __future__ import annotations
 
 import importlib.util
-import sys
 from pathlib import Path
 
 import pytest
@@ -287,7 +286,9 @@ class TestNoGapRangeBound:
 
         result = sb.analyze(bars, cfg)
 
-        assert result["signal"] == "none", f"Expected 'none' for inside-range, got {result['signal']!r}"
+        assert result["signal"] == "none", (
+            f"Expected 'none' for inside-range, got {result['signal']!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -374,14 +375,6 @@ class TestNoLookahead:
         bars_prefix = history + [today]
         result_prefix = sb.analyze(bars_prefix, _DEFAULT_CONFIG)
 
-        # Append a dramatically different "future" bar
-        future = _make_daily_bar(
-            date="2024-02-02",
-            open_=90.0,   # crash next day
-            high=91.0,
-            low=88.0,
-            close=88.5,
-        )
         # analyze on prefix AGAIN (the future bar must not be visible to prefix call)
         result_prefix_again = sb.analyze(bars_prefix, _DEFAULT_CONFIG)
 

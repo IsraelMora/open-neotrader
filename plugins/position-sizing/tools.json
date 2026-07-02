@@ -2,7 +2,7 @@
   {
     "name": "calculate_position_size",
     "description": "Compute optimal position size. Mode 'kelly': sizes from trade history win-rate/payoff. Mode 'fixed': uses fixed_pct. Call BEFORE opening any position.",
-    "input_schema": {
+    "parameters": {
       "type": "object",
       "properties": {
         "capital":         { "type": "number", "description": "Total available capital in USD" },
@@ -16,7 +16,7 @@
   {
     "name": "get_kelly_stats",
     "description": "Return Kelly statistics from accumulated trade history: win_rate, payoff_ratio, kelly_full, kelly_half, is_reliable, n_trades. Use before sizing to understand historical edge.",
-    "input_schema": {
+    "parameters": {
       "type": "object",
       "properties": {}
     }
@@ -24,7 +24,7 @@
   {
     "name": "calculate_tranches",
     "description": "Compute the pyramid tranche plan for a new entry signal. Returns entry tranche size and trigger levels for subsequent adds.",
-    "input_schema": {
+    "parameters": {
       "type": "object",
       "properties": {
         "symbol":         { "type": "string", "description": "Asset ticker" },
@@ -43,7 +43,7 @@
   {
     "name": "evaluate_add",
     "description": "Evaluate whether an open position has reached the trigger level to add the next pyramid tranche.",
-    "input_schema": {
+    "parameters": {
       "type": "object",
       "properties": {
         "symbol":             { "type": "string" },

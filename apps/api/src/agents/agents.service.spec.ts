@@ -781,6 +781,81 @@ describe('AgentsService.runGovernedTurn — decision → TradeIntent (HITL)', ()
       }),
     );
   });
+
+  it('an exit with malformed confidence/rationale still reaches TradeIntentService.recordIntent (never silently dropped)', async () => {
+    // The LLM emitted a cosmetically malformed exit (confidence out of [0,1], empty
+    // rationale). decision.plugin.py now returns ok:true for exits regardless — but
+    // TradeIntentService.recordIntent ALSO validates confidence in [0,1] and would THROW
+    // on the raw args, silently dropping the exit if agents.service.ts forwarded them
+    // unclamped. This must not happen: an exit only needs symbol+action to close a
+    // position.
+    const toolCallText =
+      '<tool_calls>[{"tool":"decision__emit_trade_intent","args":{"symbol":"AAPL","action":"exit","confidence":85,"rationale":""}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const tools = [
+      {
+        plugin_id: 'decision',
+        name: 'decision__emit_trade_intent',
+        description: 'Emit a trade decision',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ];
+    const plugins = makeFullPlugins('Emit a decision.', tools);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'skill' }] as never);
+    const sandbox = makeSandbox();
+    // Mirrors the FIXED plugin.py: exit is accepted (ok:true) with confidence clamped
+    // and rationale defaulted.
+    sandbox.callPlugin.mockResolvedValue({
+      ok: true,
+      result: {
+        ok: true,
+        result: {
+          symbol: 'AAPL',
+          action: 'exit',
+          confidence: 1.0,
+          rationale: 'position close',
+          timeframe: '1d',
+          status: 'recorded',
+        },
+      },
+    });
+    const memory = makeMemory();
+    const tradeIntent = { recordIntent: jest.fn().mockResolvedValue({ id: 'ti-2' }) };
+
+    const service = new (AgentsService as unknown as new (...a: unknown[]) => AgentsService)(
+      llm,
+      sandbox,
+      plugins,
+      memory,
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) }, // alerts
+      undefined, // snapshot
+      undefined, // cfg
+      undefined, // notifier
+      undefined, // pretest
+      makeKvSingleTurn(), // kv
+      undefined, // longTermMemory
+      undefined, // debate
+      undefined, // providerGateway
+      undefined, // mlSignalRecord
+      tradeIntent, // tradeIntent (the @Optional() dep under test)
+    );
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'Close AAPL' });
+
+    // Must actually reach recordIntent — never silently dropped.
+    expect(tradeIntent.recordIntent).toHaveBeenCalledTimes(1);
+    const recordIntentMock = tradeIntent.recordIntent as jest.Mock<
+      Promise<{ id: string }>,
+      [{ confidence: number; rationale: string; action: string }]
+    >;
+    const call = recordIntentMock.mock.calls[0][0];
+    expect(call.action).toBe('exit');
+    expect(call.confidence).toBeGreaterThanOrEqual(0);
+    expect(call.confidence).toBeLessThanOrEqual(1);
+    expect(call.rationale.length).toBeGreaterThan(0);
+  });
 });
 
 // ── Shared helper for _executeCycle tests below ───────────────────────────────
@@ -1859,7 +1934,12 @@ async function callValidateWithHoisted(
   )._validateToolCalls(cycleId, calls, hoistedTools, undefined, undefined, source);
 }
 
-/** Helper to call _executeToolCalls (private) */
+/**
+ * Helper to call _executeToolCalls (private).
+ * Passes an effectively-unlimited budget: these tests exercise per-call dispatch
+ * logic (kernel routing, debate gate), not the C2 anti-amplification cap, which
+ * has its own dedicated test suite.
+ */
 async function callExecuteToolCalls(
   service: AgentsService,
   cycleId: string,
@@ -1873,12 +1953,41 @@ async function callExecuteToolCalls(
       _executeToolCalls: (
         c: string,
         t: ToolCallRequest[],
+        budget: number,
       ) => Promise<{
         decisions: import('./agents.service').Decision[];
         sandbox_results: import('./agents.service').SandboxResult[];
       }>;
     }
-  )._executeToolCalls(cycleId, calls);
+  )._executeToolCalls(cycleId, calls, Number.MAX_SAFE_INTEGER);
+}
+
+/**
+ * Same as `callExecuteToolCalls` but with an explicit budget — used by the exit-priority
+ * cap tests (measurable-veto-shield Fix 2), which need to exercise the anti-amplification
+ * cap itself rather than bypass it.
+ */
+async function callExecuteToolCallsWithBudget(
+  service: AgentsService,
+  cycleId: string,
+  calls: ToolCallRequest[],
+  budget: number,
+): Promise<{
+  decisions: import('./agents.service').Decision[];
+  sandbox_results: import('./agents.service').SandboxResult[];
+}> {
+  return (
+    service as unknown as {
+      _executeToolCalls: (
+        c: string,
+        t: ToolCallRequest[],
+        b: number,
+      ) => Promise<{
+        decisions: import('./agents.service').Decision[];
+        sandbox_results: import('./agents.service').SandboxResult[];
+      }>;
+    }
+  )._executeToolCalls(cycleId, calls, budget);
 }
 
 describe('F4-S1 Phase 3.2/3.3 — _validateToolCalls kernel bypass', () => {
@@ -4380,6 +4489,251 @@ describe('F6-S1 T8 — termination: loop stops at maxTurns even with LLM always 
   });
 });
 
+// ── C2: Anti-amplification — hard cap on TOTAL tool calls executed per cycle ──
+
+describe('C2 — react.max_tool_calls: hard cap on total tool calls executed per cycle', () => {
+  it('C2.1 — LLM emits 2+2=4 tool calls across 2 turns, default cap (no KV override) → at most 3 execute, cap audited, loop stops early', async () => {
+    const kv = makeKv('4'); // maxTurns=4, react.max_tool_calls not set → default (3)
+    const audit = makeAudit();
+
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    const twoCallsTurn1: LlmResponse = {
+      text:
+        '<tool_calls>[' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","action":"buy"}},' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"TSLA","action":"buy"}}' +
+        ']</tool_calls>',
+      tool_calls: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+    };
+    const twoCallsTurn2: LlmResponse = {
+      text:
+        '<tool_calls>[' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"MSFT","action":"buy"}},' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"GOOG","action":"buy"}}' +
+        ']</tool_calls>',
+      tool_calls: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+    };
+
+    const llmComplete = jest
+      .fn()
+      .mockResolvedValueOnce(twoCallsTurn1)
+      .mockResolvedValueOnce(twoCallsTurn2)
+      // Fallback for any further turns the loop should NOT reach once the cap is hit —
+      // natural-exit text so the loop terminates cleanly if the cap fails to stop it.
+      .mockResolvedValue(makeLlmText('done'));
+
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const service = makeKvAgentsService({
+      llm: { complete: llmComplete },
+      kv,
+      plugins,
+      sandbox,
+      audit,
+    });
+
+    await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'context',
+      _activePlugins: [
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    // At most 3 tool calls executed total across the whole cycle, despite 4 being emitted.
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(3);
+
+    // The cap-hit event is recorded in the audit trail.
+    const capAudit = findAuditEvent(audit, 'tool_call_cap_reached');
+    expect(capAudit).toBeDefined();
+
+    // No wasted LLM call: the loop breaks the moment the cap is hit (turn 2),
+    // so the LLM is queried exactly twice — never a grace turn beyond the cap.
+    expect(llmComplete).toHaveBeenCalledTimes(2);
+  });
+
+  it('C2.2 — react.max_tool_calls KV override (=1) caps execution to 1 even though LLM emits more', async () => {
+    const audit = makeAudit();
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'react.max_turns') return Promise.resolve('4');
+        if (key === 'react.max_tool_calls') return Promise.resolve('1');
+        return Promise.resolve(null);
+      }),
+    };
+
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    const twoCallsTurn1: LlmResponse = {
+      text:
+        '<tool_calls>[' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","action":"buy"}},' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"TSLA","action":"buy"}}' +
+        ']</tool_calls>',
+      tool_calls: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+    };
+
+    const llmComplete = jest
+      .fn()
+      .mockResolvedValueOnce(twoCallsTurn1)
+      .mockResolvedValue(makeLlmText('done'));
+
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const service = makeKvAgentsService({
+      llm: { complete: llmComplete },
+      kv,
+      plugins,
+      sandbox,
+      audit,
+    });
+
+    await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'context',
+      _activePlugins: [
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+    expect(findAuditEvent(audit, 'tool_call_cap_reached')).toBeDefined();
+  });
+});
+
+// ── measurable-veto-shield Fix 2 — exit intents must never be dropped by the cap ─────
+//
+// "A position can ALWAYS be closed" invariant: emit_trade_intent calls with action='exit'
+// must survive the anti-amplification cap regardless of their emission order relative to
+// other tool calls.
+describe('measurable-veto-shield Fix 2 — _executeToolCalls exit-priority under the cap', () => {
+  const CYCLE_ID = 'exit-priority-001';
+
+  function makeAgentsServiceWithSandbox(
+    sandbox: ReturnType<typeof makeSandbox>,
+    audit: ReturnType<typeof makeAudit>,
+  ): AgentsService {
+    return new AgentsService(
+      {} as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      makePlugins([], []) as unknown as PluginsService,
+      {} as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+  }
+
+  const nonExitTc = (symbol: string): ToolCallRequest => ({
+    plugin_id: 'alpaca-provider',
+    function: 'place_order',
+    args: { symbol, action: 'buy' },
+  });
+
+  const exitTc = (symbol: string): ToolCallRequest => ({
+    plugin_id: 'decision',
+    function: 'emit_trade_intent',
+    args: { symbol, action: 'exit' },
+  });
+
+  it('4 calls [buy, buy, buy, exit] with budget=3 → the exit call IS executed and exactly one non-exit call is dropped/audited', async () => {
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const service = makeAgentsServiceWithSandbox(sandbox, audit);
+
+    const calls = [nonExitTc('AAA'), nonExitTc('BBB'), nonExitTc('CCC'), exitTc('AAPL')];
+
+    await callExecuteToolCallsWithBudget(service, CYCLE_ID, calls, 3);
+
+    // The exit call must have been dispatched — sandbox.callPlugin was invoked for it.
+    expect(sandbox.callPlugin).toHaveBeenCalledWith('decision', 'emit_trade_intent', {
+      symbol: 'AAPL',
+      action: 'exit',
+    });
+    // Exactly 3 calls executed total (the cap), one of which is the exit.
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(3);
+
+    // Exactly one non-exit call was dropped and audited via tool_call_cap_reached.
+    const capEvent = findAuditEvent(audit, 'tool_call_cap_reached');
+    expect(capEvent).toBeDefined();
+    const meta = capEvent?.['meta'] as { dropped: number; dropped_calls: string[] };
+    expect(meta.dropped).toBe(1);
+    expect(meta.dropped_calls).toEqual(['alpaca-provider.place_order']);
+  });
+
+  it('non-exit overflow without any exit present → still capped and audited exactly as before (no regression)', async () => {
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const service = makeAgentsServiceWithSandbox(sandbox, audit);
+
+    const calls = [nonExitTc('AAA'), nonExitTc('BBB'), nonExitTc('CCC'), nonExitTc('DDD')];
+
+    await callExecuteToolCallsWithBudget(service, CYCLE_ID, calls, 3);
+
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(3);
+    const capEvent = findAuditEvent(audit, 'tool_call_cap_reached');
+    expect(capEvent).toBeDefined();
+    const meta = capEvent?.['meta'] as { dropped: number; dropped_calls: string[] };
+    expect(meta.dropped).toBe(1);
+    expect(meta.dropped_calls).toEqual(['alpaca-provider.place_order']);
+  });
+
+  it('multiple exits + overflow of non-exits → ALL exits execute, only non-exits are dropped', async () => {
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const service = makeAgentsServiceWithSandbox(sandbox, audit);
+
+    const calls = [
+      nonExitTc('AAA'),
+      exitTc('AAPL'),
+      nonExitTc('BBB'),
+      exitTc('MSFT'),
+      nonExitTc('CCC'),
+    ];
+
+    await callExecuteToolCallsWithBudget(service, CYCLE_ID, calls, 2);
+
+    // Both exits must be executed even though budget=2 and there are 5 calls total.
+    expect(sandbox.callPlugin).toHaveBeenCalledWith('decision', 'emit_trade_intent', {
+      symbol: 'AAPL',
+      action: 'exit',
+    });
+    expect(sandbox.callPlugin).toHaveBeenCalledWith('decision', 'emit_trade_intent', {
+      symbol: 'MSFT',
+      action: 'exit',
+    });
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(2);
+
+    const capEvent = findAuditEvent(audit, 'tool_call_cap_reached');
+    const meta = capEvent?.['meta'] as { dropped: number; dropped_calls: string[] };
+    expect(meta.dropped).toBe(3);
+    expect(meta.dropped_calls).toEqual([
+      'alpaca-provider.place_order',
+      'alpaca-provider.place_order',
+      'alpaca-provider.place_order',
+    ]);
+  });
+});
+
 // ── T9: Context cap ───────────────────────────────────────────────────────────
 
 describe('F6-S1 T9 — _composeIterationContext: context cap enforced', () => {
@@ -5825,6 +6179,36 @@ describe('F6-S3 PR-B B2 — _isHighImpact (fail-soft notional check)', () => {
     const result = await callIsHighImpact(service, providerTc('AAPL', 50), 0.05);
     expect(result).toBe(false);
   });
+
+  // ── measurable-veto-shield Fix 3 — exits must never be routed through the debate gate ──
+  it("B2.11 — measurable-veto-shield Fix 3: emit_trade_intent action='exit', large notional → false immediately, zero I/O (never routed to debate)", async () => {
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({ gateway });
+    const exitTc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'decision',
+      function: 'emit_trade_intent',
+      args: { symbol: 'AAPL', action: 'exit', qty: 500 }, // notional=50000, well above threshold
+    };
+    const result = await callIsHighImpact(service, exitTc, 0.05);
+    expect(result).toBe(false);
+    // Fast path — no quote/portfolio I/O for exits.
+    expect(gateway.getQuote).not.toHaveBeenCalled();
+    expect(gateway.getPortfolio).not.toHaveBeenCalled();
+  });
+
+  it("B2.12 — measurable-veto-shield Fix 3 regression: emit_trade_intent action='long' with same high notional → still classified high-impact (goes through debate)", async () => {
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({ gateway });
+    const entryTc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'decision',
+      function: 'emit_trade_intent',
+      args: { symbol: 'AAPL', action: 'long', qty: 500 },
+    };
+    const result = await callIsHighImpact(service, entryTc, 0.05);
+    expect(result).toBe(true);
+    expect(gateway.getQuote).toHaveBeenCalled();
+    expect(gateway.getPortfolio).toHaveBeenCalled();
+  });
 });
 
 // ── B3: DI boot test ─────────────────────────────────────────────────────────
@@ -6307,6 +6691,76 @@ describe('F6-S3 PR-B B4 — _executeToolCalls debate intercept', () => {
     expect(sandbox.callPlugin).not.toHaveBeenCalled();
     expect(decisions[0]?.allowed).toBe(false);
     expect(decisions[0]?.reason).toBe('debate_failed');
+  });
+
+  // T10: measurable-veto-shield Fix 3 — a high-notional exit must skip the debate gate
+  // entirely and dispatch normally, never risking a 'debate_rejected' drop.
+  it('T10 — measurable-veto-shield Fix 3: high-notional exit skips debate gate entirely (runPanel never called), proceeds to normal dispatch', async () => {
+    const debateStub = makeDebateStub({
+      // Even if the panel WOULD reject, it must never be consulted for an exit.
+      runPanelResult: { recommendation: 'reject', auditor_blocked: false, stances: [] },
+    });
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    // High notional: qty=500, last=100 → notional=50000, equity=50000 → well above threshold.
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({
+      sandbox,
+      audit,
+      plugins: makePluginsWithDebate(),
+      kv: makeKvDebate({ 'debate.enabled': 'true', 'debate.min_notional_pct': '0.05' }),
+      debate: debateStub,
+      gateway,
+    });
+
+    const exitTc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'decision',
+      function: 'emit_trade_intent',
+      args: { symbol: 'AAPL', action: 'exit', qty: 500 },
+    };
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [exitTc]);
+
+    expect(debateStub.runPanel).not.toHaveBeenCalled();
+    expect(findAuditEvent(audit, 'debate_started')).toBeUndefined();
+    expect(sandbox.callPlugin).toHaveBeenCalledWith('decision', 'emit_trade_intent', {
+      symbol: 'AAPL',
+      action: 'exit',
+      qty: 500,
+    });
+    expect(decisions[0]?.allowed).toBe(true);
+  });
+
+  // T11: regression — a high-notional entry with the same shape still goes through debate.
+  it('T11 — measurable-veto-shield Fix 3 regression: high-notional entry (action=long) still goes through debate as before', async () => {
+    const consensus: DebateConsensus = {
+      recommendation: 'reject',
+      auditor_blocked: false,
+      stances: [{ role: 'bull', stance: 'reject', confidence: 0.9, rationale: 'bad trade' }],
+    };
+    const debateStub = makeDebateStub({ runPanelResult: consensus });
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({
+      sandbox,
+      audit,
+      plugins: makePluginsWithDebate(),
+      kv: makeKvDebate({ 'debate.enabled': 'true', 'debate.min_notional_pct': '0.05' }),
+      debate: debateStub,
+      gateway,
+    });
+
+    const entryTc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'decision',
+      function: 'emit_trade_intent',
+      args: { symbol: 'AAPL', action: 'long', qty: 500 },
+    };
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [entryTc]);
+
+    expect(debateStub.runPanel).toHaveBeenCalledTimes(1);
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+    expect(decisions[0]?.allowed).toBe(false);
+    expect(decisions[0]?.reason).toBe('debate_rejected');
   });
 });
 
@@ -7515,6 +7969,7 @@ function makeS3AgentsService(opts: {
   >;
   audit?: ReturnType<typeof makeAudit>;
   llm?: Partial<LlmService>;
+  prisma?: { vetoDecision: { create: jest.Mock } };
 }): AgentsService {
   const audit = opts.audit ?? makeAudit();
   const llm: Partial<LlmService> = opts.llm ?? {
@@ -7555,6 +8010,8 @@ function makeS3AgentsService(opts: {
     debate: unknown,
     providerGateway: unknown,
     mlSignalRecord: unknown,
+    tradeIntent: unknown,
+    prisma: unknown,
   ) => AgentsService)(
     llm,
     sandbox,
@@ -7575,6 +8032,8 @@ function makeS3AgentsService(opts: {
     undefined,
     undefined,
     opts.mlSignalRecord ?? makeMlSignalRecordS3(),
+    undefined,
+    opts.prisma,
   );
 }
 
@@ -9961,14 +10420,20 @@ describe('AgentsService._runSingleIteration — native tool_calls vs text fallba
     _activePlugins?: import('../plugins/plugins.service').HydratedPlugin[];
     virtual_only?: boolean;
     decisionPrompt: string | null;
+    toolCallBudget: number;
   };
 
-  async function callRunSingleIteration(service: AgentsService, args: IterationArgs) {
+  // These tests exercise dispatch/parsing behaviour, not the C2 anti-amplification
+  // cap (which has its own dedicated test suite) — default to an unlimited budget.
+  async function callRunSingleIteration(
+    service: AgentsService,
+    args: Omit<IterationArgs, 'toolCallBudget'>,
+  ) {
     return (
       service as unknown as {
         _runSingleIteration: (args: IterationArgs) => Promise<unknown>;
       }
-    )._runSingleIteration(args);
+    )._runSingleIteration({ ...args, toolCallBudget: Number.MAX_SAFE_INTEGER });
   }
 
   const TOOL: import('../plugins/plugins.service').ProviderTool = {
@@ -10213,5 +10678,498 @@ describe('runGovernedTurn chat mode', () => {
     >;
     expect(cCalls[0][0].system_prompt).toContain('[DECISION]');
     expect(cCalls[0][0].tools.length).toBeGreaterThan(0);
+  });
+});
+
+// ── veto-ledger-fix: _runVetoLayer real hook contract + fail-safe on hook failure ──
+//
+// Real discipline hooks (plugins/risk-manager/hooks/cycle.py, position-sizing,
+// signal-aggregator, atr-stop-loss) return { signals: [...], logs: [...] } — there is
+// NO `pending_signals` key on the raw hook result. The pre-fix code read
+// `vetoCtx['pending_signals']` after unconditionally replacing vetoCtx with the raw
+// hook result, so approvedSignals always ended up [] whenever any discipline plugin
+// was active — silently blocking every signal.
+
+describe('veto-ledger-fix CRIT-1 — _runVetoLayer honors the real {signals, logs} hook contract', () => {
+  it('a discipline hook returning {signals:[...approved...], logs:[]} (real shape) does NOT drop the approved signal', async () => {
+    const audit = makeAudit();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        // Real hook contract: 'signals', NOT 'pending_signals'.
+        result: { signals: [{ symbol: 'AAPL', action: 'buy', qty: 10 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, audit });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [{ symbol: 'AAPL', action: 'buy', qty: 10 }];
+
+    const { vetoCtx, vetoSummary } = await callRunVetoLayerS3(
+      service,
+      'cycle-crit1-001',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    const approved = vetoCtx['pending_signals'];
+    expect(Array.isArray(approved)).toBe(true);
+    expect(approved as unknown[]).toHaveLength(1);
+    expect((vetoSummary as { signals_approved: number }).signals_approved).toBe(1);
+  });
+});
+
+describe('veto-ledger-fix CRIT-2 — discipline hook failure is fail-safe (not fail-open)', () => {
+  it('a discipline hook that fails (ok:false) drops pending signals for the cycle instead of letting them pass', async () => {
+    const audit = makeAudit();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({ ok: false, error: 'boom', result: null }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, audit });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [{ symbol: 'AAPL', action: 'buy', qty: 10 }];
+
+    const { vetoCtx, vetoSummary } = await callRunVetoLayerS3(
+      service,
+      'cycle-crit2-001',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    const approved = vetoCtx['pending_signals'];
+    expect(Array.isArray(approved) ? approved.length : -1).toBe(0);
+    expect((vetoSummary as { veto_degraded?: boolean }).veto_degraded).toBe(true);
+  });
+});
+
+// ── veto-decisions-ledger: immutable per-signal veto ledger ───────────────────────
+
+function makePrismaVetoMock(): { vetoDecision: { create: jest.Mock } } {
+  return { vetoDecision: { create: jest.fn().mockResolvedValue({}) } };
+}
+
+type VetoDecisionCreateArgs = { data: Record<string, unknown> };
+
+describe('veto-decisions-ledger — _runVetoLayer persists one VetoDecision row per proposed signal', () => {
+  it('a. an approved signal (unchanged by disciplines) results in a VetoDecision row with verdict "approved"', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [{ symbol: 'AAPL', action: 'buy', qty: 10 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [
+      { symbol: 'AAPL', action: 'buy', qty: 10, confidence: 0.8, plugin_id: 'momentum' },
+    ];
+
+    await callRunVetoLayerS3(service, 'cycle-ledger-a', disciplinePlugins, {}, pendingSignals, {});
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data).toMatchObject({
+      cycle_id: 'cycle-ledger-a',
+      symbol: 'AAPL',
+      source_plugin: 'momentum',
+      proposed_action: 'buy',
+      proposed_qty: 10,
+      verdict: 'approved',
+    });
+    expect(typeof args.data['context_snapshot']).toBe('string');
+  });
+
+  it('b. a blocked signal (removed by a discipline) results in a VetoDecision row with verdict "blocked"', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [
+      { symbol: 'TSLA', action: 'sell', qty: 5, confidence: 0.6, plugin_id: 'mean-reversion' },
+    ];
+
+    await callRunVetoLayerS3(service, 'cycle-ledger-b', disciplinePlugins, {}, pendingSignals, {});
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data).toMatchObject({
+      cycle_id: 'cycle-ledger-b',
+      symbol: 'TSLA',
+      source_plugin: 'mean-reversion',
+      proposed_action: 'sell',
+      proposed_qty: 5,
+      verdict: 'blocked',
+      approved_action: null,
+      approved_qty: null,
+    });
+  });
+
+  it('c. a signal rescaled by a discipline results in verdict "modified" with approved_qty/approved_action populated', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [{ symbol: 'MSFT', action: 'buy', qty: 8 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [
+      { id: 'position-sizing', type: 'discipline', name: 'Position Sizing' },
+    ];
+    const pendingSignals = [
+      { symbol: 'MSFT', action: 'buy', qty: 20, confidence: 0.7, plugin_id: 'trend-follow' },
+    ];
+
+    await callRunVetoLayerS3(service, 'cycle-ledger-c', disciplinePlugins, {}, pendingSignals, {});
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data).toMatchObject({
+      cycle_id: 'cycle-ledger-c',
+      symbol: 'MSFT',
+      source_plugin: 'trend-follow',
+      proposed_action: 'buy',
+      proposed_qty: 20,
+      verdict: 'modified',
+      approved_action: 'buy',
+      approved_qty: 8,
+    });
+  });
+
+  it('d. a ledger-write failure does NOT throw out of _runVetoLayer and does not affect signal flow', async () => {
+    const prisma = makePrismaVetoMock();
+    prisma.vetoDecision.create.mockRejectedValue(new Error('DB write failed'));
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [{ symbol: 'AAPL', action: 'buy', qty: 10 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [{ symbol: 'AAPL', action: 'buy', qty: 10, plugin_id: 'momentum' }];
+
+    const { vetoCtx } = await callRunVetoLayerS3(
+      service,
+      'cycle-ledger-d',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    // Signal flow must be unaffected by the ledger write failure.
+    const approved = vetoCtx['pending_signals'] as unknown[];
+    expect(approved).toHaveLength(1);
+  });
+});
+
+// ── veto-ledger-verdict-fix: real plugin shapes drive verdict diffing ────────
+//
+// position-sizing/hooks/cycle.py (kelly/fixed modes) returns
+// {**sig, "kelly"|"fixed": {"shares": N, ...}} — the top-level `qty` is left
+// UNCHANGED; the real resized quantity lives in the nested sub-object.
+// signal-aggregator/hooks/cycle.py returns consensus_signal objects with NO
+// `qty` and NO `plugin_id`/`source` (only `sources: string[]`), so multiple
+// proposed signals for one symbol can collapse onto a single consensus object.
+// The ledger must never label a row "approved" unless the effective qty is
+// verifiably unchanged; unrecoverable/ambiguous cases must be "modified".
+
+describe('veto-ledger-verdict-fix — effective-qty extraction from nested sizing sub-objects', () => {
+  it('a. position-sizing kelly mode: nested kelly.shares differs from top-level qty → verdict "modified", approved_qty === nested shares', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        // Real position-sizing kelly-mode shape: top-level qty UNCHANGED, real
+        // resized qty nested under "kelly.shares".
+        result: {
+          signals: [
+            {
+              symbol: 'NVDA',
+              action: 'buy',
+              qty: 20,
+              kelly: { shares: 6, position_usd: 900, position_pct: 9, risk_usd: 18 },
+            },
+          ],
+          logs: [],
+        },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [
+      { id: 'position-sizing', type: 'discipline', name: 'Position Sizing' },
+    ];
+    const pendingSignals = [
+      { symbol: 'NVDA', action: 'buy', qty: 20, confidence: 0.7, plugin_id: 'momentum' },
+    ];
+
+    await callRunVetoLayerS3(
+      service,
+      'cycle-verdict-kelly',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data).toMatchObject({
+      symbol: 'NVDA',
+      proposed_qty: 20,
+      verdict: 'modified',
+      approved_qty: 6,
+    });
+  });
+
+  it('b. position-sizing fixed mode: nested fixed.shares equals top-level qty → verdict "approved"', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: {
+          signals: [
+            {
+              symbol: 'AAPL',
+              action: 'buy',
+              qty: 10,
+              fixed: { shares: 10, position_usd: 500, position_pct: 5 },
+            },
+          ],
+          logs: [],
+        },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [
+      { id: 'position-sizing', type: 'discipline', name: 'Position Sizing' },
+    ];
+    const pendingSignals = [
+      { symbol: 'AAPL', action: 'buy', qty: 10, confidence: 0.8, plugin_id: 'momentum' },
+    ];
+
+    await callRunVetoLayerS3(
+      service,
+      'cycle-verdict-fixed',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data).toMatchObject({
+      symbol: 'AAPL',
+      proposed_qty: 10,
+      verdict: 'approved',
+      approved_qty: null,
+    });
+  });
+
+  it('c. signal-aggregator consensus_signal (no qty, has sources) is NOT falsely "approved" — qty unrecoverable → "modified", raw match stored in context_snapshot', async () => {
+    const prisma = makePrismaVetoMock();
+    const consensusSignal = {
+      type: 'consensus_signal',
+      symbol: 'TSLA',
+      action: 'buy',
+      confidence: 0.75,
+      agreement_pct: 80,
+      vote_long: 2,
+      vote_short: 0,
+      contributing_signals: 2,
+      sources: ['momentum', 'trend-follow'],
+    };
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [consensusSignal], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [
+      { id: 'signal-aggregator', type: 'discipline', name: 'Signal Aggregator' },
+    ];
+    const pendingSignals = [
+      { symbol: 'TSLA', action: 'buy', qty: 15, confidence: 0.7, plugin_id: 'momentum' },
+    ];
+
+    await callRunVetoLayerS3(
+      service,
+      'cycle-verdict-aggregator',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data['verdict']).toBe('modified');
+    expect(args.data['approved_qty']).toBeNull();
+    const snapshot = JSON.parse(args.data['context_snapshot'] as string) as {
+      signal: unknown;
+      match: unknown;
+    };
+    expect(snapshot.signal).toMatchObject({ symbol: 'TSLA', qty: 15 });
+    expect(snapshot.match).toMatchObject({ type: 'consensus_signal', symbol: 'TSLA' });
+  });
+
+  it('d. two proposed signals for the same symbol collapse onto one aggregator consensus object → each gets its own row, neither is a clean "approved"', async () => {
+    const prisma = makePrismaVetoMock();
+    const consensusSignal = {
+      type: 'consensus_signal',
+      symbol: 'MSFT',
+      action: 'buy',
+      confidence: 0.8,
+      agreement_pct: 100,
+      vote_long: 2,
+      vote_short: 0,
+      contributing_signals: 2,
+      sources: ['momentum', 'mean-reversion'],
+    };
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [consensusSignal], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [
+      { id: 'signal-aggregator', type: 'discipline', name: 'Signal Aggregator' },
+    ];
+    const pendingSignals = [
+      { symbol: 'MSFT', action: 'buy', qty: 12, confidence: 0.6, plugin_id: 'momentum' },
+      { symbol: 'MSFT', action: 'buy', qty: 9, confidence: 0.65, plugin_id: 'mean-reversion' },
+    ];
+
+    await callRunVetoLayerS3(
+      service,
+      'cycle-verdict-collision',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(2);
+    const calls = prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>;
+    const dataRows = calls.map((c) => c[0].data);
+    expect(dataRows).toHaveLength(2);
+    for (const row of dataRows) {
+      expect(row['verdict']).not.toBe('approved');
+      expect(row['source_plugin']).toBeDefined();
+    }
+    const sourcePlugins = dataRows.map((r) => r['source_plugin']);
+    expect(new Set(sourcePlugins)).toEqual(new Set(['momentum', 'mean-reversion']));
+  });
+});
+
+// ── veto-ledger-persist-fix: per-row persistence must be fail-soft ───────────
+//
+// The pre-fix _persistVetoDecisions wrapped the whole for-loop in one
+// try/catch, so a single bad prisma.vetoDecision.create() dropped every
+// remaining row for that cycle. Each row must be independent.
+
+describe('veto-ledger-persist-fix — one bad row does not suppress the rest of the cycle audit trail', () => {
+  it('3 signals, the 2nd create() throws → rows 1 and 3 are still persisted', async () => {
+    const prisma = makePrismaVetoMock();
+    prisma.vetoDecision.create
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce(new Error('DB write failed for row 2'))
+      .mockResolvedValueOnce({});
+
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: {
+          signals: [
+            { symbol: 'AAA', action: 'buy', qty: 1 },
+            { symbol: 'BBB', action: 'buy', qty: 2 },
+            { symbol: 'CCC', action: 'buy', qty: 3 },
+          ],
+          logs: [],
+        },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [
+      { symbol: 'AAA', action: 'buy', qty: 1, plugin_id: 'p1' },
+      { symbol: 'BBB', action: 'buy', qty: 2, plugin_id: 'p2' },
+      { symbol: 'CCC', action: 'buy', qty: 3, plugin_id: 'p3' },
+    ];
+
+    const { vetoCtx } = await callRunVetoLayerS3(
+      service,
+      'cycle-persist-partial',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    // The cycle itself must be unaffected.
+    expect(vetoCtx['pending_signals'] as unknown[]).toHaveLength(3);
+
+    // All 3 creates must have been attempted independently.
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(3);
+    const calls = prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>;
+    const symbols = calls.map((c) => c[0].data['symbol']);
+    expect(symbols).toEqual(['AAA', 'BBB', 'CCC']);
   });
 });

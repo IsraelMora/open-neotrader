@@ -32,6 +32,9 @@ import { DashboardModule } from './dashboard/dashboard.module';
 import { BacktestModule } from './backtest/backtest.module';
 import { TradeIntentModule } from './trade-intent/trade-intent.module';
 import { StrategyModule } from './strategy/strategy.module';
+import { VetoAnalyzerModule } from './veto-analyzer/veto-analyzer.module';
+import { RealOrderModule } from './real-order/real-order.module';
+import { RealReconciliationModule } from './real-reconciliation/real-broker-reconciliation.module';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard';
 import { CorrelationMiddleware } from './common/correlation.middleware';
 
@@ -77,6 +80,23 @@ import { CorrelationMiddleware } from './common/correlation.middleware';
     BacktestModule,
     TradeIntentModule,
     StrategyModule,
+    VetoAnalyzerModule,
+    // Fix 3: RealOrderModule is listed BEFORE RealReconciliationModule here. Historically
+    // this ordering mattered because RealOrderService.onModuleInit -> recoverInflight()
+    // was the ONLY thing that ever re-checked pending_submit/submit_failed rows, and
+    // Nest generally initializes providers in import-array order — so this array
+    // position determined which module's onModuleInit ran first on boot. Since Fix 1
+    // (RealBrokerReconciliationService.reconcileAllOpenOrders() now sweeps those same
+    // rows via RealOrderService.recoverInflight() on EVERY steady-state tick, not just
+    // at boot), correctness no longer depends on this array position at all — a stuck
+    // row is recovered by the very next tick regardless of which module's
+    // onModuleInit ran first, or even if RealOrderModule's onModuleInit never ran (see
+    // the "Fix 3: boot-order independence" tests in
+    // real-broker-reconciliation.service.spec.ts). This ordering is kept purely for
+    // defense-in-depth / faster convergence (one fewer tick to wait for on a cold
+    // boot) — it is NOT load-bearing for correctness anymore.
+    RealOrderModule,
+    RealReconciliationModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: JwtAuthGuard },

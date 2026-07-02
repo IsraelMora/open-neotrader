@@ -1,28 +1,33 @@
-{
-  "tools": [
-    {
-      "name": "generate_and_send",
-      "description": "Genera un reporte de rendimiento (P&L, Sharpe, drawdown, win rate, top señales) y lo envía vía Telegram si las credenciales están configuradas.",
-      "input_schema": {
-        "type": "object",
-        "required": ["trades"],
-        "properties": {
-          "trades": {
-            "type": "array",
-            "description": "Lista de trades cerrados [{symbol, action, pnl, ts}]"
+[
+  {
+    "name": "generate_and_send",
+    "description": "Genera un reporte de rendimiento (P&L, Sharpe, drawdown, win rate, top señales) y lo envía vía Telegram si las credenciales están configuradas.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "trades"
+      ],
+      "properties": {
+        "trades": {
+          "type": "array",
+          "description": "Lista de trades cerrados [{symbol, action, pnl, ts}]"
+        },
+        "equity_curve": {
+          "type": "array",
+          "items": {
+            "type": "number"
           },
-          "equity_curve": {
-            "type": "array",
-            "items": { "type": "number" },
-            "description": "Serie de valores de cartera en orden cronológico"
-          },
-          "period": {
-            "type": "string",
-            "enum": ["weekly", "monthly"],
-            "default": "weekly"
-          }
+          "description": "Serie de valores de cartera en orden cronológico"
+        },
+        "period": {
+          "type": "string",
+          "enum": [
+            "weekly",
+            "monthly"
+          ],
+          "default": "weekly"
         }
       }
     }
-  ]
-}
+  }
+]

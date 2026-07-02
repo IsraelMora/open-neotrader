@@ -25,12 +25,16 @@ auth_key_header   = "APCA-API-KEY-ID"
 auth_secret_header = "APCA-API-SECRET-KEY"
 
 [api.endpoints]
-ohlcv     = "{data_url}/v2/stocks/{symbol}/bars?timeframe={tf}&limit={limit}&adjustment=all&feed=iex"
-quote     = "{data_url}/v2/stocks/{symbol}/quotes/latest?feed=iex"
-portfolio = "{base_url}/v2/account"
-positions = "{base_url}/v2/positions"
-account   = "{base_url}/v2/account"
-orders    = "{base_url}/v2/orders"
+ohlcv               = "{data_url}/v2/stocks/{symbol}/bars?timeframe={tf}&limit={limit}&adjustment=all&feed=iex"
+quote               = "{data_url}/v2/stocks/{symbol}/quotes/latest?feed=iex"
+portfolio           = "{base_url}/v2/account"
+positions           = "{base_url}/v2/positions"
+account             = "{base_url}/v2/account"
+orders              = "{base_url}/v2/orders"
+order_status        = "{base_url}/v2/orders/{broker_order_id}"
+order_by_client_id  = "{base_url}/v2/orders:by_client_order_id={client_order_id}"
+cancel_order        = "{base_url}/v2/orders/{broker_order_id}"
+list_orders         = "{base_url}/v2/orders?status={status}"
 
 # ── Config ajustable desde UI ─────────────────────────────────────────────────
 [config]

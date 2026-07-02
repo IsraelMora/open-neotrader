@@ -10,6 +10,7 @@ import { BacktestController } from './backtest.controller';
 import { BacktestService } from './backtest.service';
 import type { BacktestResponse } from './backtest.service';
 import { RunBacktestDto } from './dto/run-backtest.dto';
+import { WalkForwardTotpGuard } from './guards/walk-forward-totp.guard';
 
 // ── DTO validation tests ──────────────────────────────────────────────────────
 
@@ -157,5 +158,24 @@ describe('BacktestController', () => {
 
     const result = await controller.run(dto);
     expect(result).toEqual(MOCK_RESPONSE);
+  });
+
+  it('POST /backtest/walk-forward route is guarded by WalkForwardTotpGuard', () => {
+    const controllerProto: Record<string, object> =
+      BacktestController.prototype as unknown as Record<string, object>;
+    const guards = Reflect.getMetadata('__guards__', controllerProto['walkForward']) as
+      | unknown[]
+      | undefined;
+    expect(guards).toBeDefined();
+    expect(guards).toContain(WalkForwardTotpGuard);
+  });
+
+  it('POST /backtest route has no WalkForwardTotpGuard (relies on the global JwtAuthGuard only)', () => {
+    const controllerProto: Record<string, object> =
+      BacktestController.prototype as unknown as Record<string, object>;
+    const guards = Reflect.getMetadata('__guards__', controllerProto['run']) as
+      | unknown[]
+      | undefined;
+    expect(guards ?? []).not.toContain(WalkForwardTotpGuard);
   });
 });

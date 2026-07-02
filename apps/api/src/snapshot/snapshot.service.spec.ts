@@ -11,6 +11,12 @@ import type { PrismaService } from '../prisma/prisma.service';
 import type { ProviderGatewayService, Portfolio } from '../providers/provider-gateway.service';
 import type { LongTermMemoryService } from '../long-term-memory/long-term-memory.service';
 
+type RealNavSnapshotRow = {
+  ts: Date;
+  equity: number;
+  hwm: number;
+};
+
 const CYCLE_ID = 'snap-cycle-001';
 
 const fakePortfolio: Portfolio = {
@@ -123,5 +129,97 @@ describe('F6-S2 PR2 — SnapshotService + LongTermMemory', () => {
     await service.takeSnapshot(); // no cycleId arg
 
     expect(ltm.updateOutcome).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * real-money-accounting — SnapshotService.getRealEquityCurve
+ *
+ * Tests that:
+ * - Points are returned sorted chronologically (oldest → newest), shape { ts, equity, hwm }.
+ * - findMany is called with orderBy: { ts: 'desc' }, take: limit (most-recent-N query),
+ *   and the service reverses the result before returning (verified via output order,
+ *   not just call args — the DB mock returns desc rows, we assert the mapped output is asc).
+ * - No rows → returns [].
+ */
+describe('SnapshotService.getRealEquityCurve', () => {
+  function makeRealPrisma(rows: RealNavSnapshotRow[]): {
+    realNavSnapshot: jest.Mocked<Pick<PrismaService['realNavSnapshot'], 'findMany'>>;
+  } {
+    return {
+      realNavSnapshot: {
+        findMany: jest.fn().mockResolvedValue(rows),
+      },
+    };
+  }
+
+  function makeService(prisma: ReturnType<typeof makeRealPrisma>): SnapshotService {
+    return new (SnapshotService as unknown as new (db: unknown) => SnapshotService)(prisma);
+  }
+
+  it('returns points sorted chronologically ascending with { ts, equity, hwm } shape', async () => {
+    const rows: RealNavSnapshotRow[] = [
+      { ts: new Date('2026-06-03T00:00:00Z'), equity: 300, hwm: 300 },
+      { ts: new Date('2026-06-02T00:00:00Z'), equity: 200, hwm: 200 },
+      { ts: new Date('2026-06-01T00:00:00Z'), equity: 100, hwm: 100 },
+    ];
+    const prisma = makeRealPrisma(rows);
+    const service = makeService(prisma);
+
+    const result = await service.getRealEquityCurve(3);
+
+    expect(result).toEqual([
+      { ts: '2026-06-01T00:00:00.000Z', equity: 100, hwm: 100 },
+      { ts: '2026-06-02T00:00:00.000Z', equity: 200, hwm: 200 },
+      { ts: '2026-06-03T00:00:00.000Z', equity: 300, hwm: 300 },
+    ]);
+  });
+
+  it('queries with orderBy desc + take limit (most-recent-N), and returns the correct N most-recent rows in ascending order', async () => {
+    // Simulate 5 total rows in the DB; the mock DB itself only returns the 3 most recent
+    // (as findMany with take:3 would), already desc-ordered — exactly what Prisma would return.
+    const mostRecentThreeDesc: RealNavSnapshotRow[] = [
+      { ts: new Date('2026-06-05T00:00:00Z'), equity: 500, hwm: 500 },
+      { ts: new Date('2026-06-04T00:00:00Z'), equity: 400, hwm: 400 },
+      { ts: new Date('2026-06-03T00:00:00Z'), equity: 300, hwm: 300 },
+    ];
+    const prisma = makeRealPrisma(mostRecentThreeDesc);
+    const service = makeService(prisma);
+
+    const result = await service.getRealEquityCurve(3);
+
+    expect(prisma.realNavSnapshot.findMany).toHaveBeenCalledWith({
+      orderBy: { ts: 'desc' },
+      take: 3,
+      select: { ts: true, equity: true, hwm: true },
+    });
+    // Output must be the 3 most-recent rows, in ascending (chronological) order.
+    expect(result).toEqual([
+      { ts: '2026-06-03T00:00:00.000Z', equity: 300, hwm: 300 },
+      { ts: '2026-06-04T00:00:00.000Z', equity: 400, hwm: 400 },
+      { ts: '2026-06-05T00:00:00.000Z', equity: 500, hwm: 500 },
+    ]);
+  });
+
+  it('returns [] when there are no rows', async () => {
+    const prisma = makeRealPrisma([]);
+    const service = makeService(prisma);
+
+    const result = await service.getRealEquityCurve();
+
+    expect(result).toEqual([]);
+  });
+
+  it('defaults limit to 252 when not provided', async () => {
+    const prisma = makeRealPrisma([]);
+    const service = makeService(prisma);
+
+    await service.getRealEquityCurve();
+
+    expect(prisma.realNavSnapshot.findMany).toHaveBeenCalledWith({
+      orderBy: { ts: 'desc' },
+      take: 252,
+      select: { ts: true, equity: true, hwm: true },
+    });
   });
 });

@@ -2,7 +2,8 @@
 Tests for PR C — weekly-reporter off urllib.
 
 C1.1: reporter.py must NOT import urllib.
-C1.2: on_cycle with equity_curve+closed_trades → notify_intents has telegram entry with non-empty text.
+C1.2: on_cycle with equity_curve+closed_trades → notify_intents has telegram entry
+      with non-empty text.
 C1.3: on_cycle({}) → no exception, no intent (graceful degradation).
 """
 from __future__ import annotations
@@ -52,7 +53,8 @@ def test_reporter_has_no_urllib_import():
 # ── C1.2 ──────────────────────────────────────────────────────────────────────
 
 def test_on_cycle_emits_notify_intent_with_context():
-    """C1.2 — on_cycle with equity_curve+closed_trades emits notify_intents[channel=telegram, text non-empty]."""
+    """C1.2 — on_cycle with equity_curve+closed_trades emits notify_intents
+    [channel=telegram, text non-empty]."""
     mod = _load_on_cycle()
 
     # Force today to be the configured report day so the hook actually fires

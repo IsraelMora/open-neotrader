@@ -132,6 +132,30 @@ export class SnapshotService {
     return rows.map((r) => ({ ts: r.ts.toISOString(), equity: r.equity }));
   }
 
+  /**
+   * Real-money equity curve as [{ ts, equity, hwm }] for the dashboard/reporter.
+   *
+   * Intentionally queries `orderBy: { ts: 'desc' }, take: limit` (most recent N rows)
+   * and then reverses in memory before mapping, so the result is chronologically
+   * ascending AND correctly bounded to the most recent N points. This is the correct
+   * pattern for a "last N, in order" query — contrast with the pre-existing
+   * `getHistory`/`getEquityCurve` (paper) methods, which use `orderBy: { ts: 'asc' },
+   * take: limit` and therefore return the OLDEST N rows, not the most recent N. That
+   * bug is left untouched (paper behavior must stay byte-for-byte identical); it must
+   * NOT be copied here.
+   */
+  async getRealEquityCurve(limit = 252): Promise<{ ts: string; equity: number; hwm: number }[]> {
+    const rows = await this.db.realNavSnapshot.findMany({
+      orderBy: { ts: 'desc' },
+      take: limit,
+      select: { ts: true, equity: true, hwm: true },
+    });
+    return rows
+      .slice()
+      .reverse()
+      .map((r) => ({ ts: r.ts.toISOString(), equity: r.equity, hwm: r.hwm }));
+  }
+
   /** Estadísticas rápidas del NAV histórico. */
   async stats(): Promise<Record<string, unknown>> {
     const total = await this.db.navSnapshot.count();

@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────
+# LOCAL EVAL ONLY — do NOT use this in production.
+#
+# docker-compose.yml intentionally publishes NO host ports: it's built for a
+# reverse-proxy topology (Traefik/Dokploy), where the proxy reaches each
+# service over the internal Docker network. Exposing these ports directly on
+# the host would collide with that proxy and skip its TLS/routing layer.
+#
+# To evaluate the stack locally without a reverse proxy, copy this file:
+#
+#   cp compose.override.yml.example compose.override.yml
+#   docker compose up -d
+#
+# Docker Compose auto-merges compose.override.yml when present, so this stays
+# opt-in — the secure default in docker-compose.yml is never weakened.
+#
+# In production, delete/never create compose.override.yml and let the proxy
+# reach the services via the internal network as configured in
+# docker-compose.yml.
+# ─────────────────────────────────────────────────────────────────────────
+
+services:
+  web:
+    ports:
+      - "8080:80"   # Panel: http://localhost:8080
+
+  api:
+    ports:
+      - "3000:3000" # API docs (dev only): http://localhost:3000/api/docs

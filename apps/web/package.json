@@ -7,6 +7,7 @@
     "dev": "astro dev",
     "build": "astro build",
     "preview": "astro preview",
+    "test": "vitest run",
     "lint": "eslint . && prettier --check \"src/**/*.astro\"",
     "format": "prettier --write \"src/**/*.{ts,tsx,astro}\""
   },
@@ -45,9 +46,11 @@
     "eslint-plugin-prettier": "^5",
     "eslint-plugin-sonarjs": "^4",
     "globals": "^17",
+    "jsdom": "^29.1.1",
     "prettier": "^3",
     "prettier-plugin-astro": "^0.14",
     "tailwindcss": "^4.3.1",
-    "typescript-eslint": "^8"
+    "typescript-eslint": "^8",
+    "vitest": "^4.1.9"
   }
 }

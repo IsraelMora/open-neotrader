@@ -9,11 +9,7 @@ The test_no_code_execution test enforces this with a sentinel side-effect fixtur
 """
 from __future__ import annotations
 
-import os
-import sys
 from pathlib import Path
-
-import pytest
 
 # ---------------------------------------------------------------------------
 # Helper: import analyzer fresh so isolation guards don't interfere.
@@ -58,7 +54,9 @@ class TestRiskyImport:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src="import subprocess\n\ndef my_fn(): pass\n",
             manifest_dict={
-                "plugin": {"id": "test-risky", "name": "Test", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-risky", "name": "Test", "version": "0.1.0", "type": "skill",
+                },
             },
         )
         analyzer = _import_analyzer()
@@ -66,7 +64,9 @@ class TestRiskyImport:
 
         assert result["ok"] is True
         categories = [f["category"] for f in result["findings"]]
-        assert "risky_import" in categories, f"Expected risky_import finding, got: {result['findings']}"
+        assert "risky_import" in categories, (
+            f"Expected risky_import finding, got: {result['findings']}"
+        )
 
         risky = [f for f in result["findings"] if f["category"] == "risky_import"]
         assert len(risky) >= 1
@@ -78,7 +78,9 @@ class TestRiskyImport:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src="import multiprocessing\n\ndef my_fn(): pass\n",
             manifest_dict={
-                "plugin": {"id": "test-risky2", "name": "Test2", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-risky2", "name": "Test2", "version": "0.1.0", "type": "skill",
+                },
             },
         )
         analyzer = _import_analyzer()
@@ -86,7 +88,9 @@ class TestRiskyImport:
 
         assert result["ok"] is True
         categories = [f["category"] for f in result["findings"]]
-        assert "risky_import" in categories, f"Expected risky_import for multiprocessing, got: {categories}"
+        assert "risky_import" in categories, (
+            f"Expected risky_import for multiprocessing, got: {categories}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +105,9 @@ class TestDangerousCall:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src='x = eval("1+1")\n',
             manifest_dict={
-                "plugin": {"id": "test-eval", "name": "Eval", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-eval", "name": "Eval", "version": "0.1.0", "type": "skill",
+                },
             },
         )
         analyzer = _import_analyzer()
@@ -109,7 +115,9 @@ class TestDangerousCall:
 
         assert result["ok"] is True
         categories = [f["category"] for f in result["findings"]]
-        assert "dangerous_call" in categories, f"Expected dangerous_call finding, got: {result['findings']}"
+        assert "dangerous_call" in categories, (
+            f"Expected dangerous_call finding, got: {result['findings']}"
+        )
 
         dangerous = [f for f in result["findings"] if f["category"] == "dangerous_call"]
         assert dangerous[0]["severity"] in ("warn", "warning")
@@ -118,7 +126,9 @@ class TestDangerousCall:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src='exec("x=1")\n',
             manifest_dict={
-                "plugin": {"id": "test-exec", "name": "Exec", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-exec", "name": "Exec", "version": "0.1.0", "type": "skill",
+                },
             },
         )
         analyzer = _import_analyzer()
@@ -142,7 +152,9 @@ class TestNetworkMismatch:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src="import requests\n\ndef fetch(): pass\n",
             manifest_dict={
-                "plugin": {"id": "test-net", "name": "Net", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-net", "name": "Net", "version": "0.1.0", "type": "skill",
+                },
                 "permissions": {"network": False},
             },
         )
@@ -162,7 +174,9 @@ class TestNetworkMismatch:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src="import requests\n\ndef fetch(): pass\n",
             manifest_dict={
-                "plugin": {"id": "test-net-ok", "name": "NetOk", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-net-ok", "name": "NetOk", "version": "0.1.0", "type": "skill",
+                },
                 "permissions": {"network": True},
             },
         )
@@ -188,7 +202,9 @@ class TestMissingHook:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src="def my_fn(): pass\n",
             manifest_dict={
-                "plugin": {"id": "test-hook", "name": "Hook", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-hook", "name": "Hook", "version": "0.1.0", "type": "skill",
+                },
                 "hooks": {"on_activate": "hooks/on_activate.py"},
             },
             # hooks={} means no actual hook files written to disk
@@ -209,7 +225,9 @@ class TestMissingHook:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src="def my_fn(): pass\n",
             manifest_dict={
-                "plugin": {"id": "test-hook-ok", "name": "HookOk", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-hook-ok", "name": "HookOk", "version": "0.1.0", "type": "skill",
+                },
                 "hooks": {"on_activate": "hooks/on_activate.py"},
             },
             hooks={"on_activate": "def on_activate(ctx): pass\n"},
@@ -237,7 +255,9 @@ class TestUndefinedSkill:
             # plugin.py has other_fn but NOT my_signal
             plugin_py_src="def other_fn(): pass\n",
             manifest_dict={
-                "plugin": {"id": "test-skill", "name": "Skill", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-skill", "name": "Skill", "version": "0.1.0", "type": "skill",
+                },
                 "skills": {"keys": ["test-skill.my_signal"]},
             },
         )
@@ -257,7 +277,9 @@ class TestUndefinedSkill:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src="def my_signal(): pass\n",
             manifest_dict={
-                "plugin": {"id": "test-skill-ok", "name": "SkillOk", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-skill-ok", "name": "SkillOk", "version": "0.1.0", "type": "skill",
+                },
                 "skills": {"keys": ["test-skill-ok.my_signal"]},
             },
         )
@@ -284,7 +306,9 @@ class TestParseError:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src="def foo(\n",
             manifest_dict={
-                "plugin": {"id": "test-parse", "name": "Parse", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-parse", "name": "Parse", "version": "0.1.0", "type": "skill",
+                },
             },
         )
         analyzer = _import_analyzer()
@@ -307,7 +331,9 @@ class TestParseError:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src="def broken(\n",  # SyntaxError
             manifest_dict={
-                "plugin": {"id": "test-parse2", "name": "Parse2", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-parse2", "name": "Parse2", "version": "0.1.0", "type": "skill",
+                },
                 "hooks": {"on_activate": "hooks/on_activate.py"},
             },
             hooks={"on_activate": "def on_activate(ctx): pass\n"},
@@ -343,7 +369,9 @@ class TestNoCodeExecution:
         plugin_dir, manifest = make_plugin_dir(
             plugin_py_src=side_effect_src,
             manifest_dict={
-                "plugin": {"id": "test-noexec", "name": "NoExec", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-noexec", "name": "NoExec", "version": "0.1.0", "type": "skill",
+                },
             },
         )
         analyzer = _import_analyzer()
@@ -377,7 +405,9 @@ class TestCleanPlugin:
                 "    return signal['price'] * 1.05\n"
             ),
             manifest_dict={
-                "plugin": {"id": "test-clean", "name": "Clean", "version": "0.1.0", "type": "skill"},
+                "plugin": {
+                    "id": "test-clean", "name": "Clean", "version": "0.1.0", "type": "skill",
+                },
                 "skills": {"keys": ["test-clean.compute"]},
                 "permissions": {"network": False},
             },

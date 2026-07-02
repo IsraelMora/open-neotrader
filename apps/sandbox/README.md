@@ -213,13 +213,28 @@ umbral = { default = 0.5 }       # fusionado en context.config para hooks
 
 | Restricción | Mecanismo |
 |---|---|
-| Sin red | `--network=none` (Docker) o `bubblewrap` (nativo) — a nivel OS, no Python |
+| Sin red (aislamiento real, a nivel kernel) | Namespace de red por subproceso (`unshare -rn`, sin privilegios vía user namespaces), aplicado solo al subproceso Python que lanza `SandboxGateway` — ver más abajo |
+| Sin red (advisory, a nivel Python) | `isolation.py` bloquea imports de librerías de red dentro del propio intérprete Python — no es una frontera real por sí sola, ver nota |
 | CPU | `RLIMIT_CPU` = 60 s (override: `$SANDBOX_CPU_SECONDS`) |
 | Memoria virtual | `RLIMIT_AS` = 512 MB (override: `$SANDBOX_MEM_MB`) |
 | File descriptors | `RLIMIT_NOFILE` = 64 (hardcoded) |
 | Usuario | `sandbox` (UID 1001, sin root) — definido en `Dockerfile` |
 
 Los rlimits se aplican vía el módulo `resource` de Python al arrancar. Se omiten silenciosamente en Windows o en contenedores que ya los restringen.
+
+### Aislamiento de red del subproceso Python
+
+El contenedor de `apps/api` necesita salida HTTP propia (proveedores de datos, LLM), así que no es viable aplicar `--network=none` a nivel de todo el contenedor. En su lugar, `SandboxGateway` (en `apps/api`) envuelve **únicamente** el subproceso Python que ejecuta `runner.py` — el que nunca necesita red — con `unshare -rn <python3> runner.py`, creando un network namespace nuevo (sin interfaces salvo loopback) dentro de un user namespace sin privilegios.
+
+Esto se controla con la variable `SANDBOX_NETNS_ISOLATION` (ver tabla de abajo), con tres modos:
+
+- `auto` (default): si el aislamiento está disponible en el host, se aplica. Si no, continúa funcionando SIN aislamiento y solo deja un `log.warn` visible — **no es una garantía dura**.
+- `require`: exige que el aislamiento esté disponible. Si no lo está, el proceso falla al arrancar (fail-fast), no en cada request. **Recomendado en producción.**
+- `off`: desactiva explícitamente el aislamiento de red del subproceso (deja constancia en el log).
+
+Si el kernel del entorno de despliegue tiene deshabilitados los user namespaces sin privilegios (por ejemplo `sysctl kernel.unprivileged_userns_clone=0`), `unshare -rn` fallará y `require` no arrancará. En ese caso, el aislamiento de red debe reforzarse a nivel de política de red del contenedor/pod (NetworkPolicy de Kubernetes, reglas de firewall del host, etc.) en lugar de depender de `unshare`.
+
+`isolation.py` (el guard a nivel Python descrito arriba) sigue siendo solo advisory: bloquea imports de red dentro del propio intérprete, pero no impide que el código del plugin invoque `subprocess`/`ctypes` para intentar salir por otra vía. La frontera real es el network namespace del subproceso, no `isolation.py`.
 
 ---
 
@@ -232,6 +247,7 @@ Los rlimits se aplican vía el módulo `resource` de Python al arrancar. Se omit
 | `SANDBOX_MEM_MB` | `512` | Límite de memoria virtual (MB) |
 | `PYTHONUNBUFFERED` | `1` | Stdout sin buffer (fijado en Dockerfile) |
 | `PYTHONDONTWRITEBYTECODE` | `1` | Sin archivos `.pyc` (fijado en Dockerfile) |
+| `SANDBOX_NETNS_ISOLATION` | `auto` | Se lee en `apps/api`, no en `runner.py`. Controla el aislamiento de red por network namespace del subproceso Python: `auto` (mejor esfuerzo, degrada con warning), `require` (exige aislamiento, falla al arrancar si no está disponible), `off` (desactivado explícitamente) |
 
 ---
 

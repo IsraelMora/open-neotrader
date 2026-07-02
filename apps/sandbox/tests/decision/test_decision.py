@@ -92,3 +92,22 @@ class TestEmitTradeIntent:
         r = plugin.emit_trade_intent(symbol="SPY", action="long", confidence=0.6,
                                      rationale="x", timeframe="1h", _context=None)
         assert r["result"]["timeframe"] == "1h"
+
+    def test_exit_with_malformed_confidence_and_empty_rationale_still_accepted(self, plugin):
+        """An exit only needs symbol+action to close a position. Cosmetic malformed
+        confidence/rationale on an exit must not silently drop it — confidence is
+        clamped into [0, 1] and rationale defaults to a sensible close message."""
+        r = plugin.emit_trade_intent(
+            symbol="SPY", action="exit", confidence=85, rationale="", _context=None,
+        )
+        assert r["ok"] is True
+        res = r["result"]
+        assert 0.0 <= res["confidence"] <= 1.0
+        assert res["rationale"]  # non-empty default
+
+    def test_long_with_malformed_confidence_and_empty_rationale_still_rejected(self, plugin):
+        """Entry validation (long/short) must stay strict — unchanged by the exit fix."""
+        r = plugin.emit_trade_intent(
+            symbol="SPY", action="long", confidence=85, rationale="", _context=None,
+        )
+        assert r["ok"] is False

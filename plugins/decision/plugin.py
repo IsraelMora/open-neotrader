@@ -41,6 +41,33 @@ def emit_trade_intent(
             "error": f"action inválida: {action!r}. Válidas: {sorted(_VALID_ACTIONS)}",
         }
 
+    # "exit"/"hold" only need symbol+action to act (close a position / do nothing).
+    # Cosmetic malformed confidence/rationale on these must NOT hard-reject the intent —
+    # a rejected exit never reaches TradeIntentService and a real position can never be
+    # closed. Instead, clamp confidence into [0, 1] and default an empty rationale.
+    # Strict validation below stays UNCHANGED for "long"/"short" entries.
+    if action in ("exit", "hold"):
+        try:
+            conf = float(confidence)
+        except (TypeError, ValueError):
+            conf = 1.0
+        conf = max(0.0, min(1.0, conf))
+
+        if not isinstance(rationale, str) or not rationale.strip():
+            rationale = "position close" if action == "exit" else "hold — no position change"
+
+        return {
+            "ok": True,
+            "result": {
+                "symbol": symbol.strip().upper(),
+                "action": action,
+                "confidence": round(conf, 4),
+                "rationale": rationale.strip(),
+                "timeframe": timeframe or "1d",
+                "status": "recorded",
+            },
+        }
+
     try:
         conf = float(confidence)
     except (TypeError, ValueError):

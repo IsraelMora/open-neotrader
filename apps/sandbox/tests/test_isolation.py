@@ -13,8 +13,8 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
-import sys
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -224,8 +224,8 @@ class TestOpenGuardStrict:
         allowed.mkdir()
         iso.install_open_guard(allowed_roots=[allowed])
 
-        with pytest.raises(PermissionError):
-            open("/etc/passwd")  # noqa: WPS515
+        with pytest.raises(PermissionError), open("/etc/passwd"):  # noqa: WPS515
+            pass
 
     def test_open_inside_allowed_root_succeeds(self, tmp_path):
         """open() of a file within the allowed root must succeed."""
@@ -254,8 +254,8 @@ class TestOpenGuardStrict:
         iso.install_open_guard(allowed_roots=[plugin_dir])
 
         traversal = str(plugin_dir) + "/../../../etc/passwd"
-        with pytest.raises(PermissionError):
-            open(traversal)  # noqa: WPS515
+        with pytest.raises(PermissionError), open(traversal):  # noqa: WPS515
+            pass
 
 
 # ---------------------------------------------------------------------------

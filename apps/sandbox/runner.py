@@ -28,6 +28,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+
 # ---------------------------------------------------------------------------
 # Sandbox resource limits — applied inside main() before any plugin code runs
 # ---------------------------------------------------------------------------
@@ -56,7 +57,8 @@ def _apply_resource_limits() -> None:
         _resource.setrlimit(_resource.RLIMIT_NOFILE, (64, 64))
 
         # Número de procesos hijo (RLIMIT_NPROC). Default: 64. Override via SANDBOX_MAX_PROCS.
-        # Uses getattr so only NPROC is skipped on platforms that don't support it (e.g. some containers).
+        # Uses getattr so only NPROC is skipped on platforms that don't support it
+        # (e.g. some containers).
         _nproc = getattr(_resource, "RLIMIT_NPROC", None)
         if _nproc is None:
             print("[sandbox] RLIMIT_NPROC not available on this platform", file=sys.stderr)
@@ -516,7 +518,11 @@ def cmd_smoke_test(req: dict) -> dict:
             })
             m = {}
         else:
-            checks.append({"name": "manifest", "status": "passed", "detail": "manifest.toml parseable"})
+            checks.append({
+                "name": "manifest",
+                "status": "passed",
+                "detail": "manifest.toml parseable",
+            })
     except Exception as exc:
         checks.append({"name": "manifest", "status": "failed", "detail": str(exc)})
         m = {}
@@ -560,10 +566,15 @@ def cmd_smoke_test(req: dict) -> dict:
                     "detail": "on_activate function not found in hook file",
                 })
             else:
-                # Hooks receive a plain dict (mirrors cmd_run_hook: ctx = {**context, "config": ...})
+                # Hooks receive a plain dict (mirrors cmd_run_hook:
+                # ctx = {**context, "config": ...})
                 hook_ctx: dict = {"config": config_defaults}
                 fn(hook_ctx)
-                checks.append({"name": "on_activate", "status": "passed", "detail": "on_activate ran without error"})
+                checks.append({
+                    "name": "on_activate",
+                    "status": "passed",
+                    "detail": "on_activate ran without error",
+                })
         except Exception as exc:
             status, detail = _classify(exc)
             checks.append({"name": "on_activate", "status": status, "detail": detail})
@@ -580,7 +591,11 @@ def cmd_smoke_test(req: dict) -> dict:
             # Module load failure → all skill checks fail
             status, detail = _classify(exc)
             for key in declared_keys:
-                checks.append({"name": key, "status": status, "detail": f"module load error: {detail}"})
+                checks.append({
+                    "name": key,
+                    "status": status,
+                    "detail": f"module load error: {detail}",
+                })
             declared_keys = []  # skip per-skill loop below
 
     for key in declared_keys:
@@ -608,7 +623,11 @@ def cmd_smoke_test(req: dict) -> dict:
                 metadata={"config": config_defaults},
             )
             fn(signal={}, _context=skill_ctx)
-            checks.append({"name": key, "status": "passed", "detail": "skill fn called without error"})
+            checks.append({
+                "name": key,
+                "status": "passed",
+                "detail": "skill fn called without error",
+            })
         except Exception as exc:
             status, detail = _classify(exc)
             checks.append({"name": key, "status": status, "detail": detail})
@@ -784,9 +803,30 @@ def cmd_run_cycle(req: dict) -> dict:
     for pid, info in plugins_by_id.items():
         if pid not in active_ids or info["type"] != "skill":
             continue
-        _mod, fn = _load_cycle_hook(pid, info["dir"], info["manifest"], hook_counter)
+        try:
+            _mod, fn = _load_cycle_hook(pid, info["dir"], info["manifest"], hook_counter)
+        except Exception as e:
+            # A hook module can raise at IMPORT time (top-level code, a bad
+            # `from x import y`, etc.) — before on_cycle is ever looked up or
+            # called. Isolate that the same way a call-time exception is
+            # isolated below, so one broken plugin can't take down the whole
+            # cycle for every other active plugin.
+            errors.append({"plugin": pid, "stage": "on_cycle_import", "error": str(e)})
+            hook_counter += 1
+            continue
         hook_counter += 1
         if fn is None:
+            if _mod is not None:
+                # Hook file exists but does not export on_cycle(ctx) — this used to
+                # be silently skipped (dead plugin hook). Warn loudly on stderr so
+                # it's caught during development instead of vanishing without a
+                # trace. stdout MUST stay pure JSON protocol — never print there.
+                print(
+                    f"[sandbox] WARNING: plugin '{pid}' has a cycle hook file but no "
+                    "on_cycle(ctx) function — hook skipped. Did the entrypoint stay "
+                    "as run(ctx) or main()?",
+                    file=sys.stderr,
+                )
             continue
         try:
             hook_ctx = {

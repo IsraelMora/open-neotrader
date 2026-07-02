@@ -101,6 +101,13 @@ model Strategy {
   created_at  DateTime @default(now())
   updated_at  DateTime @updatedAt
 
+  // Walk-forward gate (measurable-veto-shield): real-money execution requires the
+  // CURRENTLY-APPLIED strategy to carry a recent "ROBUSTO" verdict here — see
+  // TradeIntentService._checkWalkForwardGate(). Set by BacktestService.runWalkForward()
+  // via StrategyService.recordWalkForward(); best-effort, never blocks the backtest itself.
+  walk_forward_verdict     String?   // "ROBUSTO" | "SOBREAJUSTADO" | "INSUFICIENTE_DATOS" | null
+  walk_forward_checked_at  DateTime?
+
   @@map("strategies")
 }
 
@@ -198,9 +205,46 @@ model MlSignalRecord {
   @@map("ml_signal_record")
 }
 
+// Immutable veto decision ledger — one row per proposed signal per cycle, capturing
+// what the veto layer decided (approved/blocked/modified) and enough context to
+// reconstruct the counterfactual offline. cf_* fields are NULL at write time and
+// backfilled later by a separate read-side analyzer (no lookahead), mirroring the
+// outcome_pnl pattern on MlSignalRecord.
+model VetoDecision {
+  id                     String   @id @default(uuid())
+  ts                     DateTime @default(now())
+  cycle_id               String
+  symbol                 String
+  source_plugin          String
+  signal_confidence      Float?
+  proposed_action        String
+  proposed_qty           Float
+  verdict                String              // "approved" | "blocked" | "modified"
+  approved_action        String?
+  approved_qty           Float?
+  discipline             String?
+  rationale              String?
+  ref_price              Float?
+  regime_tags            String?
+  portfolio_drawdown_pct Float?
+  context_snapshot       String?             // JSON: proposed signal + market context for offline counterfactual reconstruction
+  cf_pnl                 Float?              // counterfactual P&L — NULL at write, backfilled later by read-side analyzer (NO lookahead)
+  cf_method              String?
+  cf_evaluated_at        DateTime?
+
+  @@index([cycle_id])
+  @@index([symbol])
+  @@index([ts])
+  @@index([verdict])
+  @@map("veto_decisions")
+}
+
 // HITL paper trade-execution layer.
 // Records LLM trade decisions (TradeIntent) for human review before paper execution.
-// Real-money execution is intentionally NOT wired — only mode="paper" is supported.
+// Real-money execution IS possible but gated at the service layer, not disabled: the
+// effective mode is derived from ExecutionPolicy (execution.real=true AND a
+// broker_plugin_id AND a fresh ROBUSTO walk-forward verdict) — the `mode` column below
+// is not the source of truth for whether an order ends up paper or real.
 model TradeIntent {
   id            String    @id @default(cuid())
   cycle_id      String?
@@ -209,8 +253,8 @@ model TradeIntent {
   confidence    Float
   rationale     String
   timeframe     String    @default("1d")
-  mode          String    @default("paper") // always "paper"; real-money is hard-disabled
-  status        String    @default("pending") // "pending" | "approved" | "rejected" | "executed" | "failed"
+  mode          String    @default("paper") // stored value; effective mode is gated, see ExecutionPolicy above
+  status        String    @default("pending") // "pending" | "approved" | "rejected" | "real_pending" | "executed" | "failed"
   created_at    DateTime  @default(now())
   decided_at    DateTime?
   decided_by    String?
@@ -220,10 +264,84 @@ model TradeIntent {
   realized_pnl  Float?
   result_json   String?   // JSON: execution details
 
+  realOrders    RealOrder[]
+
   @@index([status])
   @@index([created_at])
   @@index([cycle_id])
   @@map("trade_intents")
+}
+
+// Real-money order tracking — one row per broker order submitted for a TradeIntent
+// executed in real mode. Tracks the full lifecycle (submit → poll → fill/error) so
+// the fill price/qty used for accounting comes from the broker, not a pre-order quote.
+//
+// One-active-order-per-intent invariant (DB-enforced): at most one row per
+// trade_intent_id may have a status outside {filled, canceled, rejected, expired,
+// submit_failed} at any time. Prisma's DSL cannot express a partial unique index, so
+// this is a raw-SQL constraint added in
+// prisma/migrations/0016_real_order_active_intent_unique/migration.sql — see
+// RealOrderService.submit() for the matching app-level guard + P2002 race handling.
+model RealOrder {
+  id                 String    @id @default(cuid())
+  trade_intent_id    String
+  broker_plugin_id   String
+  client_order_id    String    @unique
+  broker_order_id    String?
+  symbol             String
+  side               String
+  order_type         String    @default("market")
+  requested_qty      Float
+  limit_price        Float?
+  status             String    @default("pending_submit")
+  filled_qty         Float     @default(0)
+  filled_avg_price   Float?
+  submitted_at       DateTime?
+  filled_at          DateTime?
+  last_reconciled_at DateTime?
+  broker_raw_json    String?
+  error              String?
+  created_at         DateTime  @default(now())
+  updated_at         DateTime  @updatedAt
+  tradeIntent        TradeIntent @relation(fields: [trade_intent_id], references: [id])
+  @@index([status])
+  @@index([broker_order_id])
+  @@index([client_order_id])
+  @@index([trade_intent_id])
+  @@map("real_orders")
+}
+
+// Real-money position snapshot — one row per symbol, kept in sync with the broker's
+// reported position (best-effort polling), replacing the paper-only Portfolio KV rows.
+model RealPosition {
+  symbol            String    @id
+  broker_plugin_id  String
+  qty               Float
+  avg_entry         Float
+  market_value      Float
+  unrealized_pnl    Float
+  side              String
+  last_synced_at    DateTime  @updatedAt
+  @@map("real_positions")
+}
+
+// Real-money NAV history — periodic snapshots of broker account equity/cash/buying
+// power, replacing the paper-only NavSnapshot for the real-money accounting path.
+model RealNavSnapshot {
+  id                String    @id @default(uuid())
+  ts                DateTime  @default(now())
+  broker_plugin_id  String
+  equity            Float
+  cash              Float
+  buying_power      Float
+  positions         String
+  total_pnl         Float     @default(0)
+  hwm               Float
+  source            String    @default("poll")
+  meta              String?
+  @@index([ts])
+  @@index([broker_plugin_id, ts])
+  @@map("real_nav_snapshots")
 }
 
 // Cartera virtual de pretest — permite probar configuraciones distintas antes de usar dinero real

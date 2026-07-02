@@ -20,6 +20,7 @@ operator, metadata only) so smoke results are faithful in production.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -84,7 +85,9 @@ def _load_runner(plugins_dir: Path):
     return mod
 
 
-def _make_manifest_toml(plugin_id: str, skills: list[str] | None = None, hooks: dict | None = None) -> str:
+def _make_manifest_toml(
+    plugin_id: str, skills: list[str] | None = None, hooks: dict | None = None
+) -> str:
     """Build minimal manifest.toml TOML content."""
     skill_list = skills or []
     keys_toml = ", ".join(f'"{k}"' for k in skill_list)
@@ -221,7 +224,9 @@ def _make_plugin_syntax_error(plugins_dir: Path, plugin_id: str = "syntax-plugin
     return plugin_dir
 
 
-def _make_plugin_import_error_activate(plugins_dir: Path, plugin_id: str = "importerr-plugin") -> Path:
+def _make_plugin_import_error_activate(
+    plugins_dir: Path, plugin_id: str = "importerr-plugin"
+) -> Path:
     """
     on_activate raises ImportError → result='failed'.
     """
@@ -506,16 +511,16 @@ class TestSmokeTestMissingDir:
 
         monkeypatch.setenv("SANDBOX_STRICT", "false")
 
-        with __import__("unittest.mock", fromlist=["patch"]).patch(
-            "sys.stdin", io.StringIO(request_json)
-        ):
-            with __import__("unittest.mock", fromlist=["patch"]).patch(
+        with (
+            __import__("unittest.mock", fromlist=["patch"]).patch(
+                "sys.stdin", io.StringIO(request_json)
+            ),
+            __import__("unittest.mock", fromlist=["patch"]).patch(
                 "sys.stdout", output_buf
-            ):
-                try:
-                    runner.main()
-                except SystemExit:
-                    pass
+            ),
+            contextlib.suppress(SystemExit),
+        ):
+            runner.main()
 
         output = output_buf.getvalue().strip()
         assert output, "Runner produced no stdout for missing plugin"
@@ -542,16 +547,16 @@ class TestSmokeTestDispatch:
 
         monkeypatch.setenv("SANDBOX_STRICT", "false")
 
-        with __import__("unittest.mock", fromlist=["patch"]).patch(
-            "sys.stdin", io.StringIO(request_json)
-        ):
-            with __import__("unittest.mock", fromlist=["patch"]).patch(
+        with (
+            __import__("unittest.mock", fromlist=["patch"]).patch(
+                "sys.stdin", io.StringIO(request_json)
+            ),
+            __import__("unittest.mock", fromlist=["patch"]).patch(
                 "sys.stdout", output_buf
-            ):
-                try:
-                    runner.main()
-                except SystemExit:
-                    pass
+            ),
+            contextlib.suppress(SystemExit),
+        ):
+            runner.main()
 
         output = output_buf.getvalue().strip()
         assert output, "Runner produced no stdout"

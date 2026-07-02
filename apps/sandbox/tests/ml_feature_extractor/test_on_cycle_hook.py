@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -116,7 +115,9 @@ def _load_model_module():
     if scripts_str not in sys.path:
         sys.path.insert(0, scripts_str)
 
-    spec = importlib.util.spec_from_file_location("ml_model_for_hook_test", str(_SCRIPTS_DIR / "model.py"))
+    spec = importlib.util.spec_from_file_location(
+        "ml_model_for_hook_test", str(_SCRIPTS_DIR / "model.py")
+    )
     assert spec is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
@@ -225,7 +226,7 @@ class TestOnCycleHookWithValidBlob:
         out_signals = result.get("pending_signals", [])
         assert len(out_signals) == len(signals), "Signal count must not change"
 
-        for orig, out in zip(signals, out_signals):
+        for orig, out in zip(signals, out_signals, strict=True):
             # symbol and action MUST be unchanged
             assert out["symbol"] == orig["symbol"], f"symbol changed for {orig}"
             assert out["action"] == orig["action"], f"action changed for {orig}"
@@ -353,10 +354,13 @@ class TestOnCycleHookMissingKey:
         """Spec step 4: key absent from multipliers dict → multiplier = 1.0."""
         if hasattr(hook, "_apply_multipliers"):
             # Use _apply_multipliers with empty dict → no key → identity
-            sigs = [{"plugin_id": "unknown-plugin", "symbol": "XYZ", "action": "buy", "confidence": 0.6}]
+            sigs = [
+                {"plugin_id": "unknown-plugin", "symbol": "XYZ", "action": "buy", "confidence": 0.6}
+            ]
             result_sigs = hook._apply_multipliers([dict(s) for s in sigs], {})
             assert abs(result_sigs[0]["confidence"] - 0.6) < 1e-9, (
-                f"Missing key must default to 1.0 multiplier; expected 0.6, got {result_sigs[0]['confidence']}"
+                "Missing key must default to 1.0 multiplier; "
+                f"expected 0.6, got {result_sigs[0]['confidence']}"
             )
         else:
             # With a trained blob, signals with unknown plugin_ids not in training data
@@ -414,7 +418,9 @@ class TestOnCycleHookNeverFlip:
         """conf > 0 × multiplier ∈ [0.5, 1.5] → conf > 0 (direction preserved structurally)."""
         if hasattr(hook, "_apply_multipliers"):
             for m in [0.5, 0.7, 1.0, 1.2, 1.5]:
-                sigs = [{"plugin_id": "skill-a", "symbol": "AAPL", "action": "buy", "confidence": 0.5}]
+                sigs = [
+                    {"plugin_id": "skill-a", "symbol": "AAPL", "action": "buy", "confidence": 0.5}
+                ]
                 result_sigs = hook._apply_multipliers([dict(s) for s in sigs], {"skill-a|AAPL": m})
                 assert result_sigs[0]["confidence"] > 0.0, (
                     f"Confidence went to 0 with multiplier {m}"

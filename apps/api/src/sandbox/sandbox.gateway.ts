@@ -1,9 +1,13 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { spawn } from 'child_process';
 import * as path from 'path';
 import type { PluginManifest } from '../plugins/manifest';
 import { readManifest } from '../plugins/manifest';
+import { buildSandboxSpawnCommand, detectNetnsIsolation } from './netns-detect';
+
+/** SANDBOX_NETNS_ISOLATION modes — see SandboxGateway.onModuleInit for semantics. */
+export type NetnsIsolationMode = 'auto' | 'require' | 'off';
 
 export interface SandboxRequest {
   cmd: string; // abierto: cualquier comando que runner.py soporte
@@ -83,7 +87,7 @@ export function resolveCredentials(
 
 /** Puerta de entrada al sandbox Python (runner.py): ejecuta plugins de forma aislada enviando JSON por stdin/stdout. */
 @Injectable()
-export class SandboxGateway {
+export class SandboxGateway implements OnModuleInit {
   private readonly log = new Logger(SandboxGateway.name);
   private readonly timeout: number;
   private readonly runnerPath: string;
@@ -95,6 +99,11 @@ export class SandboxGateway {
   private readonly sandboxStrict: boolean;
   /** Intérprete Python. Default resuelto por PATH (respeta venvs/pyenv); override con PYTHON3_BIN. */
   private readonly python3Bin: string;
+
+  /** SANDBOX_NETNS_ISOLATION: 'auto' (default) | 'require' | 'off'. */
+  private readonly netnsMode: NetnsIsolationMode;
+  /** Resolved by onModuleInit; whether the python subprocess spawn is netns-wrapped. */
+  private netnsActive = false;
 
   constructor(cfg: ConfigService) {
     this.python3Bin = cfg.get<string>('PYTHON3_BIN', 'python3');
@@ -115,6 +124,52 @@ export class SandboxGateway {
     this.memMb = cfg.get<number>('SANDBOX_MEM_MB', 512);
     // Default true (prod-safe). Set SANDBOX_STRICT=false only for bare-metal dev.
     this.sandboxStrict = cfg.get<string>('SANDBOX_STRICT', 'true') !== 'false';
+    this.netnsMode = cfg.get<string>('SANDBOX_NETNS_ISOLATION', 'auto') as NetnsIsolationMode;
+  }
+
+  /**
+   * Resolves per-subprocess network-namespace isolation for the python sandbox child
+   * according to SANDBOX_NETNS_ISOLATION:
+   *   - 'off': explicit opt-out. No isolation, no probing. Logs once, visibly.
+   *   - 'require': hard guarantee. If netns isolation is unavailable, FAILS FAST here
+   *     at startup (not per-request, not silently) so the app never boots without it.
+   *   - 'auto' (default): best-effort. If unavailable, logs a prominent warning and
+   *     continues WITHOUT isolation — this is NOT a hard guarantee, only 'require' is.
+   */
+  async onModuleInit(): Promise<void> {
+    if (this.netnsMode === 'off') {
+      this.netnsActive = false;
+      this.log.warn(
+        'SANDBOX_NETNS_ISOLATION=off — sandbox network isolation is intentionally disabled; ' +
+          'plugin code running in the sandbox subprocess can reach the network.',
+      );
+      return;
+    }
+
+    const detected = await detectNetnsIsolation();
+
+    if (detected) {
+      this.netnsActive = true;
+      return;
+    }
+
+    if (this.netnsMode === 'require') {
+      throw new Error(
+        'SANDBOX_NETNS_ISOLATION=require but unprivileged network-namespace (netns) ' +
+          'isolation is not available on this host (unshare -rn failed). Refusing to start: ' +
+          'the sandbox subprocess would run with unrestricted network egress. ' +
+          'Check that user namespaces are enabled (e.g. sysctl kernel.unprivileged_userns_clone) ' +
+          'or enforce egress at the container/pod network-policy level instead.',
+      );
+    }
+
+    // netnsMode === 'auto' and detection failed: fail-loud (log), never fail-silent, never fail-hard.
+    this.netnsActive = false;
+    this.log.warn(
+      'SANDBOX_NETNS_ISOLATION=auto but network-namespace isolation is NOT available on this ' +
+        'host — sandbox subprocess network isolation is NOT enforced, plugin code could reach ' +
+        'the network. Set SANDBOX_NETNS_ISOLATION=require to fail startup instead of degrading silently.',
+    );
   }
 
   /** Envía un comando al runner.py y retorna la respuesta parseada. Mata el proceso si supera el timeout. */
@@ -132,7 +187,12 @@ export class SandboxGateway {
         memMb: this.memMb,
         sandboxStrict: this.sandboxStrict,
       });
-      const proc = spawn(this.python3Bin, [this.runnerPath], {
+      const { command, args } = buildSandboxSpawnCommand(
+        this.python3Bin,
+        this.runnerPath,
+        this.netnsActive,
+      );
+      const proc = spawn(command, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: sandboxEnv,
       });

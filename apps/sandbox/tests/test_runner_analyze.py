@@ -13,6 +13,7 @@ Contract:
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -94,7 +95,9 @@ class TestRunnerAnalyzeDispatch:
         assert result.get("ok") is True, f"Expected ok=True, got: {result}"
         assert "findings" in result, f"Expected 'findings' key, got: {result.keys()}"
         assert isinstance(result["findings"], list), "findings must be a list"
-        assert result["findings"] == [], f"Expected no findings for clean plugin, got: {result['findings']}"
+        assert result["findings"] == [], (
+            f"Expected no findings for clean plugin, got: {result['findings']}"
+        )
 
     def test_runner_analyze_dispatch_returns_findings(self, plugins_dir):
         """
@@ -144,16 +147,16 @@ class TestRunnerAnalyzeDispatch:
 
         monkeypatch.setenv("SANDBOX_STRICT", "false")  # avoid installing guards in test
 
-        with __import__("unittest.mock", fromlist=["patch"]).patch(
-            "sys.stdin", io.StringIO(request_json)
-        ):
-            with __import__("unittest.mock", fromlist=["patch"]).patch(
+        with (
+            __import__("unittest.mock", fromlist=["patch"]).patch(
+                "sys.stdin", io.StringIO(request_json)
+            ),
+            __import__("unittest.mock", fromlist=["patch"]).patch(
                 "sys.stdout", output_buf
-            ):
-                try:
-                    runner.main()
-                except SystemExit:
-                    pass
+            ),
+            contextlib.suppress(SystemExit),
+        ):
+            runner.main()
 
         output = output_buf.getvalue().strip()
         assert output, "Runner produced no stdout output"
@@ -168,7 +171,6 @@ class TestRunnerAnalyzeDispatch:
         cmd_analyze_plugin MUST NOT call _load_module.
         Verified by patching _load_module to raise if called.
         """
-        from unittest.mock import patch
 
         plugin_id = _make_clean_plugin(plugins_dir)
         runner = _load_runner(plugins_dir)

@@ -17,18 +17,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from ensemble import analyze_ensemble  # type: ignore[import]
 
 
-def run(ctx: dict) -> dict:
+def on_cycle(ctx: dict) -> dict:
     """
-    Entrada del hook. `ctx` es el contexto de ciclo del agente.
-    Devuelve el contexto actualizado con las señales ensemble.
+    Entrada del hook de ciclo. `ctx` es el contexto de ciclo del agente
+    (ver runner.py cmd_run_cycle: config viene en ctx["config"]).
+
+    Devuelve el contrato estándar de skill hooks: {"signals": [...], "logs": [...]}.
     """
-    config = ctx.get("plugin_config", {})
+    config = ctx.get("config", {})
     price_data = ctx.get("price_data", {})  # {symbol: [float, ...]}
+    logs: list[dict] = []
 
     if not price_data:
-        ctx.setdefault("ensemble_signals", {})
-        ctx.setdefault("log", []).append("[ensemble] No hay datos de precios en el contexto")
-        return ctx
+        logs.append({"level": "debug", "msg": "[ensemble] No hay datos de precios en el contexto"})
+        return {"signals": [], "logs": logs}
 
     ensemble_signals: dict[str, dict] = {}
 
@@ -40,13 +42,11 @@ def run(ctx: dict) -> dict:
         result = analyze_ensemble(symbol, [float(p) for p in prices], config)
         ensemble_signals[symbol] = result
 
-    ctx["ensemble_signals"] = ensemble_signals
-
-    # Inyectar señales como pending_signals para que el risk-manager las procese
-    pending: list[dict] = ctx.get("pending_signals", [])
+    # Nuevas señales generadas por este plugin (el runner las tagea con _plugin)
+    signals: list[dict] = []
     for symbol, sig in ensemble_signals.items():
         if sig.get("signal", 0) != 0:
-            pending.append(
+            signals.append(
                 {
                     "symbol": symbol,
                     "action": "buy" if sig["signal"] == 1 else "sell",
@@ -59,18 +59,17 @@ def run(ctx: dict) -> dict:
                 }
             )
 
-    ctx["pending_signals"] = pending
-
     active = sum(1 for s in ensemble_signals.values() if s.get("signal", 0) != 0)
-    ctx.setdefault("log", []).append(
-        f"[ensemble] {len(ensemble_signals)} símbolos analizados, {active} señales activas"
-    )
+    logs.append({
+        "level": "info",
+        "msg": f"[ensemble] {len(ensemble_signals)} símbolos analizados, {active} señales activas",
+    })
 
-    return ctx
+    return {"signals": signals, "logs": logs}
 
 
 if __name__ == "__main__":
     raw = sys.stdin.read()
     ctx = json.loads(raw)
-    out = run(ctx)
+    out = on_cycle(ctx)
     print(json.dumps(out))

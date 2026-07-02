@@ -1,0 +1,106 @@
+# NeuroTrader CI — main build/test pipeline for the TypeScript monorepo and Python sandbox.
+#
+# Runs on every push to master and on every pull request.
+# Two independent jobs:
+#   - ts:     pnpm workspace lint + build + test (with Prisma clients generated)
+#   - python: ruff lint + pytest for apps/sandbox and packages/plugin-sdk
+
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  ts:
+    name: TypeScript (lint + build + test)
+    runs-on: ubuntu-latest
+
+    # apps/api tests boot real NestJS modules (e.g. agents.service.spec.ts "REAL NestJS
+    # module compile" tests) that transitively initialize LongTermMemory/ML/real-money
+    # services through the real PrismaService — they need an actually-migrated schema,
+    # not just a generated client. Point DATABASE_URL at a throwaway sqlite file for the
+    # whole job (never the committed dev DB) and apply migrations before running tests,
+    # so `prisma migrate deploy` and the test run see the same DB.
+    env:
+      DATABASE_URL: file:${{ github.workspace }}/apps/api/ci-test.db
+      # The "REAL NestJS module compile" tests boot AgentsModule, which pulls in
+      # AuthModule/JwtStrategy — both `getOrThrow('JWT_SECRET')` at construction. Provide a
+      # throwaway CI value (NOT a real secret) so module init doesn't throw in CI.
+      JWT_SECRET: ci-test-only-not-a-real-secret
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client (api)
+        run: pnpm --filter=@neurotrader/api exec prisma generate
+
+      - name: Generate Prisma client (store)
+        run: pnpm --filter=neurotrader-store exec prisma generate
+
+      - name: Apply migrations to fresh test DB (api)
+        run: pnpm --filter=@neurotrader/api exec prisma migrate deploy
+
+      # The api's ConfigModule reads apps/api/.env (envFilePath default), which is how
+      # JWT_SECRET is provided locally. Real-module-compile tests getOrThrow('JWT_SECRET'),
+      # so create a throwaway .env for CI (gitignored; never a real secret).
+      - name: Create CI .env for apps/api
+        run: |
+          printf 'JWT_SECRET=ci-test-only-not-a-real-secret\nDATABASE_URL=%s\n' "$DATABASE_URL" > apps/api/.env
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test
+
+  python:
+    name: Python (ruff + pytest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ruff pytest
+          python3 -m pip install -r apps/sandbox/requirements.txt
+
+      - name: Ruff check (apps/sandbox)
+        run: ruff check apps/sandbox
+
+      - name: Ruff check (packages/plugin-sdk)
+        run: ruff check packages/plugin-sdk
+
+      - name: Pytest (apps/sandbox)
+        run: python3 -m pytest
+        working-directory: apps/sandbox
+
+      - name: Pytest (packages/plugin-sdk)
+        run: python3 -m pytest
+        working-directory: packages/plugin-sdk

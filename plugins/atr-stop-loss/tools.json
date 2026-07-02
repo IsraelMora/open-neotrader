@@ -2,7 +2,7 @@
   {
     "name": "calculate_atr_stop",
     "description": "Calcula stop loss dinámico basado en ATR para una nueva señal de entrada. SIEMPRE llama este tool antes de ejecutar una operación para obtener el stop loss adaptativo a la volatilidad actual del activo.",
-    "input_schema": {
+    "parameters": {
       "type": "object",
       "properties": {
         "symbol":         { "type": "string", "description": "Ticker del activo" },
@@ -18,7 +18,7 @@
   {
     "name": "update_trailing_stop",
     "description": "Actualiza el trailing stop de una posición abierta. Llama en cada ciclo para cada posición en cartera. El stop solo se mueve a favor de la posición (nunca en contra).",
-    "input_schema": {
+    "parameters": {
       "type": "object",
       "properties": {
         "symbol":          { "type": "string", "description": "Ticker del activo" },

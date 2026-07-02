@@ -16,8 +16,6 @@ import os
 import sys
 from pathlib import Path
 
-import pytest
-
 RUNNER_PATH = Path(__file__).parent.parent / "runner.py"
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
 

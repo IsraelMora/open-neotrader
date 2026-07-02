@@ -11,8 +11,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import pytest
-
 # ---------------------------------------------------------------------------
 # Helpers to load the plugin hook and scripts without installing the package
 # ---------------------------------------------------------------------------
@@ -131,3 +129,17 @@ def test_default_config_returns_non_empty_list():
     assert isinstance(result["universe"], list)
     assert len(result["universe"]) > 0, "Default config returned an empty universe"
     assert result["count"] == len(result["universe"])
+
+
+# ---------------------------------------------------------------------------
+# (f) on_activate discloses the curated universe snapshot date (survivorship
+#     bias disclosure) via an additive "as_of" key.
+# ---------------------------------------------------------------------------
+
+
+def test_on_activate_includes_as_of_snapshot_date():
+    curated = _get_curated()
+    result = _activate(["nasdaq100"])
+    assert result["ok"] is True
+    assert result["as_of"] == curated.UNIVERSE_SNAPSHOT_DATE
+    assert result["as_of"] == "2026-06-30"

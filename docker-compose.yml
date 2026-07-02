@@ -23,6 +23,10 @@ services:
       SANDBOX_TIMEOUT_MS: ${SANDBOX_TIMEOUT_MS:-60000}
       SANDBOX_CPU_SECONDS: ${SANDBOX_CPU_SECONDS:-60}
       SANDBOX_MEM_MB: ${SANDBOX_MEM_MB:-512}
+      # auto (default) = apply netns isolation when available, degrade with a log
+      # warning otherwise; require = fail startup if isolation isn't available
+      # (recommended for production hardening); off = explicitly disabled.
+      SANDBOX_NETNS_ISOLATION: ${SANDBOX_NETNS_ISOLATION:-auto}
       PLUGINS_DIR: /plugins
       PLUGIN_SDK_PATH: /opt/plugin-sdk
       # Auth

@@ -6,13 +6,10 @@ Verifies that runner.py calls isolation.apply() before loading any plugin module
 """
 from __future__ import annotations
 
+import contextlib
 import json
-import os
-import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 SANDBOX_DIR = Path(__file__).parent.parent
 RUNNER_PATH = SANDBOX_DIR / "runner.py"
@@ -63,7 +60,6 @@ class TestIsolationWiredIntoRunner:
 
         # Patch isolation.apply to track calls
         import isolation as iso_real  # noqa: F401 — must exist after isolation.py created
-        original_apply = iso_real.apply
 
         def tracking_apply(*args, **kwargs):
             apply_calls.append(True)
@@ -85,14 +81,13 @@ class TestIsolationWiredIntoRunner:
                 "context": {}
             })
             monkeypatch.setattr("sys.stdin", __import__("io").StringIO(request_json))
-            import io
             from unittest.mock import patch as up
-            with up("sys.stdin", __import__("io").StringIO(request_json)):
-                with up("sys.stdout", __import__("io").StringIO()) as mock_out:
-                    try:
-                        mod.main()
-                    except SystemExit:
-                        pass
+            with (
+                up("sys.stdin", __import__("io").StringIO(request_json)),
+                up("sys.stdout", __import__("io").StringIO()),
+                contextlib.suppress(SystemExit),
+            ):
+                mod.main()
 
         # isolation.apply was called
         assert len(apply_calls) >= 1, "isolation.apply() was not called during runner.main()"
@@ -126,12 +121,12 @@ class TestIsolationWiredIntoRunner:
         })
 
         output_buf = io.StringIO()
-        with up("sys.stdin", io.StringIO(request_json)):
-            with up("sys.stdout", output_buf):
-                try:
-                    mod.main()
-                except SystemExit:
-                    pass
+        with (
+            up("sys.stdin", io.StringIO(request_json)),
+            up("sys.stdout", output_buf),
+            contextlib.suppress(SystemExit),
+        ):
+            mod.main()
 
         output = output_buf.getvalue().strip()
         assert output, "runner produced no output"
