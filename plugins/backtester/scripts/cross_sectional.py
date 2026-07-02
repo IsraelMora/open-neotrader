@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import math
 from datetime import date as _date
-from typing import Any
 
 
 def _annualized_metrics(
@@ -101,7 +100,7 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     max_leverage = float(config.get("max_leverage", 1.0))
 
     # Common trading dates across the ENTIRE universe (so every symbol has a price).
-    date_sets = [set(b["date"] for b in bars) for bars in prices.values() if bars]
+    date_sets = [{b["date"] for b in bars} for bars in prices.values() if bars]
     if not date_sets:
         return {"ok": False, "error": "Empty price series"}
     common = sorted(set.intersection(*date_sets))

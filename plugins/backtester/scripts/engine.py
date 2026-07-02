@@ -117,7 +117,9 @@ def run_backtest(
 
     _all_dates = sorted({d for idx in price_index.values() for d in idx})
     if len(_all_dates) >= 2:
-        span_days = max((_date.fromisoformat(_all_dates[-1]) - _date.fromisoformat(_all_dates[0])).days, 1)
+        span_days = max(
+            (_date.fromisoformat(_all_dates[-1]) - _date.fromisoformat(_all_dates[0])).days, 1
+        )
     else:
         span_days = 1
 
@@ -344,7 +346,7 @@ def run_backtest(
     # y aguantar hasta el CIERRE de la última. El benchmark del universo es el
     # promedio equal-weight de esos retornos. Alpha = estrategia − benchmark.
     bh_returns: list[float] = []
-    for symbol, bars in prices.items():
+    for _symbol, bars in prices.items():
         if len(bars) < 1:
             continue
         ordered = sorted(bars, key=lambda b: b["date"])

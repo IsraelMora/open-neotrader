@@ -13,8 +13,9 @@ Modeled on the standard on_cycle hook contract:
 
 from __future__ import annotations
 
-import sys
+import json
 import os.path as _osp
+import sys
 
 sys.path.insert(0, _osp.join(_osp.dirname(__file__), "..", "scripts"))
 from trend_following import analyze  # noqa: E402

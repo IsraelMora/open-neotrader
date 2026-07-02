@@ -3,10 +3,11 @@ on_cycle hook — Market Context (merged market-breadth + volatility-regime).
 
 Sets on ctx (market-breadth output contract, preserved):
   market_breadth_score        : float 0-100
-  market_breadth_regime       : "bullish" | "neutral" | "bearish" | "extreme_bullish" | "extreme_bearish"
+  market_breadth_regime       : "bullish" | "neutral" | "bearish" | "extreme_bullish" |
+                                "extreme_bearish"
   market_breadth_divergence   : None | "bearish_divergence" | "bullish_divergence"
-  market_breadth_details      : dict with ad_ratio, pct_above_ma, mcclellan_osc, nh_nl_ratio,
-                                breadth_thrust, details
+  market_breadth_details      : dict with ad_ratio, pct_above_ma, mcclellan_osc,
+                                nh_nl_ratio, breadth_thrust, details
   emit_alerts                 : list — may receive CORRELATION_SPIKE entries
 
 Emits in returned signals list (volatility-regime output contract, preserved):
@@ -60,7 +61,9 @@ def on_cycle(ctx: dict) -> dict:
         ctx["market_breadth_regime"] = "neutral"
         ctx["market_breadth_details"] = {"note": "no A/D data"}
         ctx["market_breadth_divergence"] = None
-        logs.append({"level": "debug", "msg": "No advance/decline data; breadth defaulted to neutral"})
+        logs.append(
+            {"level": "debug", "msg": "No advance/decline data; breadth defaulted to neutral"}
+        )
     else:
         breadth = compute_breadth(
             advances=list(advances),
@@ -152,7 +155,10 @@ def on_cycle(ctx: dict) -> dict:
             )
     else:
         logs.append(
-            {"level": "warning", "msg": "No active provider. Volatility regime cannot be determined."}
+            {
+                "level": "warning",
+                "msg": "No active provider. Volatility regime cannot be determined.",
+            }
         )
         return {"signals": signals, "logs": logs}
 

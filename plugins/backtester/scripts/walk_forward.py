@@ -23,8 +23,8 @@ _SCRIPTS_STR = str(_SCRIPTS_DIR)
 if _SCRIPTS_STR not in sys.path:
     sys.path.insert(0, _SCRIPTS_STR)
 
-from generate import generate_signals
-from engine import run_backtest
+from engine import run_backtest  # noqa: E402
+from generate import generate_signals  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Pure helper functions (testable without IO)
@@ -153,9 +153,6 @@ def run_walk_forward(
 
         if is_end_idx < 20 or oos_end_idx > n or oos_start_idx >= oos_end_idx:
             continue
-
-        is_bars = ref_bars[:is_end_idx]
-        oos_bars = ref_bars[oos_start_idx:oos_end_idx]
 
         # Build per-symbol slices for both windows.
         is_prices = _slice_prices(prices, 0, is_end_idx)

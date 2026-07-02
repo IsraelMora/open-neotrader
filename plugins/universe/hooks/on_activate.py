@@ -32,7 +32,9 @@ def on_activate(ctx: dict) -> dict:
 
     symbols = get_universe(markets, config)
 
-    active = [m for m in markets if m in ("nasdaq100", "crypto-defi", "etf-thematic", "forex-majors")]
+    active = [
+        m for m in markets if m in ("nasdaq100", "crypto-defi", "etf-thematic", "forex-majors")
+    ]
     markets_label = ", ".join(active) if active else ", ".join(markets)
 
     return {

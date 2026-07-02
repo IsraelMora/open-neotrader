@@ -60,7 +60,9 @@ def check_plugin_files(plugin_ids: list[str]) -> CheckResult:
     )
 
 
-def check_credentials(required_vars: list[str], available: dict[str, str] | None = None) -> CheckResult:
+def check_credentials(
+    required_vars: list[str], available: dict[str, str] | None = None
+) -> CheckResult:
     """Verifica que las credenciales requeridas están disponibles.
 
     Since F1, credentials are no longer in the sandbox environment. Callers must

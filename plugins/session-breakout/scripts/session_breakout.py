@@ -71,7 +71,6 @@ def analyze(bars: list[dict], config: dict) -> dict:
           gap_pct     (float) — overnight gap % (positive = gap-up, negative = gap-down)
     """
     gap_threshold = float(config.get("gap_threshold_pct", 1.0))
-    breakout_buffer = float(config.get("breakout_buffer_pct", 0.1))
 
     # --- guard: need at least 2 bars (prev + today) ---
     if len(bars) < MIN_BARS:

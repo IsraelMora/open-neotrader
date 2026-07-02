@@ -35,7 +35,6 @@ Returns:
 
 from __future__ import annotations
 
-
 # ---------------------------------------------------------------------------
 # EMA helper
 # ---------------------------------------------------------------------------
@@ -103,7 +102,7 @@ def _macd_vote(
 
     # Align: fast_ema is longer by (slow - fast).
     offset = slow - fast
-    macd_line = [f - s for f, s in zip(fast_ema[offset:], slow_ema)]
+    macd_line = [f - s for f, s in zip(fast_ema[offset:], slow_ema, strict=True)]
 
     signal_line = _ema(macd_line, signal_period)
     if not signal_line:
@@ -167,7 +166,7 @@ def _ichimoku_vote(
     min_len = min(len(tenkan_series), len(kijun_series))
     senkou_a_series = [
         (t + k) / 2.0
-        for t, k in zip(tenkan_series[-min_len:], kijun_series[-min_len:])
+        for t, k in zip(tenkan_series[-min_len:], kijun_series[-min_len:], strict=True)
     ]
 
     if not senkou_a_series:

@@ -48,7 +48,12 @@ def on_cycle(ctx: dict) -> dict:
             continue
 
         if not bars or len(bars) < lookback:
-            logs.append({"level": "warning", "msg": f"{symbol}: insufficient data ({len(bars) if bars else 0} bars)"})
+            logs.append(
+                {
+                    "level": "warning",
+                    "msg": f"{symbol}: insufficient data ({len(bars) if bars else 0} bars)",
+                }
+            )
             continue
 
         result = analyze(bars, config)

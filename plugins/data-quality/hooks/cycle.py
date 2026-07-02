@@ -1,5 +1,5 @@
 """
-on_cycle hook — Data Quality discipline.
+Cycle hook — Data Quality discipline (entrypoint: main()).
 
 Lee prices/price_history del contexto, valida la calidad de cada símbolo,
 filtra las pending_signals de símbolos con datos sospechosos, y emite

@@ -28,7 +28,6 @@ sys.path.insert(0, _PLUGIN_DIR)
 
 from scripts.model import predict as _predict_from_model  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # Internal helper (pure, extracted for clarity — task 2.3 refactor)
 # ---------------------------------------------------------------------------

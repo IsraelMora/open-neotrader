@@ -23,7 +23,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Layer 1: Exposure (ported from risk-envelope)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -666,5 +665,3 @@ def check_portfolio_health(
         "warnings": warnings,
         "alerts": violations + warnings,
     }
-
-    return result
