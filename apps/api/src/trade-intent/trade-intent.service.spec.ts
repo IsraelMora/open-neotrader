@@ -68,6 +68,13 @@ function makeAudit(): MockAudit {
 
 type MockRealOrder = { submit: jest.Mock };
 
+type MockReconciliation = { fastPollOrder: jest.Mock };
+
+/** Default fastPollOrder() resolution: resolves immediately (happy path — no rejection to swallow). */
+function makeReconciliation(): MockReconciliation {
+  return { fastPollOrder: jest.fn().mockResolvedValue(undefined) };
+}
+
 /**
  * Default submit() resolution: a "submitted" RealOrder row — the happy path where the
  * broker accepted the order. Individual tests override via `.mockResolvedValueOnce` /
@@ -91,14 +98,23 @@ function makeService(
   kv: MockKv,
   realOrderService?: MockRealOrder,
   audit?: MockAudit,
+  reconciliation?: MockReconciliation,
 ): TradeIntentService {
   return new (TradeIntentService as unknown as new (
     db: unknown,
     gw: unknown,
     kv: unknown,
     realOrderService: unknown,
+    reconciliation: unknown,
     audit?: unknown,
-  ) => TradeIntentService)(prisma, gateway, kv, realOrderService ?? makeRealOrderService(), audit);
+  ) => TradeIntentService)(
+    prisma,
+    gateway,
+    kv,
+    realOrderService ?? makeRealOrderService(),
+    reconciliation ?? makeReconciliation(),
+    audit,
+  );
 }
 
 /**
@@ -212,6 +228,7 @@ describe('TradeIntentService', () => {
   let gateway: MockGateway;
   let kv: MockKv;
   let realOrderService: MockRealOrder;
+  let reconciliation: MockReconciliation;
   let service: TradeIntentService;
 
   beforeEach(() => {
@@ -219,11 +236,12 @@ describe('TradeIntentService', () => {
     gateway = makeGateway();
     kv = makeKv();
     realOrderService = makeRealOrderService();
+    reconciliation = makeReconciliation();
     // Default: all KV keys return null → autonomous=true by default.
     // Existing recordIntent tests that expect status=pending override this
     // per-test to return 'false' for execution.autonomous.
     kv.get.mockResolvedValue(null);
-    service = makeService(prisma, gateway, kv, realOrderService);
+    service = makeService(prisma, gateway, kv, realOrderService, undefined, reconciliation);
   });
 
   // ── recordIntent ────────────────────────────────────────────────────────────
@@ -1688,6 +1706,108 @@ describe('TradeIntentService', () => {
       expect(gateway.placeOrder).not.toHaveBeenCalled();
       expect(result.status).toBe('executed');
       expect(result.quantity).toBe(0);
+    });
+
+    // ── fast-poll wiring after a successful real submit ────────────────────────
+
+    describe('fast-poll wiring after a successful real submit', () => {
+      it('a successful real submit triggers fastPollOrder fire-and-forget, without blocking the cycle', async () => {
+        enableReal(kv, prisma);
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockAaplQuote(gateway);
+        realOrderService.submit.mockResolvedValue({
+          id: 'ro_fastpoll',
+          status: 'submitted',
+          client_order_id: 'nt-ti_001-abc',
+          broker_order_id: 'order_abc',
+          error: null,
+        });
+        const pending = pendingIntent({
+          status: 'real_pending',
+          fill_price: null,
+          quantity: null,
+          decided_by: 'autonomous',
+        });
+        prisma.tradeIntent.update.mockResolvedValue(pending);
+        // fastPollOrder() never resolves within this test — proves autoProcess does NOT
+        // await it (otherwise this test would hang / time out).
+        reconciliation.fastPollOrder.mockReturnValue(new Promise<void>(() => undefined));
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(result.status).toBe('real_pending');
+        expect(reconciliation.fastPollOrder).toHaveBeenCalledTimes(1);
+        expect(reconciliation.fastPollOrder).toHaveBeenCalledWith('ro_fastpoll');
+      });
+
+      it('fastPollOrder rejecting does NOT propagate into autoProcess and does NOT fail the trade intent', async () => {
+        enableReal(kv, prisma);
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockAaplQuote(gateway);
+        realOrderService.submit.mockResolvedValue({
+          id: 'ro_fastpoll_reject',
+          status: 'submitted',
+          client_order_id: 'nt-ti_001-abc',
+          broker_order_id: 'order_abc',
+          error: null,
+        });
+        const pending = pendingIntent({
+          status: 'real_pending',
+          fill_price: null,
+          quantity: null,
+          decided_by: 'autonomous',
+        });
+        prisma.tradeIntent.update.mockResolvedValue(pending);
+        reconciliation.fastPollOrder.mockRejectedValue(new Error('fastPollOrder blew up'));
+
+        await expect(service.autoProcess('ti_001')).resolves.toBeDefined();
+        // Give the fire-and-forget microtask a tick to settle its .catch() handler.
+        await new Promise((resolve) => setImmediate(resolve));
+
+        expect(reconciliation.fastPollOrder).toHaveBeenCalledTimes(1);
+      });
+
+      it('submit_failed outcome does NOT trigger fastPollOrder at all', async () => {
+        enableReal(kv, prisma);
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockAaplQuote(gateway);
+        realOrderService.submit.mockResolvedValue({
+          id: 'ro_failed_nopoll',
+          status: 'submit_failed',
+          client_order_id: 'nt-ti_001-xyz',
+          broker_order_id: null,
+          error: 'Broker connection refused',
+        });
+        const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+        prisma.tradeIntent.update.mockResolvedValue(failed);
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(result.status).toBe('failed');
+        expect(reconciliation.fastPollOrder).not.toHaveBeenCalled();
+      });
+
+      it('RealOrderService.submit throwing does NOT trigger fastPollOrder at all', async () => {
+        enableReal(kv, prisma);
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockAaplQuote(gateway);
+        realOrderService.submit.mockRejectedValue(new Error('Broker connection refused'));
+        const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+        prisma.tradeIntent.update.mockResolvedValue(failed);
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(result.status).toBe('failed');
+        expect(reconciliation.fastPollOrder).not.toHaveBeenCalled();
+      });
     });
   });
 

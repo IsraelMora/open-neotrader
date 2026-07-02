@@ -26,6 +26,7 @@ import { KvService } from '../common/kv.service';
 import { kvBool, kvNum, kvStr } from '../common/kv.util';
 import { AuditService } from '../audit/audit.service';
 import { RealOrderService } from '../real-order/real-order.service';
+import { RealBrokerReconciliationService } from '../real-reconciliation/real-broker-reconciliation.service';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -107,6 +108,10 @@ export class TradeIntentService {
     // generation, DB row created BEFORE the broker call). _executeReal delegates all real
     // order placement to it instead of calling gateway.placeOrder directly.
     private readonly realOrderService: RealOrderService,
+    // RealBrokerReconciliationService — after a successful real submit, _executeReal fires
+    // fastPollOrder(realOrder.id) fire-and-forget so a fast-filling order is reflected
+    // without waiting for the steady-state reconciliation interval.
+    private readonly reconciliation: RealBrokerReconciliationService,
     // AuditService @Optional() — records real→paper demotions from the walk-forward gate
     // so the operator understands WHY a real order didn't execute. Absent → WARN log only.
     @Optional() private readonly audit?: AuditService,
@@ -1063,9 +1068,22 @@ export class TradeIntentService {
         `real_order_id=${realOrder.id} status=${realOrder.status}`,
     );
 
+    // Fire-and-forget: kick off the fast-poll backoff burst so a fast-filling order is
+    // reflected without waiting for the steady-state reconciliation interval. NEVER awaited
+    // here — must not block _executeReal — and its rejection must never propagate to the
+    // caller (fastPollOrder is already fail-soft internally, but this .catch is a second
+    // line of defense against a genuinely unexpected throw).
+    void this.reconciliation
+      .fastPollOrder(realOrder.id)
+      .catch((err: unknown) =>
+        this.log.error(
+          `fastPollOrder fire-and-forget failed for RealOrder ${realOrder.id}: ${String(err)}`,
+        ),
+      );
+
     // No fabricated fill: a submitted order is only ACCEPTED, not filled — brokers fill
-    // asynchronously. fill_price/quantity stay NULL until the reconciliation service (a
-    // follow-up slice) observes an actual fill from the broker and updates this row.
+    // asynchronously. fill_price/quantity stay NULL until the reconciliation service
+    // observes an actual fill from the broker and updates this row.
     return this.db.tradeIntent.update({
       where: { id },
       data: {

@@ -34,6 +34,10 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
+import {
+  normalizeBrokerStatus,
+  TERMINAL_STATUSES as BROKER_TERMINAL_STATUSES,
+} from '../common/broker-status.util';
 import type { RealOrder } from '@prisma/client';
 
 /** Statuses considered "in flight" — not yet confirmed as accepted or terminally failed. */
@@ -272,13 +276,34 @@ export class RealOrderService implements OnModuleInit {
     }
 
     // Broker-has-it branch — reconcile the row to broker truth.
+    //
+    // Money-critical: this method must NEVER write a raw broker status string
+    // straight onto RealOrder.status, and must NEVER write a fill directly.
+    // See broker-status.util.ts's module doc for why — in short:
+    //   - A raw non-canonical status (e.g. "new") is in neither OPEN_STATUSES
+    //     nor TERMINAL_STATUSES, so reconcileAllOpenOrders() would never
+    //     re-select the row again — it becomes silently un-pollable forever.
+    //   - A raw "filled" written here would set RealOrder=filled while
+    //     TradeIntent stays real_pending — a fill visible on one side of the
+    //     ledger only, since this path does not touch TradeIntent at all.
+    // So: normalize the broker status, persist broker_order_id, and if the
+    // normalized status is terminal, DOWNGRADE to a pollable OPEN status
+    // instead of writing it here. The very next reconciliation tick will
+    // call reconcileOrder() for this row (it's now in OPEN_STATUSES), ask the
+    // broker again, and apply the terminal transition through the single
+    // $transaction that keeps RealOrder and TradeIntent in sync. This method
+    // deliberately never writes filled_qty/filled_avg_price — those belong
+    // exclusively to that transactional path.
+    const canonical = normalizeBrokerStatus(brokerOrder.status);
+    const pollableStatus = (BROKER_TERMINAL_STATUSES as readonly string[]).includes(canonical)
+      ? 'accepted'
+      : canonical;
+
     await this.db.realOrder.update({
       where: { id: row.id },
       data: {
         broker_order_id: brokerOrder.broker_order_id,
-        status: brokerOrder.status,
-        filled_qty: brokerOrder.filled_qty,
-        filled_avg_price: brokerOrder.filled_avg_price,
+        status: pollableStatus,
         last_reconciled_at: new Date(),
       },
     });

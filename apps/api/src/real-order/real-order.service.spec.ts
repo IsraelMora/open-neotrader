@@ -15,6 +15,7 @@
 import { RealOrderService } from './real-order.service';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { ProviderGatewayService } from '../providers/provider-gateway.service';
+import { OPEN_STATUSES } from '../common/broker-status.util';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -256,6 +257,66 @@ describe('RealOrderService.recoverInflight — broker already has it', () => {
     expect(updateCalls.length).toBeGreaterThan(0);
     const data = callArg(updateCalls, 0);
     expect(data.data['broker_order_id']).toBe('broker_order_555');
+  });
+});
+
+// ── recoverInflight — broker-status vocabulary must be fully mapped (Fix 1) ──────
+
+describe('RealOrderService.recoverInflight — broker-status normalization (Fix 1)', () => {
+  it('broker reports "new" (an Alpaca status outside the old raw-status vocabulary) — the row ends in a pollable OPEN status with broker_order_id set, never the raw "new" string', async () => {
+    const pendingRow = makeRow({ id: 'ro_new', status: 'pending_submit' });
+    const prisma = makePrisma({ findManyResult: [pendingRow] });
+    const gateway = makeGateway({
+      getOrderByClientIdResult: {
+        broker_order_id: 'broker_order_new',
+        client_order_id: pendingRow.client_order_id,
+        status: 'new',
+        filled_qty: 0,
+        filled_avg_price: null,
+        raw: {},
+      },
+    });
+    const svc = makeService(prisma, gateway);
+
+    await svc.recoverInflight();
+
+    const updateCalls = (prisma.realOrder.update as jest.Mock).mock.calls as unknown[][];
+    expect(updateCalls.length).toBeGreaterThan(0);
+    const data = callArg(updateCalls, 0);
+    expect(data.data['broker_order_id']).toBe('broker_order_new');
+    // Never the raw "new" string — must be a normalized, pollable OPEN status so
+    // reconcileAllOpenOrders() (WHERE status IN OPEN_STATUSES) re-selects this row.
+    expect(data.data['status']).not.toBe('new');
+    expect(OPEN_STATUSES).toContain(data.data['status']);
+  });
+
+  it('broker reports "filled" — recoverRow does NOT write filled/filled_qty/filled_avg_price directly (no one-sided ledger write); it leaves the row in a pollable OPEN status so the transactional reconcileOrder() path performs the real fill + TradeIntent update', async () => {
+    const pendingRow = makeRow({ id: 'ro_filled', status: 'pending_submit' });
+    const prisma = makePrisma({ findManyResult: [pendingRow] });
+    const gateway = makeGateway({
+      getOrderByClientIdResult: {
+        broker_order_id: 'broker_order_filled',
+        client_order_id: pendingRow.client_order_id,
+        status: 'filled',
+        filled_qty: 10,
+        filled_avg_price: 150.5,
+        raw: {},
+      },
+    });
+    const svc = makeService(prisma, gateway);
+
+    await svc.recoverInflight();
+
+    const updateCalls = (prisma.realOrder.update as jest.Mock).mock.calls as unknown[][];
+    expect(updateCalls.length).toBeGreaterThan(0);
+    const data = callArg(updateCalls, 0);
+    expect(data.data['broker_order_id']).toBe('broker_order_filled');
+    // Must NOT directly set status=filled or write fill numbers — that would bypass the
+    // single $transaction that keeps RealOrder and TradeIntent in sync (ledger desync risk).
+    expect(data.data['status']).not.toBe('filled');
+    expect(OPEN_STATUSES).toContain(data.data['status']);
+    expect(data.data['filled_qty']).toBeUndefined();
+    expect(data.data['filled_avg_price']).toBeUndefined();
   });
 });
 
