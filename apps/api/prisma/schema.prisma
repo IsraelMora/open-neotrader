@@ -264,10 +264,77 @@ model TradeIntent {
   realized_pnl  Float?
   result_json   String?   // JSON: execution details
 
+  realOrders    RealOrder[]
+
   @@index([status])
   @@index([created_at])
   @@index([cycle_id])
   @@map("trade_intents")
+}
+
+// Real-money order tracking — one row per broker order submitted for a TradeIntent
+// executed in real mode. Tracks the full lifecycle (submit → poll → fill/error) so
+// the fill price/qty used for accounting comes from the broker, not a pre-order quote.
+model RealOrder {
+  id                 String    @id @default(cuid())
+  trade_intent_id    String
+  broker_plugin_id   String
+  client_order_id    String    @unique
+  broker_order_id    String?
+  symbol             String
+  side               String
+  order_type         String    @default("market")
+  requested_qty      Float
+  limit_price        Float?
+  status             String    @default("pending_submit")
+  filled_qty         Float     @default(0)
+  filled_avg_price   Float?
+  submitted_at       DateTime?
+  filled_at          DateTime?
+  last_reconciled_at DateTime?
+  broker_raw_json    String?
+  error              String?
+  created_at         DateTime  @default(now())
+  updated_at         DateTime  @updatedAt
+  tradeIntent        TradeIntent @relation(fields: [trade_intent_id], references: [id])
+  @@index([status])
+  @@index([broker_order_id])
+  @@index([client_order_id])
+  @@index([trade_intent_id])
+  @@map("real_orders")
+}
+
+// Real-money position snapshot — one row per symbol, kept in sync with the broker's
+// reported position (best-effort polling), replacing the paper-only Portfolio KV rows.
+model RealPosition {
+  symbol            String    @id
+  broker_plugin_id  String
+  qty               Float
+  avg_entry         Float
+  market_value      Float
+  unrealized_pnl    Float
+  side              String
+  last_synced_at    DateTime  @updatedAt
+  @@map("real_positions")
+}
+
+// Real-money NAV history — periodic snapshots of broker account equity/cash/buying
+// power, replacing the paper-only NavSnapshot for the real-money accounting path.
+model RealNavSnapshot {
+  id                String    @id @default(uuid())
+  ts                DateTime  @default(now())
+  broker_plugin_id  String
+  equity            Float
+  cash              Float
+  buying_power      Float
+  positions         String
+  total_pnl         Float     @default(0)
+  hwm               Float
+  source            String    @default("poll")
+  meta              String?
+  @@index([ts])
+  @@index([broker_plugin_id, ts])
+  @@map("real_nav_snapshots")
 }
 
 // Cartera virtual de pretest — permite probar configuraciones distintas antes de usar dinero real
