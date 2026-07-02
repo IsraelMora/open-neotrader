@@ -27,8 +27,10 @@ import {
   SkillContribution,
 } from '../ml-signal-record/ml-signal-record.service';
 import { TradeIntentService } from '../trade-intent/trade-intent.service';
+import { PrismaService } from '../prisma/prisma.service';
 
 import type { LlmResponse } from '../llm/llm.service';
+import type { Prisma } from '@prisma/client';
 import type { DebateConsensus } from './debate.types';
 import type { ConfigFieldSpec } from '../plugins/manifest';
 import { parseToolCalls, stripToolCallBlocks } from '../llm/kernel-parser';
@@ -123,6 +125,9 @@ export interface VetoSummary {
   signals_vetoed: number;
   veto_reasons: string[];
   discipline_plugins: string[];
+  // CRIT-2: true when at least one discipline hook failed this cycle and its veto was
+  // treated as fail-safe (pending signals dropped rather than passed through silently).
+  veto_degraded: boolean;
 }
 
 /**
@@ -369,6 +374,11 @@ export class AgentsService {
     // cycle behaves exactly as before (decisions only recorded in audit/memory).
     @Optional()
     private readonly tradeIntent?: TradeIntentService,
+    // PrismaService injected @Optional() — used only by the veto decision ledger
+    // (_persistVetoDecisions). Absent → ledger writes are skipped (fail-soft);
+    // the veto gate itself never depends on this.
+    @Optional()
+    private readonly prisma?: PrismaService,
   ) {}
 
   /**
@@ -1401,6 +1411,7 @@ export class AgentsService {
   ): Promise<{ vetoCtx: Record<string, unknown>; vetoSummary: VetoSummary }> {
     let vetoCtx: Record<string, unknown> = { ...hookCtx, pending_signals: pendingSignals };
     const vetoReasons: string[] = [];
+    let vetoDegraded = false;
 
     // D1: Stable sort — ML plugin always runs first, others keep relative order.
     // This is structural and DB-order-independent (AC-S3-6/7).
@@ -1425,17 +1436,34 @@ export class AgentsService {
 
       if (discResult.ok && discResult.result) {
         const updated = discResult.result as Record<string, unknown>;
+        // CRIT-1 fix: the real Python hook contract (plugins/*/hooks/cycle.py) returns
+        // { signals, logs } — there is no `pending_signals` key on the raw result.
+        // `updated['pending_signals']` is kept as a fallback ONLY for callers/mocks that
+        // still echo the older `pending_signals` contract; production hooks use `signals`.
+        // Without this remap, vetoCtx = updated would silently drop every approved
+        // signal (approvedSignals reads vetoCtx['pending_signals'], which would be
+        // undefined) whenever a discipline plugin is active.
+        const updatedSignals: unknown[] | undefined =
+          (updated['signals'] as unknown[] | undefined) ??
+          (updated['pending_signals'] as unknown[] | undefined);
         // D2/Fix2: strip model_blob + feature_names from the ML plugin's echoed ctx
-        // before propagating to vetoCtx. The real Python hook returns the full ctx
-        // (including injected fields), so we must remove them here to prevent leakage
-        // to downstream plugins (aggregator etc.).
+        // before propagating to vetoCtx, so injected fields never leak to downstream
+        // plugins (aggregator etc.).
         if (disc.id === ML_PLUGIN_ID) {
           const stripped = { ...updated };
           delete stripped['model_blob'];
           delete stripped['feature_names'];
-          vetoCtx = stripped;
+          vetoCtx = {
+            ...vetoCtx,
+            ...stripped,
+            pending_signals: updatedSignals ?? vetoCtx['pending_signals'],
+          };
         } else {
-          vetoCtx = updated;
+          vetoCtx = {
+            ...vetoCtx,
+            ...updated,
+            pending_signals: updatedSignals ?? vetoCtx['pending_signals'],
+          };
         }
         const reasons = (updated['veto_reasons'] as string[] | undefined) ?? [];
         vetoReasons.push(...reasons.map((r) => `[${disc.name}] ${r}`));
@@ -1447,8 +1475,18 @@ export class AgentsService {
           event_type: 'cycle_fail',
           plugin_id: disc.id,
           error: discResult.error,
-          meta: { stage: 'veto_hook' },
+          meta: { stage: 'veto_hook', degraded: true },
         });
+        // CRIT-2 fix: fail-SAFE, not fail-open. A discipline hook is a safety layer —
+        // if it fails to run, we cannot know whether it would have approved, rescaled,
+        // or blocked the pending signals. Treat the failure as an effective veto of
+        // everything currently pending, and mark the cycle as veto-degraded so callers
+        // can surface/alert on it (mirrors the existing cycle_fail audit-entry pattern).
+        vetoCtx = { ...vetoCtx, pending_signals: [] };
+        vetoReasons.push(
+          `[${disc.name}] hook failed — fail-safe: signals dropped (${discResult.error})`,
+        );
+        vetoDegraded = true;
       }
     }
 
@@ -1462,6 +1500,7 @@ export class AgentsService {
       signals_vetoed: pendingSignals.length - approvedSignals.length,
       veto_reasons: vetoReasons,
       discipline_plugins: disciplinePlugins.map((p: HydratedPlugin) => p.id),
+      veto_degraded: vetoDegraded,
     };
 
     if (vetoSummary.signals_vetoed > 0) {
@@ -1473,7 +1512,247 @@ export class AgentsService {
       });
     }
 
+    await this._persistVetoDecisions(cycle_id, pendingSignals, vetoCtx, vetoReasons);
+
     return { vetoCtx, vetoSummary };
+  }
+
+  /**
+   * Resolves the source plugin id off a signal object. Mirrors _mlCaptureSignals'
+   * resolution order (plugin_id, falling back to source) — the real field name
+   * emitted by strategy/skill plugins, confirmed against signal-aggregator's
+   * aggregator.py (`plugin_id = s.get("plugin_id") or s.get("type", "unknown")`).
+   */
+  private _resolveSignalSource(sig: Record<string, unknown>): string {
+    const rawPluginId = sig['plugin_id'];
+    if (typeof rawPluginId === 'string') return rawPluginId;
+    const rawSource = sig['source'];
+    if (typeof rawSource === 'string') return rawSource;
+    return '';
+  }
+
+  /**
+   * Finds the final approved-signal counterpart for an original signal. Prefers an
+   * exact symbol+source match (multiple plugins can signal the same symbol in one
+   * cycle); falls back to a symbol-only match since some discipline hooks return
+   * trimmed signal dicts that don't echo plugin_id/source back (e.g. signal-aggregator's
+   * consensus_signal, which carries no plugin_id/source at all).
+   * `exact: true` only when the match was resolved via symbol+source — a symbol-only
+   * fallback match is inherently ambiguous when more than one proposed signal shares
+   * that symbol, since the same matched object could be the transformed result of any
+   * of them (or all of them, merged).
+   */
+  private _findVetoMatch(
+    approvedList: Record<string, unknown>[],
+    symbol: string,
+    sourcePlugin: string,
+  ): { match: Record<string, unknown> | undefined; exact: boolean } {
+    const exactMatch = approvedList.find(
+      (s) => s['symbol'] === symbol && this._resolveSignalSource(s) === sourcePlugin,
+    );
+    if (exactMatch) return { match: exactMatch, exact: true };
+    return {
+      match: approvedList.find((s) => s['symbol'] === symbol),
+      exact: false,
+    };
+  }
+
+  /**
+   * Extracts the EFFECTIVE quantity of a signal, checking in priority:
+   * 1. Nested sizing sub-objects — position-sizing/hooks/cycle.py returns
+   *    {**sig, "fixed"|"kelly"|"volatility": {"shares": N, ...}}; the real
+   *    resized qty lives there, while the top-level `qty` is left UNCHANGED.
+   * 2. A top-level `shares` field (some hooks flatten it directly).
+   * 3. A top-level `qty` field (the original proposed-signal shape).
+   * Returns null when none of the above are present — i.e. the effective qty
+   * is genuinely unrecoverable from this signal shape (e.g. signal-aggregator's
+   * consensus_signal, which carries no qty/shares field at all).
+   */
+  private _extractEffectiveQty(sig: Record<string, unknown>): number | null {
+    for (const key of ['fixed', 'kelly', 'volatility']) {
+      const nested = sig[key];
+      if (nested && typeof nested === 'object') {
+        const shares = (nested as Record<string, unknown>)['shares'];
+        if (typeof shares === 'number') return shares;
+      }
+    }
+    const shares = sig['shares'];
+    if (typeof shares === 'number') return shares;
+    const qty = sig['qty'];
+    if (typeof qty === 'number') return qty;
+    return null;
+  }
+
+  /**
+   * Pure diff of one proposed signal against its (possibly absent) approved
+   * counterpart. The ledger must NEVER report "approved" (unchanged) unless it
+   * can actually verify the effective qty is unchanged — when it's unrecoverable
+   * on either side, or the match is ambiguous (symbol-only fallback with more
+   * than one candidate), the honest label is "modified", never "approved".
+   */
+  private _resolveVetoVerdict(
+    proposedAction: string,
+    proposedSignal: Record<string, unknown>,
+    match: Record<string, unknown> | undefined,
+    matchIsAmbiguous: boolean,
+  ): {
+    verdict: 'approved' | 'blocked' | 'modified';
+    approvedAction: string | null;
+    approvedQty: number | null;
+  } {
+    if (!match || match['action'] === 'cancelled') {
+      return { verdict: 'blocked', approvedAction: null, approvedQty: null };
+    }
+    const matchAction = typeof match['action'] === 'string' ? match['action'] : proposedAction;
+    const matchQty = this._extractEffectiveQty(match);
+
+    if (matchIsAmbiguous) {
+      // The matched object could correspond to more than one proposed signal
+      // (e.g. signal-aggregator merging several proposals into one consensus
+      // object) — it was merged/transformed, so "modified" is the honest label.
+      return { verdict: 'modified', approvedAction: matchAction, approvedQty: matchQty };
+    }
+
+    const proposedQty = this._extractEffectiveQty(proposedSignal);
+    const qtyKnownAndUnchanged =
+      proposedQty !== null && matchQty !== null && proposedQty === matchQty;
+
+    if (matchAction === proposedAction && qtyKnownAndUnchanged) {
+      return { verdict: 'approved', approvedAction: null, approvedQty: null };
+    }
+    return { verdict: 'modified', approvedAction: matchAction, approvedQty: matchQty };
+  }
+
+  /**
+   * Builds the VetoDecision.create() data payload for a single proposed signal.
+   * `symbolCounts` is the per-symbol count across ALL original proposed signals in
+   * this cycle — used to detect the signal-aggregator collision case, where a
+   * symbol-only fallback match could correspond to more than one proposed signal.
+   */
+  private _buildVetoDecisionData(
+    cycle_id: string,
+    rawSignal: Record<string, unknown>,
+    vetoCtx: Record<string, unknown>,
+    discipline: string | null,
+    rationale: string | null,
+    symbolCounts: Map<string, number>,
+  ): Prisma.VetoDecisionCreateInput {
+    const symbol = typeof rawSignal['symbol'] === 'string' ? rawSignal['symbol'] : '';
+    const sourcePlugin = this._resolveSignalSource(rawSignal);
+    const proposedAction = typeof rawSignal['action'] === 'string' ? rawSignal['action'] : '';
+    const proposedQty = typeof rawSignal['qty'] === 'number' ? rawSignal['qty'] : 0;
+    const approvedList =
+      (vetoCtx['pending_signals'] as Record<string, unknown>[] | undefined) ?? [];
+    const { match, exact } = this._findVetoMatch(approvedList, symbol, sourcePlugin);
+    // A fallback (non-exact) match is ambiguous when more than one proposed signal
+    // shares this symbol AND the matched object itself cannot be attributed to a
+    // single source (no resolvable plugin_id/source) — e.g. signal-aggregator's
+    // consensus_signal collapsing several proposals into one object.
+    const matchIsAmbiguous =
+      !exact &&
+      (symbolCounts.get(symbol) ?? 0) > 1 &&
+      (!match || this._resolveSignalSource(match) === '');
+    const { verdict, approvedAction, approvedQty } = this._resolveVetoVerdict(
+      proposedAction,
+      rawSignal,
+      match,
+      matchIsAmbiguous,
+    );
+
+    return {
+      cycle_id,
+      symbol,
+      source_plugin: sourcePlugin,
+      signal_confidence:
+        typeof rawSignal['confidence'] === 'number' ? rawSignal['confidence'] : null,
+      proposed_action: proposedAction,
+      proposed_qty: proposedQty,
+      verdict,
+      approved_action: approvedAction,
+      approved_qty: approvedQty,
+      discipline: verdict === 'approved' ? null : discipline,
+      rationale: verdict === 'approved' ? null : rationale,
+      ref_price: typeof vetoCtx['ref_price'] === 'number' ? vetoCtx['ref_price'] : null,
+      regime_tags: Array.isArray(vetoCtx['regime_tags'])
+        ? JSON.stringify(vetoCtx['regime_tags'])
+        : null,
+      portfolio_drawdown_pct:
+        typeof vetoCtx['portfolio_drawdown_pct'] === 'number'
+          ? vetoCtx['portfolio_drawdown_pct']
+          : null,
+      // The raw proposed signal AND the raw matched discipline output (or an explicit
+      // null when no match) are both stored so an offline analyzer can recompute the
+      // true verdict/qty with full plugin-shape knowledge — that is the real source of
+      // truth; the live `verdict` above is only a best-effort label.
+      context_snapshot: JSON.stringify({
+        signal: rawSignal,
+        match: match ?? null,
+        market: {
+          portfolio_value: vetoCtx['portfolio_value'],
+          positions: vetoCtx['positions'],
+          portfolio: vetoCtx['portfolio'],
+        },
+      }),
+    };
+  }
+
+  /** Extracts the unique discipline names tagged in vetoReasons entries (`[Name] ...`). */
+  private _extractVetoDisciplines(vetoReasons: string[]): string | null {
+    if (vetoReasons.length === 0) return null;
+    const names = new Set<string>();
+    for (const reason of vetoReasons) {
+      const matched = /^\[(.+?)\]/.exec(reason)?.[1];
+      if (matched) names.add(matched);
+    }
+    return names.size > 0 ? [...names].join(',') : null;
+  }
+
+  /**
+   * Immutable veto decision ledger — one row per signal that was in the ORIGINAL
+   * pendingSignals input to _runVetoLayer, diffed against the FINAL approved set.
+   * Fail-soft PER ROW: a DB write failure on one signal must never affect the
+   * trading cycle NOR suppress the ledger rows for the OTHER signals in the same
+   * cycle (unlike the veto gate itself, which is a hard safety gate). Matches
+   * AuditService.log's direct PrismaService.create style — no new abstraction/
+   * repository layer.
+   */
+  private async _persistVetoDecisions(
+    cycle_id: string,
+    originalSignals: unknown[],
+    vetoCtx: Record<string, unknown>,
+    vetoReasons: string[],
+  ): Promise<void> {
+    if (!this.prisma || originalSignals.length === 0) return;
+    const prisma = this.prisma;
+    const rationale = vetoReasons.length > 0 ? vetoReasons.join('; ') : null;
+    const discipline = this._extractVetoDisciplines(vetoReasons);
+
+    const signals = originalSignals as Record<string, unknown>[];
+    const symbolCounts = new Map<string, number>();
+    for (const s of signals) {
+      const symbol = typeof s['symbol'] === 'string' ? s['symbol'] : '';
+      symbolCounts.set(symbol, (symbolCounts.get(symbol) ?? 0) + 1);
+    }
+
+    for (const rawSignal of signals) {
+      try {
+        const data = this._buildVetoDecisionData(
+          cycle_id,
+          rawSignal,
+          vetoCtx,
+          discipline,
+          rationale,
+          symbolCounts,
+        );
+        await prisma.vetoDecision.create({ data });
+      } catch (e) {
+        this.log.warn(
+          `[veto-ledger] persist failed for cycle ${cycle_id}, symbol ${String(
+            rawSignal['symbol'],
+          )} — decision not recorded: ${e}`,
+        );
+      }
+    }
   }
 
   /**

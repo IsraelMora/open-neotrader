@@ -7515,6 +7515,7 @@ function makeS3AgentsService(opts: {
   >;
   audit?: ReturnType<typeof makeAudit>;
   llm?: Partial<LlmService>;
+  prisma?: { vetoDecision: { create: jest.Mock } };
 }): AgentsService {
   const audit = opts.audit ?? makeAudit();
   const llm: Partial<LlmService> = opts.llm ?? {
@@ -7555,6 +7556,8 @@ function makeS3AgentsService(opts: {
     debate: unknown,
     providerGateway: unknown,
     mlSignalRecord: unknown,
+    tradeIntent: unknown,
+    prisma: unknown,
   ) => AgentsService)(
     llm,
     sandbox,
@@ -7575,6 +7578,8 @@ function makeS3AgentsService(opts: {
     undefined,
     undefined,
     opts.mlSignalRecord ?? makeMlSignalRecordS3(),
+    undefined,
+    opts.prisma,
   );
 }
 
@@ -10213,5 +10218,498 @@ describe('runGovernedTurn chat mode', () => {
     >;
     expect(cCalls[0][0].system_prompt).toContain('[DECISION]');
     expect(cCalls[0][0].tools.length).toBeGreaterThan(0);
+  });
+});
+
+// ── veto-ledger-fix: _runVetoLayer real hook contract + fail-safe on hook failure ──
+//
+// Real discipline hooks (plugins/risk-manager/hooks/cycle.py, position-sizing,
+// signal-aggregator, atr-stop-loss) return { signals: [...], logs: [...] } — there is
+// NO `pending_signals` key on the raw hook result. The pre-fix code read
+// `vetoCtx['pending_signals']` after unconditionally replacing vetoCtx with the raw
+// hook result, so approvedSignals always ended up [] whenever any discipline plugin
+// was active — silently blocking every signal.
+
+describe('veto-ledger-fix CRIT-1 — _runVetoLayer honors the real {signals, logs} hook contract', () => {
+  it('a discipline hook returning {signals:[...approved...], logs:[]} (real shape) does NOT drop the approved signal', async () => {
+    const audit = makeAudit();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        // Real hook contract: 'signals', NOT 'pending_signals'.
+        result: { signals: [{ symbol: 'AAPL', action: 'buy', qty: 10 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, audit });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [{ symbol: 'AAPL', action: 'buy', qty: 10 }];
+
+    const { vetoCtx, vetoSummary } = await callRunVetoLayerS3(
+      service,
+      'cycle-crit1-001',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    const approved = vetoCtx['pending_signals'];
+    expect(Array.isArray(approved)).toBe(true);
+    expect(approved as unknown[]).toHaveLength(1);
+    expect((vetoSummary as { signals_approved: number }).signals_approved).toBe(1);
+  });
+});
+
+describe('veto-ledger-fix CRIT-2 — discipline hook failure is fail-safe (not fail-open)', () => {
+  it('a discipline hook that fails (ok:false) drops pending signals for the cycle instead of letting them pass', async () => {
+    const audit = makeAudit();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({ ok: false, error: 'boom', result: null }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, audit });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [{ symbol: 'AAPL', action: 'buy', qty: 10 }];
+
+    const { vetoCtx, vetoSummary } = await callRunVetoLayerS3(
+      service,
+      'cycle-crit2-001',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    const approved = vetoCtx['pending_signals'];
+    expect(Array.isArray(approved) ? approved.length : -1).toBe(0);
+    expect((vetoSummary as { veto_degraded?: boolean }).veto_degraded).toBe(true);
+  });
+});
+
+// ── veto-decisions-ledger: immutable per-signal veto ledger ───────────────────────
+
+function makePrismaVetoMock(): { vetoDecision: { create: jest.Mock } } {
+  return { vetoDecision: { create: jest.fn().mockResolvedValue({}) } };
+}
+
+type VetoDecisionCreateArgs = { data: Record<string, unknown> };
+
+describe('veto-decisions-ledger — _runVetoLayer persists one VetoDecision row per proposed signal', () => {
+  it('a. an approved signal (unchanged by disciplines) results in a VetoDecision row with verdict "approved"', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [{ symbol: 'AAPL', action: 'buy', qty: 10 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [
+      { symbol: 'AAPL', action: 'buy', qty: 10, confidence: 0.8, plugin_id: 'momentum' },
+    ];
+
+    await callRunVetoLayerS3(service, 'cycle-ledger-a', disciplinePlugins, {}, pendingSignals, {});
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data).toMatchObject({
+      cycle_id: 'cycle-ledger-a',
+      symbol: 'AAPL',
+      source_plugin: 'momentum',
+      proposed_action: 'buy',
+      proposed_qty: 10,
+      verdict: 'approved',
+    });
+    expect(typeof args.data['context_snapshot']).toBe('string');
+  });
+
+  it('b. a blocked signal (removed by a discipline) results in a VetoDecision row with verdict "blocked"', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [
+      { symbol: 'TSLA', action: 'sell', qty: 5, confidence: 0.6, plugin_id: 'mean-reversion' },
+    ];
+
+    await callRunVetoLayerS3(service, 'cycle-ledger-b', disciplinePlugins, {}, pendingSignals, {});
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data).toMatchObject({
+      cycle_id: 'cycle-ledger-b',
+      symbol: 'TSLA',
+      source_plugin: 'mean-reversion',
+      proposed_action: 'sell',
+      proposed_qty: 5,
+      verdict: 'blocked',
+      approved_action: null,
+      approved_qty: null,
+    });
+  });
+
+  it('c. a signal rescaled by a discipline results in verdict "modified" with approved_qty/approved_action populated', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [{ symbol: 'MSFT', action: 'buy', qty: 8 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [
+      { id: 'position-sizing', type: 'discipline', name: 'Position Sizing' },
+    ];
+    const pendingSignals = [
+      { symbol: 'MSFT', action: 'buy', qty: 20, confidence: 0.7, plugin_id: 'trend-follow' },
+    ];
+
+    await callRunVetoLayerS3(service, 'cycle-ledger-c', disciplinePlugins, {}, pendingSignals, {});
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data).toMatchObject({
+      cycle_id: 'cycle-ledger-c',
+      symbol: 'MSFT',
+      source_plugin: 'trend-follow',
+      proposed_action: 'buy',
+      proposed_qty: 20,
+      verdict: 'modified',
+      approved_action: 'buy',
+      approved_qty: 8,
+    });
+  });
+
+  it('d. a ledger-write failure does NOT throw out of _runVetoLayer and does not affect signal flow', async () => {
+    const prisma = makePrismaVetoMock();
+    prisma.vetoDecision.create.mockRejectedValue(new Error('DB write failed'));
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [{ symbol: 'AAPL', action: 'buy', qty: 10 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [{ symbol: 'AAPL', action: 'buy', qty: 10, plugin_id: 'momentum' }];
+
+    const { vetoCtx } = await callRunVetoLayerS3(
+      service,
+      'cycle-ledger-d',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    // Signal flow must be unaffected by the ledger write failure.
+    const approved = vetoCtx['pending_signals'] as unknown[];
+    expect(approved).toHaveLength(1);
+  });
+});
+
+// ── veto-ledger-verdict-fix: real plugin shapes drive verdict diffing ────────
+//
+// position-sizing/hooks/cycle.py (kelly/fixed modes) returns
+// {**sig, "kelly"|"fixed": {"shares": N, ...}} — the top-level `qty` is left
+// UNCHANGED; the real resized quantity lives in the nested sub-object.
+// signal-aggregator/hooks/cycle.py returns consensus_signal objects with NO
+// `qty` and NO `plugin_id`/`source` (only `sources: string[]`), so multiple
+// proposed signals for one symbol can collapse onto a single consensus object.
+// The ledger must never label a row "approved" unless the effective qty is
+// verifiably unchanged; unrecoverable/ambiguous cases must be "modified".
+
+describe('veto-ledger-verdict-fix — effective-qty extraction from nested sizing sub-objects', () => {
+  it('a. position-sizing kelly mode: nested kelly.shares differs from top-level qty → verdict "modified", approved_qty === nested shares', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        // Real position-sizing kelly-mode shape: top-level qty UNCHANGED, real
+        // resized qty nested under "kelly.shares".
+        result: {
+          signals: [
+            {
+              symbol: 'NVDA',
+              action: 'buy',
+              qty: 20,
+              kelly: { shares: 6, position_usd: 900, position_pct: 9, risk_usd: 18 },
+            },
+          ],
+          logs: [],
+        },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [
+      { id: 'position-sizing', type: 'discipline', name: 'Position Sizing' },
+    ];
+    const pendingSignals = [
+      { symbol: 'NVDA', action: 'buy', qty: 20, confidence: 0.7, plugin_id: 'momentum' },
+    ];
+
+    await callRunVetoLayerS3(
+      service,
+      'cycle-verdict-kelly',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data).toMatchObject({
+      symbol: 'NVDA',
+      proposed_qty: 20,
+      verdict: 'modified',
+      approved_qty: 6,
+    });
+  });
+
+  it('b. position-sizing fixed mode: nested fixed.shares equals top-level qty → verdict "approved"', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: {
+          signals: [
+            {
+              symbol: 'AAPL',
+              action: 'buy',
+              qty: 10,
+              fixed: { shares: 10, position_usd: 500, position_pct: 5 },
+            },
+          ],
+          logs: [],
+        },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [
+      { id: 'position-sizing', type: 'discipline', name: 'Position Sizing' },
+    ];
+    const pendingSignals = [
+      { symbol: 'AAPL', action: 'buy', qty: 10, confidence: 0.8, plugin_id: 'momentum' },
+    ];
+
+    await callRunVetoLayerS3(
+      service,
+      'cycle-verdict-fixed',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data).toMatchObject({
+      symbol: 'AAPL',
+      proposed_qty: 10,
+      verdict: 'approved',
+      approved_qty: null,
+    });
+  });
+
+  it('c. signal-aggregator consensus_signal (no qty, has sources) is NOT falsely "approved" — qty unrecoverable → "modified", raw match stored in context_snapshot', async () => {
+    const prisma = makePrismaVetoMock();
+    const consensusSignal = {
+      type: 'consensus_signal',
+      symbol: 'TSLA',
+      action: 'buy',
+      confidence: 0.75,
+      agreement_pct: 80,
+      vote_long: 2,
+      vote_short: 0,
+      contributing_signals: 2,
+      sources: ['momentum', 'trend-follow'],
+    };
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [consensusSignal], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [
+      { id: 'signal-aggregator', type: 'discipline', name: 'Signal Aggregator' },
+    ];
+    const pendingSignals = [
+      { symbol: 'TSLA', action: 'buy', qty: 15, confidence: 0.7, plugin_id: 'momentum' },
+    ];
+
+    await callRunVetoLayerS3(
+      service,
+      'cycle-verdict-aggregator',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data['verdict']).toBe('modified');
+    expect(args.data['approved_qty']).toBeNull();
+    const snapshot = JSON.parse(args.data['context_snapshot'] as string) as {
+      signal: unknown;
+      match: unknown;
+    };
+    expect(snapshot.signal).toMatchObject({ symbol: 'TSLA', qty: 15 });
+    expect(snapshot.match).toMatchObject({ type: 'consensus_signal', symbol: 'TSLA' });
+  });
+
+  it('d. two proposed signals for the same symbol collapse onto one aggregator consensus object → each gets its own row, neither is a clean "approved"', async () => {
+    const prisma = makePrismaVetoMock();
+    const consensusSignal = {
+      type: 'consensus_signal',
+      symbol: 'MSFT',
+      action: 'buy',
+      confidence: 0.8,
+      agreement_pct: 100,
+      vote_long: 2,
+      vote_short: 0,
+      contributing_signals: 2,
+      sources: ['momentum', 'mean-reversion'],
+    };
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [consensusSignal], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [
+      { id: 'signal-aggregator', type: 'discipline', name: 'Signal Aggregator' },
+    ];
+    const pendingSignals = [
+      { symbol: 'MSFT', action: 'buy', qty: 12, confidence: 0.6, plugin_id: 'momentum' },
+      { symbol: 'MSFT', action: 'buy', qty: 9, confidence: 0.65, plugin_id: 'mean-reversion' },
+    ];
+
+    await callRunVetoLayerS3(
+      service,
+      'cycle-verdict-collision',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(2);
+    const calls = prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>;
+    const dataRows = calls.map((c) => c[0].data);
+    expect(dataRows).toHaveLength(2);
+    for (const row of dataRows) {
+      expect(row['verdict']).not.toBe('approved');
+      expect(row['source_plugin']).toBeDefined();
+    }
+    const sourcePlugins = dataRows.map((r) => r['source_plugin']);
+    expect(new Set(sourcePlugins)).toEqual(new Set(['momentum', 'mean-reversion']));
+  });
+});
+
+// ── veto-ledger-persist-fix: per-row persistence must be fail-soft ───────────
+//
+// The pre-fix _persistVetoDecisions wrapped the whole for-loop in one
+// try/catch, so a single bad prisma.vetoDecision.create() dropped every
+// remaining row for that cycle. Each row must be independent.
+
+describe('veto-ledger-persist-fix — one bad row does not suppress the rest of the cycle audit trail', () => {
+  it('3 signals, the 2nd create() throws → rows 1 and 3 are still persisted', async () => {
+    const prisma = makePrismaVetoMock();
+    prisma.vetoDecision.create
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce(new Error('DB write failed for row 2'))
+      .mockResolvedValueOnce({});
+
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: {
+          signals: [
+            { symbol: 'AAA', action: 'buy', qty: 1 },
+            { symbol: 'BBB', action: 'buy', qty: 2 },
+            { symbol: 'CCC', action: 'buy', qty: 3 },
+          ],
+          logs: [],
+        },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [
+      { symbol: 'AAA', action: 'buy', qty: 1, plugin_id: 'p1' },
+      { symbol: 'BBB', action: 'buy', qty: 2, plugin_id: 'p2' },
+      { symbol: 'CCC', action: 'buy', qty: 3, plugin_id: 'p3' },
+    ];
+
+    const { vetoCtx } = await callRunVetoLayerS3(
+      service,
+      'cycle-persist-partial',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    // The cycle itself must be unaffected.
+    expect(vetoCtx['pending_signals'] as unknown[]).toHaveLength(3);
+
+    // All 3 creates must have been attempted independently.
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(3);
+    const calls = prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>;
+    const symbols = calls.map((c) => c[0].data['symbol']);
+    expect(symbols).toEqual(['AAA', 'BBB', 'CCC']);
   });
 });

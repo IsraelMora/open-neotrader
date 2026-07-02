@@ -198,6 +198,40 @@ model MlSignalRecord {
   @@map("ml_signal_record")
 }
 
+// Immutable veto decision ledger — one row per proposed signal per cycle, capturing
+// what the veto layer decided (approved/blocked/modified) and enough context to
+// reconstruct the counterfactual offline. cf_* fields are NULL at write time and
+// backfilled later by a separate read-side analyzer (no lookahead), mirroring the
+// outcome_pnl pattern on MlSignalRecord.
+model VetoDecision {
+  id                     String   @id @default(uuid())
+  ts                     DateTime @default(now())
+  cycle_id               String
+  symbol                 String
+  source_plugin          String
+  signal_confidence      Float?
+  proposed_action        String
+  proposed_qty           Float
+  verdict                String              // "approved" | "blocked" | "modified"
+  approved_action        String?
+  approved_qty           Float?
+  discipline             String?
+  rationale              String?
+  ref_price              Float?
+  regime_tags            String?
+  portfolio_drawdown_pct Float?
+  context_snapshot       String?             // JSON: proposed signal + market context for offline counterfactual reconstruction
+  cf_pnl                 Float?              // counterfactual P&L — NULL at write, backfilled later by read-side analyzer (NO lookahead)
+  cf_method              String?
+  cf_evaluated_at        DateTime?
+
+  @@index([cycle_id])
+  @@index([symbol])
+  @@index([ts])
+  @@index([verdict])
+  @@map("veto_decisions")
+}
+
 // HITL paper trade-execution layer.
 // Records LLM trade decisions (TradeIntent) for human review before paper execution.
 // Real-money execution is intentionally NOT wired — only mode="paper" is supported.
