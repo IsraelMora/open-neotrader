@@ -19,11 +19,12 @@
  * Paper portfolio storage: Portfolio model, name="paper", data=JSON PaperState.
  * This reuses the existing Portfolio table (keyed by name) and avoids a new table.
  */
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
 import { KvService } from '../common/kv.service';
 import { kvBool, kvNum, kvStr } from '../common/kv.util';
+import { AuditService } from '../audit/audit.service';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -77,6 +78,17 @@ const DEFAULT_EXECUTION_POLICY: ExecutionPolicy = {
 const PAPER_PORTFOLIO_INITIAL_CAPITAL = 10_000;
 const PAPER_PORTFOLIO_NAME = 'paper';
 
+/**
+ * Walk-forward gate (measurable-veto-shield): freshness window for a passing verdict.
+ * Real-money execution requires the CURRENTLY-APPLIED strategy to carry a ROBUSTO
+ * walk-forward verdict recorded within this many days. Configurable via KV
+ * `execution.walk_forward_max_age_days`; clamped to [1, 3650].
+ */
+const DEFAULT_WALK_FORWARD_MAX_AGE_DAYS = 30;
+const WALK_FORWARD_MAX_AGE_DAYS_MIN = 1;
+const WALK_FORWARD_MAX_AGE_DAYS_MAX = 3650;
+const REQUIRED_WALK_FORWARD_VERDICT = 'ROBUSTO';
+
 /** Fraction of available cash used per long entry (human-approved path). */
 const SIZING_PCT = 0.05;
 
@@ -90,6 +102,9 @@ export class TradeIntentService {
     private readonly db: PrismaService,
     private readonly gateway: ProviderGatewayService,
     private readonly kv: KvService,
+    // AuditService @Optional() — records real→paper demotions from the walk-forward gate
+    // so the operator understands WHY a real order didn't execute. Absent → WARN log only.
+    @Optional() private readonly audit?: AuditService,
   ) {}
 
   // ── recordIntent ─────────────────────────────────────────────────────────────
@@ -184,7 +199,7 @@ export class TradeIntentService {
     }
 
     const policy = await this._readExecutionPolicy();
-    const effectiveMode = this._effectiveMode(policy);
+    const effectiveMode = await this._effectiveMode(policy, id);
 
     // Load the shared paper portfolio (create with defaults if missing).
     // Also needed in real mode for exit qty lookup and risk gate state.
@@ -284,7 +299,7 @@ export class TradeIntentService {
     }
 
     const policy = await this._readExecutionPolicy();
-    const effectiveMode = this._effectiveMode(policy);
+    const effectiveMode = await this._effectiveMode(policy, id);
 
     // Load the shared paper portfolio (create with defaults if missing).
     // Also needed in real mode for exit qty lookup.
@@ -455,19 +470,122 @@ export class TradeIntentService {
   // ── _effectiveMode ────────────────────────────────────────────────────────────
 
   /**
-   * Derives the execution mode from policy.
-   * Returns 'real' ONLY when BOTH conditions hold:
+   * Derives the execution mode from policy. This is the SINGLE source of truth for
+   * real-vs-paper; intent.mode (stored in DB) is irrelevant at execution time.
+   *
+   * Returns 'real' ONLY when ALL of these hold:
    *   1. policy.real === true  (operator explicitly set execution.real=true)
    *   2. policy.broker_plugin_id is non-empty  (a broker is configured)
+   *   3. the walk-forward GATE passes: the CURRENTLY-APPLIED strategy carries a recent
+   *      ROBUSTO walk-forward verdict (measurable-veto-shield).
    *
-   * Any other combination → 'paper'. This is the SINGLE source of truth.
-   * intent.mode (stored in DB) is irrelevant at execution time.
+   * Any failure → 'paper'. The gate ONLY ever downgrades real→paper: it never throws,
+   * never blocks the intent, and never touches the paper path. A demotion is logged at
+   * WARN and audited so the operator understands why real didn't execute.
    */
-  private _effectiveMode(policy: ExecutionPolicy): 'paper' | 'real' {
-    if (policy.real === true && policy.broker_plugin_id.length > 0) {
-      return 'real';
+  private async _effectiveMode(
+    policy: ExecutionPolicy,
+    contextId: string,
+  ): Promise<'paper' | 'real'> {
+    if (!(policy.real === true && policy.broker_plugin_id.length > 0)) {
+      return 'paper';
     }
-    return 'paper';
+
+    const gate = await this._checkWalkForwardGate();
+    if (!gate.pass) {
+      this.log.warn(
+        `REAL DEMOTED TO PAPER [${contextId}]: walk-forward gate failed — ${gate.reason}`,
+      );
+      await this._auditDemotion(contextId, gate.reason ?? 'walk-forward gate failed');
+      return 'paper';
+    }
+    return 'real';
+  }
+
+  // ── walk-forward gate ─────────────────────────────────────────────────────────
+
+  /**
+   * Walk-forward gate before live trading: real money is only allowed when the
+   * CURRENTLY-APPLIED strategy (KV `strategy.applied`, same key SnapshotService reads)
+   * has a ROBUSTO walk-forward verdict recorded within the freshness window.
+   *
+   * Fail-soft and fail-closed: any missing/stale/failed condition returns { pass:false }
+   * (→ demote to paper). Never throws — every DB/KV read is guarded.
+   */
+  private async _checkWalkForwardGate(): Promise<{ pass: boolean; reason?: string }> {
+    let strategyId: string | null;
+    try {
+      strategyId = kvStr(await this.kv.get('strategy.applied'));
+    } catch {
+      strategyId = null;
+    }
+    if (!strategyId) {
+      return { pass: false, reason: 'no applied strategy (KV strategy.applied unset)' };
+    }
+
+    let row: { walk_forward_verdict: string | null; walk_forward_checked_at: Date | null } | null;
+    try {
+      row = await this.db.strategy.findUnique({
+        where: { id: strategyId },
+        select: { walk_forward_verdict: true, walk_forward_checked_at: true },
+      });
+    } catch {
+      return { pass: false, reason: `strategy lookup failed for '${strategyId}'` };
+    }
+    if (!row) {
+      return { pass: false, reason: `applied strategy '${strategyId}' has no matching row` };
+    }
+
+    if (row.walk_forward_verdict !== REQUIRED_WALK_FORWARD_VERDICT) {
+      return {
+        pass: false,
+        reason: `walk-forward verdict is ${row.walk_forward_verdict ?? 'null'} (need ${REQUIRED_WALK_FORWARD_VERDICT})`,
+      };
+    }
+    if (!row.walk_forward_checked_at) {
+      return { pass: false, reason: 'walk-forward verdict has no checked_at timestamp' };
+    }
+
+    const maxAgeDays = await this._readWalkForwardMaxAgeDays();
+    const ageMs = Date.now() - new Date(row.walk_forward_checked_at).getTime();
+    if (ageMs > maxAgeDays * 86_400_000) {
+      const ageDays = Math.floor(ageMs / 86_400_000);
+      return {
+        pass: false,
+        reason: `walk-forward verdict is stale (${ageDays}d old > ${maxAgeDays}d window)`,
+      };
+    }
+
+    return { pass: true };
+  }
+
+  /** Freshness window (days) for the walk-forward gate. Clamped to sane bounds. */
+  private async _readWalkForwardMaxAgeDays(): Promise<number> {
+    let raw: string | null;
+    try {
+      raw = await this.kv.get('execution.walk_forward_max_age_days');
+    } catch {
+      raw = null;
+    }
+    let days = kvNum(raw, DEFAULT_WALK_FORWARD_MAX_AGE_DAYS);
+    if (!Number.isFinite(days) || days < WALK_FORWARD_MAX_AGE_DAYS_MIN) {
+      days = WALK_FORWARD_MAX_AGE_DAYS_MIN;
+    }
+    if (days > WALK_FORWARD_MAX_AGE_DAYS_MAX) days = WALK_FORWARD_MAX_AGE_DAYS_MAX;
+    return days;
+  }
+
+  /** Best-effort audit of a real→paper demotion. Never breaks execution. */
+  private async _auditDemotion(intentId: string, reason: string): Promise<void> {
+    if (!this.audit) return;
+    try {
+      await this.audit.log({
+        event_type: 'walk_forward_gate_demotion',
+        meta: { intent_id: intentId, reason },
+      });
+    } catch {
+      // audit is best-effort — a logging failure must never affect execution.
+    }
   }
 
   // ── _executeReal ──────────────────────────────────────────────────────────────
@@ -478,7 +596,9 @@ export class TradeIntentService {
    * Pre-checks (any failure → status=failed, NEVER place order):
    *   - broker_plugin_id must be set (defensive; _effectiveMode already guards this)
    *   - qty computed from fresh getQuote; must be > 0
-   *   - notional (qty * price) must be <= policy.max_order_notional
+   *   - notional (qty * price) must be <= policy.max_order_notional — EXEMPT for "exit"
+   *     (closing a position must never be blocked by the ceiling; mirrors the qty-clamp
+   *     and paper path, which already exempt exits from sizing limits)
    *
    * Side mapping:
    *   long  → 'buy'
@@ -513,6 +633,26 @@ export class TradeIntentService {
           decided_at: new Date(),
           decided_by,
           result_json: JSON.stringify({ error: 'broker_plugin_id not configured' }),
+        },
+      });
+    }
+
+    // Defensive walk-forward gate re-check (belt-and-suspenders beyond _effectiveMode) so
+    // no future caller can reach real execution without a recent ROBUSTO verdict on the
+    // applied strategy. In the normal flow _effectiveMode already demoted to paper, so this
+    // never fires; if it ever does, fail safe like the broker guard — no real order.
+    const gate = await this._checkWalkForwardGate();
+    if (!gate.pass) {
+      this.log.warn(
+        `REAL ORDER REJECTED [${id}]: walk-forward gate failed — ${gate.reason} — safety guard`,
+      );
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({ error: `walk-forward gate: ${gate.reason}` }),
         },
       });
     }
@@ -608,9 +748,12 @@ export class TradeIntentService {
       });
     }
 
-    // Notional ceiling check.
+    // Notional ceiling check — exits are EXEMPT (closing a position reduces risk and must
+    // never be blocked, mirroring the qty-clamp and the paper path, which already exempt
+    // exits). A real position whose notional exceeds the ceiling must still be closeable;
+    // otherwise the ceiling would trap the user in a position they can't exit.
     const notional = qty * price;
-    if (notional > policy.max_order_notional) {
+    if (action !== 'exit' && notional > policy.max_order_notional) {
       this.log.warn(
         `REAL ORDER REJECTED [${id}]: notional=${notional} exceeds max_order_notional=${policy.max_order_notional} for ${symbol}`,
       );

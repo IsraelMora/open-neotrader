@@ -23,6 +23,10 @@ type MockPrisma = {
     findUnique: jest.Mock;
     upsert: jest.Mock;
   };
+  strategy: {
+    findUnique: jest.Mock;
+    update: jest.Mock;
+  };
 };
 
 function makePrisma(): MockPrisma {
@@ -36,6 +40,10 @@ function makePrisma(): MockPrisma {
     portfolio: {
       findUnique: jest.fn(),
       upsert: jest.fn(),
+    },
+    strategy: {
+      findUnique: jest.fn(),
+      update: jest.fn(),
     },
   };
 }
@@ -52,12 +60,42 @@ function makeKv(): MockKv {
   return { get: jest.fn(), set: jest.fn().mockResolvedValue(undefined) };
 }
 
-function makeService(prisma: MockPrisma, gateway: MockGateway, kv: MockKv): TradeIntentService {
+type MockAudit = { log: jest.Mock };
+
+function makeAudit(): MockAudit {
+  return { log: jest.fn().mockResolvedValue(undefined) };
+}
+
+function makeService(
+  prisma: MockPrisma,
+  gateway: MockGateway,
+  kv: MockKv,
+  audit?: MockAudit,
+): TradeIntentService {
   return new (TradeIntentService as unknown as new (
     db: unknown,
     gw: unknown,
     kv: unknown,
-  ) => TradeIntentService)(prisma, gateway, kv);
+    audit?: unknown,
+  ) => TradeIntentService)(prisma, gateway, kv, audit);
+}
+
+/**
+ * Wires a passing walk-forward gate: an applied strategy (KV strategy.applied) whose
+ * Strategy row carries a fresh ROBUSTO verdict. Real execution requires this on top of
+ * execution.real=true + broker_plugin_id. NOTE: call AFTER any kv.get.mockImplementation
+ * so the strategy.applied branch is present — helpers below already include it.
+ */
+function mockRobustAppliedStrategy(
+  prisma: MockPrisma,
+  verdict: string | null = 'ROBUSTO',
+  checkedAt: Date | null = new Date(),
+): void {
+  prisma.strategy.findUnique.mockResolvedValue({
+    id: 's_live',
+    walk_forward_verdict: verdict,
+    walk_forward_checked_at: checkedAt,
+  });
 }
 
 /** Minimal paper portfolio state stored in Portfolio.data (JSON). */
@@ -464,8 +502,10 @@ describe('TradeIntentService', () => {
         if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
         if (key === 'execution.max_order_notional') return Promise.resolve('100000'); // generous, isolate size clamp
         if (key === 'execution.max_position_pct') return Promise.resolve('0.02');
+        if (key === 'strategy.applied') return Promise.resolve('s_live');
         return Promise.resolve(null);
       });
+      mockRobustAppliedStrategy(prisma); // walk-forward gate passes
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
       );
@@ -1023,9 +1063,12 @@ describe('TradeIntentService', () => {
   // ── real execution ──────────────────────────────────────────────────────────
 
   describe('real execution', () => {
-    // Helper: configure KV for real execution with a broker
+    // Helper: configure KV for real execution with a broker AND a passing walk-forward
+    // gate (an applied strategy with a fresh ROBUSTO verdict). Both are now required for
+    // real execution — real=true + broker alone is no longer sufficient.
     function enableReal(
       kvMock: MockKv,
+      prismaMock: MockPrisma,
       brokerPluginId = 'alpaca-provider',
       maxOrderNotional = 1000,
     ) {
@@ -1034,8 +1077,10 @@ describe('TradeIntentService', () => {
         if (key === 'execution.broker_plugin_id') return Promise.resolve(brokerPluginId);
         if (key === 'execution.max_order_notional')
           return Promise.resolve(String(maxOrderNotional));
+        if (key === 'strategy.applied') return Promise.resolve('s_live');
         return Promise.resolve(null); // all other keys → defaults (autonomous=true, etc.)
       });
+      mockRobustAppliedStrategy(prismaMock); // fresh ROBUSTO verdict → gate passes
     }
 
     it.each([
@@ -1077,7 +1122,7 @@ describe('TradeIntentService', () => {
     });
 
     it('real=true + broker set → autoProcess long calls placeOrder with side=buy, type=market, qty>0, status=executed', async () => {
-      enableReal(kv); // real=true, broker='alpaca-provider', max_order_notional=1000
+      enableReal(kv, prisma); // real=true, broker='alpaca-provider', max_order_notional=1000
       // qty = floor(10000 * 0.1 / 150) = floor(6.66) = 6; notional = 6*150 = 900 <= 1000 ✓
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
@@ -1121,8 +1166,10 @@ describe('TradeIntentService', () => {
         if (key === 'execution.real') return Promise.resolve('true');
         if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
         if (key === 'execution.max_order_notional') return Promise.resolve('100'); // tiny ceiling
+        if (key === 'strategy.applied') return Promise.resolve('s_live');
         return Promise.resolve(null);
       });
+      mockRobustAppliedStrategy(prisma); // gate passes → reach the notional check
 
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
@@ -1145,8 +1192,76 @@ describe('TradeIntentService', () => {
       );
     });
 
+    it('real exit above max_order_notional STILL executes (exits must never be trapped by the ceiling)', async () => {
+      // Ceiling is tiny (100) but the held position's exit notional (10 * 150 = 1500) exceeds
+      // it. Exits must be exempt from the notional ceiling — same reasoning as the qty-clamp
+      // and the paper path — otherwise a real position could become impossible to close.
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        if (key === 'execution.max_order_notional') return Promise.resolve('100'); // tiny ceiling
+        if (key === 'strategy.applied') return Promise.resolve('s_live');
+        return Promise.resolve(null);
+      });
+      mockRobustAppliedStrategy(prisma);
+
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: JSON.stringify({
+          equity: 10_000,
+          cash: 8_500,
+          positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 140 }],
+        }),
+        updatedAt: new Date(),
+      });
+      mockAaplQuote(gateway); // last=150 → notional = 10 * 150 = 1500 > 100
+      gateway.placeOrder.mockResolvedValue({ id: 'order_exit', status: 'accepted' });
+      const executed = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        quantity: 10,
+        decided_by: 'autonomous',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).toHaveBeenCalledWith(
+        'alpaca-provider',
+        oc({ symbol: 'AAPL', qty: 10, side: 'sell', type: 'market' }),
+      );
+      expect(result.status).toBe('executed');
+    });
+
+    it('real long above max_order_notional is still rejected (ceiling stays enforced for entries)', async () => {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        if (key === 'execution.max_order_notional') return Promise.resolve('100'); // tiny ceiling
+        if (key === 'strategy.applied') return Promise.resolve('s_live');
+        return Promise.resolve(null);
+      });
+      mockRobustAppliedStrategy(prisma);
+
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
+      const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(failed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('failed');
+    });
+
     it('placeOrder throws → status=failed, no throw to caller', async () => {
-      enableReal(kv);
+      enableReal(kv, prisma);
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
       );
@@ -1171,7 +1286,7 @@ describe('TradeIntentService', () => {
 
     it('real exit → side=sell with the held position qty from portfolio', async () => {
       // Portfolio holds 10 AAPL at avg 140; exit → sell 10 shares
-      enableReal(kv, 'alpaca-provider', 5000); // ceiling high enough
+      enableReal(kv, prisma, 'alpaca-provider', 5000); // ceiling high enough
       const portfolioWithPosition = JSON.stringify({
         equity: 11_400,
         cash: 10_000,
@@ -1209,7 +1324,7 @@ describe('TradeIntentService', () => {
     });
 
     it('risk gate still applies in real mode — drawdown halt prevents real order', async () => {
-      enableReal(kv);
+      enableReal(kv, prisma);
       // hwm=10_000 → 30% dd
       const portfolioWithDrawdown = JSON.stringify({
         equity: 7_000,
@@ -1241,7 +1356,7 @@ describe('TradeIntentService', () => {
     });
 
     it('hold in real mode → no order placed, status=executed, quantity=0', async () => {
-      enableReal(kv);
+      enableReal(kv, prisma);
       prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'hold' }));
       const executed = pendingIntent({ status: 'executed', quantity: 0, decided_by: 'autonomous' });
       prisma.tradeIntent.update.mockResolvedValue(executed);
@@ -1252,6 +1367,246 @@ describe('TradeIntentService', () => {
       expect(gateway.placeOrder).not.toHaveBeenCalled();
       expect(result.status).toBe('executed');
       expect(result.quantity).toBe(0);
+    });
+  });
+
+  // ── walk-forward gate before live trading (measurable-veto-shield) ───────────
+  //
+  // Real execution now requires, ON TOP of execution.real=true + broker_plugin_id, that
+  // the CURRENTLY-APPLIED strategy (KV strategy.applied) carry a recent ROBUSTO
+  // walk-forward verdict. Any failure DEMOTES real→paper — it never blocks the intent and
+  // never touches the paper path.
+  describe('walk-forward gate before live trading', () => {
+    /** real=true + broker set, but the applied-strategy gate is configurable per test. */
+    function enableRealNoGate(kvMock: MockKv, extra: Record<string, string> = {}) {
+      kvMock.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        if (key === 'execution.max_order_notional') return Promise.resolve('100000');
+        if (key in extra) return Promise.resolve(extra[key]);
+        return Promise.resolve(null);
+      });
+    }
+
+    it('applied strategy ROBUSTO + fresh timestamp → effective mode real, real order placed', async () => {
+      enableRealNoGate(kv, { 'strategy.applied': 's_live' });
+      mockRobustAppliedStrategy(prisma, 'ROBUSTO', new Date());
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
+      gateway.placeOrder.mockResolvedValue({ id: 'o1', status: 'accepted', filled_qty: '6' });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({
+          status: 'executed',
+          fill_price: 150,
+          quantity: 6,
+          decided_by: 'autonomous',
+        }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).toHaveBeenCalledWith('alpaca-provider', oc({ side: 'buy' }));
+      expect(result.status).toBe('executed');
+      expect(prisma.portfolio.upsert).not.toHaveBeenCalled(); // real path, not paper
+    });
+
+    it.each([
+      ['SOBREAJUSTADO', 'SOBREAJUSTADO'],
+      ['INSUFICIENTE_DATOS', 'INSUFICIENTE_DATOS'],
+      ['null verdict', null],
+    ])(
+      'verdict %s → demoted to paper, NO real order, demotion audited',
+      async (_label, verdict) => {
+        const audit = makeAudit();
+        service = makeService(prisma, gateway, kv, audit);
+        enableRealNoGate(kv, { 'strategy.applied': 's_live' });
+        mockRobustAppliedStrategy(prisma, verdict, new Date());
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockPaperPortfolio(prisma);
+        mockAaplQuote(gateway);
+        prisma.portfolio.upsert.mockResolvedValue({
+          name: 'paper',
+          data: '{}',
+          updatedAt: new Date(),
+        });
+        prisma.tradeIntent.update.mockResolvedValue(
+          pendingIntent({ status: 'executed', decided_by: 'autonomous' }),
+        );
+
+        await service.autoProcess('ti_001');
+
+        expect(gateway.placeOrder).not.toHaveBeenCalled(); // demoted → no real order
+        expect(prisma.portfolio.upsert).toHaveBeenCalled(); // paper path ran
+        expect(audit.log).toHaveBeenCalledWith(oc({ event_type: 'walk_forward_gate_demotion' }));
+      },
+    );
+
+    it('ROBUSTO but walk_forward_checked_at older than max_age_days → demoted to paper', async () => {
+      // default max age = 30 days; make it 40 days old.
+      const stale = new Date(Date.now() - 40 * 86_400_000);
+      enableRealNoGate(kv, { 'strategy.applied': 's_live' });
+      mockRobustAppliedStrategy(prisma, 'ROBUSTO', stale);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'executed', decided_by: 'autonomous' }),
+      );
+
+      await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(prisma.portfolio.upsert).toHaveBeenCalled();
+    });
+
+    it('configurable max_age_days: a 40-day-old ROBUSTO verdict passes when window is 60 days', async () => {
+      const aged = new Date(Date.now() - 40 * 86_400_000);
+      enableRealNoGate(kv, {
+        'strategy.applied': 's_live',
+        'execution.walk_forward_max_age_days': '60',
+      });
+      mockRobustAppliedStrategy(prisma, 'ROBUSTO', aged);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
+      gateway.placeOrder.mockResolvedValue({ id: 'o2', status: 'accepted', filled_qty: '6' });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'executed', quantity: 6, decided_by: 'autonomous' }),
+      );
+
+      await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).toHaveBeenCalled();
+    });
+
+    it('no strategy.applied in KV → demoted to paper (never real)', async () => {
+      enableRealNoGate(kv); // strategy.applied unset
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'executed', decided_by: 'autonomous' }),
+      );
+
+      await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(prisma.portfolio.upsert).toHaveBeenCalled();
+    });
+
+    it('strategy.applied set but no matching Strategy row → demoted to paper', async () => {
+      enableRealNoGate(kv, { 'strategy.applied': 'ghost' });
+      prisma.strategy.findUnique.mockResolvedValue(null); // row missing
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'executed', decided_by: 'autonomous' }),
+      );
+
+      await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(prisma.portfolio.upsert).toHaveBeenCalled();
+    });
+
+    it('gate never throws even if the Strategy lookup rejects → demoted to paper', async () => {
+      enableRealNoGate(kv, { 'strategy.applied': 's_live' });
+      prisma.strategy.findUnique.mockRejectedValue(new Error('db down'));
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'executed', decided_by: 'autonomous' }),
+      );
+
+      const result = await service.autoProcess('ti_001'); // must not throw
+
+      expect(result.status).toBe('executed');
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(prisma.portfolio.upsert).toHaveBeenCalled();
+    });
+
+    it('approve() path is gated too: verdict SOBREAJUSTADO demotes a human-approved real order to paper', async () => {
+      enableRealNoGate(kv, { 'strategy.applied': 's_live' });
+      mockRobustAppliedStrategy(prisma, 'SOBREAJUSTADO', new Date());
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'executed', decided_by: 'alice' }),
+      );
+
+      await service.approve('ti_001', 'alice');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(prisma.portfolio.upsert).toHaveBeenCalled();
+    });
+
+    it('paper path is untouched by the gate: policy.real=false never reads the applied strategy', async () => {
+      kv.get.mockResolvedValue(null); // real=false → paper
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'executed', decided_by: 'autonomous' }),
+      );
+
+      await service.autoProcess('ti_001');
+
+      // Gate short-circuits: real=false means the applied-strategy row is never queried.
+      expect(prisma.strategy.findUnique).not.toHaveBeenCalled();
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(prisma.portfolio.upsert).toHaveBeenCalled();
     });
   });
 

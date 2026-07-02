@@ -244,6 +244,20 @@ export class BacktestService {
     if (!result.ok) {
       throw new BadGatewayException(`Walk-forward error: ${result.error ?? 'unknown error'}`);
     }
+
+    // Persist the verdict against the DB Strategy row so real-money execution can be gated
+    // on a recent ROBUSTO verdict (walk-forward gate). `dto.strategy` is a strategy-KIND
+    // string, NOT a Strategy.id — persistence keys off the explicit `strategy_row_id`.
+    // Best-effort: StrategyService.recordWalkForward is fail-soft and never throws, but we
+    // also guard here so a persistence issue can never break the walk-forward response.
+    if (dto.strategy_row_id) {
+      try {
+        await this.strategies.recordWalkForward(dto.strategy_row_id, result.verdict);
+      } catch {
+        // Never let verdict persistence break the backtest response.
+      }
+    }
+
     return result;
   }
 

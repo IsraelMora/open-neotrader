@@ -7,7 +7,10 @@
  *
  * Approve and reject are money-adjacent actions and therefore require TOTP.
  *
- * REAL-MONEY EXECUTION IS HARD-DISABLED at the service layer.
+ * Real-money execution IS possible but gated, not disabled: TradeIntentService derives
+ * the effective mode from ExecutionPolicy (execution.real=true AND a broker_plugin_id
+ * AND a fresh ROBUSTO walk-forward verdict on the applied strategy) — intent.mode as
+ * stored in the DB is not the source of truth.
  */
 import {
   Controller,

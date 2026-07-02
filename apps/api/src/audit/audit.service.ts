@@ -42,7 +42,10 @@ export type AuditEventType =
   // ml-feature-extractor-s3: live confidence adjustment via on_cycle hook
   | 'ml_signals_adjusted'
   // adaptive-parameters: kernel__tune_plugin_param success
-  | 'param_tuned';
+  | 'param_tuned'
+  // measurable-veto-shield: real→paper demotion because the applied strategy lacks a
+  // recent ROBUSTO walk-forward verdict (walk-forward gate before live trading)
+  | 'walk_forward_gate_demotion';
 
 export interface AuditPayload {
   cycle_id?: string;

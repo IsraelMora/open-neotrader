@@ -92,8 +92,19 @@ function makeSandbox(response: Record<string, unknown> = SANDBOX_SUCCESS) {
 function makeService(gateway: ProviderGatewayService, sandbox: SandboxGateway): BacktestService {
   const strategies = {
     get: jest.fn(),
+    recordWalkForward: jest.fn().mockResolvedValue(undefined),
   } as unknown as import('../strategy/strategy.service').StrategyService;
   return new BacktestService(gateway, sandbox, strategies);
+}
+
+/** Like makeService but exposes the StrategyService mocks so tests can assert on them. */
+function makeServiceWithStrategies(gateway: ProviderGatewayService, sandbox: SandboxGateway) {
+  const recordWalkForward = jest.fn().mockResolvedValue(undefined);
+  const strategies = {
+    get: jest.fn(),
+    recordWalkForward,
+  } as unknown as import('../strategy/strategy.service').StrategyService;
+  return { svc: new BacktestService(gateway, sandbox, strategies), recordWalkForward };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -245,6 +256,38 @@ describe('BacktestService — runWalkForward', () => {
     };
     expect(payload.config.n_windows).toBe(5);
     expect(payload.config.in_sample_pct).toBeCloseTo(0.7, 10);
+  });
+
+  it('persists the verdict on the Strategy row when strategy_row_id is provided', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox } = makeSandbox(WF_OK);
+    const { svc, recordWalkForward } = makeServiceWithStrategies(gateway, sandbox);
+
+    const result = await svc.runWalkForward(makeDto({ strategy_row_id: 's1' }));
+
+    expect(result.verdict).toBe('ROBUSTO');
+    expect(recordWalkForward).toHaveBeenCalledWith('s1', 'ROBUSTO');
+  });
+
+  it('does NOT persist when strategy_row_id is absent (dto.strategy is a kind, not a row id)', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox } = makeSandbox(WF_OK);
+    const { svc, recordWalkForward } = makeServiceWithStrategies(gateway, sandbox);
+
+    await svc.runWalkForward(makeDto());
+
+    expect(recordWalkForward).not.toHaveBeenCalled();
+  });
+
+  it('fail-soft: still returns the response when recordWalkForward rejects', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox } = makeSandbox(WF_OK);
+    const { svc, recordWalkForward } = makeServiceWithStrategies(gateway, sandbox);
+    recordWalkForward.mockRejectedValue(new Error('db down'));
+
+    const result = await svc.runWalkForward(makeDto({ strategy_row_id: 's1' }));
+
+    expect(result.verdict).toBe('ROBUSTO');
   });
 });
 

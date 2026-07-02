@@ -243,6 +243,30 @@ export class StrategyService {
     await this.db.strategy.delete({ where: { id } });
   }
 
+  /**
+   * Persists a walk-forward verdict on a Strategy row — the "measurable veto shield":
+   * real-money execution is gated on this being ROBUSTO and recent (see
+   * TradeIntentService._checkWalkForwardGate()).
+   *
+   * Fail-soft by design: callers (BacktestService.runWalkForward) invoke this best-effort
+   * and must never have the walk-forward response itself broken by a persistence failure
+   * (e.g. the strategy row doesn't exist because dto.strategy is a strategy-kind string,
+   * not a Strategy row id). Any error here is swallowed.
+   */
+  async recordWalkForward(strategyRowId: string, verdict: string): Promise<void> {
+    try {
+      await this.db.strategy.update({
+        where: { id: strategyRowId },
+        data: {
+          walk_forward_verdict: verdict,
+          walk_forward_checked_at: new Date(),
+        },
+      });
+    } catch {
+      // best-effort — no matching row, DB error, etc. Never propagate.
+    }
+  }
+
   async setActive(id: string, active: boolean): Promise<StrategyDto> {
     await this.get(id);
     const r = await this.db.strategy.update({

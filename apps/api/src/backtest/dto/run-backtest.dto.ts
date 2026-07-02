@@ -113,4 +113,16 @@ export class RunBacktestDto {
   @IsOptional()
   @IsObject()
   params?: Record<string, unknown>;
+
+  /**
+   * Walk-forward gate only: the DB Strategy row id (Strategy.id, a UUID) to record the
+   * walk-forward verdict against. Distinct from `strategy` above, which is a strategy-KIND
+   * string ("trend-following" | ...), not a Strategy row id. When set, a successful
+   * walk-forward run persists its verdict on that row (best-effort) so real-money
+   * execution can be gated on a recent ROBUSTO verdict. Absent → nothing is persisted.
+   */
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  strategy_row_id?: string;
 }

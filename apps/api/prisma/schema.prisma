@@ -101,6 +101,13 @@ model Strategy {
   created_at  DateTime @default(now())
   updated_at  DateTime @updatedAt
 
+  // Walk-forward gate (measurable-veto-shield): real-money execution requires the
+  // CURRENTLY-APPLIED strategy to carry a recent "ROBUSTO" verdict here — see
+  // TradeIntentService._checkWalkForwardGate(). Set by BacktestService.runWalkForward()
+  // via StrategyService.recordWalkForward(); best-effort, never blocks the backtest itself.
+  walk_forward_verdict     String?   // "ROBUSTO" | "SOBREAJUSTADO" | "INSUFICIENTE_DATOS" | null
+  walk_forward_checked_at  DateTime?
+
   @@map("strategies")
 }
 
@@ -234,7 +241,10 @@ model VetoDecision {
 
 // HITL paper trade-execution layer.
 // Records LLM trade decisions (TradeIntent) for human review before paper execution.
-// Real-money execution is intentionally NOT wired — only mode="paper" is supported.
+// Real-money execution IS possible but gated at the service layer, not disabled: the
+// effective mode is derived from ExecutionPolicy (execution.real=true AND a
+// broker_plugin_id AND a fresh ROBUSTO walk-forward verdict) — the `mode` column below
+// is not the source of truth for whether an order ends up paper or real.
 model TradeIntent {
   id            String    @id @default(cuid())
   cycle_id      String?
@@ -243,7 +253,7 @@ model TradeIntent {
   confidence    Float
   rationale     String
   timeframe     String    @default("1d")
-  mode          String    @default("paper") // always "paper"; real-money is hard-disabled
+  mode          String    @default("paper") // stored value; effective mode is gated, see ExecutionPolicy above
   status        String    @default("pending") // "pending" | "approved" | "rejected" | "executed" | "failed"
   created_at    DateTime  @default(now())
   decided_at    DateTime?
