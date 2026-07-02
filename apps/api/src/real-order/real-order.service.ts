@@ -34,10 +34,12 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
+import { KvService } from '../common/kv.service';
 import {
   normalizeBrokerStatus,
   TERMINAL_STATUSES as BROKER_TERMINAL_STATUSES,
 } from '../common/broker-status.util';
+import { haltRealExecution } from '../common/real-execution-halt.util';
 import type { RealOrder } from '@prisma/client';
 
 /** Statuses considered "in flight" — not yet confirmed as accepted or terminally failed. */
@@ -50,6 +52,15 @@ const RECOVERABLE_STATUSES = ['pending_submit', 'submit_failed'];
  * migration 0016) — keep these in sync.
  */
 const TERMINAL_STATUSES = ['filled', 'canceled', 'rejected', 'expired', 'submit_failed'];
+
+/**
+ * R8 kill-switch threshold: this many CONSECUTIVE submit_failed events within
+ * SUBMIT_FAILURE_WINDOW_MS trip the real-money kill-switch (see real-execution-halt.util.ts).
+ * A simple in-memory sliding window is enough here — this only needs to catch a burst of
+ * failures within one process's lifetime; it deliberately does not survive a restart.
+ */
+const SUBMIT_FAILURE_THRESHOLD = 3;
+const SUBMIT_FAILURE_WINDOW_MS = 5 * 60_000;
 
 export interface SubmitArgs {
   tradeIntentId: string;
@@ -65,9 +76,13 @@ export interface SubmitArgs {
 export class RealOrderService implements OnModuleInit {
   private readonly log = new Logger(RealOrderService.name);
 
+  /** In-memory sliding window of recent CONSECUTIVE submit_failed timestamps (ms epoch). */
+  private submitFailureTimestamps: number[] = [];
+
   constructor(
     private readonly db: PrismaService,
     private readonly gateway: ProviderGatewayService,
+    private readonly kv: KvService,
   ) {}
 
   /**
@@ -165,6 +180,10 @@ export class RealOrderService implements OnModuleInit {
         limitPrice: args.limitPrice,
       });
 
+      // A successful placeOrder resets the consecutive-failure streak — only CONSECUTIVE
+      // failures should ever trip the kill-switch (R8).
+      this.submitFailureTimestamps = [];
+
       const brokerOrderId = this.extractBrokerOrderId(orderResponse);
       try {
         return await this.db.realOrder.update({
@@ -188,6 +207,7 @@ export class RealOrderService implements OnModuleInit {
       this.log.warn(
         `REAL ORDER SUBMIT FAILED [${row.id}]: ${args.side} ${args.requestedQty} ${args.symbol} — ${String(err)}`,
       );
+      await this._recordSubmitFailureAndMaybeHalt();
       try {
         return await this.db.realOrder.update({
           where: { id: row.id },
@@ -202,6 +222,31 @@ export class RealOrderService implements OnModuleInit {
         );
         return row;
       }
+    }
+  }
+
+  /**
+   * R8: tracks CONSECUTIVE submit_failed events in an in-memory sliding window and trips
+   * the global real-money kill-switch (see real-execution-halt.util.ts) once
+   * SUBMIT_FAILURE_THRESHOLD failures land within SUBMIT_FAILURE_WINDOW_MS. The window is
+   * pruned on every call so failures that age out never count towards the threshold.
+   * Fail-soft: a KV write error here is logged, never thrown — a broken kill-switch write
+   * must not prevent submit() from returning its best-available row state.
+   */
+  private async _recordSubmitFailureAndMaybeHalt(): Promise<void> {
+    const now = Date.now();
+    this.submitFailureTimestamps = [
+      ...this.submitFailureTimestamps.filter((t) => now - t <= SUBMIT_FAILURE_WINDOW_MS),
+      now,
+    ];
+    if (this.submitFailureTimestamps.length < SUBMIT_FAILURE_THRESHOLD) return;
+
+    try {
+      await haltRealExecution(this.kv, 'repeated real order submit failures');
+    } catch (haltErr) {
+      this.log.error(
+        `Failed to trip the real-execution kill-switch after repeated submit failures: ${String(haltErr)}`,
+      );
     }
   }
 

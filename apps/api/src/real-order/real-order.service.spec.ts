@@ -119,14 +119,40 @@ function callArg(calls: unknown[][], callIndex: number): { data: Record<string, 
   return calls[callIndex][0] as { data: Record<string, unknown> };
 }
 
+/**
+ * Stateful KV mock — mirrors real-broker-reconciliation.service.spec.ts's makeKv: `set`
+ * writes are visible to later `get` calls against the SAME instance, so the kill-switch
+ * tests below can assert on real_execution.halted/halt_reason like the real KvService.
+ */
+function makeKv(): {
+  get: jest.Mock;
+  set: jest.Mock;
+  delete: jest.Mock;
+} {
+  const store: Record<string, string | null> = {};
+  return {
+    get: jest.fn().mockImplementation((key: string) => Promise.resolve(store[key] ?? null)),
+    set: jest.fn().mockImplementation((key: string, value: string) => {
+      store[key] = value;
+      return Promise.resolve();
+    }),
+    delete: jest.fn().mockImplementation((key: string) => {
+      delete store[key];
+      return Promise.resolve();
+    }),
+  };
+}
+
 function makeService(
   prisma: ReturnType<typeof makePrisma>,
   gateway: ReturnType<typeof makeGateway>,
+  kv: ReturnType<typeof makeKv> = makeKv(),
 ): RealOrderService {
   return new (RealOrderService as unknown as new (
     db: unknown,
     gateway: unknown,
-  ) => RealOrderService)(prisma, gateway);
+    kv: unknown,
+  ) => RealOrderService)(prisma, gateway, kv);
 }
 
 // ── generateClientOrderId ───────────────────────────────────────────────────────
@@ -227,6 +253,165 @@ describe('RealOrderService.submit — failure path', () => {
     const lastUpdate = callArg(updateCalls, updateCalls.length - 1);
     expect(lastUpdate.data['status']).toBe('submit_failed');
     expect(lastUpdate.data['error']).toContain('broker unreachable');
+  });
+});
+
+// ── submit — repeated failures trip the real-money kill-switch (R8) ──────────────
+//
+// A simple in-memory sliding window: 3 consecutive submit_failed events within 5
+// minutes trips the switch. Fewer failures, or failures spread outside the window,
+// must NOT trip it.
+
+describe('RealOrderService.submit — repeated failures trip the kill-switch', () => {
+  it('3 consecutive submit failures within the window halt real execution with the correct reason', async () => {
+    const prisma = makePrisma({ createResult: makeRow() });
+    const gateway = makeGateway({ placeOrderThrows: new Error('broker unreachable') });
+    const kv = makeKv();
+    const svc = makeService(prisma, gateway, kv);
+
+    await svc.submit({
+      tradeIntentId: 'ti_1',
+      brokerPluginId: 'alpaca',
+      symbol: 'AAPL',
+      side: 'buy',
+      requestedQty: 10,
+    });
+    expect(await kv.get('real_execution.halted')).toBeNull();
+
+    await svc.submit({
+      tradeIntentId: 'ti_2',
+      brokerPluginId: 'alpaca',
+      symbol: 'AAPL',
+      side: 'buy',
+      requestedQty: 10,
+    });
+    expect(await kv.get('real_execution.halted')).toBeNull();
+
+    await svc.submit({
+      tradeIntentId: 'ti_3',
+      brokerPluginId: 'alpaca',
+      symbol: 'AAPL',
+      side: 'buy',
+      requestedQty: 10,
+    });
+
+    expect(await kv.get('real_execution.halted')).toBe('true');
+    expect(await kv.get('real_execution.halt_reason')).toContain(
+      'repeated real order submit failures',
+    );
+  });
+
+  it('fewer than 3 consecutive failures do NOT trip the kill-switch', async () => {
+    const prisma = makePrisma({ createResult: makeRow() });
+    const gateway = makeGateway({ placeOrderThrows: new Error('broker unreachable') });
+    const kv = makeKv();
+    const svc = makeService(prisma, gateway, kv);
+
+    await svc.submit({
+      tradeIntentId: 'ti_1',
+      brokerPluginId: 'alpaca',
+      symbol: 'AAPL',
+      side: 'buy',
+      requestedQty: 10,
+    });
+    await svc.submit({
+      tradeIntentId: 'ti_2',
+      brokerPluginId: 'alpaca',
+      symbol: 'AAPL',
+      side: 'buy',
+      requestedQty: 10,
+    });
+
+    expect(await kv.get('real_execution.halted')).toBeNull();
+  });
+
+  it('a success in between resets the consecutive-failure count — 2 failures + 1 success + 2 failures does NOT trip it', async () => {
+    const prisma = makePrisma({ createResult: makeRow() });
+    const kv = makeKv();
+    const failingGateway = makeGateway({ placeOrderThrows: new Error('broker unreachable') });
+    const svc = makeService(prisma, failingGateway, kv);
+
+    await svc.submit({
+      tradeIntentId: 'ti_1',
+      brokerPluginId: 'alpaca',
+      symbol: 'AAPL',
+      side: 'buy',
+      requestedQty: 10,
+    });
+    await svc.submit({
+      tradeIntentId: 'ti_2',
+      brokerPluginId: 'alpaca',
+      symbol: 'AAPL',
+      side: 'buy',
+      requestedQty: 10,
+    });
+
+    // A successful submit in between resets the streak.
+    (failingGateway.placeOrder as jest.Mock).mockResolvedValueOnce({ id: 'broker_order_ok' });
+    await svc.submit({
+      tradeIntentId: 'ti_3',
+      brokerPluginId: 'alpaca',
+      symbol: 'AAPL',
+      side: 'buy',
+      requestedQty: 10,
+    });
+
+    await svc.submit({
+      tradeIntentId: 'ti_4',
+      brokerPluginId: 'alpaca',
+      symbol: 'AAPL',
+      side: 'buy',
+      requestedQty: 10,
+    });
+    await svc.submit({
+      tradeIntentId: 'ti_5',
+      brokerPluginId: 'alpaca',
+      symbol: 'AAPL',
+      side: 'buy',
+      requestedQty: 10,
+    });
+
+    expect(await kv.get('real_execution.halted')).toBeNull();
+  });
+
+  it('failures outside the 5-minute window do NOT accumulate towards the threshold', async () => {
+    jest.useFakeTimers();
+    try {
+      const prisma = makePrisma({ createResult: makeRow() });
+      const gateway = makeGateway({ placeOrderThrows: new Error('broker unreachable') });
+      const kv = makeKv();
+      const svc = makeService(prisma, gateway, kv);
+
+      await svc.submit({
+        tradeIntentId: 'ti_1',
+        brokerPluginId: 'alpaca',
+        symbol: 'AAPL',
+        side: 'buy',
+        requestedQty: 10,
+      });
+      await svc.submit({
+        tradeIntentId: 'ti_2',
+        brokerPluginId: 'alpaca',
+        symbol: 'AAPL',
+        side: 'buy',
+        requestedQty: 10,
+      });
+
+      // Advance past the 5-minute window — the first two failures should age out.
+      jest.advanceTimersByTime(5 * 60_000 + 1);
+
+      await svc.submit({
+        tradeIntentId: 'ti_3',
+        brokerPluginId: 'alpaca',
+        symbol: 'AAPL',
+        side: 'buy',
+        requestedQty: 10,
+      });
+
+      expect(await kv.get('real_execution.halted')).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 

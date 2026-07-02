@@ -50,6 +50,7 @@ import { KvService } from '../common/kv.service';
 import { kvNum, kvStr } from '../common/kv.util';
 import { normalizeBrokerStatus } from '../common/broker-status.util';
 import { AlertsService } from '../alerts/alerts.service';
+import { haltRealExecution } from '../common/real-execution-halt.util';
 import type { RealOrder } from '@prisma/client';
 
 /** Persisted circuit-breaker state — mirrors CycleSchedulerService.CircuitBreakerState. */
@@ -554,6 +555,17 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
           `Failed to emit RECONCILIATION_HALTED alert (reconciliation is still halted): ${String(alertErr)}`,
         );
       }
+
+      // R8: also trips the global real-money kill-switch — blocks NEW real long/short
+      // entries platform-wide until a human operator explicitly clears it (never
+      // auto-cleared by a later successful tick, see real-execution-halt.util.ts).
+      try {
+        await haltRealExecution(this.kv, 'reconciliation circuit breaker open');
+      } catch (haltErr) {
+        this.log.error(
+          `Failed to trip the real-execution kill-switch after reconciliation circuit breaker OPEN: ${String(haltErr)}`,
+        );
+      }
     }
   }
 
@@ -733,8 +745,19 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
       }
     }
 
-    // Future work: R8 will consume the caller's driftedSymbols to trigger an
-    // auto-kill-switch here. Not implemented in this slice.
+    // R8: at least one unexplained broker position also trips the global real-money
+    // kill-switch — blocks NEW real long/short entries platform-wide until a human
+    // operator explicitly clears it (never auto-cleared, see real-execution-halt.util.ts).
+    if (drifted.length > 0) {
+      try {
+        await haltRealExecution(this.kv, 'broker position drift detected');
+      } catch (haltErr) {
+        this.log.error(
+          `detectDrift: failed to trip the real-execution kill-switch: ${String(haltErr)}`,
+        );
+      }
+    }
+
     return drifted;
   }
 

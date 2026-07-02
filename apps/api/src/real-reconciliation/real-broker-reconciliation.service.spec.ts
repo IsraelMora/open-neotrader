@@ -912,6 +912,60 @@ describe('RealBrokerReconciliationService — steady-state loop', () => {
     await jest.advanceTimersByTimeAsync(5_000);
     expect(reconcileAllSpy).toHaveBeenCalledTimes(1);
   });
+
+  it('circuit breaker trip ALSO trips the real-money kill-switch with the correct reason, alongside (not instead of) the RECONCILIATION_HALTED alert (R8)', async () => {
+    const prisma = makePrisma();
+    const gateway = makeGateway();
+    const kv = makeKv({ 'execution.real_reconciliation_interval_ms': '5000' });
+    const alerts = makeAlerts();
+    const svc = makeService(prisma, gateway, kv, alerts);
+    jest.spyOn(svc, 'reconcileAllOpenOrders').mockRejectedValue(new Error('db unreachable'));
+
+    await svc.onModuleInit();
+    await jest.advanceTimersByTimeAsync(5_000);
+    await jest.advanceTimersByTimeAsync(5_000);
+
+    expect(await kv.get('real_execution.halted')).toBe('true');
+    expect(await kv.get('real_execution.halt_reason')).toContain(
+      'reconciliation circuit breaker open',
+    );
+    // The existing alert is still emitted — the kill-switch is additive, not a replacement.
+    expect(alerts.create).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'RECONCILIATION_HALTED', severity: 'CRITICAL' }) as unknown,
+    );
+
+    svc.onModuleDestroy();
+  });
+
+  it('no auto-clear: a subsequent healthy tick after a trip does NOT clear the kill-switch', async () => {
+    const prisma = makePrisma();
+    const gateway = makeGateway();
+    const kv = makeKv({ 'execution.real_reconciliation_interval_ms': '5000' });
+    const alerts = makeAlerts();
+    const svc = makeService(prisma, gateway, kv, alerts);
+    const reconcileAllSpy = jest
+      .spyOn(svc, 'reconcileAllOpenOrders')
+      .mockRejectedValueOnce(new Error('fail 1')) // onModuleInit tick
+      .mockRejectedValueOnce(new Error('fail 2')) // interval tick 1
+      .mockRejectedValueOnce(new Error('fail 3')) // interval tick 2 — trips breaker + kill-switch
+      .mockResolvedValue(undefined); // half-open probe succeeds — a healthy cycle
+
+    await svc.onModuleInit();
+    await jest.advanceTimersByTimeAsync(5_000);
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(await kv.get('real_execution.halted')).toBe('true');
+
+    // Advance past the half-open cooldown — the breaker closes on a successful probe.
+    await jest.advanceTimersByTimeAsync(5 * 60_000);
+    expect((await svc.getCircuitBreaker()).state).toBe('closed');
+    expect(reconcileAllSpy).toHaveBeenCalled();
+
+    // The kill-switch stays tripped — only an explicit clearRealExecutionHalt() call may
+    // un-halt it, never a healthy cycle.
+    expect(await kv.get('real_execution.halted')).toBe('true');
+
+    svc.onModuleDestroy();
+  });
 });
 
 // ── syncPortfolio / detectDrift ─────────────────────────────────────────────
@@ -1200,6 +1254,38 @@ describe('RealBrokerReconciliationService.detectDrift', () => {
 
     expect(result.driftedSymbols).toEqual(['X']);
     expect(alerts.create).not.toHaveBeenCalled();
+  });
+
+  it('a drifted symbol ALSO trips the real-money kill-switch with the correct reason, alongside (not instead of) the BROKER_DRIFT alert (R8)', async () => {
+    const txClient = makePortfolioTxClient();
+    const prisma = makePortfolioPrisma({ txClient, realOrderFindFirstResult: null });
+    const portfolio = makePortfolio({ positions: [makeBrokerPosition({ symbol: 'X' })] });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const alerts = makePortfolioAlerts();
+    const kv = makeKv();
+    const svc = makePortfolioService(prisma, gateway, kv, alerts);
+
+    await svc.syncPortfolio('alpaca', 'poll');
+
+    expect(await kv.get('real_execution.halted')).toBe('true');
+    expect(await kv.get('real_execution.halt_reason')).toContain('broker position drift detected');
+    expect(alerts.create).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'BROKER_DRIFT', severity: 'CRITICAL' }) as unknown,
+    );
+  });
+
+  it('no drift → the kill-switch is left untouched', async () => {
+    const txClient = makePortfolioTxClient();
+    const prisma = makePortfolioPrisma({ txClient, realOrderFindFirstResult: { id: 'ro_1' } });
+    const portfolio = makePortfolio({ positions: [makeBrokerPosition({ symbol: 'Y' })] });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const alerts = makePortfolioAlerts();
+    const kv = makeKv();
+    const svc = makePortfolioService(prisma, gateway, kv, alerts);
+
+    await svc.syncPortfolio('alpaca', 'poll');
+
+    expect(await kv.get('real_execution.halted')).toBeNull();
   });
 });
 

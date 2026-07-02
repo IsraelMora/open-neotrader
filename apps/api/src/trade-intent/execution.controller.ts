@@ -1,4 +1,13 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Patch, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Patch,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { IsBoolean, IsInt, IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
 import { TradeIntentService } from './trade-intent.service';
@@ -45,5 +54,32 @@ export class ExecutionController {
   })
   setConfig(@Body() dto: UpdateExecutionPolicyDto) {
     return this.svc.setPolicy(dto);
+  }
+
+  /**
+   * Global real-money kill-switch (see real-execution-halt.util.ts). Halts NEW real
+   * long/short entries; exit/hold and the entire paper path are unaffected. The switch
+   * is auto-tripped by the system when unhealthy (reconciliation circuit breaker,
+   * broker position drift, repeated order-submit failures) and can ONLY be cleared by
+   * a human operator via clearRealHalt below — read-only, no TOTP required.
+   */
+  @Get('real-halt')
+  @ApiOperation({ summary: 'Estado del kill-switch de ejecución real (halted + motivo)' })
+  getRealHalt() {
+    return this.svc.getRealExecutionHaltStatus();
+  }
+
+  /**
+   * Clears the real-money kill-switch. Re-arming real trading after an automated halt
+   * is money-adjacent — same class as PATCH /execution/config — so it requires TOTP.
+   */
+  @Post('real-halt/clear')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TotpRequiredGuard)
+  @ApiOperation({
+    summary: 'Limpia el kill-switch de ejecución real (solo humano, TOTP requerido)',
+  })
+  clearRealHalt() {
+    return this.svc.clearRealExecutionHalt();
   }
 }

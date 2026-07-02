@@ -66,10 +66,14 @@ function makeGateway(): MockGateway {
   return { getQuote: jest.fn(), placeOrder: jest.fn(), getPortfolio: jest.fn() };
 }
 
-type MockKv = { get: jest.Mock; set: jest.Mock };
+type MockKv = { get: jest.Mock; set: jest.Mock; delete: jest.Mock };
 
 function makeKv(): MockKv {
-  return { get: jest.fn(), set: jest.fn().mockResolvedValue(undefined) };
+  return {
+    get: jest.fn(),
+    set: jest.fn().mockResolvedValue(undefined),
+    delete: jest.fn().mockResolvedValue(undefined),
+  };
 }
 
 type MockAudit = { log: jest.Mock };
@@ -2441,6 +2445,144 @@ describe('TradeIntentService', () => {
     });
   });
 
+  // ── real-money kill-switch (real_execution.halted) ────────────────────────────
+  //
+  // A global halt that blocks NEW real long/short entries while exit/hold and the
+  // entire paper path remain completely unaffected — see real-execution-halt.util.ts.
+  describe('real execution kill-switch (real_execution.halted)', () => {
+    function enableRealHalted(reason = 'reconciliation circuit breaker open') {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        if (key === 'execution.max_order_notional') return Promise.resolve('1000');
+        if (key === 'strategy.applied') return Promise.resolve('s_live');
+        if (key === 'real_execution.halted') return Promise.resolve('true');
+        if (key === 'real_execution.halt_reason') return Promise.resolve(reason);
+        return Promise.resolve(null);
+      });
+      mockRobustAppliedStrategy(prisma);
+      mockRealAccountState(prisma);
+    }
+
+    it.each(['long', 'short'] as const)(
+      'real %s is rejected with status=failed and the kill-switch reason when halted',
+      async (action) => {
+        enableRealHalted();
+        prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action, symbol: 'AAPL' }));
+        mockAaplQuote(gateway);
+        const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+        prisma.tradeIntent.update.mockResolvedValue(failed);
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(realOrderService.submit).not.toHaveBeenCalled();
+        expect(gateway.placeOrder).not.toHaveBeenCalled();
+        expect(result.status).toBe('failed');
+        expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+          oc({
+            data: oc({
+              status: 'failed',
+              result_json: expect.stringContaining('kill-switch') as string,
+            }),
+          }),
+        );
+      },
+    );
+
+    it('real exit still executes normally when halted (closing a position must never be blocked)', async () => {
+      enableRealHalted();
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 11_400,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: 10,
+            avg_entry: 140,
+            market_value: 1500,
+            unrealized_pnl: 100,
+            side: 'long',
+          },
+        ],
+        total_market_value: 1500,
+        total_pnl: 100,
+        ts: new Date().toISOString(),
+      });
+      mockAaplQuote(gateway);
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_halt_exit',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-exit',
+        broker_order_id: 'order_exit',
+        error: null,
+      });
+      const pending = pendingIntent({
+        status: 'real_pending',
+        fill_price: null,
+        quantity: null,
+        decided_by: 'autonomous',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(pending);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', requestedQty: 10, side: 'sell' }),
+      );
+      expect(result.status).toBe('real_pending');
+    });
+
+    it('hold intents are unaffected by the halt flag', async () => {
+      enableRealHalted();
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'hold' }));
+      const executed = pendingIntent({ status: 'executed', quantity: 0, decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('executed');
+      expect(result.quantity).toBe(0);
+    });
+
+    it.each(['long', 'short', 'exit', 'hold'] as const)(
+      'PAPER mode %s intents are completely unaffected by the halt flag',
+      async (action) => {
+        kv.get.mockImplementation((key: string) => {
+          if (key === 'real_execution.halted') return Promise.resolve('true');
+          return Promise.resolve(null); // execution.real stays unset → paper mode
+        });
+        prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action, symbol: 'AAPL' }));
+        mockPaperPortfolio(prisma);
+        mockAaplQuote(gateway);
+        prisma.portfolio.upsert.mockResolvedValue({
+          name: 'paper',
+          data: '{}',
+          updatedAt: new Date(),
+        });
+        const executed = pendingIntent({
+          status: 'executed',
+          fill_price: action === 'hold' ? null : 150,
+          quantity: action === 'hold' ? 0 : undefined,
+          decided_by: 'autonomous',
+        });
+        prisma.tradeIntent.update.mockResolvedValue(executed);
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(realOrderService.submit).not.toHaveBeenCalled();
+        expect(gateway.placeOrder).not.toHaveBeenCalled();
+        expect(result.status).toBe('executed');
+      },
+    );
+  });
+
   // ── exit routing must follow WHERE the position actually lives, not the CURRENT
   // policy (stranded real-position bug) ─────────────────────────────────────────
   //
@@ -3187,5 +3329,40 @@ describe('TradeIntentService policy config', () => {
     expect(policy.autonomous).toBe(true);
     expect(policy.real).toBe(false);
     expect(policy.broker_plugin_id).toBe('');
+  });
+});
+
+describe('TradeIntentService real-execution kill-switch operator methods', () => {
+  it('getRealExecutionHaltStatus reflects the persisted KV state', async () => {
+    const prisma = makePrisma();
+    const gateway = makeGateway();
+    const kv = makeKv();
+    kv.get.mockImplementation((k: string) =>
+      Promise.resolve(
+        {
+          'real_execution.halted': 'true',
+          'real_execution.halt_reason': 'broker position drift detected',
+        }[k] ?? null,
+      ),
+    );
+    const service = makeService(prisma, gateway, kv);
+
+    const status = await service.getRealExecutionHaltStatus();
+
+    expect(status).toEqual({ halted: true, reason: 'broker position drift detected' });
+  });
+
+  it('clearRealExecutionHalt writes halted=false and deletes the reason key, then returns the cleared status', async () => {
+    const prisma = makePrisma();
+    const gateway = makeGateway();
+    const kv = makeKv();
+    kv.get.mockResolvedValue(null); // after clearing, both keys read back as unset
+    const service = makeService(prisma, gateway, kv);
+
+    const status = await service.clearRealExecutionHalt();
+
+    expect(kv.set).toHaveBeenCalledWith('real_execution.halted', 'false');
+    expect(kv.delete).toHaveBeenCalledWith('real_execution.halt_reason');
+    expect(status).toEqual({ halted: false, reason: null });
   });
 });

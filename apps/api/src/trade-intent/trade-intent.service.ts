@@ -31,6 +31,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService, Portfolio } from '../providers/provider-gateway.service';
 import { KvService } from '../common/kv.service';
 import { kvBool, kvNum, kvStr } from '../common/kv.util';
+import {
+  isRealExecutionHalted,
+  clearRealExecutionHalt,
+  getRealExecutionHaltStatus,
+  RealExecutionHaltStatus,
+} from '../common/real-execution-halt.util';
 import { AuditService } from '../audit/audit.service';
 import { RealOrderService } from '../real-order/real-order.service';
 import { RealBrokerReconciliationService } from '../real-reconciliation/real-broker-reconciliation.service';
@@ -580,6 +586,20 @@ export class TradeIntentService {
     return this._readExecutionPolicy();
   }
 
+  /** Operator-facing read of the real-money kill-switch (see real-execution-halt.util.ts). */
+  async getRealExecutionHaltStatus(): Promise<RealExecutionHaltStatus> {
+    return getRealExecutionHaltStatus(this.kv);
+  }
+
+  /**
+   * Clears the real-money kill-switch. Must ONLY ever be called from the TOTP-gated
+   * operator "clear" endpoint — never automatically. See real-execution-halt.util.ts.
+   */
+  async clearRealExecutionHalt(): Promise<RealExecutionHaltStatus> {
+    await clearRealExecutionHalt(this.kv);
+    return getRealExecutionHaltStatus(this.kv);
+  }
+
   // ── _effectiveMode ────────────────────────────────────────────────────────────
 
   /**
@@ -977,6 +997,30 @@ export class TradeIntentService {
     realState: RealAccountState | null,
     decided_by: string,
   ): Promise<{ failedUpdate: ReturnType<PrismaService['tradeIntent']['update']> } | { ok: true }> {
+    // Global real-money kill-switch: blocks NEW entries (long/short) only. "exit"/"hold"
+    // are exempt — closing/holding a position must always be reachable, same exemption as
+    // every other real-mode gate. See real-execution-halt.util.ts for the KV keys and the
+    // auto-trip wiring (reconciliation circuit breaker, drift detection, repeated submit
+    // failures) — the flag can ONLY be cleared by a human operator (TOTP-gated endpoint),
+    // never automatically.
+    if (action !== 'exit' && action !== 'hold') {
+      const halted = await isRealExecutionHalted(this.kv);
+      if (halted) {
+        this.log.warn(`REAL ORDER REJECTED [${id}]: real execution halted (kill-switch active)`);
+        return {
+          failedUpdate: this.db.tradeIntent.update({
+            where: { id },
+            data: {
+              status: 'failed',
+              decided_at: new Date(),
+              decided_by,
+              result_json: JSON.stringify({ error: 'real execution halted (kill-switch active)' }),
+            },
+          }),
+        };
+      }
+    }
+
     // Defensive: broker must be set (belt-and-suspenders beyond _effectiveMode).
     if (!policy.broker_plugin_id) {
       this.log.warn(`REAL ORDER REJECTED [${id}]: broker_plugin_id is empty — safety guard`);
