@@ -19,13 +19,24 @@ Stack auto-contenido: `docker compose up` levanta API + panel + sandbox.
 - (Opcional, para ejecutar órdenes) una cuenta **paper** de [Alpaca](https://alpaca.markets).
 
 ## 2. Instalar
+`docker-compose.yml` no publica puertos al host por defecto: está pensado para correr
+detrás de un reverse proxy (Traefik/Dokploy), que llega a los servicios por la red
+interna de Docker. Para evaluar localmente sin proxy, copiá el override de ejemplo
+(`compose.override.yml.example`) antes de levantar — Docker Compose lo mergea solo si
+existe como `compose.override.yml`, así que es opt-in y no debilita el default seguro.
+
 ```bash
 git clone https://github.com/IsraelMora/open-neotrader && cd open-neotrader
 cp .env.example .env
 # Editá .env: poné JWT_SECRET (genéralo) y, si querés, la key del LLM.
+cp compose.override.yml.example compose.override.yml   # solo para evaluación local
 docker compose up -d
 ```
-El panel queda detrás del proxy; la API en `/api`. Verificá: `curl http://localhost:8080/api/health`.
+Con el override local, el panel queda en `http://localhost:8080` y la API en `/api`.
+Verificá: `curl http://localhost:8080/api/health`.
+
+En producción (detrás de Traefik/Dokploy) no crees `compose.override.yml`: el proxy
+llega a los servicios por la red interna, sin publicar puertos al host.
 
 ## 3. Configurar (todo por API — "configurá y listo")
 Reemplazá `$T` por tu token de login.
