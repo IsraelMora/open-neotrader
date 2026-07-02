@@ -41,6 +41,8 @@ export interface PaperState {
   cash: number;
   positions: PaperPosition[];
   max_drawdown_pct?: number;
+  /** High-water-mark equity — the highest equity ever recorded for this paper portfolio. */
+  hwm?: number;
 }
 
 export interface ExecutionPolicy {
@@ -247,6 +249,7 @@ export class TradeIntentService {
       paperState,
       'autonomous',
       policy.max_position_pct,
+      policy.max_position_pct,
     );
   }
 
@@ -296,16 +299,37 @@ export class TradeIntentService {
           positions: [],
         };
 
+    // Kernel risk gate — SAME gate as autoProcess(), applied on the human-approval
+    // path too. Human approval must not bypass the drawdown halt / max-open-positions
+    // floor. "exit"/"hold" always pass — closing a position must remain possible
+    // even during an active halt.
+    const action = intent.action as TradeAction;
+    if (action === 'long' || action === 'short') {
+      const { pass, reason } = this._passesAutoRisk(state, policy);
+      if (!pass) {
+        return this.db.tradeIntent.update({
+          where: { id },
+          data: {
+            status: 'rejected',
+            decided_at: new Date(),
+            decided_by,
+            reject_reason: reason,
+          },
+        });
+      }
+    }
+
     if (effectiveMode === 'real') {
       return this._executeReal(id, intent, policy, state, decided_by, SIZING_PCT);
     }
     return this._runPaperExecution(
       id,
       intent.symbol,
-      intent.action as TradeAction,
+      action,
       state,
       decided_by,
       SIZING_PCT,
+      policy.max_position_pct,
     );
   }
 
@@ -530,15 +554,30 @@ export class TradeIntentService {
 
     if (action === 'long') {
       side = 'buy';
-      qty = Math.floor((paperState.equity * sizingPct) / price);
+      qty = this._clampToPositionCeiling(
+        Math.floor((paperState.equity * sizingPct) / price),
+        paperState.equity,
+        price,
+        policy.max_position_pct,
+        id,
+        'real long',
+      );
     } else if (action === 'exit') {
       side = 'sell';
       // Use held position quantity from paper portfolio as the authoritative qty.
+      // No ceiling clamp on exits — closing an existing position reduces risk.
       const pos = paperState.positions.find((p) => p.symbol === symbol);
       qty = pos ? pos.quantity : 0;
     } else if (action === 'short') {
       side = 'sell';
-      qty = Math.floor((paperState.equity * sizingPct) / price);
+      qty = this._clampToPositionCeiling(
+        Math.floor((paperState.equity * sizingPct) / price),
+        paperState.equity,
+        price,
+        policy.max_position_pct,
+        id,
+        'real short',
+      );
     } else {
       // 'hold' — should have been short-circuited before reaching here; defensive no-op.
       return this.db.tradeIntent.update({
@@ -643,13 +682,36 @@ export class TradeIntentService {
     });
   }
 
+  // ── _computeDrawdownPct ───────────────────────────────────────────────────────
+
+  /**
+   * Real drawdown from the true high-water-mark (hwm), read from the PAPER PORTFOLIO
+   * itself — the same state the kernel actually sizes/gates against. NOT from an
+   * external-provider-sourced snapshot history, which is disconnected from the paper
+   * portfolio and stays empty (hence a permanently-0 drawdown) whenever no broker
+   * credentials are configured — the common self-hosted case.
+   *
+   * hwm defaults to the current equity when unset (fresh portfolio, no trades yet),
+   * so a brand-new account is NEVER false-halted on its very first trade.
+   */
+  private _computeDrawdownPct(state: PaperState): number {
+    const hwm = state.hwm ?? state.equity;
+    return hwm > 0 ? Math.max(0, ((hwm - state.equity) / hwm) * 100) : 0;
+  }
+
   // ── _passesAutoRisk ───────────────────────────────────────────────────────────
 
+  /**
+   * Kernel risk gate for NEW ENTRIES (long/short). Called from BOTH autoProcess()
+   * and approve() — the human-approval path must not bypass these checks.
+   * "exit"/"hold" are never gated here (callers must keep letting position-closing
+   * actions through even during an active halt).
+   */
   private _passesAutoRisk(
     state: PaperState,
     policy: ExecutionPolicy,
   ): { pass: boolean; reason?: string } {
-    const drawdown = state.max_drawdown_pct ?? 0;
+    const drawdown = this._computeDrawdownPct(state);
     if (drawdown >= policy.max_drawdown_halt_pct) {
       return {
         pass: false,
@@ -667,6 +729,35 @@ export class TradeIntentService {
     return { pass: true };
   }
 
+  // ── _clampToPositionCeiling ───────────────────────────────────────────────────
+
+  /**
+   * Hard, non-bypassable ceiling on entry sizing: qty can never exceed what
+   * policy.max_position_pct allows for the current equity, regardless of what
+   * sizingPct was used to compute the intended qty (e.g. approve()'s conservative
+   * hardcoded SIZING_PCT). Tightening max_position_pct always reduces what actually
+   * executes, even if the caller's intended sizing was larger.
+   */
+  private _clampToPositionCeiling(
+    qty: number,
+    equity: number,
+    price: number,
+    maxPositionPct: number,
+    id: string,
+    context: string,
+  ): number {
+    if (qty <= 0) return qty;
+    const maxQty = Math.floor((equity * maxPositionPct) / price);
+    if (qty > maxQty) {
+      this.log.warn(
+        `POSITION SIZE CLAMPED [${id}] (${context}): qty ${qty} → ${maxQty} ` +
+          `(ceiling: equity=${equity} * max_position_pct=${maxPositionPct} / price=${price})`,
+      );
+      return maxQty;
+    }
+    return qty;
+  }
+
   // ── _runPaperExecution ────────────────────────────────────────────────────────
 
   /**
@@ -680,6 +771,7 @@ export class TradeIntentService {
     state: PaperState,
     decided_by: string,
     sizingPct: number,
+    maxPositionPct: number,
   ) {
     // Fetch live quote (fail-soft on error).
     let fillPrice: number;
@@ -713,11 +805,13 @@ export class TradeIntentService {
 
     // Execute the trade in-memory.
     const { quantity, realized_pnl, newState } = this._executePaper(
+      id,
       action,
       symbol,
       fillPrice,
       state,
       sizingPct,
+      maxPositionPct,
     );
 
     // Persist updated portfolio state.
@@ -759,29 +853,45 @@ export class TradeIntentService {
    * Applies a paper trade to the virtual portfolio state (pure function except for state mutation).
    * Returns the executed quantity, any realized_pnl (for exit), and the updated state.
    *
-   * "long"  → buy floor(cash * sizingPct / fill_price) shares; avg_price cost-basis.
+   * "long"  → buy floor(cash * sizingPct / fill_price) shares, hard-clamped to the
+   *           policy.max_position_pct ceiling; avg_price cost-basis.
    * "exit"  → close entire existing position; realized_pnl = (fill - avg) * qty.
    * "short" → not really executable in simple paper mode; records qty=0, no state change.
    * "hold"  → no trade; qty=0.
+   *
+   * hwm (high-water-mark) is recomputed on every return path as max(previous hwm,
+   * new equity) — this is the source the drawdown risk gate reads (_computeDrawdownPct).
    */
   private _executePaper(
+    id: string,
     action: TradeAction,
     symbol: string,
     fillPrice: number,
     state: PaperState,
     sizingPct = SIZING_PCT,
+    maxPositionPct = DEFAULT_EXECUTION_POLICY.max_position_pct,
   ): { quantity: number; realized_pnl: number | null; newState: PaperState } {
     // Deep-copy positions so we don't mutate the original.
     const newState: PaperState = {
       equity: state.equity,
       cash: state.cash,
       positions: state.positions.map((p) => ({ ...p })),
+      hwm: state.hwm,
     };
+    const baseHwm = state.hwm ?? state.equity;
 
     if (action === 'long') {
       const budget = newState.cash * sizingPct;
-      const quantity = Math.floor(budget / fillPrice);
+      const quantity = this._clampToPositionCeiling(
+        Math.floor(budget / fillPrice),
+        state.equity,
+        fillPrice,
+        maxPositionPct,
+        id,
+        'paper long',
+      );
       if (quantity <= 0) {
+        newState.hwm = Math.max(baseHwm, newState.equity);
         return { quantity: 0, realized_pnl: null, newState };
       }
       const cost = fillPrice * quantity;
@@ -798,6 +908,7 @@ export class TradeIntentService {
       }
 
       newState.equity = newState.cash + this._positionsValue(newState.positions, fillPrice, symbol);
+      newState.hwm = Math.max(baseHwm, newState.equity);
       return { quantity, realized_pnl: null, newState };
     }
 
@@ -805,6 +916,7 @@ export class TradeIntentService {
       const posIdx = newState.positions.findIndex((p) => p.symbol === symbol);
       if (posIdx < 0) {
         // No open position to exit — still executed, just qty=0
+        newState.hwm = Math.max(baseHwm, newState.equity);
         return { quantity: 0, realized_pnl: null, newState };
       }
       const pos = newState.positions[posIdx];
@@ -814,10 +926,12 @@ export class TradeIntentService {
       newState.cash += proceeds;
       newState.positions.splice(posIdx, 1);
       newState.equity = newState.cash + this._positionsValue(newState.positions, fillPrice, symbol);
+      newState.hwm = Math.max(baseHwm, newState.equity);
       return { quantity, realized_pnl, newState };
     }
 
     // "short" and "hold": no portfolio mutation in simple paper mode.
+    newState.hwm = Math.max(baseHwm, newState.equity);
     return { quantity: 0, realized_pnl: null, newState };
   }
 
