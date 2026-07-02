@@ -45,11 +45,6 @@ export class PluginWatcherService implements OnModuleInit, OnModuleDestroy {
     this.watchers.clear();
   }
 
-  private async refresh() {
-    if (!this.enabled) return;
-    await this.watchAll();
-  }
-
   private async watchAll() {
     const active = await this.plugins.findActive();
     const activePaths = new Set(active.map((p) => p.installed_path).filter(Boolean) as string[]);

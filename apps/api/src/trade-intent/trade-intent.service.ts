@@ -538,8 +538,12 @@ export class TradeIntentService {
     const autonomous = kvBool(rawAutonomous, DEFAULT_EXECUTION_POLICY.autonomous);
 
     let max_position_pct = kvNum(rawMaxPosPct, DEFAULT_EXECUTION_POLICY.max_position_pct);
-    if (max_position_pct <= 0 || max_position_pct > 1)
+    if (max_position_pct <= 0 || max_position_pct > 1) {
+      this.log.warn(
+        `execution.max_position_pct out of range (${max_position_pct}) — falling back to default ${DEFAULT_EXECUTION_POLICY.max_position_pct}`,
+      );
       max_position_pct = DEFAULT_EXECUTION_POLICY.max_position_pct;
+    }
 
     let max_open_positions = Math.round(
       kvNum(rawMaxOpenPos, DEFAULT_EXECUTION_POLICY.max_open_positions),
@@ -1647,8 +1651,8 @@ export class TradeIntentService {
     symbol: string,
     fillPrice: number,
     state: PaperState,
-    sizingPct = SIZING_PCT,
-    maxPositionPct = DEFAULT_EXECUTION_POLICY.max_position_pct,
+    sizingPct: number,
+    maxPositionPct: number,
   ): { quantity: number; realized_pnl: number | null; newState: PaperState } {
     // Deep-copy positions so we don't mutate the original.
     const newState: PaperState = {

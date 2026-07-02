@@ -1,7 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
 
-export type NotifyChannel = 'telegram';
-
 export interface SendOpts {
   parse_mode?: 'Markdown' | 'HTML';
 }

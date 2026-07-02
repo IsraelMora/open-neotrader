@@ -1,9 +1,9 @@
 /**
  * RealOrderService — real-money order lifecycle tracking for the accounting foundation.
  *
- * This slice is intentionally isolated: it persists RealOrder rows and talks to the
- * broker via ProviderGatewayService, but nothing in the platform calls it yet
- * (_executeReal in trade-intent.service.ts is rewired in a follow-up slice).
+ * It persists RealOrder rows and talks to the broker via ProviderGatewayService. It is
+ * wired into the platform: _executeReal in trade-intent.service.ts submits through it,
+ * and RealBrokerReconciliationService reconciles broker fills back onto its rows.
  *
  * Crash-safety invariant (the whole point of this service): the DB row is created
  * with status="pending_submit" and AWAITED/COMMITTED before any network call to the
@@ -40,6 +40,7 @@ import {
   TERMINAL_STATUSES as BROKER_TERMINAL_STATUSES,
 } from '../common/broker-status.util';
 import { haltRealExecution } from '../common/real-execution-halt.util';
+import { isPrismaUniqueViolation } from '../common/prisma-error.util';
 import type { RealOrder } from '@prisma/client';
 
 /** Statuses considered "in flight" — not yet confirmed as accepted or terminally failed. */
@@ -166,7 +167,7 @@ export class RealOrderService implements OnModuleInit {
         },
       });
     } catch (err) {
-      if (this.isUniqueConstraintViolation(err)) {
+      if (isPrismaUniqueViolation(err)) {
         // Concurrent submit() won the DB-level race — fetch and return its row.
         const raceWinner = await this.findActiveOrderForIntent(args.tradeIntentId);
         if (raceWinner) {
@@ -268,16 +269,6 @@ export class RealOrderService implements OnModuleInit {
         status: { notIn: TERMINAL_STATUSES },
       },
     });
-  }
-
-  /** Detects a Prisma P2002 (unique constraint violation) without importing @prisma/client's error class. */
-  private isUniqueConstraintViolation(err: unknown): boolean {
-    return (
-      typeof err === 'object' &&
-      err !== null &&
-      'code' in err &&
-      (err as { code?: unknown }).code === 'P2002'
-    );
   }
 
   /**
