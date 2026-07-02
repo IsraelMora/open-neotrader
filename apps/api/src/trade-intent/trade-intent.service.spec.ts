@@ -477,6 +477,31 @@ describe('TradeIntentService', () => {
       expect(result.status).toBe('failed');
     });
 
+    it('action "hold" short-circuits in approve() as a no-op even when getQuote throws (Bug 2)', async () => {
+      // Bug 2: autoProcess() short-circuits "hold" before any quote/portfolio work (line ~273),
+      // but approve() previously fell through to _executeReal/_runPaperExecution, which could
+      // mark an approved hold as "failed" on a price-feed error. approve() must mirror
+      // autoProcess()'s short-circuit.
+      const intent = pendingIntent({ action: 'hold' });
+      prisma.tradeIntent.findUnique.mockResolvedValue(intent);
+      gateway.getQuote.mockRejectedValue(new Error('Market data outage'));
+      const executed = pendingIntent({
+        status: 'executed',
+        quantity: 0,
+        decided_by: 'alice',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.approve('ti_001', 'alice');
+
+      expect(gateway.getQuote).not.toHaveBeenCalled();
+      expect(result.status).toBe('executed');
+      expect(result.quantity).toBe(0);
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({ data: oc({ status: 'executed', quantity: 0 }) }),
+      );
+    });
+
     it('kernel risk gate applies on approve() too: drawdown halt rejects a human-approved LONG', async () => {
       // hwm=10_000 (persisted on the paper portfolio), current equity=7_000 → drawdown=30% >= 25% halt.
       const intent = pendingIntent({ action: 'long', symbol: 'AAPL' });
@@ -1416,6 +1441,116 @@ describe('TradeIntentService', () => {
       );
       expect(gateway.placeOrder).not.toHaveBeenCalled();
       expect(result.status).toBe('real_pending');
+    });
+
+    it('real exit STILL executes when getQuote THROWS (market-data outage must never block closing)', async () => {
+      // Bug 1: a real exit's qty comes from the broker portfolio (a market order), NOT the
+      // quote — the quote is only used for the WARN log and the notional ceiling, which
+      // already exempts exits. A quote failure must never fail an exit.
+      enableReal(kv, prisma, 'alpaca-provider', 5000);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 11_400,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: 10,
+            avg_entry: 140,
+            market_value: 1500,
+            unrealized_pnl: 100,
+            side: 'long',
+          },
+        ],
+        total_market_value: 1500,
+        total_pnl: 100,
+        ts: new Date().toISOString(),
+      });
+      gateway.getQuote.mockRejectedValue(new Error('Market data outage'));
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_outage_exit',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-outage',
+        broker_order_id: 'order_outage',
+        error: null,
+      });
+      const pending = pendingIntent({
+        status: 'real_pending',
+        fill_price: null,
+        quantity: null,
+        decided_by: 'autonomous',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(pending);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', requestedQty: 10, side: 'sell' }),
+      );
+      expect(result.status).not.toBe('failed');
+      expect(prisma.tradeIntent.update).not.toHaveBeenCalledWith(
+        oc({ data: oc({ status: 'failed' }) }),
+      );
+    });
+
+    it('real exit STILL executes when getQuote returns an invalid price (<=0/NaN)', async () => {
+      enableReal(kv, prisma, 'alpaca-provider', 5000);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 11_400,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: 10,
+            avg_entry: 140,
+            market_value: 1500,
+            unrealized_pnl: 100,
+            side: 'long',
+          },
+        ],
+        total_market_value: 1500,
+        total_pnl: 100,
+        ts: new Date().toISOString(),
+      });
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'AAPL',
+        bid: NaN,
+        ask: NaN,
+        last: NaN,
+        ts: new Date().toISOString(),
+      });
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_badprice_exit',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-badprice',
+        broker_order_id: 'order_badprice',
+        error: null,
+      });
+      const pending = pendingIntent({
+        status: 'real_pending',
+        fill_price: null,
+        quantity: null,
+        decided_by: 'autonomous',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(pending);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', requestedQty: 10, side: 'sell' }),
+      );
+      expect(result.status).not.toBe('failed');
     });
 
     it('real long above max_order_notional is still rejected (ceiling stays enforced for entries)', async () => {
