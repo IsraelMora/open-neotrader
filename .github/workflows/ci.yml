@@ -18,6 +18,15 @@ jobs:
     name: TypeScript (lint + build + test)
     runs-on: ubuntu-latest
 
+    # apps/api tests boot real NestJS modules (e.g. agents.service.spec.ts "REAL NestJS
+    # module compile" tests) that transitively initialize LongTermMemory/ML/real-money
+    # services through the real PrismaService — they need an actually-migrated schema,
+    # not just a generated client. Point DATABASE_URL at a throwaway sqlite file for the
+    # whole job (never the committed dev DB) and apply migrations before running tests,
+    # so `prisma migrate deploy` and the test run see the same DB.
+    env:
+      DATABASE_URL: file:${{ github.workspace }}/apps/api/ci-test.db
+
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +49,9 @@ jobs:
 
       - name: Generate Prisma client (store)
         run: pnpm --filter=neurotrader-store exec prisma generate
+
+      - name: Apply migrations to fresh test DB (api)
+        run: pnpm --filter=@neurotrader/api exec prisma migrate deploy
 
       - name: Lint
         run: pnpm lint
