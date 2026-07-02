@@ -26,6 +26,10 @@ jobs:
     # so `prisma migrate deploy` and the test run see the same DB.
     env:
       DATABASE_URL: file:${{ github.workspace }}/apps/api/ci-test.db
+      # The "REAL NestJS module compile" tests boot AgentsModule, which pulls in
+      # AuthModule/JwtStrategy — both `getOrThrow('JWT_SECRET')` at construction. Provide a
+      # throwaway CI value (NOT a real secret) so module init doesn't throw in CI.
+      JWT_SECRET: ci-test-only-not-a-real-secret
 
     steps:
       - uses: actions/checkout@v4
