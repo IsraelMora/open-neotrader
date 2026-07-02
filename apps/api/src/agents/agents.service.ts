@@ -150,6 +150,18 @@ export interface ReflectionTurnResult {
  */
 const REACT_MAX_TURNS_DEFAULT = 4;
 
+/**
+ * Anti-amplification hard cap: maximum number of tool calls EXECUTED per cycle,
+ * counted across ALL ReAct iterations (not per-turn). This is the invariant
+ * documented in README.md / CLAUDE.md as "max 3 tool calls per cycle".
+ * Overridable via KV key 'react.max_tool_calls'. Clamped 1..20 at parse time
+ * (same clamp style as REACT_MAX_TURNS_DEFAULT's 1..10; the ceiling is higher here
+ * because this axis bounds total EXECUTED calls across up to 10 turns, not turns
+ * themselves — 20 still keeps amplification bounded while allowing legitimate
+ * multi-tool cycles room to breathe).
+ */
+const REACT_MAX_TOOL_CALLS_DEFAULT = 3;
+
 // ── Kernel tool constants (Phase 3.6) ─────────────────────────────────────────
 
 /**
@@ -420,6 +432,19 @@ export class AgentsService {
   }
 
   /**
+   * Resolves the per-cycle TOTAL tool-call execution ceiling from KV (anti-amplification).
+   * Reads 'react.max_tool_calls', parses with Number(), applies fail-safe and clamp 1..20.
+   * Absent/invalid/kv-unavailable → REACT_MAX_TOOL_CALLS_DEFAULT (3).
+   * Mirrors _resolveMaxTurns exactly, on a separate KV key and clamp range.
+   */
+  private async _resolveMaxToolCalls(): Promise<number> {
+    const raw = this.kv ? await this.kv.get('react.max_tool_calls') : null;
+    const n = raw === null ? REACT_MAX_TOOL_CALLS_DEFAULT : Number(raw);
+    const v = Number.isFinite(n) ? Math.trunc(n) : REACT_MAX_TOOL_CALLS_DEFAULT;
+    return Math.min(20, Math.max(1, v));
+  }
+
+  /**
    * Composes the LLM context for a given iteration.
    * On iteration 1 (obs empty) → returns base unchanged (byte-identical path).
    * On subsequent iterations → appends a [OBSERVACIONES DE ITERACIONES PREVIAS] block.
@@ -497,6 +522,11 @@ export class AgentsService {
     virtual_only?: boolean;
     /** Pre-resolved decision prompt (hoisted once per governed turn — avoids N DB round-trips). */
     decisionPrompt: string | null;
+    /**
+     * C2: remaining anti-amplification budget for the WHOLE cycle (not per-turn) —
+     * total tool calls this iteration may EXECUTE. Threaded across turns by the caller.
+     */
+    toolCallBudget: number;
   }): Promise<{
     text: string;
     tool_calls: import('../llm/llm.service').ToolCallRequest[];
@@ -507,6 +537,7 @@ export class AgentsService {
     skills_read: string[];
     skills_written: string[];
     hadToolCalls: boolean;
+    executedCount: number;
   }> {
     const { cycle_id, source, effectiveTools, visibleTools, decisionPrompt } = args;
 
@@ -568,10 +599,8 @@ export class AgentsService {
       args.virtual_only,
       source,
     );
-    const { decisions, sandbox_results, signalsEmitted } = await this._executeToolCalls(
-      cycle_id,
-      validatedCalls,
-    );
+    const { decisions, sandbox_results, signalsEmitted, executedCount } =
+      await this._executeToolCalls(cycle_id, validatedCalls, args.toolCallBudget);
 
     // hadToolCalls is measured on post-validation calls (not raw parsed calls).
     // An all-dropped iteration counts as no valid intent → natural exit (safe direction).
@@ -625,6 +654,7 @@ export class AgentsService {
       skills_read,
       skills_written,
       hadToolCalls,
+      executedCount,
     };
   }
 
@@ -693,6 +723,10 @@ export class AgentsService {
       turnSystemPrompt = input.system_prompt;
     }
     const maxTurns = await this._resolveMaxTurns();
+    // C2: anti-amplification — total tool calls EXECUTED across the whole cycle,
+    // counted across every turn (not per-turn). See REACT_MAX_TOOL_CALLS_DEFAULT.
+    const maxToolCalls = await this._resolveMaxToolCalls();
+    let toolCallsExecuted = 0;
 
     // ── Accumulators ─────────────────────────────────────────────────────────
     const allDecisions: Decision[] = [];
@@ -707,6 +741,7 @@ export class AgentsService {
     while (turn < maxTurns) {
       turn++;
       const iterContext = this._composeIterationContext(input.context, observations);
+      const toolCallBudget = Math.max(0, maxToolCalls - toolCallsExecuted);
       last = await this._runSingleIteration({
         cycle_id,
         source: input.source,
@@ -717,7 +752,9 @@ export class AgentsService {
         _activePlugins: input._activePlugins,
         virtual_only: input.virtual_only,
         decisionPrompt,
+        toolCallBudget,
       });
+      toolCallsExecuted += last.executedCount;
 
       // Accumulate results
       allDecisions.push(...last.decisions);
@@ -762,6 +799,14 @@ export class AgentsService {
           });
         }
         break; // SAFE DEFAULT — stop, no grace call
+      }
+
+      // TOOL-CALL CAP REACHED — anti-amplification ceiling hit for the whole cycle.
+      // _executeToolCalls already audited 'tool_call_cap_reached' if any calls were
+      // dropped this iteration. Stop the loop now — no point calling the LLM again
+      // for a turn that can never execute another tool call.
+      if (toolCallsExecuted >= maxToolCalls) {
+        break;
       }
     }
 
@@ -2701,19 +2746,34 @@ export class AgentsService {
     return false; // approved → fall through to normal dispatch
   }
 
+  /**
+   * Dispatches validated tool_calls, enforcing the anti-amplification cap: at most
+   * `budget` calls are EXECUTED (dispatched to the sandbox/kernel) — this is the
+   * remaining allowance for the WHOLE cycle, not just this iteration (the caller
+   * threads it across ReAct turns). Calls beyond `budget` are never dispatched;
+   * they are audited once as 'tool_call_cap_reached' (cycle id + how many were
+   * skipped) and silently omitted from decisions/sandbox_results — never a crash,
+   * never a silent drop with no trace.
+   */
   private async _executeToolCalls(
     cycle_id: string,
     toolCalls: import('../llm/llm.service').ToolCallRequest[],
+    budget: number,
   ): Promise<{
     decisions: Decision[];
     sandbox_results: SandboxResult[];
     signalsEmitted: { symbol: string; action: string }[];
+    executedCount: number;
   }> {
     const decisions: Decision[] = [];
     const sandbox_results: SandboxResult[] = [];
     const signalsEmitted: { symbol: string; action: string }[] = [];
 
-    for (const tc of toolCalls) {
+    const safeBudget = Math.max(0, budget);
+    const toExecute = toolCalls.slice(0, safeBudget);
+    const droppedByCap = toolCalls.length - toExecute.length;
+
+    for (const tc of toExecute) {
       try {
         // ── DEBATE GATE — additive; short-circuits to byte-identical legacy path when off.
         // Fully nested under `if (this.debate)` — when @Optional resolves to undefined
@@ -2749,7 +2809,23 @@ export class AgentsService {
       }
     }
 
-    return { decisions, sandbox_results, signalsEmitted };
+    if (droppedByCap > 0) {
+      this.log.warn(
+        `Anti-amplification cap reached [${cycle_id}]: ${String(droppedByCap)} tool call(s) skipped (budget=${String(safeBudget)})`,
+      );
+      await this.audit.log({
+        cycle_id,
+        event_type: 'tool_call_cap_reached',
+        meta: {
+          budget: safeBudget,
+          executed: toExecute.length,
+          dropped: droppedByCap,
+          dropped_calls: toolCalls.slice(safeBudget).map((c) => `${c.plugin_id}.${c.function}`),
+        },
+      });
+    }
+
+    return { decisions, sandbox_results, signalsEmitted, executedCount: toExecute.length };
   }
 
   /**

@@ -1859,7 +1859,12 @@ async function callValidateWithHoisted(
   )._validateToolCalls(cycleId, calls, hoistedTools, undefined, undefined, source);
 }
 
-/** Helper to call _executeToolCalls (private) */
+/**
+ * Helper to call _executeToolCalls (private).
+ * Passes an effectively-unlimited budget: these tests exercise per-call dispatch
+ * logic (kernel routing, debate gate), not the C2 anti-amplification cap, which
+ * has its own dedicated test suite.
+ */
 async function callExecuteToolCalls(
   service: AgentsService,
   cycleId: string,
@@ -1873,12 +1878,13 @@ async function callExecuteToolCalls(
       _executeToolCalls: (
         c: string,
         t: ToolCallRequest[],
+        budget: number,
       ) => Promise<{
         decisions: import('./agents.service').Decision[];
         sandbox_results: import('./agents.service').SandboxResult[];
       }>;
     }
-  )._executeToolCalls(cycleId, calls);
+  )._executeToolCalls(cycleId, calls, Number.MAX_SAFE_INTEGER);
 }
 
 describe('F4-S1 Phase 3.2/3.3 — _validateToolCalls kernel bypass', () => {
@@ -4377,6 +4383,138 @@ describe('F6-S1 T8 — termination: loop stops at maxTurns even with LLM always 
     // The all-dropped call exits naturally (hadToolCalls = validatedCalls.length > 0 = false after drop)
     expect(result.turns_used).toBe(1);
     expect(llmComplete).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── C2: Anti-amplification — hard cap on TOTAL tool calls executed per cycle ──
+
+describe('C2 — react.max_tool_calls: hard cap on total tool calls executed per cycle', () => {
+  it('C2.1 — LLM emits 2+2=4 tool calls across 2 turns, default cap (no KV override) → at most 3 execute, cap audited, loop stops early', async () => {
+    const kv = makeKv('4'); // maxTurns=4, react.max_tool_calls not set → default (3)
+    const audit = makeAudit();
+
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    const twoCallsTurn1: LlmResponse = {
+      text:
+        '<tool_calls>[' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","action":"buy"}},' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"TSLA","action":"buy"}}' +
+        ']</tool_calls>',
+      tool_calls: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+    };
+    const twoCallsTurn2: LlmResponse = {
+      text:
+        '<tool_calls>[' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"MSFT","action":"buy"}},' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"GOOG","action":"buy"}}' +
+        ']</tool_calls>',
+      tool_calls: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+    };
+
+    const llmComplete = jest
+      .fn()
+      .mockResolvedValueOnce(twoCallsTurn1)
+      .mockResolvedValueOnce(twoCallsTurn2)
+      // Fallback for any further turns the loop should NOT reach once the cap is hit —
+      // natural-exit text so the loop terminates cleanly if the cap fails to stop it.
+      .mockResolvedValue(makeLlmText('done'));
+
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const service = makeKvAgentsService({
+      llm: { complete: llmComplete },
+      kv,
+      plugins,
+      sandbox,
+      audit,
+    });
+
+    await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'context',
+      _activePlugins: [
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    // At most 3 tool calls executed total across the whole cycle, despite 4 being emitted.
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(3);
+
+    // The cap-hit event is recorded in the audit trail.
+    const capAudit = findAuditEvent(audit, 'tool_call_cap_reached');
+    expect(capAudit).toBeDefined();
+
+    // No wasted LLM call: the loop breaks the moment the cap is hit (turn 2),
+    // so the LLM is queried exactly twice — never a grace turn beyond the cap.
+    expect(llmComplete).toHaveBeenCalledTimes(2);
+  });
+
+  it('C2.2 — react.max_tool_calls KV override (=1) caps execution to 1 even though LLM emits more', async () => {
+    const audit = makeAudit();
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'react.max_turns') return Promise.resolve('4');
+        if (key === 'react.max_tool_calls') return Promise.resolve('1');
+        return Promise.resolve(null);
+      }),
+    };
+
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+
+    const twoCallsTurn1: LlmResponse = {
+      text:
+        '<tool_calls>[' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","action":"buy"}},' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"TSLA","action":"buy"}}' +
+        ']</tool_calls>',
+      tool_calls: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+    };
+
+    const llmComplete = jest
+      .fn()
+      .mockResolvedValueOnce(twoCallsTurn1)
+      .mockResolvedValue(makeLlmText('done'));
+
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const service = makeKvAgentsService({
+      llm: { complete: llmComplete },
+      kv,
+      plugins,
+      sandbox,
+      audit,
+    });
+
+    await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'context',
+      _activePlugins: [
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+    expect(findAuditEvent(audit, 'tool_call_cap_reached')).toBeDefined();
   });
 });
 
@@ -9966,14 +10104,20 @@ describe('AgentsService._runSingleIteration — native tool_calls vs text fallba
     _activePlugins?: import('../plugins/plugins.service').HydratedPlugin[];
     virtual_only?: boolean;
     decisionPrompt: string | null;
+    toolCallBudget: number;
   };
 
-  async function callRunSingleIteration(service: AgentsService, args: IterationArgs) {
+  // These tests exercise dispatch/parsing behaviour, not the C2 anti-amplification
+  // cap (which has its own dedicated test suite) — default to an unlimited budget.
+  async function callRunSingleIteration(
+    service: AgentsService,
+    args: Omit<IterationArgs, 'toolCallBudget'>,
+  ) {
     return (
       service as unknown as {
         _runSingleIteration: (args: IterationArgs) => Promise<unknown>;
       }
-    )._runSingleIteration(args);
+    )._runSingleIteration({ ...args, toolCallBudget: Number.MAX_SAFE_INTEGER });
   }
 
   const TOOL: import('../plugins/plugins.service').ProviderTool = {

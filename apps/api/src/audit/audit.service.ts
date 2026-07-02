@@ -30,6 +30,7 @@ export type AuditEventType =
   | 'plugin_content_changed'
   | 'react_iteration'
   | 'react_budget_exhausted'
+  | 'tool_call_cap_reached'
   | 'lesson_recorded'
   // F6-S3: Multi-agent debate / consensus events
   | 'debate_started'
