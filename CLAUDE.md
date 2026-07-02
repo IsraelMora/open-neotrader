@@ -62,7 +62,7 @@ Browser → nginx (apps/web) ── /        → Astro static panel
 
 ### Security boundaries (non-negotiable)
 
-- **The Python sandbox has NO network.** Only `apps/api/src/providers/` (ProviderGateway) makes outbound HTTP. Don't add network calls inside `apps/sandbox/` or plugins.
+- **The Python sandbox subprocess is network-isolated at the OS level, per-subprocess.** `SandboxGateway` (`apps/api/src/sandbox/sandbox.gateway.ts`) wraps the spawned `runner.py` child with `unshare -rn` (unprivileged network namespace), never the whole `apps/api` container — the container itself still needs outbound HTTP for providers/LLM. This is controlled by `SANDBOX_NETNS_ISOLATION`: `auto` (default) applies isolation when available but **silently degrades to no isolation with just a log warning if detection fails — this is NOT a hard guarantee**; `require` is a hard guarantee (fails app startup if isolation isn't available); `off` explicitly disables it. Only `require` should be trusted as an actual network boundary. `isolation.py` inside `apps/sandbox/` is a separate, advisory-only Python-level import guard — it does not block `subprocess`/`ctypes` and is not a real boundary on its own. Only `apps/api/src/providers/` (ProviderGateway) makes outbound HTTP from the API process. Don't add network calls inside `apps/sandbox/` or plugins.
 - The LLM only sees text/news/events — never price series.
 - API keys flow only via env passthrough (`.env`, gitignored) — never baked into the image or committed. `.env.example` must stay credential-free.
 - Plugins are baked into the image at `/plugins`; runtime installs (`POST /api/plugins/install`) write there too (hence `chown node:node /plugins` in the Dockerfile).
