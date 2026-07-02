@@ -1,5 +1,5 @@
 // Distancia de Levenshtein (edición) entre dos strings.
-export function levenshtein(a: string, b: string): number {
+function levenshtein(a: string, b: string): number {
   a = a.toLowerCase();
   b = b.toLowerCase();
   const m = a.length,

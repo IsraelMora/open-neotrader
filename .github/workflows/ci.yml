@@ -97,6 +97,9 @@ jobs:
       - name: Ruff check (packages/plugin-sdk)
         run: ruff check packages/plugin-sdk
 
+      - name: Ruff check (plugins)
+        run: ruff check plugins/
+
       - name: Pytest (apps/sandbox)
         run: python3 -m pytest
         working-directory: apps/sandbox

@@ -118,7 +118,7 @@ NestJS llama a `python3 runner.py` como subprocess. Protocolo stdin→stdout:
 {"cmd": "call_plugin", "plugin_id": "mi-plugin", "function": "analizar", "args": {"symbol": "BTC"}}
 
 // Ciclo completo del agente
-{"cmd": "run_cycle", "active_ids": ["mi-plugin", "universe-crypto-defi"], "context": {}}
+{"cmd": "run_cycle", "active_ids": ["mi-plugin", "universe"], "context": {}}
 ```
 
 Respuesta siempre: `{"ok": true, "result": ...}` o `{"ok": false, "error": "..."}`.
