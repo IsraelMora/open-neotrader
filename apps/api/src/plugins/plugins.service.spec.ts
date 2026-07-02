@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { BadRequestException } from '@nestjs/common';
 import { PluginsService } from './plugins.service';
 import type { PluginManifest } from './manifest';
 import type { PrismaService } from '../prisma/prisma.service';
@@ -1138,6 +1139,91 @@ describe('F3-s4 — install() content_checksum wiring', () => {
     const result = await svc.install('https://github.com/user/my-plugin.git');
 
     expect(result.content_checksum).toBe('abc123hash');
+  });
+});
+
+// ── Security: install() path-traversal hardening ───────────────────────────────
+
+describe('PluginsService.install — path-traversal hardening', () => {
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    (readManifest as unknown as jest.Mock).mockReturnValue(null);
+    (validateManifest as unknown as jest.Mock).mockReturnValue([]);
+    (execFileMock as unknown as jest.Mock).mockImplementation(
+      (
+        _cmd: string,
+        _args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        cb(null, { stdout: '', stderr: '' });
+      },
+    );
+  });
+
+  it('sec-1 — source ending in "/.." derives a traversal id and must be rejected before cloning', async () => {
+    const { svc } = makePluginsSvcForWiring({ pluginRow: null });
+    const gitCloneSpy = jest
+      .spyOn(svc as unknown as SvcPrivate, 'gitClone')
+      .mockResolvedValue(undefined);
+
+    await expect(svc.install('https://evil.example.com/..')).rejects.toThrow(BadRequestException);
+    expect(gitCloneSpy).not.toHaveBeenCalled();
+  });
+
+  it('sec-2 — source ending in "/../.." must be rejected before cloning', async () => {
+    const { svc } = makePluginsSvcForWiring({ pluginRow: null });
+    const gitCloneSpy = jest
+      .spyOn(svc as unknown as SvcPrivate, 'gitClone')
+      .mockResolvedValue(undefined);
+
+    await expect(svc.install('https://evil.example.com/../..')).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(gitCloneSpy).not.toHaveBeenCalled();
+  });
+
+  it('sec-3 — a bypassed/forged id containing ".." never produces an installedPath outside pluginsDir', async () => {
+    const { svc } = makePluginsSvcForWiring({ pluginRow: null });
+    // Even if id validation were somehow bypassed, the belt-and-suspenders
+    // containment check must still catch it.
+    const deriveIdSpy = jest
+      .spyOn(svc as unknown as { deriveId: (s: string) => string }, 'deriveId')
+      .mockReturnValue('../../etc');
+    const gitCloneSpy = jest
+      .spyOn(svc as unknown as SvcPrivate, 'gitClone')
+      .mockResolvedValue(undefined);
+
+    await expect(svc.install('https://github.com/user/whatever.git')).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(gitCloneSpy).not.toHaveBeenCalled();
+    deriveIdSpy.mockRestore();
+  });
+
+  it('sec-4 — happy path: a normal git source still installs successfully', async () => {
+    const row = makePluginRow('my-plugin');
+    const { svc, dbCreateSpy } = makePluginsSvcForWiring({ pluginRow: null });
+    dbCreateSpy.mockResolvedValue(row);
+    (svc as unknown as SvcPrivate).db.plugin.findUnique = jest.fn().mockResolvedValue(null);
+    jest.spyOn(svc as unknown as SvcPrivate, 'gitClone').mockResolvedValue(undefined);
+    jest.spyOn(svc as unknown as SvcPrivate, '_scanOnInstall').mockResolvedValue(undefined);
+
+    await expect(svc.install('https://github.com/user/my-plugin.git')).resolves.toBeDefined();
+  });
+
+  it('sec-5 — a git transport-helper source (ext::) that derives a valid id must be rejected before cloning', async () => {
+    const { svc } = makePluginsSvcForWiring({ pluginRow: null });
+    const gitCloneSpy = jest
+      .spyOn(svc as unknown as SvcPrivate, 'gitClone')
+      .mockResolvedValue(undefined);
+
+    // Ends in ".git" and derives the valid id "evil", so the bare endsWith('.git')
+    // allowlist would have passed it straight to `git clone`, where git's ext::
+    // remote helper can execute arbitrary commands. Must be rejected: not https://|git@.
+    await expect(svc.install('ext::sh -c "touch /tmp/pwned"/evil.git')).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(gitCloneSpy).not.toHaveBeenCalled();
   });
 });
 

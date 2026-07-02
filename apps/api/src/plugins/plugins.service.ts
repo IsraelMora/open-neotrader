@@ -76,6 +76,14 @@ const execFileAsync = promisify(execFile);
 
 const PLATFORM_VERSION = '1.0.0';
 
+/**
+ * Strict kebab-case plugin-id shape (mirrors manifest.ts's validateManifest).
+ * Any id derived from an untrusted install `source` MUST match this before
+ * it is used to build a filesystem path — this is what blocks path-traversal
+ * segments like ".." or embedded separators.
+ */
+const PLUGIN_ID_REGEX = /^[a-z][a-z0-9-]{0,62}$/;
+
 function parseSemver(v: string): [number, number, number] | null {
   const m = /^(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
   if (!m) return null;
@@ -963,7 +971,7 @@ export class PluginsService implements OnApplicationBootstrap {
     if (!isGit) {
       throw new BadRequestException('Solo se permiten fuentes git (https:// o git@)');
     }
-    const installedPath = path.join(this.pluginsDir, this.deriveId(source));
+    const installedPath = this.resolveInstallPath(source);
 
     // 1. Clonar si es git
     if (isGit) {
@@ -1465,7 +1473,10 @@ export class PluginsService implements OnApplicationBootstrap {
   }
 
   private isGitUrl(source: string): boolean {
-    return source.startsWith('https://') || source.startsWith('git@') || source.endsWith('.git');
+    // Only real git schemes. A bare `.git` suffix must NOT qualify: sources like
+    // `ext::sh -c "..."/x.git` or `fd::0.git` end in `.git` but are git remote
+    // helpers that execute arbitrary commands when passed to `git clone`.
+    return source.startsWith('https://') || source.startsWith('git@');
   }
 
   private deriveId(source: string): string {
@@ -1477,8 +1488,54 @@ export class PluginsService implements OnApplicationBootstrap {
     );
   }
 
+  /**
+   * Security: derives the plugin id from an untrusted install `source` and
+   * builds the target install path, rejecting anything that could escape
+   * `pluginsDir`.
+   *
+   * Two independent guards:
+   * 1. The derived id MUST match the strict kebab-case shape BEFORE it is
+   *    used to build any filesystem path — reject outright, never
+   *    sanitize-and-continue. This blocks a crafted `source` (e.g. ending
+   *    in `/..`) from producing an id like `..`.
+   * 2. Belt-and-suspenders: even with a validated id, assert the resulting
+   *    path is strictly contained within the resolved `pluginsDir`.
+   */
+  private resolveInstallPath(source: string): string {
+    const derivedId = this.deriveId(source);
+    if (!PLUGIN_ID_REGEX.test(derivedId)) {
+      throw new BadRequestException(
+        `Fuente inválida: no se pudo derivar un id de plugin válido de '${source}'`,
+      );
+    }
+
+    const installedPath = path.join(this.pluginsDir, derivedId);
+    const resolvedPluginsDir = path.resolve(this.pluginsDir);
+    const resolvedInstalledPath = path.resolve(installedPath);
+    if (
+      resolvedInstalledPath !== resolvedPluginsDir &&
+      !resolvedInstalledPath.startsWith(resolvedPluginsDir + path.sep)
+    ) {
+      throw new BadRequestException(`Fuente inválida: ruta de instalación fuera de pluginsDir`);
+    }
+
+    return installedPath;
+  }
+
   private async gitClone(url: string, dest: string): Promise<void> {
     if (!fs.existsSync(this.pluginsDir)) fs.mkdirSync(this.pluginsDir, { recursive: true });
-    await execFileAsync('git', ['clone', '--depth', '1', url, dest]);
+    // Defense-in-depth: even though isGitUrl already blocks non-https/git@ sources,
+    // explicitly disable git's command-executing remote helpers on the clone.
+    await execFileAsync('git', [
+      '-c',
+      'protocol.ext.allow=never',
+      '-c',
+      'protocol.fd.allow=never',
+      'clone',
+      '--depth',
+      '1',
+      url,
+      dest,
+    ]);
   }
 }
