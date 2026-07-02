@@ -23,6 +23,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+# Epsilon below which a float qty/market-value is treated as flat (zero),
+# guarding against exact-equality (`== 0`) false negatives from float residue
+# (e.g. a partial close leaving a tiny non-zero remainder).
+EPS = 1e-9
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Layer 1: Exposure (ported from risk-envelope)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,7 +152,7 @@ def apply_exposure_layer(
             notional = notional * factor
 
         # Rule 4: Max open positions (only for brand-new symbols)
-        is_new = sym not in current_positions or current_positions[sym] == 0
+        is_new = sym not in current_positions or abs(current_positions[sym]) < EPS
         if is_new and canonical == "buy":
             active_count = sum(1 for v in current_positions.values() if v > 0)
             if active_count >= cfg_max_open:
@@ -320,7 +325,7 @@ def pearson_correlation(returns_a: list[float], returns_b: list[float]) -> float
     var_b = sum((x - mean_b) ** 2 for x in b) / n
     std_a = math.sqrt(var_a)
     std_b = math.sqrt(var_b)
-    if std_a == 0 or std_b == 0:
+    if std_a < EPS or std_b < EPS:
         return 0.0
     return round(cov / (std_a * std_b), 4)
 
