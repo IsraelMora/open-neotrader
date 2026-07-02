@@ -20,6 +20,7 @@
  * This reuses the existing Portfolio table (keyed by name) and avoids a new table.
  */
 import { Injectable, Logger, Optional } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService, Portfolio } from '../providers/provider-gateway.service';
 import { KvService } from '../common/kv.service';
@@ -1008,11 +1009,16 @@ export class TradeIntentService {
     // Place the real order — fail-soft on broker error.
     let orderResponse: Record<string, unknown>;
     try {
+      // client_order_id gives the broker an idempotency key so a retried submission
+      // never double-fills. Generated inline for now — this will move to a dedicated
+      // order-tracking service once the real-money accounting ledger lands.
+      const clientOrderId = `nt-${randomUUID()}`;
       orderResponse = await this.gateway.placeOrder(policy.broker_plugin_id, {
         symbol,
         qty,
         side,
         type: 'market',
+        clientOrderId,
       });
     } catch (err) {
       this.log.warn(`REAL ORDER FAILED [${id}]: broker threw — ${String(err)}`);

@@ -62,6 +62,16 @@ export interface Portfolio {
   ts: string;
 }
 
+/** Normalized broker order status, independent of the underlying provider's raw response shape. */
+export interface OrderStatusResult {
+  broker_order_id: string;
+  client_order_id: string | null;
+  status: string;
+  filled_qty: number;
+  filled_avg_price: number | null;
+  raw: unknown;
+}
+
 // ── Mapa de timeframes de la plataforma a formato por provider ────────────────
 
 const TF_ALPACA: Record<string, string> = {
@@ -471,6 +481,8 @@ export class ProviderGatewayService implements OnModuleInit {
       type: 'market' | 'limit';
       limitPrice?: number;
       timeInForce?: string;
+      /** Idempotency key for the broker. Required so retries never double-submit. */
+      clientOrderId: string;
     },
   ): Promise<Record<string, unknown>> {
     const manifest = this.resolveManifest(pluginId);
@@ -497,6 +509,7 @@ export class ProviderGatewayService implements OnModuleInit {
       type: string;
       limitPrice?: number;
       timeInForce?: string;
+      clientOrderId?: string;
     },
   ): Promise<Record<string, unknown>> {
     const api = manifest.api;
@@ -512,6 +525,7 @@ export class ProviderGatewayService implements OnModuleInit {
       time_in_force: order.timeInForce ?? 'day',
     };
     if (order.limitPrice != null) body['limit_price'] = order.limitPrice;
+    if (order.clientOrderId != null) body['client_order_id'] = order.clientOrderId;
 
     const res = await globalThis.fetch(url, {
       method: 'POST',
@@ -583,11 +597,12 @@ export class ProviderGatewayService implements OnModuleInit {
 
   // ── HTTP core ─────────────────────────────────────────────────────────────
 
-  private async request(
+  /** Sustituye variables del template del endpoint declarado en manifest.toml, sanitizando params. */
+  private buildRequestUrl(
     manifest: ProviderManifest,
     endpointKey: string,
     params: Record<string, unknown>,
-  ): Promise<unknown> {
+  ): string {
     const api = manifest.api;
     const endpointTemplate = api.endpoints[endpointKey];
     if (!endpointTemplate) {
@@ -595,7 +610,6 @@ export class ProviderGatewayService implements OnModuleInit {
     }
 
     const authKey = api.auth_key_env ? (process.env[api.auth_key_env] ?? '') : '';
-    const authSecret = api.auth_secret_env ? (process.env[api.auth_secret_env] ?? '') : '';
 
     // Sanitizar parámetros antes de interpolar en la URL (prevenir URL injection)
     const sanitized = Object.fromEntries(
@@ -622,9 +636,15 @@ export class ProviderGatewayService implements OnModuleInit {
       auth_key: authKey,
       ...sanitized,
     };
-    const url = endpointTemplate.replace(/\{(\w+)\}/g, (_, k: string) => vars[k] ?? '');
+    return endpointTemplate.replace(/\{(\w+)\}/g, (_, k: string) => vars[k] ?? '');
+  }
 
-    // Headers de autenticación
+  /** Headers de autenticación según auth_type declarado en manifest.toml. */
+  private buildAuthHeaders(manifest: ProviderManifest): Record<string, string> {
+    const api = manifest.api;
+    const authKey = api.auth_key_env ? (process.env[api.auth_key_env] ?? '') : '';
+    const authSecret = api.auth_secret_env ? (process.env[api.auth_secret_env] ?? '') : '';
+
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (api.auth_type === 'header') {
       if (api.auth_key_header && authKey) headers[api.auth_key_header] = authKey;
@@ -633,8 +653,18 @@ export class ProviderGatewayService implements OnModuleInit {
       headers['Authorization'] = `Bearer ${authKey}`;
     }
     // query_param auth ya está en la URL template
+    return headers;
+  }
 
+  private async request(
+    manifest: ProviderManifest,
+    endpointKey: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    const url = this.buildRequestUrl(manifest, endpointKey, params);
+    const headers = this.buildAuthHeaders(manifest);
     const timeoutMs = 10_000;
+
     const res = await globalThis.fetch(url, {
       headers,
       signal: AbortSignal.timeout(timeoutMs),
@@ -645,6 +675,145 @@ export class ProviderGatewayService implements OnModuleInit {
       throw new Error(`${manifest.plugin.id} HTTP ${res.status}: ${body.slice(0, 200)}`);
     }
     return res.json();
+  }
+
+  // ── Order lifecycle (Alpaca-specific: status / cancel / list) ──────────────
+  // These operations are gated by manifest.api.format === 'alpaca' the same way
+  // placeOrder branches per-format — the platform doesn't yet have a lifecycle
+  // implementation for other brokers.
+
+  /** Obtiene el estado normalizado de una orden por su id de broker. */
+  async getOrderStatus(pluginId: string | null, brokerOrderId: string): Promise<OrderStatusResult> {
+    const manifest = this.resolveManifest(pluginId);
+    this.assertAlpacaFormat(manifest, 'getOrderStatus');
+    const raw = await this.fetchOrderEndpoint(manifest, 'order_status', {
+      broker_order_id: brokerOrderId,
+    });
+    return this.normalizeOrderStatus(manifest, raw);
+  }
+
+  /** Obtiene el estado normalizado de una orden por su client_order_id (idempotencia). */
+  async getOrderByClientId(
+    pluginId: string | null,
+    clientOrderId: string,
+  ): Promise<OrderStatusResult> {
+    const manifest = this.resolveManifest(pluginId);
+    this.assertAlpacaFormat(manifest, 'getOrderByClientId');
+    const raw = await this.fetchOrderEndpoint(manifest, 'order_by_client_id', {
+      client_order_id: clientOrderId,
+    });
+    return this.normalizeOrderStatus(manifest, raw);
+  }
+
+  /** Lista órdenes filtradas por estado, normalizadas. */
+  async listOrders(
+    pluginId: string | null,
+    opts: { status: string },
+  ): Promise<OrderStatusResult[]> {
+    const manifest = this.resolveManifest(pluginId);
+    this.assertAlpacaFormat(manifest, 'listOrders');
+    const raw = await this.fetchOrderEndpoint(manifest, 'list_orders', { status: opts.status });
+    const rows = Array.isArray(raw) ? raw : [];
+    return rows.map((row) => this.normalizeOrderStatus(manifest, row));
+  }
+
+  /**
+   * Cancela una orden por id de broker. Tolerante: si el broker responde 404
+   * (orden inexistente) o 422 (orden ya llena/cancelada — no cancelable), se
+   * trata como no-op exitoso en vez de lanzar, porque el resultado deseado
+   * ("la orden ya no está activa") ya se cumple.
+   */
+  async cancelOrder(pluginId: string | null, brokerOrderId: string): Promise<void> {
+    const manifest = this.resolveManifest(pluginId);
+    this.assertAlpacaFormat(manifest, 'cancelOrder');
+
+    const url = this.buildRequestUrl(manifest, 'cancel_order', { broker_order_id: brokerOrderId });
+    const headers = this.buildAuthHeaders(manifest);
+    const res = await globalThis.fetch(url, {
+      method: 'DELETE',
+      headers,
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (res.ok) return;
+    if (res.status === 404 || res.status === 422) {
+      this.log.warn(
+        `cancelOrder [${manifest.plugin.id}/${brokerOrderId}]: HTTP ${res.status} — orden ya inexistente/no cancelable, tratado como no-op`,
+      );
+      return;
+    }
+    const body = await res.text().catch(() => '');
+    throw new Error(`${manifest.plugin.id} cancel_order HTTP ${res.status}: ${body.slice(0, 200)}`);
+  }
+
+  private assertAlpacaFormat(manifest: ProviderManifest, op: string): void {
+    if (manifest.api.format !== 'alpaca') {
+      throw new Error(
+        `Provider ${manifest.plugin.id}: ${op} no implementado para formato "${manifest.api.format}"`,
+      );
+    }
+  }
+
+  private async fetchOrderEndpoint(
+    manifest: ProviderManifest,
+    endpointKey: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    const url = this.buildRequestUrl(manifest, endpointKey, params);
+    const headers = this.buildAuthHeaders(manifest);
+    const res = await globalThis.fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(
+        `${manifest.plugin.id} ${endpointKey} HTTP ${res.status}: ${body.slice(0, 200)}`,
+      );
+    }
+    return res.json();
+  }
+
+  /** Normaliza la respuesta cruda de Alpaca a OrderStatusResult, fallando ruidosamente ante campos numéricos ilegibles. */
+  private normalizeOrderStatus(manifest: ProviderManifest, raw: unknown): OrderStatusResult {
+    const o = raw as {
+      id?: string;
+      client_order_id?: string | null;
+      status?: string;
+      filled_qty?: string;
+      filled_avg_price?: string | null;
+    };
+    if (!o.id || !o.status) {
+      throw new Error(
+        `${manifest.plugin.id}: respuesta de orden sin "id"/"status": ${JSON.stringify(raw)}`,
+      );
+    }
+    return {
+      broker_order_id: o.id,
+      client_order_id: o.client_order_id ?? null,
+      status: o.status,
+      filled_qty: this.parseAlpacaOrderNumber(manifest, o.filled_qty, 'filled_qty'),
+      filled_avg_price:
+        o.filled_avg_price == null
+          ? null
+          : this.parseAlpacaOrderNumber(manifest, o.filled_avg_price, 'filled_avg_price'),
+      raw,
+    };
+  }
+
+  /** Number(...) nunca debe filtrar NaN silenciosamente: falla ruidosamente ante un valor ilegible. */
+  private parseAlpacaOrderNumber(
+    manifest: ProviderManifest,
+    value: string | undefined,
+    field: string,
+  ): number {
+    const n = Number(value);
+    if (value == null || value === '' || Number.isNaN(n)) {
+      throw new Error(
+        `${manifest.plugin.id}: campo numérico "${field}" ilegible en respuesta de orden: ${JSON.stringify(value)}`,
+      );
+    }
+    return n;
   }
 
   // ── Normalización ─────────────────────────────────────────────────────────
