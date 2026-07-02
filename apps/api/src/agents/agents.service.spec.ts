@@ -781,6 +781,81 @@ describe('AgentsService.runGovernedTurn — decision → TradeIntent (HITL)', ()
       }),
     );
   });
+
+  it('an exit with malformed confidence/rationale still reaches TradeIntentService.recordIntent (never silently dropped)', async () => {
+    // The LLM emitted a cosmetically malformed exit (confidence out of [0,1], empty
+    // rationale). decision.plugin.py now returns ok:true for exits regardless — but
+    // TradeIntentService.recordIntent ALSO validates confidence in [0,1] and would THROW
+    // on the raw args, silently dropping the exit if agents.service.ts forwarded them
+    // unclamped. This must not happen: an exit only needs symbol+action to close a
+    // position.
+    const toolCallText =
+      '<tool_calls>[{"tool":"decision__emit_trade_intent","args":{"symbol":"AAPL","action":"exit","confidence":85,"rationale":""}}]</tool_calls>';
+    const llm = makeLlm(toolCallText);
+    const audit = makeAudit();
+    const tools = [
+      {
+        plugin_id: 'decision',
+        name: 'decision__emit_trade_intent',
+        description: 'Emit a trade decision',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ];
+    const plugins = makeFullPlugins('Emit a decision.', tools);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'skill' }] as never);
+    const sandbox = makeSandbox();
+    // Mirrors the FIXED plugin.py: exit is accepted (ok:true) with confidence clamped
+    // and rationale defaulted.
+    sandbox.callPlugin.mockResolvedValue({
+      ok: true,
+      result: {
+        ok: true,
+        result: {
+          symbol: 'AAPL',
+          action: 'exit',
+          confidence: 1.0,
+          rationale: 'position close',
+          timeframe: '1d',
+          status: 'recorded',
+        },
+      },
+    });
+    const memory = makeMemory();
+    const tradeIntent = { recordIntent: jest.fn().mockResolvedValue({ id: 'ti-2' }) };
+
+    const service = new (AgentsService as unknown as new (...a: unknown[]) => AgentsService)(
+      llm,
+      sandbox,
+      plugins,
+      memory,
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) }, // alerts
+      undefined, // snapshot
+      undefined, // cfg
+      undefined, // notifier
+      undefined, // pretest
+      makeKvSingleTurn(), // kv
+      undefined, // longTermMemory
+      undefined, // debate
+      undefined, // providerGateway
+      undefined, // mlSignalRecord
+      tradeIntent, // tradeIntent (the @Optional() dep under test)
+    );
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'Close AAPL' });
+
+    // Must actually reach recordIntent — never silently dropped.
+    expect(tradeIntent.recordIntent).toHaveBeenCalledTimes(1);
+    const recordIntentMock = tradeIntent.recordIntent as jest.Mock<
+      Promise<{ id: string }>,
+      [{ confidence: number; rationale: string; action: string }]
+    >;
+    const call = recordIntentMock.mock.calls[0][0];
+    expect(call.action).toBe('exit');
+    expect(call.confidence).toBeGreaterThanOrEqual(0);
+    expect(call.confidence).toBeLessThanOrEqual(1);
+    expect(call.rationale.length).toBeGreaterThan(0);
+  });
 });
 
 // ── Shared helper for _executeCycle tests below ───────────────────────────────

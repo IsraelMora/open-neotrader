@@ -1590,6 +1590,205 @@ describe('TradeIntentService', () => {
     });
   });
 
+  // ── exit routing must follow WHERE the position actually lives, not the CURRENT
+  // policy (stranded real-position bug) ─────────────────────────────────────────
+  //
+  // A real position can be opened while execution.real=true + broker_plugin_id set.
+  // If the operator later flips execution.real=false (or clears broker_plugin_id)
+  // while that real position is STILL OPEN at the broker, _effectiveMode alone would
+  // route the next exit to paper — _executePaper finds no matching paper position
+  // (it was never paper) and reports a FALSE "closed" (quantity:0, status:'executed')
+  // while the real broker position remains open. This is a money-critical stranding
+  // bug: exits must always check where the position actually lives.
+  describe('exit routing follows the actual broker position, not just policy.real', () => {
+    it('(a) real position open at broker + policy.real later flipped to false → exit STILL closes for REAL via broker, not a false paper close', async () => {
+      // policy.real=false (flipped after the real entry), but broker_plugin_id is still
+      // configured and the broker reports an open position for the symbol.
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('false');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        return Promise.resolve(null);
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      // Paper portfolio has NO matching position — proves the paper path would have
+      // falsely reported a qty=0 "close" if it were used.
+      mockPaperPortfolio(prisma);
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 10_900,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: 6,
+            avg_entry: 150,
+            market_value: 900,
+            unrealized_pnl: 0,
+            side: 'long',
+          },
+        ],
+        total_market_value: 900,
+        total_pnl: 0,
+        ts: new Date().toISOString(),
+      });
+      gateway.placeOrder.mockResolvedValue({ id: 'order_close', status: 'accepted' });
+      const executed = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        quantity: 6,
+        decided_by: 'autonomous',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.getPortfolio).toHaveBeenCalledWith('alpaca-provider');
+      expect(gateway.placeOrder).toHaveBeenCalledWith(
+        'alpaca-provider',
+        oc({ symbol: 'AAPL', side: 'sell', qty: 6, type: 'market' }),
+      );
+      expect(result.status).toBe('executed');
+      // Paper portfolio must NOT be mutated — this was a real close.
+      expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
+    });
+
+    it('(b) broker_plugin_id configured but broker reports NO position for the symbol → legitimate paper exit executes', async () => {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('false');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        return Promise.resolve(null);
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      // Paper portfolio DOES have a matching position — this is a legitimate paper-only exit.
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: JSON.stringify({
+          equity: 11_500,
+          cash: 10_000,
+          positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 140 }],
+        }),
+        updatedAt: new Date(),
+      });
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 10_000,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [], // broker holds nothing for this symbol
+        total_market_value: 0,
+        total_pnl: 0,
+        ts: new Date().toISOString(),
+      });
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      const executed = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        quantity: 10,
+        realized_pnl: 100,
+        decided_by: 'autonomous',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.getPortfolio).toHaveBeenCalledWith('alpaca-provider');
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('executed');
+      expect(prisma.portfolio.upsert).toHaveBeenCalled(); // paper portfolio WAS mutated
+    });
+
+    it('(c) broker position query throws → status=failed, no sell order placed, no false paper "executed"', async () => {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('false');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        return Promise.resolve(null);
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      // Paper portfolio has a matching position — must NOT be used as a fallback when
+      // the broker query is unreliable; existence cannot be determined → fail safe.
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: JSON.stringify({
+          equity: 11_400,
+          cash: 10_000,
+          positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 140 }],
+        }),
+        updatedAt: new Date(),
+      });
+      gateway.getPortfolio.mockRejectedValue(new Error('Broker unreachable'));
+      const failed = pendingIntent({
+        status: 'failed',
+        decided_by: 'autonomous',
+        result_json: JSON.stringify({
+          error: 'broker position unavailable — refusing to guess exit routing',
+        }),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(failed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
+      expect(result.status).toBe('failed');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({ data: oc({ status: 'failed' }) }),
+      );
+    });
+
+    it('(d) pure paper account (no broker_plugin_id ever) → exit behaves exactly as before, unchanged', async () => {
+      kv.get.mockResolvedValue(null); // execution.real, broker_plugin_id all unset/default
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: JSON.stringify({
+          equity: 11_400,
+          cash: 10_000,
+          positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 140 }],
+        }),
+        updatedAt: new Date(),
+      });
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      const executed = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        quantity: 10,
+        realized_pnl: 100,
+        decided_by: 'autonomous',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.autoProcess('ti_001');
+
+      // No broker configured at all → no broker lookup attempted, paper path unchanged.
+      expect(gateway.getPortfolio).not.toHaveBeenCalled();
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('executed');
+      expect(result.realized_pnl).toBe(100);
+      expect(prisma.portfolio.upsert).toHaveBeenCalled();
+    });
+  });
+
   // ── walk-forward gate before live trading (measurable-veto-shield) ───────────
   //
   // Real execution now requires, ON TOP of execution.real=true + broker_plugin_id, that

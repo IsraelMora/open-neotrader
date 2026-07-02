@@ -2861,6 +2861,38 @@ export class AgentsService {
   }
 
   /**
+   * Normalizes confidence/rationale before forwarding to TradeIntentService.recordIntent.
+   *
+   * "exit"/"hold" only need symbol+action to act (close a position / do nothing).
+   * decision.plugin.py already relaxes its OWN validation for these two actions (clamps
+   * confidence, defaults rationale) — but _recordSignalAndIntent forwards the RAW args
+   * the LLM sent (tc.args), not the plugin's sanitized output. Without this mirroring
+   * clamp, TradeIntentService.recordIntent's OWN [0,1] confidence check would still
+   * throw on a cosmetically malformed exit, and the caller's catch would silently drop
+   * it — a real position could then never be closed over a typo'd confidence.
+   * "long"/"short" stay unclamped: entry validation must remain strict.
+   */
+  private _normalizeIntentConfidenceRationale(
+    action: string,
+    args: Record<string, unknown>,
+  ): { confidence: number; rationale: string } {
+    const rawConfidence = Number(args['confidence']);
+    const rationaleArg = typeof args['rationale'] === 'string' ? args['rationale'] : '';
+
+    if (action !== 'exit' && action !== 'hold') {
+      return {
+        confidence: Number.isFinite(rawConfidence) ? rawConfidence : 0,
+        rationale: rationaleArg,
+      };
+    }
+
+    const confidence = Math.max(0, Math.min(1, Number.isFinite(rawConfidence) ? rawConfidence : 1));
+    const defaultRationale = action === 'exit' ? 'position close' : 'hold — no position change';
+    const rationale = rationaleArg.trim() ? rationaleArg : defaultRationale;
+    return { confidence, rationale };
+  }
+
+  /**
    * Registra la señal emitida por un tool call (audit) y, si es un emit_trade_intent
    * exitoso de `decision`, persiste el TradeIntent pendiente (HITL, paper-only). Fail-soft:
    * recordIntent nunca rompe el ciclo y es no-op si tradeIntent no está inyectado.
@@ -2890,13 +2922,15 @@ export class AgentsService {
       !!ti && res.ok && tc.plugin_id === 'decision' && tc.function === 'emit_trade_intent';
     if (!ti || !isTradeIntent) return;
 
+    const { confidence, rationale } = this._normalizeIntentConfidenceRationale(action, args);
+
     try {
       await ti.recordIntent({
         cycle_id,
         symbol,
         action,
-        confidence: Number(args['confidence']) || 0,
-        rationale: typeof args['rationale'] === 'string' ? args['rationale'] : '',
+        confidence,
+        rationale,
         timeframe: typeof args['timeframe'] === 'string' ? args['timeframe'] : undefined,
       });
     } catch (e: unknown) {

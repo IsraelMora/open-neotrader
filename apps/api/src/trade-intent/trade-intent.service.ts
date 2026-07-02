@@ -199,10 +199,14 @@ export class TradeIntentService {
     }
 
     const policy = await this._readExecutionPolicy();
-    // action must be known BEFORE _effectiveMode so it can skip the walk-forward gate
-    // for exit/hold (closing reduces risk; holding touches nothing — see method doc).
+    // action must be known BEFORE resolving mode so it can skip the walk-forward gate
+    // for exit/hold (closing reduces risk; holding touches nothing — see method doc), and
+    // so exit routing can be decided by WHERE the position actually lives (see
+    // _resolveExitRouting doc comment — stranded real-position bug).
     const action = intent.action as TradeAction;
-    const effectiveMode = await this._effectiveMode(policy, id, action);
+    const modeResult = await this._resolveMode(policy, id, intent.symbol, action, 'autonomous');
+    if (modeResult.mode === 'failed') return modeResult.failedUpdate;
+    const effectiveMode = modeResult.mode;
 
     // Load the shared paper portfolio (create with defaults if missing).
     // Also needed in real mode for exit qty lookup and risk gate state.
@@ -300,10 +304,14 @@ export class TradeIntentService {
     }
 
     const policy = await this._readExecutionPolicy();
-    // action must be known BEFORE _effectiveMode so it can skip the walk-forward gate
-    // for exit/hold (closing reduces risk; holding touches nothing — see method doc).
+    // action must be known BEFORE resolving mode so it can skip the walk-forward gate
+    // for exit/hold (closing reduces risk; holding touches nothing — see method doc), and
+    // so exit routing can be decided by WHERE the position actually lives (see
+    // _resolveExitRouting doc comment — stranded real-position bug).
     const action = intent.action as TradeAction;
-    const effectiveMode = await this._effectiveMode(policy, id, action);
+    const modeResult = await this._resolveMode(policy, id, intent.symbol, action, decided_by);
+    if (modeResult.mode === 'failed') return modeResult.failedUpdate;
+    const effectiveMode = modeResult.mode;
 
     // Load the shared paper portfolio (create with defaults if missing).
     // Also needed in real mode for exit qty lookup.
@@ -516,6 +524,106 @@ export class TradeIntentService {
       return 'paper';
     }
     return 'real';
+  }
+
+  // ── _resolveExitRouting ───────────────────────────────────────────────────────
+
+  /**
+   * Determines where an `exit` must actually route, INDEPENDENT of policy.real.
+   *
+   * Rationale (money-critical stranding-bug fix): a real position can be opened while
+   * execution.real=true + broker_plugin_id set. If the operator later flips
+   * execution.real=false (or clears broker_plugin_id) while that real position is STILL
+   * OPEN at the broker, _effectiveMode alone would route the next exit to paper —
+   * _executePaper finds no matching paper position (it was never paper) and reports a
+   * FALSE "closed" (quantity:0, status:'executed') while the real position remains open.
+   * An exit must always close the position WHERE IT ACTUALLY LIVES. Routing a sell to the
+   * real broker whenever a real position exists is ALWAYS SAFE — it only ever reduces
+   * risk, never increases it — regardless of what policy.real currently says.
+   *
+   * Contract:
+   *   - broker HOLDS a position for the symbol → route 'real' (close it for real).
+   *   - broker HOLDS NO position for the symbol → route 'paper' (legitimate — nothing
+   *     real to close; fall through to the normal paper exit path).
+   *   - broker query FAILS/throws → route 'failed' with a failedUpdate promise. Position
+   *     existence cannot be determined — fail safe: NEVER place a sell order and NEVER
+   *     report a false paper 'executed'.
+   *
+   * Only called when policy.broker_plugin_id is non-empty; a pure paper-only account
+   * (never had a broker) skips this entirely and keeps the unchanged paper exit path.
+   */
+  private async _resolveExitRouting(
+    id: string,
+    symbol: string,
+    brokerPluginId: string,
+    decided_by: string,
+  ): Promise<
+    | { route: 'real' }
+    | { route: 'paper' }
+    | { route: 'failed'; failedUpdate: ReturnType<PrismaService['tradeIntent']['update']> }
+  > {
+    let brokerPortfolio: Portfolio;
+    try {
+      brokerPortfolio = await this.gateway.getPortfolio(brokerPluginId);
+    } catch (err) {
+      this.log.warn(
+        `EXIT ROUTING FAILED [${id}]: getPortfolio error for ${symbol} — ${String(err)}`,
+      );
+      return {
+        route: 'failed',
+        failedUpdate: this.db.tradeIntent.update({
+          where: { id },
+          data: {
+            status: 'failed',
+            decided_at: new Date(),
+            decided_by,
+            result_json: JSON.stringify({
+              error: 'broker position unavailable — refusing to guess exit routing',
+              detail: String(err),
+            }),
+          },
+        }),
+      };
+    }
+
+    const brokerPos = brokerPortfolio.positions.find((p) => p.symbol === symbol);
+    if (brokerPos && Math.abs(brokerPos.qty) > 0) {
+      return { route: 'real' };
+    }
+    return { route: 'paper' };
+  }
+
+  /**
+   * Resolves the execution mode for a TradeIntent, honoring the exit-routing fix above.
+   *
+   * For "exit" with a configured broker: mode is decided by WHERE the position actually
+   * lives (see _resolveExitRouting), never by policy.real alone. For everything else
+   * (long/short/hold, or exit with no broker ever configured): unchanged, delegates to
+   * _effectiveMode.
+   */
+  private async _resolveMode(
+    policy: ExecutionPolicy,
+    id: string,
+    symbol: string,
+    action: TradeAction,
+    decided_by: string,
+  ): Promise<
+    | { mode: 'paper' | 'real' }
+    | { mode: 'failed'; failedUpdate: ReturnType<PrismaService['tradeIntent']['update']> }
+  > {
+    if (action === 'exit' && policy.broker_plugin_id) {
+      const routing = await this._resolveExitRouting(
+        id,
+        symbol,
+        policy.broker_plugin_id,
+        decided_by,
+      );
+      if (routing.route === 'failed') {
+        return { mode: 'failed', failedUpdate: routing.failedUpdate };
+      }
+      return { mode: routing.route };
+    }
+    return { mode: await this._effectiveMode(policy, id, action) };
   }
 
   // ── walk-forward gate ─────────────────────────────────────────────────────────
