@@ -2647,6 +2647,17 @@ export class AgentsService {
     tc: import('../llm/llm.service').ToolCallRequest,
     equityPctThreshold: number,
   ): Promise<boolean> {
+    // Fast path — an 'exit' emit_trade_intent is NEVER high-impact: closing a position
+    // must never be routed through the debate gate, where a 'reject' consensus would drop
+    // it and violate the "a position can ALWAYS be closed" invariant. Zero I/O cost.
+    if (
+      tc.plugin_id === 'decision' &&
+      tc.function === 'emit_trade_intent' &&
+      tc.args['action'] === 'exit'
+    ) {
+      return false;
+    }
+
     // Fast path — promote_pretest is always high-impact; zero I/O cost.
     if (tc.plugin_id === 'kernel' && tc.function === 'promote_pretest') return true;
 
@@ -2747,6 +2758,26 @@ export class AgentsService {
   }
 
   /**
+   * Stable-partitions `toolCalls` so that `emit_trade_intent` calls with `args.action ===
+   * 'exit'` come first, preserving relative order within each partition. This guarantees
+   * an exit is never among the calls dropped by the anti-amplification cap in
+   * `_executeToolCalls` (unless budget is 0) — mirrors the "a position can ALWAYS be
+   * closed" invariant enforced elsewhere (e.g. the notional-ceiling exemption for exits
+   * in trade-intent.service.ts).
+   */
+  private _prioritizeExits(
+    toolCalls: import('../llm/llm.service').ToolCallRequest[],
+  ): import('../llm/llm.service').ToolCallRequest[] {
+    const isExit = (tc: import('../llm/llm.service').ToolCallRequest): boolean =>
+      tc.plugin_id === 'decision' &&
+      tc.function === 'emit_trade_intent' &&
+      tc.args['action'] === 'exit';
+    const exits = toolCalls.filter(isExit);
+    const rest = toolCalls.filter((tc) => !isExit(tc));
+    return [...exits, ...rest];
+  }
+
+  /**
    * Dispatches validated tool_calls, enforcing the anti-amplification cap: at most
    * `budget` calls are EXECUTED (dispatched to the sandbox/kernel) — this is the
    * remaining allowance for the WHOLE cycle, not just this iteration (the caller
@@ -2770,8 +2801,9 @@ export class AgentsService {
     const signalsEmitted: { symbol: string; action: string }[] = [];
 
     const safeBudget = Math.max(0, budget);
-    const toExecute = toolCalls.slice(0, safeBudget);
-    const droppedByCap = toolCalls.length - toExecute.length;
+    const prioritized = this._prioritizeExits(toolCalls);
+    const toExecute = prioritized.slice(0, safeBudget);
+    const droppedByCap = prioritized.length - toExecute.length;
 
     for (const tc of toExecute) {
       try {
@@ -2820,7 +2852,7 @@ export class AgentsService {
           budget: safeBudget,
           executed: toExecute.length,
           dropped: droppedByCap,
-          dropped_calls: toolCalls.slice(safeBudget).map((c) => `${c.plugin_id}.${c.function}`),
+          dropped_calls: prioritized.slice(safeBudget).map((c) => `${c.plugin_id}.${c.function}`),
         },
       });
     }

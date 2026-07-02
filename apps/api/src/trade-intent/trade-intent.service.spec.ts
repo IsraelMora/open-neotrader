@@ -48,10 +48,10 @@ function makePrisma(): MockPrisma {
   };
 }
 
-type MockGateway = { getQuote: jest.Mock; placeOrder: jest.Mock };
+type MockGateway = { getQuote: jest.Mock; placeOrder: jest.Mock; getPortfolio: jest.Mock };
 
 function makeGateway(): MockGateway {
-  return { getQuote: jest.fn(), placeOrder: jest.fn() };
+  return { getQuote: jest.fn(), placeOrder: jest.fn(), getPortfolio: jest.fn() };
 }
 
 type MockKv = { get: jest.Mock; set: jest.Mock };
@@ -1208,14 +1208,27 @@ describe('TradeIntentService', () => {
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'exit', symbol: 'AAPL' }),
       );
-      prisma.portfolio.findUnique.mockResolvedValue({
-        name: 'paper',
-        data: JSON.stringify({
-          equity: 10_000,
-          cash: 8_500,
-          positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 140 }],
-        }),
-        updatedAt: new Date(),
+      // Paper portfolio is unrelated for a real exit — it holds a DIFFERENT qty than the
+      // broker to prove the sell quantity is sourced from the broker, not the paper state.
+      mockPaperPortfolio(prisma);
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 11_400,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: 10,
+            avg_entry: 140,
+            market_value: 1500,
+            unrealized_pnl: 100,
+            side: 'long',
+          },
+        ],
+        total_market_value: 1500,
+        total_pnl: 100,
+        ts: new Date().toISOString(),
       });
       mockAaplQuote(gateway); // last=150 → notional = 10 * 150 = 1500 > 100
       gateway.placeOrder.mockResolvedValue({ id: 'order_exit', status: 'accepted' });
@@ -1284,23 +1297,42 @@ describe('TradeIntentService', () => {
       );
     });
 
-    it('real exit → side=sell with the held position qty from portfolio', async () => {
-      // Portfolio holds 10 AAPL at avg 140; exit → sell 10 shares
+    it('real exit → side=sell with the held position qty sourced from the BROKER (not the paper portfolio)', async () => {
+      // Broker reports 10 AAPL held at the broker; the paper portfolio holds a DIFFERENT
+      // quantity (3) for the same symbol, to prove the sell qty comes from getPortfolio and
+      // is never derived from paper state for real exits.
       enableReal(kv, prisma, 'alpaca-provider', 5000); // ceiling high enough
-      const portfolioWithPosition = JSON.stringify({
-        equity: 11_400,
-        cash: 10_000,
-        positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 140 }],
-      });
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'exit', symbol: 'AAPL' }),
       );
       mockAaplQuote(gateway);
-      // For exit in real mode, we look up held qty from the paper portfolio to know how many to sell
       prisma.portfolio.findUnique.mockResolvedValue({
         name: 'paper',
-        data: portfolioWithPosition,
+        data: JSON.stringify({
+          equity: 11_400,
+          cash: 10_000,
+          positions: [{ symbol: 'AAPL', quantity: 3, avg_price: 140 }], // stale/irrelevant paper qty
+        }),
         updatedAt: new Date(),
+      });
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 11_400,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: 10,
+            avg_entry: 140,
+            market_value: 1500,
+            unrealized_pnl: 100,
+            side: 'long',
+          },
+        ],
+        total_market_value: 1500,
+        total_pnl: 100,
+        ts: new Date().toISOString(),
       });
       gateway.placeOrder.mockResolvedValue({
         id: 'order_456',
@@ -1317,9 +1349,197 @@ describe('TradeIntentService', () => {
 
       await service.autoProcess('ti_001');
 
+      expect(gateway.getPortfolio).toHaveBeenCalledWith('alpaca-provider');
       expect(gateway.placeOrder).toHaveBeenCalledWith(
         'alpaca-provider',
         oc({ symbol: 'AAPL', side: 'sell', qty: 10, type: 'market' }),
+      );
+    });
+
+    it('real exit with a SHORT held position → sells Math.abs(qty) (negative broker qty)', async () => {
+      // A short position is reported by the broker as a negative qty. Closing (buying back)
+      // a short is still routed through the 'exit' action in this codebase's simplified
+      // side-mapping (side='sell' is fixed for exit at the trade-intent layer) — the point
+      // under test here is that Math.abs() is applied to the broker qty, not the sign.
+      enableReal(kv, prisma, 'alpaca-provider', 5000);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      mockPaperPortfolio(prisma);
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 11_400,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: -7,
+            avg_entry: 140,
+            market_value: 1050,
+            unrealized_pnl: 0,
+            side: 'short',
+          },
+        ],
+        total_market_value: 1050,
+        total_pnl: 0,
+        ts: new Date().toISOString(),
+      });
+      gateway.placeOrder.mockResolvedValue({ id: 'order_short_exit', status: 'accepted' });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({
+          status: 'executed',
+          fill_price: 150,
+          quantity: 7,
+          decided_by: 'autonomous',
+        }),
+      );
+
+      await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).toHaveBeenCalledWith(
+        'alpaca-provider',
+        oc({ symbol: 'AAPL', side: 'sell', qty: 7, type: 'market' }),
+      );
+    });
+
+    it('real exit when getPortfolio throws → status=failed, placeOrder NEVER called (fail-safe, no wrong-qty sell)', async () => {
+      enableReal(kv, prisma, 'alpaca-provider', 5000);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      // Paper portfolio has a matching position — must NOT be used as a fallback.
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: JSON.stringify({
+          equity: 11_400,
+          cash: 10_000,
+          positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 140 }],
+        }),
+        updatedAt: new Date(),
+      });
+      gateway.getPortfolio.mockRejectedValue(new Error('Broker unreachable'));
+      const failed = pendingIntent({
+        status: 'failed',
+        decided_by: 'autonomous',
+        result_json: JSON.stringify({
+          error: 'broker position unavailable — refusing to guess exit qty',
+        }),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(failed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('failed');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({ data: oc({ status: 'failed' }) }),
+      );
+    });
+
+    it('real exit when broker reports no matching position → status=failed, placeOrder NEVER called', async () => {
+      enableReal(kv, prisma, 'alpaca-provider', 5000);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      mockPaperPortfolio(prisma);
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 10_000,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [], // no open position for AAPL
+        total_market_value: 0,
+        total_pnl: 0,
+        ts: new Date().toISOString(),
+      });
+      const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(failed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('failed');
+    });
+
+    it('end-to-end: real long opens a position via broker, then real exit closes it using the broker-reported qty', async () => {
+      enableReal(kv, prisma, 'alpaca-provider', 5000);
+
+      // Step 1: open a real long. qty = floor(10000 * 0.1 / 150) = 6.
+      prisma.tradeIntent.findUnique.mockResolvedValueOnce(
+        pendingIntent({ id: 'ti_open', action: 'long', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      gateway.placeOrder.mockResolvedValueOnce({
+        id: 'order_open',
+        status: 'accepted',
+        filled_qty: '6',
+      });
+      prisma.tradeIntent.update.mockResolvedValueOnce(
+        pendingIntent({
+          id: 'ti_open',
+          status: 'executed',
+          fill_price: 150,
+          quantity: 6,
+          decided_by: 'autonomous',
+        }),
+      );
+
+      const opened = await service.autoProcess('ti_open');
+      expect(opened.status).toBe('executed');
+      expect(gateway.placeOrder).toHaveBeenNthCalledWith(
+        1,
+        'alpaca-provider',
+        oc({ symbol: 'AAPL', side: 'buy', qty: 6, type: 'market' }),
+      );
+
+      // Step 2: broker now reports the 6-share position opened above; issue a real exit.
+      prisma.tradeIntent.findUnique.mockResolvedValueOnce(
+        pendingIntent({ id: 'ti_close', action: 'exit', symbol: 'AAPL' }),
+      );
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 10_900,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: 6,
+            avg_entry: 150,
+            market_value: 900,
+            unrealized_pnl: 0,
+            side: 'long',
+          },
+        ],
+        total_market_value: 900,
+        total_pnl: 0,
+        ts: new Date().toISOString(),
+      });
+      gateway.placeOrder.mockResolvedValueOnce({
+        id: 'order_close',
+        status: 'accepted',
+        filled_qty: '6',
+      });
+      prisma.tradeIntent.update.mockResolvedValueOnce(
+        pendingIntent({
+          id: 'ti_close',
+          status: 'executed',
+          fill_price: 150,
+          quantity: 6,
+          decided_by: 'autonomous',
+        }),
+      );
+
+      const closed = await service.autoProcess('ti_close');
+      expect(closed.status).toBe('executed');
+      expect(gateway.placeOrder).toHaveBeenNthCalledWith(
+        2,
+        'alpaca-provider',
+        oc({ symbol: 'AAPL', side: 'sell', qty: 6, type: 'market' }),
       );
     });
 
@@ -1607,6 +1827,159 @@ describe('TradeIntentService', () => {
       expect(prisma.strategy.findUnique).not.toHaveBeenCalled();
       expect(gateway.placeOrder).not.toHaveBeenCalled();
       expect(prisma.portfolio.upsert).toHaveBeenCalled();
+    });
+
+    // ── exit/hold must NEVER be gated by walk-forward (closing reduces risk) ──────
+
+    it('real exit with MISSING walk-forward verdict (no strategy.applied) still executes as real — never demoted, never falsely marked executed via the paper zero-qty path', async () => {
+      const audit = makeAudit();
+      service = makeService(prisma, gateway, kv, audit);
+      enableRealNoGate(kv); // strategy.applied unset → gate would fail if it were checked
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      // Paper portfolio is unrelated for a real exit — deliberately holds NO position for
+      // AAPL, so if the bug were present (demoted to paper) this would resolve qty=0 and
+      // be falsely marked executed instead of reaching the broker.
+      mockPaperPortfolio(prisma);
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 11_400,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: 10,
+            avg_entry: 140,
+            market_value: 1500,
+            unrealized_pnl: 100,
+            side: 'long',
+          },
+        ],
+        total_market_value: 1500,
+        total_pnl: 100,
+        ts: new Date().toISOString(),
+      });
+      mockAaplQuote(gateway);
+      gateway.placeOrder.mockResolvedValue({ id: 'order_exit_missing_gate', status: 'accepted' });
+      const executed = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        quantity: 10,
+        decided_by: 'autonomous',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).toHaveBeenCalledWith(
+        'alpaca-provider',
+        oc({ symbol: 'AAPL', qty: 10, side: 'sell', type: 'market' }),
+      );
+      expect(result.status).toBe('executed');
+      expect(prisma.portfolio.upsert).not.toHaveBeenCalled(); // never routed to paper
+      expect(audit.log).not.toHaveBeenCalledWith(oc({ event_type: 'walk_forward_gate_demotion' }));
+    });
+
+    it('real exit with STALE walk-forward verdict still executes as real — the defensive re-check in _executeReal must not block it either', async () => {
+      const audit = makeAudit();
+      service = makeService(prisma, gateway, kv, audit);
+      const stale = new Date(Date.now() - 40 * 86_400_000); // default window is 30 days
+      enableRealNoGate(kv, { 'strategy.applied': 's_live' });
+      mockRobustAppliedStrategy(prisma, 'ROBUSTO', stale);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 11_400,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: 10,
+            avg_entry: 140,
+            market_value: 1500,
+            unrealized_pnl: 100,
+            side: 'long',
+          },
+        ],
+        total_market_value: 1500,
+        total_pnl: 100,
+        ts: new Date().toISOString(),
+      });
+      mockAaplQuote(gateway);
+      gateway.placeOrder.mockResolvedValue({ id: 'order_exit_stale_gate', status: 'accepted' });
+      const executed = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        quantity: 10,
+        decided_by: 'autonomous',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.placeOrder).toHaveBeenCalledWith(
+        'alpaca-provider',
+        oc({ symbol: 'AAPL', qty: 10, side: 'sell', type: 'market' }),
+      );
+      expect(result.status).toBe('executed');
+      expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
+      expect(audit.log).not.toHaveBeenCalledWith(oc({ event_type: 'walk_forward_gate_demotion' }));
+    });
+
+    it('policy.real=false + exit on an existing paper position → paper path unchanged, no walk-forward machinery touched', async () => {
+      kv.get.mockResolvedValue(null); // real=false → paper, always
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: JSON.stringify({
+          equity: 11_500,
+          cash: 10_000,
+          positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 140 }],
+        }),
+        updatedAt: new Date(),
+      });
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'executed', quantity: 10, decided_by: 'autonomous' }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(prisma.strategy.findUnique).not.toHaveBeenCalled();
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(gateway.getPortfolio).not.toHaveBeenCalled();
+      expect(prisma.portfolio.upsert).toHaveBeenCalled();
+      expect(result.status).toBe('executed');
+    });
+
+    it('real hold with a stale/missing walk-forward gate never triggers a demotion audit (hold never touches broker/paper state, so it must not depend on gate freshness)', async () => {
+      const audit = makeAudit();
+      service = makeService(prisma, gateway, kv, audit);
+      enableRealNoGate(kv); // strategy.applied unset → gate would fail if checked
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'hold', symbol: 'AAPL' }),
+      );
+      const executed = pendingIntent({ status: 'executed', quantity: 0, decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(result.status).toBe('executed');
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(audit.log).not.toHaveBeenCalledWith(oc({ event_type: 'walk_forward_gate_demotion' }));
     });
   });
 

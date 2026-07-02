@@ -21,7 +21,7 @@
  */
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { ProviderGatewayService } from '../providers/provider-gateway.service';
+import { ProviderGatewayService, Portfolio } from '../providers/provider-gateway.service';
 import { KvService } from '../common/kv.service';
 import { kvBool, kvNum, kvStr } from '../common/kv.util';
 import { AuditService } from '../audit/audit.service';
@@ -199,7 +199,10 @@ export class TradeIntentService {
     }
 
     const policy = await this._readExecutionPolicy();
-    const effectiveMode = await this._effectiveMode(policy, id);
+    // action must be known BEFORE _effectiveMode so it can skip the walk-forward gate
+    // for exit/hold (closing reduces risk; holding touches nothing — see method doc).
+    const action = intent.action as TradeAction;
+    const effectiveMode = await this._effectiveMode(policy, id, action);
 
     // Load the shared paper portfolio (create with defaults if missing).
     // Also needed in real mode for exit qty lookup and risk gate state.
@@ -213,8 +216,6 @@ export class TradeIntentService {
           cash: PAPER_PORTFOLIO_INITIAL_CAPITAL,
           positions: [],
         };
-
-    const action = intent.action as TradeAction;
 
     // "hold" → executed immediately as no-op, no quote fetch, no portfolio mutation.
     if (action === 'hold') {
@@ -299,7 +300,10 @@ export class TradeIntentService {
     }
 
     const policy = await this._readExecutionPolicy();
-    const effectiveMode = await this._effectiveMode(policy, id);
+    // action must be known BEFORE _effectiveMode so it can skip the walk-forward gate
+    // for exit/hold (closing reduces risk; holding touches nothing — see method doc).
+    const action = intent.action as TradeAction;
+    const effectiveMode = await this._effectiveMode(policy, id, action);
 
     // Load the shared paper portfolio (create with defaults if missing).
     // Also needed in real mode for exit qty lookup.
@@ -318,7 +322,6 @@ export class TradeIntentService {
     // path too. Human approval must not bypass the drawdown halt / max-open-positions
     // floor. "exit"/"hold" always pass — closing a position must remain possible
     // even during an active halt.
-    const action = intent.action as TradeAction;
     if (action === 'long' || action === 'short') {
       const { pass, reason } = this._passesAutoRisk(state, policy);
       if (!pass) {
@@ -476,19 +479,32 @@ export class TradeIntentService {
    * Returns 'real' ONLY when ALL of these hold:
    *   1. policy.real === true  (operator explicitly set execution.real=true)
    *   2. policy.broker_plugin_id is non-empty  (a broker is configured)
-   *   3. the walk-forward GATE passes: the CURRENTLY-APPLIED strategy carries a recent
-   *      ROBUSTO walk-forward verdict (measurable-veto-shield).
+   *   3. for "long"/"short" ONLY: the walk-forward GATE passes — the CURRENTLY-APPLIED
+   *      strategy carries a recent ROBUSTO walk-forward verdict (measurable-veto-shield).
    *
-   * Any failure → 'paper'. The gate ONLY ever downgrades real→paper: it never throws,
-   * never blocks the intent, and never touches the paper path. A demotion is logged at
-   * WARN and audited so the operator understands why real didn't execute.
+   * "exit" and "hold" SKIP the walk-forward gate entirely (no demotion, no audit call):
+   * walk-forward validates OPENING new risk, and must never gate CLOSING an existing
+   * position — a stale/missing verdict must never turn a real "exit" into a silent
+   * no-op on an unrelated paper portfolio (see class-level incident notes). "hold" never
+   * touches broker/paper state either way, so it has nothing for the gate to protect.
+   *
+   * Any long/short gate failure → 'paper'. The gate ONLY ever downgrades real→paper: it
+   * never throws, never blocks the intent, and never touches the paper path. A demotion
+   * is logged at WARN and audited so the operator understands why real didn't execute.
    */
   private async _effectiveMode(
     policy: ExecutionPolicy,
     contextId: string,
+    action: TradeAction,
   ): Promise<'paper' | 'real'> {
     if (!(policy.real === true && policy.broker_plugin_id.length > 0)) {
       return 'paper';
+    }
+
+    // Closing (exit) reduces risk and must always be reachable; holding touches nothing.
+    // Neither depends on walk-forward freshness — only opening new risk does.
+    if (action === 'exit' || action === 'hold') {
+      return 'real';
     }
 
     const gate = await this._checkWalkForwardGate();
@@ -602,7 +618,8 @@ export class TradeIntentService {
    *
    * Side mapping:
    *   long  → 'buy'
-   *   exit  → 'sell' (qty = held position qty from paper portfolio)
+   *   exit  → 'sell' (qty = |held position qty| from the broker's live portfolio, never
+   *           the paper portfolio — see fail-safe behavior below)
    *   short → 'sell'
    *   hold  → no-op (executed, qty=0) — caller should have short-circuited before here
    *
@@ -612,6 +629,125 @@ export class TradeIntentService {
    *
    * Every real order attempt emits a WARN-level audit log line.
    */
+  /**
+   * Resolves the sell quantity for a REAL `exit`, sourced from the broker's live portfolio
+   * — never the paper portfolio, which is unmutated/stale in real mode. Fail-safe: any
+   * broker error or missing/zero position returns a `failedUpdate` promise (the caller
+   * must return it directly) instead of guessing a quantity or placing a wrong-sized sell.
+   *
+   * Extracted from `_executeReal` to keep its cognitive complexity within the sonarjs limit.
+   */
+  private async _resolveRealExitQty(
+    id: string,
+    symbol: string,
+    brokerPluginId: string,
+    decided_by: string,
+  ): Promise<
+    { qty: number } | { failedUpdate: ReturnType<PrismaService['tradeIntent']['update']> }
+  > {
+    let brokerPortfolio: Portfolio;
+    try {
+      brokerPortfolio = await this.gateway.getPortfolio(brokerPluginId);
+    } catch (err) {
+      this.log.warn(`REAL ORDER FAILED [${id}]: getPortfolio error for ${symbol} — ${String(err)}`);
+      return {
+        failedUpdate: this.db.tradeIntent.update({
+          where: { id },
+          data: {
+            status: 'failed',
+            decided_at: new Date(),
+            decided_by,
+            result_json: JSON.stringify({
+              error: 'broker position unavailable — refusing to guess exit qty',
+              detail: String(err),
+            }),
+          },
+        }),
+      };
+    }
+
+    const brokerPos = brokerPortfolio.positions.find((p) => p.symbol === symbol);
+    if (!brokerPos || Math.abs(brokerPos.qty) <= 0) {
+      this.log.warn(
+        `REAL ORDER REJECTED [${id}]: no open broker position for ${symbol} — not placing`,
+      );
+      return {
+        failedUpdate: this.db.tradeIntent.update({
+          where: { id },
+          data: {
+            status: 'failed',
+            decided_at: new Date(),
+            decided_by,
+            result_json: JSON.stringify({ error: `no open broker position for ${symbol}` }),
+          },
+        }),
+      };
+    }
+
+    return { qty: Math.abs(brokerPos.qty) };
+  }
+
+  /**
+   * Belt-and-suspenders preconditions for `_executeReal`, re-checked defensively even
+   * though `_effectiveMode` already gates real execution — so no future caller can reach
+   * a real order without a configured broker and (for long/short only) a fresh ROBUSTO
+   * walk-forward verdict.
+   *
+   * "exit"/"hold" are EXEMPT from the walk-forward re-check: closing a position reduces
+   * risk and must never be blocked by a stale/missing verdict — mirrors the exemption in
+   * `_effectiveMode`. The broker check still applies to every action.
+   *
+   * Extracted from `_executeReal` to keep its cognitive complexity within the sonarjs limit.
+   */
+  private async _checkExecuteRealPreconditions(
+    id: string,
+    policy: ExecutionPolicy,
+    action: TradeAction,
+    decided_by: string,
+  ): Promise<{ failedUpdate: ReturnType<PrismaService['tradeIntent']['update']> } | { ok: true }> {
+    // Defensive: broker must be set (belt-and-suspenders beyond _effectiveMode).
+    if (!policy.broker_plugin_id) {
+      this.log.warn(`REAL ORDER REJECTED [${id}]: broker_plugin_id is empty — safety guard`);
+      return {
+        failedUpdate: this.db.tradeIntent.update({
+          where: { id },
+          data: {
+            status: 'failed',
+            decided_at: new Date(),
+            decided_by,
+            result_json: JSON.stringify({ error: 'broker_plugin_id not configured' }),
+          },
+        }),
+      };
+    }
+
+    // Defensive walk-forward gate re-check (belt-and-suspenders beyond _effectiveMode) so
+    // no future caller can reach real execution without a recent ROBUSTO verdict on the
+    // applied strategy. In the normal flow _effectiveMode already demoted to paper, so this
+    // never fires; if it ever does, fail safe like the broker guard — no real order.
+    if (action !== 'exit' && action !== 'hold') {
+      const gate = await this._checkWalkForwardGate();
+      if (!gate.pass) {
+        this.log.warn(
+          `REAL ORDER REJECTED [${id}]: walk-forward gate failed — ${gate.reason} — safety guard`,
+        );
+        return {
+          failedUpdate: this.db.tradeIntent.update({
+            where: { id },
+            data: {
+              status: 'failed',
+              decided_at: new Date(),
+              decided_by,
+              result_json: JSON.stringify({ error: `walk-forward gate: ${gate.reason}` }),
+            },
+          }),
+        };
+      }
+    }
+
+    return { ok: true };
+  }
+
   private async _executeReal(
     id: string,
     intent: { symbol: string; action: string },
@@ -623,39 +759,11 @@ export class TradeIntentService {
     const symbol = intent.symbol;
     const action = intent.action as TradeAction;
 
-    // Defensive: broker must be set (belt-and-suspenders beyond _effectiveMode).
-    if (!policy.broker_plugin_id) {
-      this.log.warn(`REAL ORDER REJECTED [${id}]: broker_plugin_id is empty — safety guard`);
-      return this.db.tradeIntent.update({
-        where: { id },
-        data: {
-          status: 'failed',
-          decided_at: new Date(),
-          decided_by,
-          result_json: JSON.stringify({ error: 'broker_plugin_id not configured' }),
-        },
-      });
-    }
-
-    // Defensive walk-forward gate re-check (belt-and-suspenders beyond _effectiveMode) so
-    // no future caller can reach real execution without a recent ROBUSTO verdict on the
-    // applied strategy. In the normal flow _effectiveMode already demoted to paper, so this
-    // never fires; if it ever does, fail safe like the broker guard — no real order.
-    const gate = await this._checkWalkForwardGate();
-    if (!gate.pass) {
-      this.log.warn(
-        `REAL ORDER REJECTED [${id}]: walk-forward gate failed — ${gate.reason} — safety guard`,
-      );
-      return this.db.tradeIntent.update({
-        where: { id },
-        data: {
-          status: 'failed',
-          decided_at: new Date(),
-          decided_by,
-          result_json: JSON.stringify({ error: `walk-forward gate: ${gate.reason}` }),
-        },
-      });
-    }
+    // Broker + walk-forward re-check (exit/hold exempt from the walk-forward part — see
+    // _checkExecuteRealPreconditions doc comment). Extracted to keep this function's
+    // cognitive complexity within the sonarjs limit.
+    const preconditions = await this._checkExecuteRealPreconditions(id, policy, action, decided_by);
+    if ('failedUpdate' in preconditions) return preconditions.failedUpdate;
 
     // Fetch live quote for sizing.
     let price: number;
@@ -704,10 +812,19 @@ export class TradeIntentService {
       );
     } else if (action === 'exit') {
       side = 'sell';
-      // Use held position quantity from paper portfolio as the authoritative qty.
+      // Real exits must source qty from the BROKER's live position — the paper portfolio
+      // is never mutated in real mode (see method doc comment above) and is therefore
+      // stale/irrelevant here. Fail safe if the broker is unreachable or reports no open
+      // position: never guess a quantity, never place a wrong-sized sell.
       // No ceiling clamp on exits — closing an existing position reduces risk.
-      const pos = paperState.positions.find((p) => p.symbol === symbol);
-      qty = pos ? pos.quantity : 0;
+      const exitQty = await this._resolveRealExitQty(
+        id,
+        symbol,
+        policy.broker_plugin_id,
+        decided_by,
+      );
+      if ('failedUpdate' in exitQty) return exitQty.failedUpdate;
+      qty = exitQty.qty;
     } else if (action === 'short') {
       side = 'sell';
       qty = this._clampToPositionCeiling(

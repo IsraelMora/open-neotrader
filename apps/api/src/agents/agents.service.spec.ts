@@ -1887,6 +1887,34 @@ async function callExecuteToolCalls(
   )._executeToolCalls(cycleId, calls, Number.MAX_SAFE_INTEGER);
 }
 
+/**
+ * Same as `callExecuteToolCalls` but with an explicit budget — used by the exit-priority
+ * cap tests (measurable-veto-shield Fix 2), which need to exercise the anti-amplification
+ * cap itself rather than bypass it.
+ */
+async function callExecuteToolCallsWithBudget(
+  service: AgentsService,
+  cycleId: string,
+  calls: ToolCallRequest[],
+  budget: number,
+): Promise<{
+  decisions: import('./agents.service').Decision[];
+  sandbox_results: import('./agents.service').SandboxResult[];
+}> {
+  return (
+    service as unknown as {
+      _executeToolCalls: (
+        c: string,
+        t: ToolCallRequest[],
+        b: number,
+      ) => Promise<{
+        decisions: import('./agents.service').Decision[];
+        sandbox_results: import('./agents.service').SandboxResult[];
+      }>;
+    }
+  )._executeToolCalls(cycleId, calls, budget);
+}
+
 describe('F4-S1 Phase 3.2/3.3 — _validateToolCalls kernel bypass', () => {
   const CYCLE_ID = 'kernel-validate-001';
 
@@ -4518,6 +4546,119 @@ describe('C2 — react.max_tool_calls: hard cap on total tool calls executed per
   });
 });
 
+// ── measurable-veto-shield Fix 2 — exit intents must never be dropped by the cap ─────
+//
+// "A position can ALWAYS be closed" invariant: emit_trade_intent calls with action='exit'
+// must survive the anti-amplification cap regardless of their emission order relative to
+// other tool calls.
+describe('measurable-veto-shield Fix 2 — _executeToolCalls exit-priority under the cap', () => {
+  const CYCLE_ID = 'exit-priority-001';
+
+  function makeAgentsServiceWithSandbox(
+    sandbox: ReturnType<typeof makeSandbox>,
+    audit: ReturnType<typeof makeAudit>,
+  ): AgentsService {
+    return new AgentsService(
+      {} as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      makePlugins([], []) as unknown as PluginsService,
+      {} as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+  }
+
+  const nonExitTc = (symbol: string): ToolCallRequest => ({
+    plugin_id: 'alpaca-provider',
+    function: 'place_order',
+    args: { symbol, action: 'buy' },
+  });
+
+  const exitTc = (symbol: string): ToolCallRequest => ({
+    plugin_id: 'decision',
+    function: 'emit_trade_intent',
+    args: { symbol, action: 'exit' },
+  });
+
+  it('4 calls [buy, buy, buy, exit] with budget=3 → the exit call IS executed and exactly one non-exit call is dropped/audited', async () => {
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const service = makeAgentsServiceWithSandbox(sandbox, audit);
+
+    const calls = [nonExitTc('AAA'), nonExitTc('BBB'), nonExitTc('CCC'), exitTc('AAPL')];
+
+    await callExecuteToolCallsWithBudget(service, CYCLE_ID, calls, 3);
+
+    // The exit call must have been dispatched — sandbox.callPlugin was invoked for it.
+    expect(sandbox.callPlugin).toHaveBeenCalledWith('decision', 'emit_trade_intent', {
+      symbol: 'AAPL',
+      action: 'exit',
+    });
+    // Exactly 3 calls executed total (the cap), one of which is the exit.
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(3);
+
+    // Exactly one non-exit call was dropped and audited via tool_call_cap_reached.
+    const capEvent = findAuditEvent(audit, 'tool_call_cap_reached');
+    expect(capEvent).toBeDefined();
+    const meta = capEvent?.['meta'] as { dropped: number; dropped_calls: string[] };
+    expect(meta.dropped).toBe(1);
+    expect(meta.dropped_calls).toEqual(['alpaca-provider.place_order']);
+  });
+
+  it('non-exit overflow without any exit present → still capped and audited exactly as before (no regression)', async () => {
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const service = makeAgentsServiceWithSandbox(sandbox, audit);
+
+    const calls = [nonExitTc('AAA'), nonExitTc('BBB'), nonExitTc('CCC'), nonExitTc('DDD')];
+
+    await callExecuteToolCallsWithBudget(service, CYCLE_ID, calls, 3);
+
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(3);
+    const capEvent = findAuditEvent(audit, 'tool_call_cap_reached');
+    expect(capEvent).toBeDefined();
+    const meta = capEvent?.['meta'] as { dropped: number; dropped_calls: string[] };
+    expect(meta.dropped).toBe(1);
+    expect(meta.dropped_calls).toEqual(['alpaca-provider.place_order']);
+  });
+
+  it('multiple exits + overflow of non-exits → ALL exits execute, only non-exits are dropped', async () => {
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const service = makeAgentsServiceWithSandbox(sandbox, audit);
+
+    const calls = [
+      nonExitTc('AAA'),
+      exitTc('AAPL'),
+      nonExitTc('BBB'),
+      exitTc('MSFT'),
+      nonExitTc('CCC'),
+    ];
+
+    await callExecuteToolCallsWithBudget(service, CYCLE_ID, calls, 2);
+
+    // Both exits must be executed even though budget=2 and there are 5 calls total.
+    expect(sandbox.callPlugin).toHaveBeenCalledWith('decision', 'emit_trade_intent', {
+      symbol: 'AAPL',
+      action: 'exit',
+    });
+    expect(sandbox.callPlugin).toHaveBeenCalledWith('decision', 'emit_trade_intent', {
+      symbol: 'MSFT',
+      action: 'exit',
+    });
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(2);
+
+    const capEvent = findAuditEvent(audit, 'tool_call_cap_reached');
+    const meta = capEvent?.['meta'] as { dropped: number; dropped_calls: string[] };
+    expect(meta.dropped).toBe(3);
+    expect(meta.dropped_calls).toEqual([
+      'alpaca-provider.place_order',
+      'alpaca-provider.place_order',
+      'alpaca-provider.place_order',
+    ]);
+  });
+});
+
 // ── T9: Context cap ───────────────────────────────────────────────────────────
 
 describe('F6-S1 T9 — _composeIterationContext: context cap enforced', () => {
@@ -5963,6 +6104,36 @@ describe('F6-S3 PR-B B2 — _isHighImpact (fail-soft notional check)', () => {
     const result = await callIsHighImpact(service, providerTc('AAPL', 50), 0.05);
     expect(result).toBe(false);
   });
+
+  // ── measurable-veto-shield Fix 3 — exits must never be routed through the debate gate ──
+  it("B2.11 — measurable-veto-shield Fix 3: emit_trade_intent action='exit', large notional → false immediately, zero I/O (never routed to debate)", async () => {
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({ gateway });
+    const exitTc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'decision',
+      function: 'emit_trade_intent',
+      args: { symbol: 'AAPL', action: 'exit', qty: 500 }, // notional=50000, well above threshold
+    };
+    const result = await callIsHighImpact(service, exitTc, 0.05);
+    expect(result).toBe(false);
+    // Fast path — no quote/portfolio I/O for exits.
+    expect(gateway.getQuote).not.toHaveBeenCalled();
+    expect(gateway.getPortfolio).not.toHaveBeenCalled();
+  });
+
+  it("B2.12 — measurable-veto-shield Fix 3 regression: emit_trade_intent action='long' with same high notional → still classified high-impact (goes through debate)", async () => {
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({ gateway });
+    const entryTc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'decision',
+      function: 'emit_trade_intent',
+      args: { symbol: 'AAPL', action: 'long', qty: 500 },
+    };
+    const result = await callIsHighImpact(service, entryTc, 0.05);
+    expect(result).toBe(true);
+    expect(gateway.getQuote).toHaveBeenCalled();
+    expect(gateway.getPortfolio).toHaveBeenCalled();
+  });
 });
 
 // ── B3: DI boot test ─────────────────────────────────────────────────────────
@@ -6445,6 +6616,76 @@ describe('F6-S3 PR-B B4 — _executeToolCalls debate intercept', () => {
     expect(sandbox.callPlugin).not.toHaveBeenCalled();
     expect(decisions[0]?.allowed).toBe(false);
     expect(decisions[0]?.reason).toBe('debate_failed');
+  });
+
+  // T10: measurable-veto-shield Fix 3 — a high-notional exit must skip the debate gate
+  // entirely and dispatch normally, never risking a 'debate_rejected' drop.
+  it('T10 — measurable-veto-shield Fix 3: high-notional exit skips debate gate entirely (runPanel never called), proceeds to normal dispatch', async () => {
+    const debateStub = makeDebateStub({
+      // Even if the panel WOULD reject, it must never be consulted for an exit.
+      runPanelResult: { recommendation: 'reject', auditor_blocked: false, stances: [] },
+    });
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    // High notional: qty=500, last=100 → notional=50000, equity=50000 → well above threshold.
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({
+      sandbox,
+      audit,
+      plugins: makePluginsWithDebate(),
+      kv: makeKvDebate({ 'debate.enabled': 'true', 'debate.min_notional_pct': '0.05' }),
+      debate: debateStub,
+      gateway,
+    });
+
+    const exitTc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'decision',
+      function: 'emit_trade_intent',
+      args: { symbol: 'AAPL', action: 'exit', qty: 500 },
+    };
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [exitTc]);
+
+    expect(debateStub.runPanel).not.toHaveBeenCalled();
+    expect(findAuditEvent(audit, 'debate_started')).toBeUndefined();
+    expect(sandbox.callPlugin).toHaveBeenCalledWith('decision', 'emit_trade_intent', {
+      symbol: 'AAPL',
+      action: 'exit',
+      qty: 500,
+    });
+    expect(decisions[0]?.allowed).toBe(true);
+  });
+
+  // T11: regression — a high-notional entry with the same shape still goes through debate.
+  it('T11 — measurable-veto-shield Fix 3 regression: high-notional entry (action=long) still goes through debate as before', async () => {
+    const consensus: DebateConsensus = {
+      recommendation: 'reject',
+      auditor_blocked: false,
+      stances: [{ role: 'bull', stance: 'reject', confidence: 0.9, rationale: 'bad trade' }],
+    };
+    const debateStub = makeDebateStub({ runPanelResult: consensus });
+    const sandbox = makeSandbox();
+    const audit = makeAudit();
+    const gateway = makeGatewayStub({ quoteLast: 100, portfolioEquity: 50_000 });
+    const service = makeDebateAgentsService({
+      sandbox,
+      audit,
+      plugins: makePluginsWithDebate(),
+      kv: makeKvDebate({ 'debate.enabled': 'true', 'debate.min_notional_pct': '0.05' }),
+      debate: debateStub,
+      gateway,
+    });
+
+    const entryTc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'decision',
+      function: 'emit_trade_intent',
+      args: { symbol: 'AAPL', action: 'long', qty: 500 },
+    };
+    const { decisions } = await callExecuteToolCalls(service, CYCLE_ID, [entryTc]);
+
+    expect(debateStub.runPanel).toHaveBeenCalledTimes(1);
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+    expect(decisions[0]?.allowed).toBe(false);
+    expect(decisions[0]?.reason).toBe('debate_rejected');
   });
 });
 
