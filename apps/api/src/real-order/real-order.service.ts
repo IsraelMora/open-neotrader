@@ -89,6 +89,16 @@ export class RealOrderService implements OnModuleInit {
    * Startup recovery hook — runs recoverInflight() once the module is initialized.
    * Fail-soft: a thrown error inside recovery is logged, never rethrown, so it can
    * never block application boot.
+   *
+   * Fix 3 (boot-order independence): this used to be the ONLY path that ever called
+   * recoverInflight() — a stuck pending_submit/submit_failed row would sit unrecovered
+   * until the next process restart, which made AppModule's import-array ordering
+   * (RealOrderModule before RealReconciliationModule, see app.module.ts) load-bearing
+   * for correctness. Since RealBrokerReconciliationService.reconcileAllOpenOrders()
+   * now also calls recoverInflight() on every steady-state tick (Fix 1), this
+   * onModuleInit call is no longer the only safety net — it's kept as a fast-path
+   * convenience (recovers a stuck row immediately on boot instead of waiting for the
+   * first tick), never a correctness requirement.
    */
   async onModuleInit(): Promise<void> {
     try {

@@ -12,6 +12,7 @@
  * instantiation — no Test.createTestingModule needed).
  */
 import { RealBrokerReconciliationService } from './real-broker-reconciliation.service';
+import { RealOrderService } from '../real-order/real-order.service';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { ProviderGatewayService } from '../providers/provider-gateway.service';
 import type { KvService } from '../common/kv.service';
@@ -166,18 +167,31 @@ function makeAlerts(): jest.Mocked<Pick<AlertsService, 'create'>> {
   };
 }
 
+/**
+ * Default RealOrderService collaborator mock — resolves recoverInflight() to a no-op
+ * so the existing 71 tests (which don't care about the Fix 1 pre-tick sweep) keep
+ * passing unchanged. Tests that DO care (Fix 1) pass their own instance.
+ */
+function makeRealOrderService(): jest.Mocked<Pick<RealOrderService, 'recoverInflight'>> {
+  return { recoverInflight: jest.fn().mockResolvedValue(undefined) };
+}
+
 function makeService(
   prisma: ReturnType<typeof makePrisma>,
   gateway: ReturnType<typeof makeGateway>,
   kv: ReturnType<typeof makeKv> = makeKv(),
   alerts: ReturnType<typeof makeAlerts> = makeAlerts(),
+  realOrderService:
+    | ReturnType<typeof makeRealOrderService>
+    | RealOrderService = makeRealOrderService(),
 ): RealBrokerReconciliationService {
   return new (RealBrokerReconciliationService as unknown as new (
     db: unknown,
     gateway: unknown,
     kv: unknown,
     alerts: unknown,
-  ) => RealBrokerReconciliationService)(prisma, gateway, kv, alerts);
+    realOrderService: unknown,
+  ) => RealBrokerReconciliationService)(prisma, gateway, kv, alerts, realOrderService);
 }
 
 /** Typed accessor for a jest mock's nth call's first argument (avoids unsafe `any` indexing). */
@@ -383,6 +397,123 @@ describe.each(['rejected', 'canceled', 'expired'])(
     });
   },
 );
+
+// ── Fix 2 — a partial fill survives a terminal cancel/expire/reject ─────────
+
+describe('RealBrokerReconciliationService.reconcileOrder — Fix 2: partial fill preserved on terminal transition', () => {
+  it('order filled 5 of 10 then canceled: TradeIntent is executed (NOT failed) with quantity=5 and fill_price=filled_avg_price, in the SAME $transaction; RealOrder.status stays canceled', async () => {
+    const txClient = makeTxClient();
+    const row = makeRow({ status: 'partially_filled', filled_qty: 5, filled_avg_price: 149.5 });
+    const prisma = makePrisma({ findUniqueResult: row, txClient });
+    const gateway = makeGateway({
+      getOrderStatusResult: {
+        broker_order_id: 'broker_order_1',
+        client_order_id: row.client_order_id,
+        status: 'canceled',
+        filled_qty: 5,
+        filled_avg_price: 149.5,
+        raw: {},
+      },
+    });
+    const svc = makeService(prisma, gateway);
+
+    await svc.reconcileOrder('ro_1');
+
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    const roArgs = callArg<{ data: Record<string, unknown> }>(txClient.realOrder.updateMany);
+    // RealOrder's OWN lifecycle status is still accurately "canceled" — only the
+    // TradeIntent fill accounting changes.
+    expect(roArgs.data['status']).toBe('canceled');
+
+    const tiArgs = callArg<{ data: Record<string, unknown> }>(txClient.tradeIntent.update);
+    expect(tiArgs.data['status']).toBe('executed');
+    expect(tiArgs.data['quantity']).toBe(5);
+    expect(tiArgs.data['fill_price']).toBeCloseTo(149.5, 5);
+    expect(tiArgs.data['reject_reason']).toBeUndefined();
+  });
+
+  it('order jumps directly from submitted (filled_qty=0) to canceled with a fresh partial fill revealed in this same call: RealOrder.filled_qty/filled_avg_price are persisted so detectDrift can still find it', async () => {
+    const txClient = makeTxClient();
+    const row = makeRow({ status: 'submitted', filled_qty: 0, filled_avg_price: null });
+    const prisma = makePrisma({ findUniqueResult: row, txClient });
+    const gateway = makeGateway({
+      getOrderStatusResult: {
+        broker_order_id: 'broker_order_1',
+        client_order_id: row.client_order_id,
+        status: 'canceled',
+        filled_qty: 5,
+        filled_avg_price: 149.5,
+        raw: {},
+      },
+    });
+    const svc = makeService(prisma, gateway);
+
+    await svc.reconcileOrder('ro_1');
+
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    const roArgs = callArg<{ data: Record<string, unknown> }>(txClient.realOrder.updateMany);
+    expect(roArgs.data['status']).toBe('canceled');
+    // Regression: RealOrder's own filled_qty/filled_avg_price must be persisted too —
+    // otherwise detectDrift's `filled_qty: { gt: 0 }` query never finds this order and
+    // fires a false BROKER_DRIFT alert / kill-switch trip.
+    expect(roArgs.data['filled_qty']).toBe(5);
+    expect(roArgs.data['filled_avg_price']).toBeCloseTo(149.5, 5);
+
+    const tiArgs = callArg<{ data: Record<string, unknown> }>(txClient.tradeIntent.update);
+    expect(tiArgs.data['status']).toBe('executed');
+    expect(tiArgs.data['quantity']).toBe(5);
+    expect(tiArgs.data['fill_price']).toBeCloseTo(149.5, 5);
+  });
+
+  it('order filled 0 (no partial fill) then canceled: TradeIntent still becomes failed with a reject_reason — unchanged existing behavior', async () => {
+    const txClient = makeTxClient();
+    const row = makeRow({ status: 'submitted', filled_qty: 0, filled_avg_price: null });
+    const prisma = makePrisma({ findUniqueResult: row, txClient });
+    const gateway = makeGateway({
+      getOrderStatusResult: {
+        broker_order_id: 'broker_order_1',
+        client_order_id: row.client_order_id,
+        status: 'canceled',
+        filled_qty: 0,
+        filled_avg_price: null,
+        raw: {},
+      },
+    });
+    const svc = makeService(prisma, gateway);
+
+    await svc.reconcileOrder('ro_1');
+
+    const tiArgs = callArg<{ data: Record<string, unknown> }>(txClient.tradeIntent.update);
+    expect(tiArgs.data['status']).toBe('failed');
+    expect(typeof tiArgs.data['reject_reason']).toBe('string');
+  });
+
+  it('order filled 3 of 10 then expired: TradeIntent executed with quantity=3', async () => {
+    const txClient = makeTxClient();
+    const row = makeRow({ status: 'partially_filled', filled_qty: 3, filled_avg_price: 100 });
+    const prisma = makePrisma({ findUniqueResult: row, txClient });
+    const gateway = makeGateway({
+      getOrderStatusResult: {
+        broker_order_id: 'broker_order_1',
+        client_order_id: row.client_order_id,
+        status: 'expired',
+        filled_qty: 3,
+        filled_avg_price: 100,
+        raw: {},
+      },
+    });
+    const svc = makeService(prisma, gateway);
+
+    await svc.reconcileOrder('ro_1');
+
+    const roArgs = callArg<{ data: Record<string, unknown> }>(txClient.realOrder.updateMany);
+    expect(roArgs.data['status']).toBe('expired');
+    const tiArgs = callArg<{ data: Record<string, unknown> }>(txClient.tradeIntent.update);
+    expect(tiArgs.data['status']).toBe('executed');
+    expect(tiArgs.data['quantity']).toBe(3);
+    expect(tiArgs.data['fill_price']).toBeCloseTo(100, 5);
+  });
+});
 
 // ── fail-soft lookup error ───────────────────────────────────────────────────
 
@@ -734,6 +865,294 @@ describe('RealBrokerReconciliationService.reconcileAllOpenOrders', () => {
     await expect(svc.reconcileAllOpenOrders()).resolves.toBeUndefined();
 
     expect(reconcileSpy).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── Fix 1 — steady-state sweep of pending_submit/submit_failed rows ─────────
+
+describe('RealBrokerReconciliationService.reconcileAllOpenOrders — Fix 1: in-flight sweep', () => {
+  it('calls realOrderService.recoverInflight() before querying OPEN_STATUSES rows, every tick — not just at boot', async () => {
+    const prisma = makePrisma();
+    const gateway = makeGateway();
+    const realOrderService = makeRealOrderService();
+    const callOrder: string[] = [];
+    realOrderService.recoverInflight.mockImplementation(() => {
+      callOrder.push('recoverInflight');
+      return Promise.resolve();
+    });
+    prisma._realOrderFindMany.mockImplementation(() => {
+      callOrder.push('findMany');
+      return Promise.resolve([]);
+    });
+    const svc = makeService(prisma, gateway, undefined, undefined, realOrderService);
+
+    await svc.reconcileAllOpenOrders();
+
+    expect(realOrderService.recoverInflight).toHaveBeenCalledTimes(1);
+    expect(callOrder).toEqual(['recoverInflight', 'findMany']);
+  });
+
+  it('recoverInflight throwing does not prevent the OPEN_STATUSES sweep from still running (fail-soft)', async () => {
+    const prisma = makePrisma();
+    const gateway = makeGateway();
+    prisma._realOrderFindMany.mockResolvedValue([{ id: 'ro_1' }]);
+    const realOrderService = makeRealOrderService();
+    realOrderService.recoverInflight.mockRejectedValue(new Error('sweep blew up'));
+    const svc = makeService(prisma, gateway, undefined, undefined, realOrderService);
+    const reconcileSpy = jest.spyOn(svc, 'reconcileOrder').mockResolvedValue(undefined);
+
+    await expect(svc.reconcileAllOpenOrders()).resolves.toBeUndefined();
+
+    expect(reconcileSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Shared in-flight-sweep test fixtures (Fix 1 + Fix 3) ────────────────────
+//
+// Minimal stateful in-memory RealOrder/TradeIntent store, shared by the Fix 1
+// end-to-end and Fix 3 boot-order-independence test blocks below — both need
+// a real RealOrderService + real RealBrokerReconciliationService wired
+// together against the SAME mutable backing store (not independently mocked
+// return values), since these tests assert on state written by ONE service
+// and observed by the OTHER.
+
+type SharedRow = {
+  id: string;
+  trade_intent_id: string;
+  broker_plugin_id: string;
+  client_order_id: string;
+  broker_order_id: string | null;
+  symbol: string;
+  side: string;
+  order_type: string;
+  requested_qty: number;
+  limit_price: number | null;
+  status: string;
+  filled_qty: number;
+  filled_avg_price: number | null;
+  submitted_at: Date | null;
+  filled_at: Date | null;
+  last_reconciled_at: Date | null;
+  broker_raw_json: string | null;
+  error: string | null;
+};
+
+function makeSharedStore(initialRows: SharedRow[]) {
+  const rows = new Map<string, SharedRow>(initialRows.map((r) => [r.id, r]));
+  const tradeIntents = new Map<string, Record<string, unknown>>();
+
+  const applyRealOrderUpdate = (id: string, data: Partial<SharedRow>) => {
+    const existing = rows.get(id);
+    if (!existing) return;
+    rows.set(id, { ...existing, ...data });
+  };
+
+  type SharedDb = {
+    realOrder: {
+      findMany: jest.Mock;
+      findUnique: jest.Mock;
+      update: jest.Mock;
+      updateMany: jest.Mock;
+    };
+    tradeIntent: { update: jest.Mock };
+    $transaction: jest.Mock;
+  };
+
+  const db: SharedDb = {
+    realOrder: {
+      findMany: jest.fn((args: { where: { status: { in: string[] } } }) =>
+        Promise.resolve([...rows.values()].filter((r) => args.where.status.in.includes(r.status))),
+      ),
+      findUnique: jest.fn((args: { where: { id: string } }) =>
+        Promise.resolve(rows.get(args.where.id) ?? null),
+      ),
+      update: jest.fn((args: { where: { id: string }; data: Partial<SharedRow> }) => {
+        applyRealOrderUpdate(args.where.id, args.data);
+        return Promise.resolve(rows.get(args.where.id));
+      }),
+      updateMany: jest.fn(
+        (args: { where: { id: string; status: string }; data: Partial<SharedRow> }) => {
+          const existing = rows.get(args.where.id);
+          if (!existing || existing.status !== args.where.status) {
+            return Promise.resolve({ count: 0 });
+          }
+          applyRealOrderUpdate(args.where.id, args.data);
+          return Promise.resolve({ count: 1 });
+        },
+      ),
+    },
+    tradeIntent: {
+      update: jest.fn((args: { where: { id: string }; data: Record<string, unknown> }) => {
+        const existing = tradeIntents.get(args.where.id) ?? {};
+        tradeIntents.set(args.where.id, { ...existing, ...args.data });
+        return Promise.resolve(tradeIntents.get(args.where.id));
+      }),
+    },
+    $transaction: jest.fn(async (fn: (tx: SharedDb) => Promise<void>) => await fn(db)),
+  };
+
+  return { db, rows, tradeIntents };
+}
+
+function makeStuckRow(overrides: Partial<SharedRow> = {}): SharedRow {
+  return {
+    id: 'ro_stuck',
+    trade_intent_id: 'ti_stuck',
+    broker_plugin_id: 'alpaca',
+    client_order_id: 'nt-ti_stuck-abc12345',
+    broker_order_id: null,
+    symbol: 'AAPL',
+    side: 'buy',
+    order_type: 'market',
+    requested_qty: 10,
+    limit_price: null,
+    status: 'submit_failed',
+    filled_qty: 0,
+    filled_avg_price: null,
+    submitted_at: null,
+    filled_at: null,
+    last_reconciled_at: null,
+    broker_raw_json: null,
+    error: 'network timeout on original submit',
+    ...overrides,
+  };
+}
+
+describe('RealBrokerReconciliationService — Fix 1: end-to-end self-heal without a restart', () => {
+  it('a submit_failed row the broker actually HAS self-heals to a filled TradeIntent via a steady tick alone — no restart, no blind resubmit', async () => {
+    const stuck = makeStuckRow();
+    const { db, rows, tradeIntents } = makeSharedStore([stuck]);
+
+    const placeOrder = jest.fn().mockResolvedValue({ id: 'should-never-be-called' });
+    const getOrderByClientId = jest.fn().mockResolvedValue({
+      broker_order_id: 'broker_order_recovered',
+      client_order_id: stuck.client_order_id,
+      status: 'filled',
+      filled_qty: 10,
+      filled_avg_price: 150.5,
+      raw: {},
+    });
+    const getOrderStatus = jest.fn().mockResolvedValue({
+      broker_order_id: 'broker_order_recovered',
+      client_order_id: stuck.client_order_id,
+      status: 'filled',
+      filled_qty: 10,
+      filled_avg_price: 150.5,
+      raw: {},
+    });
+    const gateway = { placeOrder, getOrderByClientId, getOrderStatus };
+
+    const realOrderService = new RealOrderService(
+      db as unknown as PrismaService,
+      gateway as unknown as ProviderGatewayService,
+      makeKv() as unknown as KvService,
+    );
+    const svc = new RealBrokerReconciliationService(
+      db as unknown as PrismaService,
+      gateway as unknown as ProviderGatewayService,
+      makeKv() as unknown as KvService,
+      makeAlerts() as unknown as AlertsService,
+      realOrderService,
+    );
+
+    // Called directly — proves this is the STEADY-STATE tick path, not onModuleInit.
+    await svc.reconcileAllOpenOrders();
+    // recoverInflight() only downgrades the row within the same call; the fill itself
+    // is recorded on the SAME or a subsequent reconcile call (per the task spec) —
+    // running the sweep twice models "this tick, or the next" without waiting on timers.
+    await svc.reconcileAllOpenOrders();
+
+    expect(placeOrder).not.toHaveBeenCalled();
+    expect(rows.get('ro_stuck')?.broker_order_id).toBe('broker_order_recovered');
+    expect(rows.get('ro_stuck')?.status).toBe('filled');
+    expect(tradeIntents.get('ti_stuck')?.['status']).toBe('executed');
+    expect(tradeIntents.get('ti_stuck')?.['fill_price']).toBeCloseTo(150.5, 5);
+    expect(tradeIntents.get('ti_stuck')?.['quantity']).toBe(10);
+  });
+
+  it('a submit_failed row the broker never received (404) is left untouched by the tick, and placeOrder is NEVER called (no blind resubmit)', async () => {
+    const stuck = makeStuckRow({ id: 'ro_404', trade_intent_id: 'ti_404' });
+    const { db, rows } = makeSharedStore([stuck]);
+
+    const placeOrder = jest.fn().mockResolvedValue({ id: 'should-never-be-called' });
+    const getOrderByClientId = jest.fn().mockResolvedValue(null);
+    const getOrderStatus = jest.fn().mockResolvedValue(null);
+    const gateway = { placeOrder, getOrderByClientId, getOrderStatus };
+
+    const realOrderService = new RealOrderService(
+      db as unknown as PrismaService,
+      gateway as unknown as ProviderGatewayService,
+      makeKv() as unknown as KvService,
+    );
+    const svc = new RealBrokerReconciliationService(
+      db as unknown as PrismaService,
+      gateway as unknown as ProviderGatewayService,
+      makeKv() as unknown as KvService,
+      makeAlerts() as unknown as AlertsService,
+      realOrderService,
+    );
+
+    await svc.reconcileAllOpenOrders();
+
+    expect(placeOrder).not.toHaveBeenCalled();
+    expect(rows.get('ro_404')?.status).toBe('submit_failed');
+    expect(rows.get('ro_404')?.broker_order_id).toBeNull();
+  });
+});
+
+describe('RealBrokerReconciliationService — Fix 3: boot-order independence', () => {
+  it('a stuck submit_failed row is still recovered by the steady-state tick alone, even though RealOrderService.onModuleInit (boot recovery) NEVER ran', async () => {
+    const stuck = makeStuckRow({ id: 'ro_stuck3', trade_intent_id: 'ti_stuck3' });
+    const { db, rows, tradeIntents } = makeSharedStore([stuck]);
+
+    const placeOrder = jest.fn().mockResolvedValue({ id: 'should-never-be-called' });
+    const getOrderByClientId = jest.fn().mockResolvedValue({
+      broker_order_id: 'broker_order_recovered_3',
+      client_order_id: stuck.client_order_id,
+      status: 'filled',
+      filled_qty: 10,
+      filled_avg_price: 200,
+      raw: {},
+    });
+    const getOrderStatus = jest.fn().mockResolvedValue({
+      broker_order_id: 'broker_order_recovered_3',
+      client_order_id: stuck.client_order_id,
+      status: 'filled',
+      filled_qty: 10,
+      filled_avg_price: 200,
+      raw: {},
+    });
+    const gateway = { placeOrder, getOrderByClientId, getOrderStatus };
+
+    const realOrderService = new RealOrderService(
+      db as unknown as PrismaService,
+      gateway as unknown as ProviderGatewayService,
+      makeKv() as unknown as KvService,
+    );
+    const onModuleInitSpy = jest.spyOn(realOrderService, 'onModuleInit');
+    const recoverInflightSpy = jest.spyOn(realOrderService, 'recoverInflight');
+
+    const svc = new RealBrokerReconciliationService(
+      db as unknown as PrismaService,
+      gateway as unknown as ProviderGatewayService,
+      makeKv() as unknown as KvService,
+      makeAlerts() as unknown as AlertsService,
+      realOrderService,
+    );
+
+    // RealOrderService.onModuleInit is deliberately NEVER called in this test — this
+    // simulates the reconciliation tick running before (or entirely without) boot
+    // recovery having had any chance to run.
+    await svc.reconcileAllOpenOrders();
+    await svc.reconcileAllOpenOrders();
+
+    expect(onModuleInitSpy).not.toHaveBeenCalled();
+    // recoverInflight WAS still exercised — via the tick's own sweep, not boot.
+    expect(recoverInflightSpy).toHaveBeenCalled();
+    expect(placeOrder).not.toHaveBeenCalled();
+    expect(rows.get('ro_stuck3')?.status).toBe('filled');
+    expect(tradeIntents.get('ti_stuck3')?.['status']).toBe('executed');
+    expect(tradeIntents.get('ti_stuck3')?.['quantity']).toBe(10);
   });
 });
 
@@ -1225,6 +1644,22 @@ describe('RealBrokerReconciliationService.detectDrift', () => {
     );
   });
 
+  it('Fix 2: the explained-position query filters by filled_qty > 0, not by a fixed status list', async () => {
+    const txClient = makePortfolioTxClient();
+    const prisma = makePortfolioPrisma({ txClient, realOrderFindFirstResult: { id: 'ro_1' } });
+    const portfolio = makePortfolio({ positions: [makeBrokerPosition({ symbol: 'Y' })] });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const svc = makePortfolioService(prisma, gateway);
+
+    await svc.syncPortfolio('alpaca', 'poll');
+
+    const findFirstCalls = (prisma.realOrder.findFirst as jest.Mock).mock.calls as unknown[][];
+    expect(findFirstCalls.length).toBeGreaterThan(0);
+    const args = findFirstCalls[0][0] as { where: Record<string, unknown> };
+    expect(args.where['status']).toBeUndefined();
+    expect(args.where['filled_qty']).toEqual(expect.objectContaining({ gt: 0 }) as unknown);
+  });
+
   it('an explained position (filled RealOrder exists for the symbol) is never flagged as drift', async () => {
     const txClient = makePortfolioTxClient();
     const prisma = makePortfolioPrisma({ txClient, realOrderFindFirstResult: { id: 'ro_1' } });
@@ -1272,6 +1707,26 @@ describe('RealBrokerReconciliationService.detectDrift', () => {
     expect(alerts.create).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'BROKER_DRIFT', severity: 'CRITICAL' }) as unknown,
     );
+  });
+
+  it('Fix 2: a canceled-but-partially-filled RealOrder still explains the position — no false-positive BROKER_DRIFT', async () => {
+    const txClient = makePortfolioTxClient();
+    // The order that created this position has since transitioned to "canceled" (it no
+    // longer matches the old status-based FILL_EVIDENCE_STATUSES filter), but it DID
+    // fill 7 shares — the detectDrift query must match on filled_qty > 0, not status.
+    const prisma = makePortfolioPrisma({
+      txClient,
+      realOrderFindFirstResult: { id: 'ro_canceled_partial', status: 'canceled', filled_qty: 7 },
+    });
+    const portfolio = makePortfolio({ positions: [makeBrokerPosition({ symbol: 'Z', qty: 7 })] });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const alerts = makePortfolioAlerts();
+    const svc = makePortfolioService(prisma, gateway, makeKv(), alerts);
+
+    const result = await svc.syncPortfolio('alpaca', 'poll');
+
+    expect(result.driftedSymbols).toEqual([]);
+    expect(alerts.create).not.toHaveBeenCalled();
   });
 
   it('no drift → the kill-switch is left untouched', async () => {

@@ -51,6 +51,7 @@ import { kvNum, kvStr } from '../common/kv.util';
 import { normalizeBrokerStatus } from '../common/broker-status.util';
 import { AlertsService } from '../alerts/alerts.service';
 import { haltRealExecution } from '../common/real-execution-halt.util';
+import { RealOrderService } from '../real-order/real-order.service';
 import type { RealOrder } from '@prisma/client';
 
 /** Persisted circuit-breaker state — mirrors CycleSchedulerService.CircuitBreakerState. */
@@ -100,9 +101,6 @@ const CB_HALF_OPEN_MS = 5 * 60_000;
 /** KV key for the active broker plugin id — same key _effectiveMode (TradeIntentService) reads. */
 const BROKER_PLUGIN_ID_KEY = 'execution.broker_plugin_id';
 
-/** RealOrder statuses that count as evidence explaining a broker position (see detectDrift). */
-const FILL_EVIDENCE_STATUSES = ['filled', 'partially_filled'];
-
 /**
  * Minimum spacing between steady-state-tick-triggered portfolio syncs. The
  * reconciliation interval (default 15s, min-clamped 5s) is much finer-grained
@@ -127,6 +125,7 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
     private readonly gateway: ProviderGatewayService,
     private readonly kv: KvService,
     private readonly alerts: AlertsService,
+    private readonly realOrderService: RealOrderService,
   ) {}
 
   /**
@@ -277,6 +276,17 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
     }
 
     if (canonical === 'rejected' || canonical === 'canceled' || canonical === 'expired') {
+      // Fix 2: a partial fill must NEVER be discarded just because the order then
+      // stopped (canceled/expired) or was rejected after partially filling. The
+      // platform genuinely holds filled_qty shares at filled_avg_price — that is real
+      // money, not a failed trade. RealOrder.status still accurately reflects the
+      // order's OWN terminal lifecycle (still canceled/expired/rejected); only the
+      // TradeIntent fill accounting differs based on whether anything actually filled.
+      // Reuses isValidFillEvidence (broker's own numbers, not row's possibly-stale
+      // cache) — the same numeric sanity guard as the "filled" branch above, so a
+      // malformed/partial broker response can't fabricate a partial-fill execution
+      // here either.
+      const hasPartialFill = isValidFillEvidence;
       const rejectReason = this.extractRejectReason(brokerOrder);
       await this.db.$transaction(async (tx) => {
         const result = await tx.realOrder.updateMany({
@@ -284,6 +294,8 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
           data: {
             status: canonical,
             broker_order_id: brokerOrder.broker_order_id,
+            filled_qty: brokerOrder.filled_qty,
+            filled_avg_price: brokerOrder.filled_avg_price,
             last_reconciled_at: now,
           },
         });
@@ -292,6 +304,17 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
             `reconcileOrder: stale ${canonical} write skipped for RealOrder ${row.id} — status ` +
               `changed since this call's read (expected "${row.status}")`,
           );
+          return;
+        }
+        if (hasPartialFill) {
+          await tx.tradeIntent.update({
+            where: { id: row.trade_intent_id },
+            data: {
+              status: 'executed',
+              fill_price: brokerOrder.filled_avg_price,
+              quantity: brokerOrder.filled_qty,
+            },
+          });
           return;
         }
         await tx.tradeIntent.update({
@@ -397,13 +420,44 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
 
   /**
    * Reconciles every RealOrder row still open with the broker (status in
-   * submitted/accepted/partially_filled — NOT pending_submit/submit_failed,
-   * which are handled by RealOrderService.recoverInflight). Processed
-   * sequentially; one order's reconcileOrder() throwing does not stop the
-   * others (reconcileOrder is itself fail-soft, but this is an extra
-   * per-order guard for defense in depth).
+   * submitted/accepted/partially_filled), AND — Fix 1 — sweeps rows stuck in
+   * pending_submit/submit_failed on every steady-state tick, not only at app
+   * boot (RealOrderService.onModuleInit).
+   *
+   * Rationale (Fix 1, CRITICAL): a LIVE placeOrder call can time out on the
+   * network without the app crashing — the broker may have accepted (or even
+   * filled) the order, but the row is left marked submit_failed and its
+   * TradeIntent marked failed. Before this fix, only a process restart would
+   * ever re-check such a row (via RealOrderService.onModuleInit ->
+   * recoverInflight). That is a silent, permanent ledger mislabel for any
+   * long-lived process. Delegating to RealOrderService.recoverInflight() here
+   * reuses the exact same no-blind-resubmit broker-truth logic used at boot —
+   * see RealOrderService's class doc and recoverRow() for that invariant.
+   *
+   * Ordering + no double-processing: the sweep runs BEFORE the OPEN_STATUSES
+   * query below, in the same tick. recoverInflight() only ever touches rows
+   * in pending_submit/submit_failed (RECOVERABLE_STATUSES) and, when the
+   * broker has the order, downgrades them to a pollable OPEN status (e.g.
+   * "accepted") — it never writes a fill directly (see recoverRow()'s doc).
+   * Because RECOVERABLE_STATUSES and OPEN_STATUSES are disjoint sets, a row
+   * can never be selected by both queries in the same tick; a row downgraded
+   * by the sweep simply becomes eligible for the OPEN_STATUSES query run
+   * immediately after within this same call, so a fast-recovering row can be
+   * fully reconciled (RealOrder + TradeIntent) within a single tick rather
+   * than waiting for the next one.
+   *
+   * Fail-soft: a throwing sweep never blocks the OPEN_STATUSES reconciliation
+   * that follows it (recoverInflight is itself fail-soft per row, but this is
+   * an extra whole-sweep guard for defense in depth, mirroring the per-order
+   * guard below).
    */
   async reconcileAllOpenOrders(): Promise<void> {
+    try {
+      await this.realOrderService.recoverInflight();
+    } catch (err) {
+      this.log.warn(`reconcileAllOpenOrders: in-flight sweep failed: ${String(err)}`);
+    }
+
     const rows = await this.db.realOrder.findMany({
       where: { status: { in: OPEN_STATUSES } },
     });
@@ -693,8 +747,19 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
   /**
    * Flags broker positions with no explaining fill history. A broker position
    * is "drift" when no RealOrder row exists for that symbol+broker with
-   * status filled or partially_filled (FILL_EVIDENCE_STATUSES) — i.e. this
-   * platform never placed/tracked an order that could explain the position.
+   * filled_qty > 0 — i.e. this platform never placed/tracked an order that
+   * filled and could explain the position.
+   *
+   * Fix 2: this MUST match on filled_qty > 0, NOT on a fixed status list (the
+   * old FILL_EVIDENCE_STATUSES = ['filled', 'partially_filled'] filter). A
+   * RealOrder that partially filled and then transitioned to a terminal
+   * non-filled status (canceled/expired/rejected) still created a real
+   * position the platform holds — see reconcileOrder()'s terminal-status
+   * branch, which now preserves that partial fill on TradeIntent. If this
+   * query still filtered by status, that same order would stop "explaining"
+   * its own position the moment it went terminal, causing a false-positive
+   * BROKER_DRIFT alert (and a spurious kill-switch trip) for a position that
+   * is 100% accounted for.
    *
    * On drift, emits ONE CRITICAL BROKER_DRIFT AlertEntry (via AlertsService,
    * same path as RECONCILIATION_HALTED). Alert-spam guard: an already-open
@@ -717,7 +782,7 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
         where: {
           symbol: pos.symbol,
           broker_plugin_id: brokerPluginId,
-          status: { in: FILL_EVIDENCE_STATUSES },
+          filled_qty: { gt: 0 },
         },
       });
       if (explained) continue;
