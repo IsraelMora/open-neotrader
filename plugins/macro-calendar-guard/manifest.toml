@@ -16,6 +16,9 @@ interval_ms = 86_400_000   # una vez al día es suficiente
 network     = false
 filesystem  = false
 
+[hooks]
+on_cycle = "hooks/cycle.py"
+
 [config]
 blackout_hours_before  = { type = "integer", default = 4,    description = "Horas antes del evento para suprimir señales" }
 blackout_hours_after   = { type = "integer", default = 2,    description = "Horas después del evento para suprimir señales" }

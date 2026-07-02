@@ -13,22 +13,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from funding_arb import scan_funding_opportunities  # type: ignore[import]
 
 
-def run(ctx: dict) -> dict:
-    config = ctx.get("plugin_config", {})
+def on_cycle(ctx: dict) -> dict:
+    config = ctx.get("config", {})
     funding_data = ctx.get("funding_rates", [])  # [{symbol, funding_rate_8h, open_interest_usd}]
 
     if not funding_data:
-        ctx.setdefault("log", []).append("[funding-arb] Sin datos de funding en el contexto")
-        return ctx
+        return {
+            "signals": [],
+            "logs": [
+                {"level": "debug", "msg": "[funding-arb] Sin datos de funding en el contexto"}
+            ],
+        }
 
     result = scan_funding_opportunities(funding_data, config)
-    ctx["funding_arb_scan"] = result
 
     # Emitir señales para oportunidades excelentes/buenas
-    pending: list[dict] = ctx.get("pending_signals", [])
+    signals: list[dict] = []
     for opp in result.get("opportunities", []):
         if opp["signal"] == 1 and opp["quality"] in ("excellent", "good"):
-            pending.append(
+            signals.append(
                 {
                     "symbol": opp["symbol"],
                     "action": "arb_entry",
@@ -40,17 +43,19 @@ def run(ctx: dict) -> dict:
                 }
             )
 
-    ctx["pending_signals"] = pending
-    ctx.setdefault("log", []).append(
-        f"[funding-arb] {result['opportunities_found']} oportunidades, "
-        f"mejor APR: {result['best_apr']:.1%}"
-    )
+    logs = [{
+        "level": "info",
+        "msg": (
+            f"[funding-arb] {result['opportunities_found']} oportunidades, "
+            f"mejor APR: {result['best_apr']:.1%}"
+        ),
+    }]
 
-    return ctx
+    return {"signals": signals, "logs": logs}
 
 
 if __name__ == "__main__":
     raw = sys.stdin.read()
     ctx = json.loads(raw)
-    out = run(ctx)
+    out = on_cycle(ctx)
     print(json.dumps(out))

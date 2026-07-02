@@ -11,6 +11,9 @@ tags        = ["risk", "governance", "params", "overfitting", "discipline"]
 mode        = "polling"
 timeframe   = "1d"
 
+[hooks]
+on_cycle = "hooks/cycle.py"
+
 [config]
 lock_after_change_cycles = 3        # ciclos que deben pasar antes de permitir otro cambio
 require_hypothesis       = true     # requiere hipótesis al cambiar parámetros

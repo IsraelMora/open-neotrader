@@ -10,16 +10,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from kalman import analyze_kalman  # type: ignore[import]
 
 
-def run(ctx: dict) -> dict:
-    config = ctx.get("plugin_config", {})
+def on_cycle(ctx: dict) -> dict:
+    config = ctx.get("config", {})
     price_data = ctx.get("price_data", {})
 
     if not price_data:
-        ctx.setdefault("log", []).append("[kalman] Sin datos de precios")
-        return ctx
+        return {"signals": [], "logs": [{"level": "debug", "msg": "[kalman] Sin datos de precios"}]}
 
     kalman_signals: dict[str, dict] = {}
-    pending: list[dict] = ctx.get("pending_signals", [])
+    signals: list[dict] = []
 
     for symbol, prices in price_data.items():
         if not isinstance(prices, list) or len(prices) < 10:
@@ -35,7 +34,7 @@ def run(ctx: dict) -> dict:
         }
 
         if result.signal != 0:
-            pending.append(
+            signals.append(
                 {
                     "symbol": symbol,
                     "action": "buy" if result.signal == 1 else "sell",
@@ -46,15 +45,14 @@ def run(ctx: dict) -> dict:
                 }
             )
 
-    ctx["kalman_signals"] = kalman_signals
-    ctx["pending_signals"] = pending
     active = sum(1 for s in kalman_signals.values() if s["signal"] != 0)
-    ctx.setdefault("log", []).append(
-        f"[kalman] {len(kalman_signals)} símbolos, {active} señales activas"
-    )
-    return ctx
+    logs = [{
+        "level": "info",
+        "msg": f"[kalman] {len(kalman_signals)} símbolos, {active} señales activas",
+    }]
+    return {"signals": signals, "logs": logs}
 
 
 if __name__ == "__main__":
     ctx = json.loads(sys.stdin.read())
-    print(json.dumps(run(ctx)))
+    print(json.dumps(on_cycle(ctx)))

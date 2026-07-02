@@ -784,9 +784,30 @@ def cmd_run_cycle(req: dict) -> dict:
     for pid, info in plugins_by_id.items():
         if pid not in active_ids or info["type"] != "skill":
             continue
-        _mod, fn = _load_cycle_hook(pid, info["dir"], info["manifest"], hook_counter)
+        try:
+            _mod, fn = _load_cycle_hook(pid, info["dir"], info["manifest"], hook_counter)
+        except Exception as e:
+            # A hook module can raise at IMPORT time (top-level code, a bad
+            # `from x import y`, etc.) — before on_cycle is ever looked up or
+            # called. Isolate that the same way a call-time exception is
+            # isolated below, so one broken plugin can't take down the whole
+            # cycle for every other active plugin.
+            errors.append({"plugin": pid, "stage": "on_cycle_import", "error": str(e)})
+            hook_counter += 1
+            continue
         hook_counter += 1
         if fn is None:
+            if _mod is not None:
+                # Hook file exists but does not export on_cycle(ctx) — this used to
+                # be silently skipped (dead plugin hook). Warn loudly on stderr so
+                # it's caught during development instead of vanishing without a
+                # trace. stdout MUST stay pure JSON protocol — never print there.
+                print(
+                    f"[sandbox] WARNING: plugin '{pid}' has a cycle hook file but no "
+                    "on_cycle(ctx) function — hook skipped. Did the entrypoint stay "
+                    "as run(ctx) or main()?",
+                    file=sys.stderr,
+                )
             continue
         try:
             hook_ctx = {
