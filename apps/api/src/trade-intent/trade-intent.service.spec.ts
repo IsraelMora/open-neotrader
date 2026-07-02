@@ -66,18 +66,39 @@ function makeAudit(): MockAudit {
   return { log: jest.fn().mockResolvedValue(undefined) };
 }
 
+type MockRealOrder = { submit: jest.Mock };
+
+/**
+ * Default submit() resolution: a "submitted" RealOrder row — the happy path where the
+ * broker accepted the order. Individual tests override via `.mockResolvedValueOnce` /
+ * `.mockResolvedValue` for submit_failed or a specific real_order id.
+ */
+function makeRealOrderService(): MockRealOrder {
+  return {
+    submit: jest.fn().mockResolvedValue({
+      id: 'ro_default',
+      status: 'submitted',
+      client_order_id: 'nt-default',
+      broker_order_id: 'broker_default',
+      error: null,
+    }),
+  };
+}
+
 function makeService(
   prisma: MockPrisma,
   gateway: MockGateway,
   kv: MockKv,
+  realOrderService?: MockRealOrder,
   audit?: MockAudit,
 ): TradeIntentService {
   return new (TradeIntentService as unknown as new (
     db: unknown,
     gw: unknown,
     kv: unknown,
+    realOrderService: unknown,
     audit?: unknown,
-  ) => TradeIntentService)(prisma, gateway, kv, audit);
+  ) => TradeIntentService)(prisma, gateway, kv, realOrderService ?? makeRealOrderService(), audit);
 }
 
 /**
@@ -190,17 +211,19 @@ describe('TradeIntentService', () => {
   let prisma: MockPrisma;
   let gateway: MockGateway;
   let kv: MockKv;
+  let realOrderService: MockRealOrder;
   let service: TradeIntentService;
 
   beforeEach(() => {
     prisma = makePrisma();
     gateway = makeGateway();
     kv = makeKv();
+    realOrderService = makeRealOrderService();
     // Default: all KV keys return null → autonomous=true by default.
     // Existing recordIntent tests that expect status=pending override this
     // per-test to return 'false' for execution.autonomous.
     kv.get.mockResolvedValue(null);
-    service = makeService(prisma, gateway, kv);
+    service = makeService(prisma, gateway, kv, realOrderService);
   });
 
   // ── recordIntent ────────────────────────────────────────────────────────────
@@ -511,18 +534,26 @@ describe('TradeIntentService', () => {
       );
       mockPaperPortfolio(prisma); // equity=10_000
       mockAaplQuote(gateway); // price=150 → intended qty=floor(10000*0.05/150)=3; ceiling=floor(10000*0.02/150)=1
-      gateway.placeOrder.mockResolvedValue({
-        id: 'order_789',
-        status: 'accepted',
-        filled_qty: '1',
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_789',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-clamp',
+        broker_order_id: 'order_789',
+        error: null,
       });
-      const executed = pendingIntent({ status: 'executed', quantity: 1, decided_by: 'alice' });
-      prisma.tradeIntent.update.mockResolvedValue(executed);
+      const pending = pendingIntent({
+        status: 'real_pending',
+        fill_price: null,
+        quantity: null,
+        decided_by: 'alice',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(pending);
 
       const result = await service.approve('ti_001', 'alice');
 
-      expect(result.quantity).toBe(1);
-      expect(gateway.placeOrder).toHaveBeenCalledWith('alpaca-provider', oc({ qty: 1 }));
+      expect(result.status).toBe('real_pending');
+      expect(realOrderService.submit).toHaveBeenCalledWith(oc({ requestedQty: 1 }));
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
     });
 
     it('computes realized_pnl on EXIT after a previous position exists', async () => {
@@ -1121,43 +1152,95 @@ describe('TradeIntentService', () => {
       expect(prisma.portfolio.upsert).toHaveBeenCalled(); // paper portfolio updated
     });
 
-    it('real=true + broker set → autoProcess long calls placeOrder with side=buy, type=market, qty>0, status=executed', async () => {
+    it('real=true + broker set → autoProcess long submits via RealOrderService with side=buy, qty>0, status=real_pending, NO fabricated fill', async () => {
       enableReal(kv, prisma); // real=true, broker='alpaca-provider', max_order_notional=1000
       // qty = floor(10000 * 0.1 / 150) = floor(6.66) = 6; notional = 6*150 = 900 <= 1000 ✓
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
       );
       mockAaplQuote(gateway);
-      gateway.placeOrder.mockResolvedValue({
-        id: 'order_123',
-        status: 'accepted',
-        filled_qty: '6',
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_123',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-abc',
+        broker_order_id: 'order_123',
+        error: null,
       });
-      const executed = pendingIntent({
-        status: 'executed',
-        fill_price: 150,
-        quantity: 6,
+      const pending = pendingIntent({
+        status: 'real_pending',
+        fill_price: null,
+        quantity: null,
         decided_by: 'autonomous',
       });
-      prisma.tradeIntent.update.mockResolvedValue(executed);
+      prisma.tradeIntent.update.mockResolvedValue(pending);
 
       const result = await service.autoProcess('ti_001');
 
-      expect(gateway.placeOrder).toHaveBeenCalledWith(
-        'alpaca-provider',
+      // The order MUST go through RealOrderService — never a direct gateway.placeOrder call.
+      expect(realOrderService.submit).toHaveBeenCalledTimes(1);
+      expect(realOrderService.submit).toHaveBeenCalledWith(
         oc({
+          tradeIntentId: 'ti_001',
+          brokerPluginId: 'alpaca-provider',
           symbol: 'AAPL',
-          qty: expect.any(Number) as number,
           side: 'buy',
-          type: 'market',
+          requestedQty: expect.any(Number) as number,
         }),
       );
-      // qty must be > 0
-      const [[, placeOrderArg]] = gateway.placeOrder.mock.calls as [[unknown, { qty: number }]];
-      expect(placeOrderArg.qty).toBeGreaterThan(0);
-      expect(result.status).toBe('executed');
+      const [[submitArg]] = realOrderService.submit.mock.calls as [[{ requestedQty: number }]];
+      expect(submitArg.requestedQty).toBeGreaterThan(0);
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('real_pending');
+      // No fabricated fill: fill_price/quantity are set later by reconciliation, not here.
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'real_pending',
+          }),
+        }),
+      );
+      const [[updateArgs]] = prisma.tradeIntent.update.mock.calls as [
+        [{ data: Record<string, unknown> }],
+      ];
+      expect(updateArgs.data).not.toHaveProperty('fill_price');
+      expect(updateArgs.data).not.toHaveProperty('quantity');
       // Paper portfolio must NOT be upserted in real mode
       expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
+    });
+
+    it('RealOrderService.submit returns submit_failed → TradeIntent status=failed with reason, no false real_pending', async () => {
+      enableReal(kv, prisma);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_failed',
+        status: 'submit_failed',
+        client_order_id: 'nt-ti_001-xyz',
+        broker_order_id: null,
+        error: 'Broker connection refused',
+      });
+      const failed = pendingIntent({
+        status: 'failed',
+        decided_by: 'autonomous',
+        result_json: JSON.stringify({ error: 'Broker connection refused' }),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(failed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(realOrderService.submit).toHaveBeenCalledTimes(1);
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('failed');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'failed',
+            result_json: expect.stringContaining('Broker connection refused') as string,
+          }),
+        }),
+      );
     });
 
     it('real order notional exceeds max_order_notional → status=failed, placeOrder NOT called', async () => {
@@ -1231,22 +1314,28 @@ describe('TradeIntentService', () => {
         ts: new Date().toISOString(),
       });
       mockAaplQuote(gateway); // last=150 → notional = 10 * 150 = 1500 > 100
-      gateway.placeOrder.mockResolvedValue({ id: 'order_exit', status: 'accepted' });
-      const executed = pendingIntent({
-        status: 'executed',
-        fill_price: 150,
-        quantity: 10,
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_exit',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-exit',
+        broker_order_id: 'order_exit',
+        error: null,
+      });
+      const pending = pendingIntent({
+        status: 'real_pending',
+        fill_price: null,
+        quantity: null,
         decided_by: 'autonomous',
       });
-      prisma.tradeIntent.update.mockResolvedValue(executed);
+      prisma.tradeIntent.update.mockResolvedValue(pending);
 
       const result = await service.autoProcess('ti_001');
 
-      expect(gateway.placeOrder).toHaveBeenCalledWith(
-        'alpaca-provider',
-        oc({ symbol: 'AAPL', qty: 10, side: 'sell', type: 'market' }),
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', requestedQty: 10, side: 'sell' }),
       );
-      expect(result.status).toBe('executed');
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('real_pending');
     });
 
     it('real long above max_order_notional is still rejected (ceiling stays enforced for entries)', async () => {
@@ -1273,19 +1362,20 @@ describe('TradeIntentService', () => {
       expect(result.status).toBe('failed');
     });
 
-    it('placeOrder throws → status=failed, no throw to caller', async () => {
+    it('RealOrderService.submit throws (e.g. non-idempotency DB failure) → status=failed, no throw to caller', async () => {
       enableReal(kv, prisma);
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
       );
       mockAaplQuote(gateway);
-      gateway.placeOrder.mockRejectedValue(new Error('Broker connection refused'));
+      realOrderService.submit.mockRejectedValue(new Error('Broker connection refused'));
       const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
       prisma.tradeIntent.update.mockResolvedValue(failed);
 
       // Must NOT throw
       const result = await service.autoProcess('ti_001');
 
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
       expect(result.status).toBe('failed');
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
         oc({
@@ -1334,26 +1424,28 @@ describe('TradeIntentService', () => {
         total_pnl: 100,
         ts: new Date().toISOString(),
       });
-      gateway.placeOrder.mockResolvedValue({
-        id: 'order_456',
-        status: 'accepted',
-        filled_qty: '10',
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_456',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-456',
+        broker_order_id: 'order_456',
+        error: null,
       });
-      const executed = pendingIntent({
-        status: 'executed',
-        fill_price: 150,
-        quantity: 10,
+      const pending = pendingIntent({
+        status: 'real_pending',
+        fill_price: null,
+        quantity: null,
         decided_by: 'autonomous',
       });
-      prisma.tradeIntent.update.mockResolvedValue(executed);
+      prisma.tradeIntent.update.mockResolvedValue(pending);
 
       await service.autoProcess('ti_001');
 
       expect(gateway.getPortfolio).toHaveBeenCalledWith('alpaca-provider');
-      expect(gateway.placeOrder).toHaveBeenCalledWith(
-        'alpaca-provider',
-        oc({ symbol: 'AAPL', side: 'sell', qty: 10, type: 'market' }),
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', side: 'sell', requestedQty: 10 }),
       );
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
     });
 
     it('real exit with a SHORT held position → sells Math.abs(qty) (negative broker qty)', async () => {
@@ -1386,22 +1478,28 @@ describe('TradeIntentService', () => {
         total_pnl: 0,
         ts: new Date().toISOString(),
       });
-      gateway.placeOrder.mockResolvedValue({ id: 'order_short_exit', status: 'accepted' });
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_short_exit',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-short',
+        broker_order_id: 'order_short_exit',
+        error: null,
+      });
       prisma.tradeIntent.update.mockResolvedValue(
         pendingIntent({
-          status: 'executed',
-          fill_price: 150,
-          quantity: 7,
+          status: 'real_pending',
+          fill_price: null,
+          quantity: null,
           decided_by: 'autonomous',
         }),
       );
 
       await service.autoProcess('ti_001');
 
-      expect(gateway.placeOrder).toHaveBeenCalledWith(
-        'alpaca-provider',
-        oc({ symbol: 'AAPL', side: 'sell', qty: 7, type: 'market' }),
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', side: 'sell', requestedQty: 7 }),
       );
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
     });
 
     it('real exit when getPortfolio throws → status=failed, placeOrder NEVER called (fail-safe, no wrong-qty sell)', async () => {
@@ -1473,27 +1571,28 @@ describe('TradeIntentService', () => {
         pendingIntent({ id: 'ti_open', action: 'long', symbol: 'AAPL' }),
       );
       mockAaplQuote(gateway);
-      gateway.placeOrder.mockResolvedValueOnce({
-        id: 'order_open',
-        status: 'accepted',
-        filled_qty: '6',
+      realOrderService.submit.mockResolvedValueOnce({
+        id: 'ro_open',
+        status: 'submitted',
+        client_order_id: 'nt-ti_open',
+        broker_order_id: 'order_open',
+        error: null,
       });
       prisma.tradeIntent.update.mockResolvedValueOnce(
         pendingIntent({
           id: 'ti_open',
-          status: 'executed',
-          fill_price: 150,
-          quantity: 6,
+          status: 'real_pending',
+          fill_price: null,
+          quantity: null,
           decided_by: 'autonomous',
         }),
       );
 
       const opened = await service.autoProcess('ti_open');
-      expect(opened.status).toBe('executed');
-      expect(gateway.placeOrder).toHaveBeenNthCalledWith(
+      expect(opened.status).toBe('real_pending');
+      expect(realOrderService.submit).toHaveBeenNthCalledWith(
         1,
-        'alpaca-provider',
-        oc({ symbol: 'AAPL', side: 'buy', qty: 6, type: 'market' }),
+        oc({ symbol: 'AAPL', side: 'buy', requestedQty: 6 }),
       );
 
       // Step 2: broker now reports the 6-share position opened above; issue a real exit.
@@ -1519,28 +1618,30 @@ describe('TradeIntentService', () => {
         total_pnl: 0,
         ts: new Date().toISOString(),
       });
-      gateway.placeOrder.mockResolvedValueOnce({
-        id: 'order_close',
-        status: 'accepted',
-        filled_qty: '6',
+      realOrderService.submit.mockResolvedValueOnce({
+        id: 'ro_close',
+        status: 'submitted',
+        client_order_id: 'nt-ti_close',
+        broker_order_id: 'order_close',
+        error: null,
       });
       prisma.tradeIntent.update.mockResolvedValueOnce(
         pendingIntent({
           id: 'ti_close',
-          status: 'executed',
-          fill_price: 150,
-          quantity: 6,
+          status: 'real_pending',
+          fill_price: null,
+          quantity: null,
           decided_by: 'autonomous',
         }),
       );
 
       const closed = await service.autoProcess('ti_close');
-      expect(closed.status).toBe('executed');
-      expect(gateway.placeOrder).toHaveBeenNthCalledWith(
+      expect(closed.status).toBe('real_pending');
+      expect(realOrderService.submit).toHaveBeenNthCalledWith(
         2,
-        'alpaca-provider',
-        oc({ symbol: 'AAPL', side: 'sell', qty: 6, type: 'market' }),
+        oc({ symbol: 'AAPL', side: 'sell', requestedQty: 6 }),
       );
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
     });
 
     it('risk gate still applies in real mode — drawdown halt prevents real order', async () => {
@@ -1635,23 +1736,29 @@ describe('TradeIntentService', () => {
         total_pnl: 0,
         ts: new Date().toISOString(),
       });
-      gateway.placeOrder.mockResolvedValue({ id: 'order_close', status: 'accepted' });
-      const executed = pendingIntent({
-        status: 'executed',
-        fill_price: 150,
-        quantity: 6,
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_close_routing',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-routing',
+        broker_order_id: 'order_close',
+        error: null,
+      });
+      const pending = pendingIntent({
+        status: 'real_pending',
+        fill_price: null,
+        quantity: null,
         decided_by: 'autonomous',
       });
-      prisma.tradeIntent.update.mockResolvedValue(executed);
+      prisma.tradeIntent.update.mockResolvedValue(pending);
 
       const result = await service.autoProcess('ti_001');
 
       expect(gateway.getPortfolio).toHaveBeenCalledWith('alpaca-provider');
-      expect(gateway.placeOrder).toHaveBeenCalledWith(
-        'alpaca-provider',
-        oc({ symbol: 'AAPL', side: 'sell', qty: 6, type: 'market' }),
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', side: 'sell', requestedQty: 6 }),
       );
-      expect(result.status).toBe('executed');
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('real_pending');
       // Paper portfolio must NOT be mutated — this was a real close.
       expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
     });
@@ -1815,20 +1922,27 @@ describe('TradeIntentService', () => {
       );
       mockPaperPortfolio(prisma);
       mockAaplQuote(gateway);
-      gateway.placeOrder.mockResolvedValue({ id: 'o1', status: 'accepted', filled_qty: '6' });
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro1',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-o1',
+        broker_order_id: 'o1',
+        error: null,
+      });
       prisma.tradeIntent.update.mockResolvedValue(
         pendingIntent({
-          status: 'executed',
-          fill_price: 150,
-          quantity: 6,
+          status: 'real_pending',
+          fill_price: null,
+          quantity: null,
           decided_by: 'autonomous',
         }),
       );
 
       const result = await service.autoProcess('ti_001');
 
-      expect(gateway.placeOrder).toHaveBeenCalledWith('alpaca-provider', oc({ side: 'buy' }));
-      expect(result.status).toBe('executed');
+      expect(realOrderService.submit).toHaveBeenCalledWith(oc({ side: 'buy' }));
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('real_pending');
       expect(prisma.portfolio.upsert).not.toHaveBeenCalled(); // real path, not paper
     });
 
@@ -1840,7 +1954,7 @@ describe('TradeIntentService', () => {
       'verdict %s → demoted to paper, NO real order, demotion audited',
       async (_label, verdict) => {
         const audit = makeAudit();
-        service = makeService(prisma, gateway, kv, audit);
+        service = makeService(prisma, gateway, kv, realOrderService, audit);
         enableRealNoGate(kv, { 'strategy.applied': 's_live' });
         mockRobustAppliedStrategy(prisma, verdict, new Date());
         prisma.tradeIntent.findUnique.mockResolvedValue(
@@ -1902,14 +2016,26 @@ describe('TradeIntentService', () => {
       );
       mockPaperPortfolio(prisma);
       mockAaplQuote(gateway);
-      gateway.placeOrder.mockResolvedValue({ id: 'o2', status: 'accepted', filled_qty: '6' });
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro2',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-o2',
+        broker_order_id: 'o2',
+        error: null,
+      });
       prisma.tradeIntent.update.mockResolvedValue(
-        pendingIntent({ status: 'executed', quantity: 6, decided_by: 'autonomous' }),
+        pendingIntent({
+          status: 'real_pending',
+          fill_price: null,
+          quantity: null,
+          decided_by: 'autonomous',
+        }),
       );
 
       await service.autoProcess('ti_001');
 
-      expect(gateway.placeOrder).toHaveBeenCalled();
+      expect(realOrderService.submit).toHaveBeenCalled();
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
     });
 
     it('no strategy.applied in KV → demoted to paper (never real)', async () => {
@@ -2032,7 +2158,7 @@ describe('TradeIntentService', () => {
 
     it('real exit with MISSING walk-forward verdict (no strategy.applied) still executes as real — never demoted, never falsely marked executed via the paper zero-qty path', async () => {
       const audit = makeAudit();
-      service = makeService(prisma, gateway, kv, audit);
+      service = makeService(prisma, gateway, kv, realOrderService, audit);
       enableRealNoGate(kv); // strategy.applied unset → gate would fail if it were checked
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'exit', symbol: 'AAPL' }),
@@ -2061,29 +2187,35 @@ describe('TradeIntentService', () => {
         ts: new Date().toISOString(),
       });
       mockAaplQuote(gateway);
-      gateway.placeOrder.mockResolvedValue({ id: 'order_exit_missing_gate', status: 'accepted' });
-      const executed = pendingIntent({
-        status: 'executed',
-        fill_price: 150,
-        quantity: 10,
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_missing_gate',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-missing-gate',
+        broker_order_id: 'order_exit_missing_gate',
+        error: null,
+      });
+      const pending = pendingIntent({
+        status: 'real_pending',
+        fill_price: null,
+        quantity: null,
         decided_by: 'autonomous',
       });
-      prisma.tradeIntent.update.mockResolvedValue(executed);
+      prisma.tradeIntent.update.mockResolvedValue(pending);
 
       const result = await service.autoProcess('ti_001');
 
-      expect(gateway.placeOrder).toHaveBeenCalledWith(
-        'alpaca-provider',
-        oc({ symbol: 'AAPL', qty: 10, side: 'sell', type: 'market' }),
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', requestedQty: 10, side: 'sell' }),
       );
-      expect(result.status).toBe('executed');
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('real_pending');
       expect(prisma.portfolio.upsert).not.toHaveBeenCalled(); // never routed to paper
       expect(audit.log).not.toHaveBeenCalledWith(oc({ event_type: 'walk_forward_gate_demotion' }));
     });
 
     it('real exit with STALE walk-forward verdict still executes as real — the defensive re-check in _executeReal must not block it either', async () => {
       const audit = makeAudit();
-      service = makeService(prisma, gateway, kv, audit);
+      service = makeService(prisma, gateway, kv, realOrderService, audit);
       const stale = new Date(Date.now() - 40 * 86_400_000); // default window is 30 days
       enableRealNoGate(kv, { 'strategy.applied': 's_live' });
       mockRobustAppliedStrategy(prisma, 'ROBUSTO', stale);
@@ -2111,22 +2243,28 @@ describe('TradeIntentService', () => {
         ts: new Date().toISOString(),
       });
       mockAaplQuote(gateway);
-      gateway.placeOrder.mockResolvedValue({ id: 'order_exit_stale_gate', status: 'accepted' });
-      const executed = pendingIntent({
-        status: 'executed',
-        fill_price: 150,
-        quantity: 10,
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_stale_gate',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-stale-gate',
+        broker_order_id: 'order_exit_stale_gate',
+        error: null,
+      });
+      const pending = pendingIntent({
+        status: 'real_pending',
+        fill_price: null,
+        quantity: null,
         decided_by: 'autonomous',
       });
-      prisma.tradeIntent.update.mockResolvedValue(executed);
+      prisma.tradeIntent.update.mockResolvedValue(pending);
 
       const result = await service.autoProcess('ti_001');
 
-      expect(gateway.placeOrder).toHaveBeenCalledWith(
-        'alpaca-provider',
-        oc({ symbol: 'AAPL', qty: 10, side: 'sell', type: 'market' }),
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', requestedQty: 10, side: 'sell' }),
       );
-      expect(result.status).toBe('executed');
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('real_pending');
       expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
       expect(audit.log).not.toHaveBeenCalledWith(oc({ event_type: 'walk_forward_gate_demotion' }));
     });
@@ -2166,7 +2304,7 @@ describe('TradeIntentService', () => {
 
     it('real hold with a stale/missing walk-forward gate never triggers a demotion audit (hold never touches broker/paper state, so it must not depend on gate freshness)', async () => {
       const audit = makeAudit();
-      service = makeService(prisma, gateway, kv, audit);
+      service = makeService(prisma, gateway, kv, realOrderService, audit);
       enableRealNoGate(kv); // strategy.applied unset → gate would fail if checked
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'hold', symbol: 'AAPL' }),

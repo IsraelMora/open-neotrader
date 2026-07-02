@@ -6,6 +6,7 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { ProvidersModule } from '../providers/providers.module';
 import { AuthModule } from '../auth/auth.module';
 import { AuditModule } from '../audit/audit.module';
+import { RealOrderModule } from '../real-order/real-order.module';
 import { KvService } from '../common/kv.service';
 
 @Module({
@@ -16,6 +17,8 @@ import { KvService } from '../common/kv.service';
     AuthModule,
     // AuditModule exports AuditService — records walk-forward gate real→paper demotions
     AuditModule,
+    // RealOrderModule exports RealOrderService — idempotent, crash-safe real-order submission
+    RealOrderModule,
   ],
   providers: [TradeIntentService, KvService],
   controllers: [TradeIntentController, ExecutionController],

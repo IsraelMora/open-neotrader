@@ -20,12 +20,12 @@
  * This reuses the existing Portfolio table (keyed by name) and avoids a new table.
  */
 import { Injectable, Logger, Optional } from '@nestjs/common';
-import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService, Portfolio } from '../providers/provider-gateway.service';
 import { KvService } from '../common/kv.service';
 import { kvBool, kvNum, kvStr } from '../common/kv.util';
 import { AuditService } from '../audit/audit.service';
+import { RealOrderService } from '../real-order/real-order.service';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -103,6 +103,10 @@ export class TradeIntentService {
     private readonly db: PrismaService,
     private readonly gateway: ProviderGatewayService,
     private readonly kv: KvService,
+    // RealOrderService owns idempotent, crash-safe real-order submission (client_order_id
+    // generation, DB row created BEFORE the broker call). _executeReal delegates all real
+    // order placement to it instead of calling gateway.placeOrder directly.
+    private readonly realOrderService: RealOrderService,
     // AuditService @Optional() — records real→paper demotions from the walk-forward gate
     // so the operator understands WHY a real order didn't execute. Absent → WARN log only.
     @Optional() private readonly audit?: AuditService,
@@ -1006,22 +1010,23 @@ export class TradeIntentService {
         `(notional=${notional}) via broker=${policy.broker_plugin_id} decided_by=${decided_by}`,
     );
 
-    // Place the real order — fail-soft on broker error.
-    let orderResponse: Record<string, unknown>;
+    // Submit through RealOrderService — it owns client_order_id generation, creates the
+    // RealOrder row BEFORE any broker call (crash-safe), and is idempotent per
+    // trade_intent_id. It never throws for a broker-side failure (returns a
+    // status="submit_failed" row instead) but CAN throw for a genuine DB failure on the
+    // initial row create (see its class doc) — wrap defensively so _executeReal itself
+    // still never throws to its caller.
+    let realOrder: Awaited<ReturnType<RealOrderService['submit']>>;
     try {
-      // client_order_id gives the broker an idempotency key so a retried submission
-      // never double-fills. Generated inline for now — this will move to a dedicated
-      // order-tracking service once the real-money accounting ledger lands.
-      const clientOrderId = `nt-${randomUUID()}`;
-      orderResponse = await this.gateway.placeOrder(policy.broker_plugin_id, {
+      realOrder = await this.realOrderService.submit({
+        tradeIntentId: id,
+        brokerPluginId: policy.broker_plugin_id,
         symbol,
-        qty,
         side,
-        type: 'market',
-        clientOrderId,
+        requestedQty: qty,
       });
     } catch (err) {
-      this.log.warn(`REAL ORDER FAILED [${id}]: broker threw — ${String(err)}`);
+      this.log.warn(`REAL ORDER SUBMIT THREW [${id}]: ${String(err)}`);
       return this.db.tradeIntent.update({
         where: { id },
         data: {
@@ -1033,24 +1038,46 @@ export class TradeIntentService {
       });
     }
 
+    if (realOrder.status === 'submit_failed') {
+      this.log.warn(
+        `REAL ORDER SUBMIT FAILED [${id}]: ${side} ${qty} ${symbol} — ${realOrder.error ?? 'unknown error'}`,
+      );
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({
+            error: realOrder.error ?? 'real order submission failed',
+            qty,
+            side,
+            symbol,
+          }),
+        },
+      });
+    }
+
     this.log.warn(
-      `REAL ORDER EXECUTED [${id}]: ${side.toUpperCase()} ${qty} ${symbol} — broker response: ${JSON.stringify(orderResponse)}`,
+      `REAL ORDER SUBMITTED [${id}]: ${side.toUpperCase()} ${qty} ${symbol} — ` +
+        `real_order_id=${realOrder.id} status=${realOrder.status}`,
     );
 
+    // No fabricated fill: a submitted order is only ACCEPTED, not filled — brokers fill
+    // asynchronously. fill_price/quantity stay NULL until the reconciliation service (a
+    // follow-up slice) observes an actual fill from the broker and updates this row.
     return this.db.tradeIntent.update({
       where: { id },
       data: {
-        status: 'executed',
-        fill_price: price,
-        quantity: qty,
+        status: 'real_pending',
         decided_at: new Date(),
         decided_by,
         result_json: JSON.stringify({
-          fill_price: price,
-          quantity: qty,
+          requested_qty: qty,
           side,
           broker: policy.broker_plugin_id,
-          order: orderResponse,
+          real_order_id: realOrder.id,
+          real_order_status: realOrder.status,
         }),
       },
     });

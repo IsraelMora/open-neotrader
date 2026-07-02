@@ -254,7 +254,7 @@ model TradeIntent {
   rationale     String
   timeframe     String    @default("1d")
   mode          String    @default("paper") // stored value; effective mode is gated, see ExecutionPolicy above
-  status        String    @default("pending") // "pending" | "approved" | "rejected" | "executed" | "failed"
+  status        String    @default("pending") // "pending" | "approved" | "rejected" | "real_pending" | "executed" | "failed"
   created_at    DateTime  @default(now())
   decided_at    DateTime?
   decided_by    String?
