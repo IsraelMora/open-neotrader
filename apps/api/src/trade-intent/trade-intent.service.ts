@@ -16,6 +16,13 @@
  * All real orders pass through the same risk gates and a per-order notional ceiling.
  * Every real order attempt is logged at WARN level.
  *
+ * KERNEL GATES READ THE ACCOUNT THAT ACTUALLY HOLDS THE MONEY: in real mode, the drawdown
+ * halt, max-open-positions gate, and entry sizing all read RealAccountState (RealNavSnapshot
+ * + RealPosition — see getRealAccountState), never the paper portfolio. If no RealNavSnapshot
+ * exists yet for the configured broker (a fresh, never-synced real account), a real long/short
+ * FAILS CLOSED (status=failed) rather than falling back to paper numbers or a fabricated 0%
+ * drawdown. "exit"/"hold" are exempt — closing/holding is always safe.
+ *
  * Paper portfolio storage: Portfolio model, name="paper", data=JSON PaperState.
  * This reuses the existing Portfolio table (keyed by name) and avoids a new table.
  */
@@ -46,6 +53,19 @@ export interface PaperState {
   max_drawdown_pct?: number;
   /** High-water-mark equity — the highest equity ever recorded for this paper portfolio. */
   hwm?: number;
+}
+
+/**
+ * Real-account state for the kernel risk gates — sourced from RealNavSnapshot (latest row
+ * for this broker) + a live count of RealPosition rows (open positions at this broker).
+ * Written by RealBrokerReconciliationService.syncPortfolio; NEVER derived from the paper
+ * Portfolio row, which is a different account with different money.
+ */
+export interface RealAccountState {
+  equity: number;
+  hwm: number;
+  buyingPower: number;
+  openPositionsCount: number;
 }
 
 export interface ExecutionPolicy {
@@ -90,6 +110,18 @@ const DEFAULT_WALK_FORWARD_MAX_AGE_DAYS = 30;
 const WALK_FORWARD_MAX_AGE_DAYS_MIN = 1;
 const WALK_FORWARD_MAX_AGE_DAYS_MAX = 3650;
 const REQUIRED_WALK_FORWARD_VERDICT = 'ROBUSTO';
+
+/**
+ * Real-account-state freshness gate: a RealNavSnapshot older than this window is treated
+ * as unavailable (same fail-closed handling as no snapshot at all) for opening trades
+ * (long/short). If broker sync/reconciliation is down, the latest snapshot can be
+ * arbitrarily stale — sizing/drawdown must never be computed off stale-optimistic equity.
+ * Configurable via KV `execution.real_state_max_age_ms`; clamped to [30_000, 3_600_000]
+ * (30s .. 1h). "exit"/"hold" never depend on this — see getRealAccountState doc comment.
+ */
+const DEFAULT_REAL_STATE_MAX_AGE_MS = 300_000;
+const REAL_STATE_MAX_AGE_MS_MIN = 30_000;
+const REAL_STATE_MAX_AGE_MS_MAX = 3_600_000;
 
 /** Fraction of available cash used per long entry (human-approved path). */
 const SIZING_PCT = 0.05;
@@ -245,9 +277,39 @@ export class TradeIntentService {
       });
     }
 
-    // Risk gate — only for opening trades.
+    // Real mode: risk gates/sizing MUST read the REAL account (RealNavSnapshot/RealPosition),
+    // never the paper portfolio — see getRealAccountState doc comment. Loaded unconditionally
+    // once effectiveMode === 'real' (cheap: one findFirst + one count).
+    const realState =
+      effectiveMode === 'real' ? await this.getRealAccountState(policy.broker_plugin_id) : null;
+
+    // FAIL CLOSED: a real opening trade with NO RealNavSnapshot yet (fresh, never-synced real
+    // account) must be rejected outright — never sized/gated against paper numbers or a
+    // fabricated 0% drawdown. "exit"/"hold" never reach this (closing/holding is always safe).
+    if (effectiveMode === 'real' && (action === 'long' || action === 'short') && !realState) {
+      this.log.warn(
+        `REAL ORDER REJECTED [${id}]: no RealNavSnapshot for broker=${policy.broker_plugin_id} — failing closed`,
+      );
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by: 'autonomous',
+          result_json: JSON.stringify({
+            error: 'real account state unavailable — cannot size/risk-check safely',
+          }),
+        },
+      });
+    }
+
+    // Risk gate — only for opening trades. Real mode gates the REAL account (realState,
+    // non-null here — see fail-closed check above); paper mode gates paperState, unchanged.
     if (action === 'long' || action === 'short') {
-      const { pass, reason } = this._passesAutoRisk(paperState, policy);
+      const { pass, reason } =
+        effectiveMode === 'real'
+          ? this._passesAutoRisk(realState as RealAccountState, policy, 'real')
+          : this._passesAutoRisk(paperState, policy, 'paper');
       if (!pass) {
         return this.db.tradeIntent.update({
           where: { id },
@@ -267,7 +329,7 @@ export class TradeIntentService {
         id,
         intent,
         policy,
-        paperState,
+        realState,
         'autonomous',
         policy.max_position_pct,
       );
@@ -336,12 +398,42 @@ export class TradeIntentService {
           positions: [],
         };
 
+    // Real mode: risk gates/sizing MUST read the REAL account (RealNavSnapshot/RealPosition),
+    // never the paper portfolio — see getRealAccountState doc comment. Loaded unconditionally
+    // once effectiveMode === 'real' (cheap: one findFirst + one count).
+    const realState =
+      effectiveMode === 'real' ? await this.getRealAccountState(policy.broker_plugin_id) : null;
+
+    // FAIL CLOSED: a real opening trade with NO RealNavSnapshot yet (fresh, never-synced real
+    // account) must be rejected outright — never sized/gated against paper numbers or a
+    // fabricated 0% drawdown. "exit"/"hold" never reach this (closing/holding is always safe).
+    if (effectiveMode === 'real' && (action === 'long' || action === 'short') && !realState) {
+      this.log.warn(
+        `REAL ORDER REJECTED [${id}]: no RealNavSnapshot for broker=${policy.broker_plugin_id} — failing closed`,
+      );
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'failed',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({
+            error: 'real account state unavailable — cannot size/risk-check safely',
+          }),
+        },
+      });
+    }
+
     // Kernel risk gate — SAME gate as autoProcess(), applied on the human-approval
     // path too. Human approval must not bypass the drawdown halt / max-open-positions
     // floor. "exit"/"hold" always pass — closing a position must remain possible
-    // even during an active halt.
+    // even during an active halt. Real mode gates the REAL account (realState, non-null
+    // here — see fail-closed check above); paper mode gates the paper state, unchanged.
     if (action === 'long' || action === 'short') {
-      const { pass, reason } = this._passesAutoRisk(state, policy);
+      const { pass, reason } =
+        effectiveMode === 'real'
+          ? this._passesAutoRisk(realState as RealAccountState, policy, 'real')
+          : this._passesAutoRisk(state, policy, 'paper');
       if (!pass) {
         return this.db.tradeIntent.update({
           where: { id },
@@ -356,7 +448,7 @@ export class TradeIntentService {
     }
 
     if (effectiveMode === 'real') {
-      return this._executeReal(id, intent, policy, state, decided_by, SIZING_PCT);
+      return this._executeReal(id, intent, policy, realState, decided_by, SIZING_PCT);
     }
     return this._runPaperExecution(
       id,
@@ -636,6 +728,67 @@ export class TradeIntentService {
     return { mode: await this._effectiveMode(policy, id, action) };
   }
 
+  // ── getRealAccountState ───────────────────────────────────────────────────────
+
+  /**
+   * Real-account state for the kernel risk gates — sourced from RealNavSnapshot (latest row
+   * for this broker) + a live count of RealPosition rows. Written by
+   * RealBrokerReconciliationService.syncPortfolio; NEVER derived from the paper Portfolio
+   * row, which is a different account with different money.
+   *
+   * Returns `null` when NO RealNavSnapshot exists yet for this broker — a fresh real account
+   * that has never been synced — OR when the latest snapshot is STALE (older than
+   * `_readRealStateMaxAgeMs()`, e.g. broker sync/reconciliation has stopped running). Callers
+   * MUST fail closed on `null` for opening trades (long/short): never fall back to paper
+   * numbers, a 0% drawdown default, or stale-optimistic equity. Closing (exit) is always safe
+   * and does not depend on this loader — its qty is sourced directly from the broker's live
+   * portfolio by `_resolveRealExitQty`.
+   */
+  private async getRealAccountState(brokerPluginId: string): Promise<RealAccountState | null> {
+    const snapshot = await this.db.realNavSnapshot.findFirst({
+      where: { broker_plugin_id: brokerPluginId },
+      orderBy: { ts: 'desc' },
+    });
+    if (!snapshot) return null;
+
+    const ageMs = Date.now() - new Date(snapshot.ts).getTime();
+    const maxAgeMs = await this._readRealStateMaxAgeMs();
+    if (ageMs > maxAgeMs) {
+      this.log.warn(
+        `REAL ACCOUNT STATE STALE: latest RealNavSnapshot for broker=${brokerPluginId} is ` +
+          `${ageMs}ms old (> ${maxAgeMs}ms window) — treating as unavailable, failing closed`,
+      );
+      return null;
+    }
+
+    const openPositionsCount = await this.db.realPosition.count({
+      where: { broker_plugin_id: brokerPluginId },
+    });
+
+    return {
+      equity: snapshot.equity,
+      hwm: snapshot.hwm,
+      buyingPower: snapshot.buying_power,
+      openPositionsCount,
+    };
+  }
+
+  /** Freshness window (ms) for the real-account-state (RealNavSnapshot) staleness gate. */
+  private async _readRealStateMaxAgeMs(): Promise<number> {
+    let raw: string | null;
+    try {
+      raw = await this.kv.get('execution.real_state_max_age_ms');
+    } catch {
+      raw = null;
+    }
+    let ms = kvNum(raw, DEFAULT_REAL_STATE_MAX_AGE_MS);
+    if (!Number.isFinite(ms) || ms < REAL_STATE_MAX_AGE_MS_MIN) {
+      ms = REAL_STATE_MAX_AGE_MS_MIN;
+    }
+    if (ms > REAL_STATE_MAX_AGE_MS_MAX) ms = REAL_STATE_MAX_AGE_MS_MAX;
+    return ms;
+  }
+
   // ── walk-forward gate ─────────────────────────────────────────────────────────
 
   /**
@@ -821,6 +974,7 @@ export class TradeIntentService {
     id: string,
     policy: ExecutionPolicy,
     action: TradeAction,
+    realState: RealAccountState | null,
     decided_by: string,
   ): Promise<{ failedUpdate: ReturnType<PrismaService['tradeIntent']['update']> } | { ok: true }> {
     // Defensive: broker must be set (belt-and-suspenders beyond _effectiveMode).
@@ -834,6 +988,27 @@ export class TradeIntentService {
             decided_at: new Date(),
             decided_by,
             result_json: JSON.stringify({ error: 'broker_plugin_id not configured' }),
+          },
+        }),
+      };
+    }
+
+    // Defensive: opening trades require real account state (belt-and-suspenders beyond the
+    // fail-closed check in autoProcess/approve — see getRealAccountState doc comment). Never
+    // place a long/short order without a real RealNavSnapshot to size/risk-check against.
+    // "exit"/"hold" are exempt: closing/holding never sizes off this state.
+    if ((action === 'long' || action === 'short') && !realState) {
+      this.log.warn(`REAL ORDER REJECTED [${id}]: real account state unavailable — safety guard`);
+      return {
+        failedUpdate: this.db.tradeIntent.update({
+          where: { id },
+          data: {
+            status: 'failed',
+            decided_at: new Date(),
+            decided_by,
+            result_json: JSON.stringify({
+              error: 'real account state unavailable — cannot size/risk-check safely',
+            }),
           },
         }),
       };
@@ -866,21 +1041,140 @@ export class TradeIntentService {
     return { ok: true };
   }
 
+  /**
+   * Resolves the order side + qty for `_executeReal`. Extracted to keep that function's
+   * cognitive complexity within the sonarjs limit.
+   *
+   * "exit"  → side='sell', qty sourced from the BROKER's live position via
+   *           `_resolveRealExitQty` — the paper portfolio is never mutated in real mode and
+   *           is therefore stale/irrelevant here. No ceiling clamp (closing reduces risk).
+   * "long"/"short" → side='buy'/'sell', qty sized against `realState.equity` (the REAL
+   *           account, never paper, and never buying_power — see below) and hard-clamped to
+   *           policy.max_position_pct via `_clampToPositionCeiling`, THEN capped so notional
+   *           never exceeds `realState.buyingPower` (the broker's hard constraint). Sizing off
+   *           equity (not buying_power) keeps real sizing consistent with the paper path: on
+   *           margin accounts buying_power can exceed equity, which would otherwise make
+   *           max_position_pct a larger fraction of TRUE equity than intended. The
+   *           buying_power cap is a MIN, never a substitute — it can only reduce qty, never
+   *           raise it above the equity-based ceiling.
+   *           `realState` is guaranteed non-null here — `_checkExecuteRealPreconditions`
+   *           already fails closed for opening trades without it — this null check is a
+   *           second belt-and-suspenders layer, never a fallback to paper numbers. A
+   *           non-finite `equity`/`buyingPower` (NaN/Infinity) also fails closed BEFORE any
+   *           arithmetic — NaN comparisons are always false, so a naive qty<=0 check would
+   *           silently let a NaN-sized order slip through.
+   */
+  private async _resolveRealSideAndQty(
+    id: string,
+    symbol: string,
+    action: TradeAction,
+    policy: ExecutionPolicy,
+    realState: RealAccountState | null,
+    price: number,
+    sizingPct: number,
+    decided_by: string,
+  ): Promise<
+    | { side: 'buy' | 'sell'; qty: number }
+    | { failedUpdate: ReturnType<PrismaService['tradeIntent']['update']> }
+  > {
+    if (action === 'exit') {
+      const exitQty = await this._resolveRealExitQty(
+        id,
+        symbol,
+        policy.broker_plugin_id,
+        decided_by,
+      );
+      if ('failedUpdate' in exitQty) return exitQty;
+      return { side: 'sell', qty: exitQty.qty };
+    }
+
+    if (!realState) {
+      return {
+        failedUpdate: this.db.tradeIntent.update({
+          where: { id },
+          data: {
+            status: 'failed',
+            decided_at: new Date(),
+            decided_by,
+            result_json: JSON.stringify({
+              error: 'real account state unavailable — cannot size/risk-check safely',
+            }),
+          },
+        }),
+      };
+    }
+
+    // Finite guard BEFORE any arithmetic — a non-finite equity/buying_power (NaN/Infinity)
+    // must fail closed here, never silently propagate into Math.floor/comparisons (NaN
+    // comparisons are always false, so a downstream qty<=0 check would never catch it).
+    if (!Number.isFinite(realState.equity) || !Number.isFinite(realState.buyingPower)) {
+      this.log.warn(
+        `REAL ORDER REJECTED [${id}]: non-finite real account state (equity=${realState.equity}, ` +
+          `buyingPower=${realState.buyingPower}) — refusing to size`,
+      );
+      return {
+        failedUpdate: this.db.tradeIntent.update({
+          where: { id },
+          data: {
+            status: 'failed',
+            decided_at: new Date(),
+            decided_by,
+            result_json: JSON.stringify({
+              error: 'real account state has non-finite equity/buying_power — refusing to size',
+            }),
+          },
+        }),
+      };
+    }
+
+    const side: 'buy' | 'sell' = action === 'long' ? 'buy' : 'sell';
+    // Base sizing on EQUITY (never buying_power) so real sizing stays consistent with the
+    // paper path — see doc comment above.
+    let qty = this._clampToPositionCeiling(
+      Math.floor((realState.equity * sizingPct) / price),
+      realState.equity,
+      price,
+      policy.max_position_pct,
+      id,
+      action === 'long' ? 'real long' : 'real short',
+    );
+
+    // Second, independent cap: notional must never exceed the broker's actual buying power.
+    // This is a MIN, never a substitute for the equity-based ceiling above — it can only
+    // reduce qty further, never raise it.
+    const buyingPowerMaxQty = Math.floor(realState.buyingPower / price);
+    if (qty > buyingPowerMaxQty) {
+      this.log.warn(
+        `POSITION SIZE CAPPED BY BUYING POWER [${id}] (${action === 'long' ? 'real long' : 'real short'}): ` +
+          `qty ${qty} → ${buyingPowerMaxQty} (buying_power=${realState.buyingPower} / price=${price})`,
+      );
+      qty = buyingPowerMaxQty;
+    }
+
+    return { side, qty };
+  }
+
   private async _executeReal(
     id: string,
     intent: { symbol: string; action: string },
     policy: ExecutionPolicy,
-    paperState: PaperState,
+    realState: RealAccountState | null,
     decided_by: string,
     sizingPct: number,
   ) {
     const symbol = intent.symbol;
     const action = intent.action as TradeAction;
 
-    // Broker + walk-forward re-check (exit/hold exempt from the walk-forward part — see
-    // _checkExecuteRealPreconditions doc comment). Extracted to keep this function's
-    // cognitive complexity within the sonarjs limit.
-    const preconditions = await this._checkExecuteRealPreconditions(id, policy, action, decided_by);
+    // Broker + real-state + walk-forward re-check (exit/hold exempt from the real-state and
+    // walk-forward parts — see _checkExecuteRealPreconditions doc comment). Extracted to keep
+    // this function's cognitive complexity within the sonarjs limit.
+    const preconditions = await this._checkExecuteRealPreconditions(
+      id,
+      policy,
+      action,
+      realState,
+      decided_by,
+    );
     if ('failedUpdate' in preconditions) return preconditions.failedUpdate;
 
     // Fetch live quote for sizing.
@@ -914,47 +1208,8 @@ export class TradeIntentService {
       });
     }
 
-    // Compute side and qty.
-    let side: 'buy' | 'sell';
-    let qty: number;
-
-    if (action === 'long') {
-      side = 'buy';
-      qty = this._clampToPositionCeiling(
-        Math.floor((paperState.equity * sizingPct) / price),
-        paperState.equity,
-        price,
-        policy.max_position_pct,
-        id,
-        'real long',
-      );
-    } else if (action === 'exit') {
-      side = 'sell';
-      // Real exits must source qty from the BROKER's live position — the paper portfolio
-      // is never mutated in real mode (see method doc comment above) and is therefore
-      // stale/irrelevant here. Fail safe if the broker is unreachable or reports no open
-      // position: never guess a quantity, never place a wrong-sized sell.
-      // No ceiling clamp on exits — closing an existing position reduces risk.
-      const exitQty = await this._resolveRealExitQty(
-        id,
-        symbol,
-        policy.broker_plugin_id,
-        decided_by,
-      );
-      if ('failedUpdate' in exitQty) return exitQty.failedUpdate;
-      qty = exitQty.qty;
-    } else if (action === 'short') {
-      side = 'sell';
-      qty = this._clampToPositionCeiling(
-        Math.floor((paperState.equity * sizingPct) / price),
-        paperState.equity,
-        price,
-        policy.max_position_pct,
-        id,
-        'real short',
-      );
-    } else {
-      // 'hold' — should have been short-circuited before reaching here; defensive no-op.
+    // 'hold' — should have been short-circuited before reaching here; defensive no-op.
+    if (action === 'hold') {
       return this.db.tradeIntent.update({
         where: { id },
         data: {
@@ -966,6 +1221,21 @@ export class TradeIntentService {
         },
       });
     }
+
+    // Compute side and qty. Extracted to keep this function's cognitive complexity within
+    // the sonarjs limit.
+    const resolved = await this._resolveRealSideAndQty(
+      id,
+      symbol,
+      action,
+      policy,
+      realState,
+      price,
+      sizingPct,
+      decided_by,
+    );
+    if ('failedUpdate' in resolved) return resolved.failedUpdate;
+    const { side, qty } = resolved;
 
     // Qty safety check.
     if (qty <= 0) {
@@ -1104,18 +1374,28 @@ export class TradeIntentService {
   // ── _computeDrawdownPct ───────────────────────────────────────────────────────
 
   /**
-   * Real drawdown from the true high-water-mark (hwm), read from the PAPER PORTFOLIO
-   * itself — the same state the kernel actually sizes/gates against. NOT from an
-   * external-provider-sourced snapshot history, which is disconnected from the paper
-   * portfolio and stays empty (hence a permanently-0 drawdown) whenever no broker
-   * credentials are configured — the common self-hosted case.
+   * Real drawdown from the true high-water-mark (hwm).
    *
-   * hwm defaults to the current equity when unset (fresh portfolio, no trades yet),
-   * so a brand-new account is NEVER false-halted on its very first trade.
+   * Paper mode: read from the PAPER PORTFOLIO itself — the same state the kernel actually
+   * sizes/gates against. hwm defaults to the current equity when unset (fresh portfolio, no
+   * trades yet), so a brand-new paper account is NEVER false-halted on its very first trade.
+   *
+   * Real mode: read from RealAccountState (sourced from the latest RealNavSnapshot for the
+   * configured broker — see getRealAccountState). hwm is always present on that row (never
+   * defaulted) — callers must FAIL CLOSED upstream when no RealNavSnapshot exists at all
+   * (state is `null`), rather than calling this with a fabricated 0%-drawdown state.
    */
-  private _computeDrawdownPct(state: PaperState): number {
-    const hwm = state.hwm ?? state.equity;
-    return hwm > 0 ? Math.max(0, ((hwm - state.equity) / hwm) * 100) : 0;
+  private _computeDrawdownPct(
+    state: PaperState | RealAccountState,
+    mode: 'paper' | 'real',
+  ): number {
+    if (mode === 'real') {
+      const real = state as RealAccountState;
+      return real.hwm > 0 ? Math.max(0, ((real.hwm - real.equity) / real.hwm) * 100) : 0;
+    }
+    const paper = state as PaperState;
+    const hwm = paper.hwm ?? paper.equity;
+    return hwm > 0 ? Math.max(0, ((hwm - paper.equity) / hwm) * 100) : 0;
   }
 
   // ── _passesAutoRisk ───────────────────────────────────────────────────────────
@@ -1125,12 +1405,17 @@ export class TradeIntentService {
    * and approve() — the human-approval path must not bypass these checks.
    * "exit"/"hold" are never gated here (callers must keep letting position-closing
    * actions through even during an active halt).
+   *
+   * Paper mode gates against `state.positions.length` (PaperState). Real mode gates against
+   * `state.openPositionsCount` (RealAccountState, sourced from RealPosition rows) — callers
+   * must never pass paperState here for a real-mode check (see getRealAccountState).
    */
   private _passesAutoRisk(
-    state: PaperState,
+    state: PaperState | RealAccountState,
     policy: ExecutionPolicy,
+    mode: 'paper' | 'real',
   ): { pass: boolean; reason?: string } {
-    const drawdown = this._computeDrawdownPct(state);
+    const drawdown = this._computeDrawdownPct(state, mode);
     if (drawdown >= policy.max_drawdown_halt_pct) {
       return {
         pass: false,
@@ -1138,10 +1423,14 @@ export class TradeIntentService {
       };
     }
 
-    if (state.positions.length >= policy.max_open_positions) {
+    const openPositions =
+      mode === 'real'
+        ? (state as RealAccountState).openPositionsCount
+        : (state as PaperState).positions.length;
+    if (openPositions >= policy.max_open_positions) {
       return {
         pass: false,
-        reason: `max open positions reached (${state.positions.length}/${policy.max_open_positions})`,
+        reason: `max open positions reached (${openPositions}/${policy.max_open_positions})`,
       };
     }
 

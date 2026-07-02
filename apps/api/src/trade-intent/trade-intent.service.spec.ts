@@ -27,6 +27,12 @@ type MockPrisma = {
     findUnique: jest.Mock;
     update: jest.Mock;
   };
+  realNavSnapshot: {
+    findFirst: jest.Mock;
+  };
+  realPosition: {
+    count: jest.Mock;
+  };
 };
 
 function makePrisma(): MockPrisma {
@@ -44,6 +50,12 @@ function makePrisma(): MockPrisma {
     strategy: {
       findUnique: jest.fn(),
       update: jest.fn(),
+    },
+    realNavSnapshot: {
+      findFirst: jest.fn(),
+    },
+    realPosition: {
+      count: jest.fn(),
     },
   };
 }
@@ -192,6 +204,46 @@ function mockPaperPortfolio(prisma: MockPrisma): void {
     data: EMPTY_PORTFOLIO_DATA,
     updatedAt: new Date(),
   });
+}
+
+/**
+ * Wire prisma.realNavSnapshot/realPosition to a real account state. Defaults mirror the
+ * paper defaults ($10k, no drawdown, 0 open positions) so existing real-mode tests that don't
+ * care about real-account accounting specifically keep their original qty/gate math. Override
+ * individual fields per test to prove real-vs-paper divergence.
+ */
+function mockRealAccountState(
+  prisma: MockPrisma,
+  overrides: {
+    equity?: number;
+    hwm?: number;
+    buying_power?: number;
+    openPositionsCount?: number;
+    ts?: Date;
+  } = {},
+): void {
+  const equity = overrides.equity ?? 10_000;
+  prisma.realNavSnapshot.findFirst.mockResolvedValue({
+    id: 'nav_1',
+    ts: overrides.ts ?? new Date(),
+    broker_plugin_id: 'alpaca-provider',
+    equity,
+    cash: equity,
+    buying_power: overrides.buying_power ?? equity,
+    positions: '[]',
+    total_pnl: 0,
+    hwm: overrides.hwm ?? equity,
+    source: 'poll',
+    meta: null,
+  });
+  prisma.realPosition.count.mockResolvedValue(overrides.openPositionsCount ?? 0);
+}
+
+/** Wire prisma.realNavSnapshot to report NO snapshot yet — a fresh real account that has
+ * never been synced. Kernel gates must FAIL CLOSED on this for opening trades. */
+function mockNoRealAccountState(prisma: MockPrisma): void {
+  prisma.realNavSnapshot.findFirst.mockResolvedValue(null);
+  prisma.realPosition.count.mockResolvedValue(0);
 }
 
 /**
@@ -547,6 +599,7 @@ describe('TradeIntentService', () => {
         return Promise.resolve(null);
       });
       mockRobustAppliedStrategy(prisma); // walk-forward gate passes
+      mockRealAccountState(prisma); // real buying_power=10_000 — sizing/gate must read THIS, not paper
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
       );
@@ -1130,6 +1183,10 @@ describe('TradeIntentService', () => {
         return Promise.resolve(null); // all other keys → defaults (autonomous=true, etc.)
       });
       mockRobustAppliedStrategy(prismaMock); // fresh ROBUSTO verdict → gate passes
+      // Default real account state — $10k, no drawdown, 0 open positions (mirrors the paper
+      // defaults so pre-existing qty math in tests that don't care about real accounting stays
+      // unchanged). Individual tests override via mockRealAccountState/mockNoRealAccountState.
+      mockRealAccountState(prismaMock);
     }
 
     it.each([
@@ -1271,6 +1328,7 @@ describe('TradeIntentService', () => {
         return Promise.resolve(null);
       });
       mockRobustAppliedStrategy(prisma); // gate passes → reach the notional check
+      mockRealAccountState(prisma); // real buying_power=10_000 — same math as the paper default
 
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
@@ -1365,6 +1423,7 @@ describe('TradeIntentService', () => {
         return Promise.resolve(null);
       });
       mockRobustAppliedStrategy(prisma);
+      mockRealAccountState(prisma); // real buying_power=10_000 — same math as the paper default
 
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
@@ -1662,19 +1721,17 @@ describe('TradeIntentService', () => {
       expect(gateway.placeOrder).not.toHaveBeenCalled();
     });
 
-    it('risk gate still applies in real mode — drawdown halt prevents real order', async () => {
+    it('risk gate in real mode reads the REAL account, NOT the paper portfolio — drawdown halt fires on real drawdown even when paper shows none', async () => {
+      // THE HEADLINE BUG FIX: the paper portfolio is perfectly healthy (no drawdown at all —
+      // equity == hwm), but the REAL account (RealNavSnapshot) is drawn down 30%, past the
+      // 25% halt. If the kernel were still reading paperState (the bug), this order would
+      // execute. It must be rejected — driven by REAL equity/hwm, not paper.
       enableReal(kv, prisma);
-      // hwm=10_000 → 30% dd
-      const portfolioWithDrawdown = JSON.stringify({
-        equity: 7_000,
-        cash: 7_000,
-        positions: [],
-        hwm: 10_000,
-      });
+      mockRealAccountState(prisma, { equity: 7_000, hwm: 10_000 }); // real: 30% dd
       prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
       prisma.portfolio.findUnique.mockResolvedValue({
         name: 'paper',
-        data: portfolioWithDrawdown,
+        data: JSON.stringify({ equity: 10_000, cash: 10_000, positions: [], hwm: 10_000 }), // paper: 0% dd
         updatedAt: new Date(),
       });
       const rejected = pendingIntent({
@@ -1684,13 +1741,174 @@ describe('TradeIntentService', () => {
       });
       prisma.tradeIntent.update.mockResolvedValue(rejected);
 
-      await service.autoProcess('ti_001');
+      const result = await service.autoProcess('ti_001');
 
       // Real mode: risk gate fires BEFORE any quote fetch or order
       expect(gateway.getQuote).not.toHaveBeenCalled();
       expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(realOrderService.submit).not.toHaveBeenCalled();
+      expect(result.status).toBe('rejected');
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
-        oc({ data: oc({ status: 'rejected' }) }),
+        oc({
+          data: oc({
+            status: 'rejected',
+            reject_reason: expect.stringContaining('drawdown 30%') as string,
+          }),
+        }),
+      );
+    });
+
+    it('real long with NO RealNavSnapshot yet (fresh, never-synced real account) FAILS CLOSED — status=failed, never falls back to paper', async () => {
+      enableReal(kv, prisma);
+      mockNoRealAccountState(prisma); // overrides enableReal's default — simulates a fresh real account
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
+      mockPaperPortfolio(prisma); // paper shows a perfectly healthy account — must NOT be used
+      const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(failed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.getQuote).not.toHaveBeenCalled();
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(realOrderService.submit).not.toHaveBeenCalled();
+      expect(result.status).toBe('failed');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'failed',
+            result_json: expect.stringContaining('real account state unavailable') as string,
+          }),
+        }),
+      );
+    });
+
+    it('real short with NO RealNavSnapshot yet FAILS CLOSED — status=failed', async () => {
+      enableReal(kv, prisma);
+      mockNoRealAccountState(prisma);
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'short' }));
+      mockPaperPortfolio(prisma);
+      const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(failed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(realOrderService.submit).not.toHaveBeenCalled();
+      expect(result.status).toBe('failed');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'failed',
+            result_json: expect.stringContaining('real account state unavailable') as string,
+          }),
+        }),
+      );
+    });
+
+    it('real exit with NO RealNavSnapshot yet still executes — closing is always safe, qty is sourced from the broker', async () => {
+      enableReal(kv, prisma, 'alpaca-provider', 5000);
+      mockNoRealAccountState(prisma); // fail-closed only applies to opening trades
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 10_900,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: 6,
+            avg_entry: 150,
+            market_value: 900,
+            unrealized_pnl: 0,
+            side: 'long',
+          },
+        ],
+        total_market_value: 900,
+        total_pnl: 0,
+        ts: new Date().toISOString(),
+      });
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_exit_nostate',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-exit',
+        broker_order_id: 'order_exit',
+        error: null,
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({
+          status: 'real_pending',
+          fill_price: null,
+          quantity: null,
+          decided_by: 'autonomous',
+        }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(result.status).toBe('real_pending');
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', side: 'sell', requestedQty: 6 }),
+      );
+    });
+
+    it('real long sizing uses real buying_power, independent of paperState.equity', async () => {
+      enableReal(kv, prisma);
+      // Real buying power ($3k) much smaller than the paper equity ($10k, mocked below) — if
+      // sizing were wrongly derived from paper, qty would be floor(10000*0.1/150)=6 instead.
+      mockRealAccountState(prisma, { equity: 3_000, hwm: 3_000, buying_power: 3_000 });
+      mockPaperPortfolio(prisma); // paper equity=10_000 — must NOT be used for real sizing
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway); // price=150 → expected qty = floor(3000 * 0.1 / 150) = 2
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_sizing',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-sizing',
+        broker_order_id: 'order_sizing',
+        error: null,
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({
+          status: 'real_pending',
+          fill_price: null,
+          quantity: null,
+          decided_by: 'autonomous',
+        }),
+      );
+
+      await service.autoProcess('ti_001');
+
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', side: 'buy', requestedQty: 2 }),
+      );
+    });
+
+    it('real max-open-positions gate uses the RealPosition count, independent of paperState.positions', async () => {
+      enableReal(kv, prisma);
+      // Paper has 0 open positions (would pass if wrongly gated on paper) but the real
+      // account already has 10 open RealPosition rows — at the default max_open_positions=10.
+      mockRealAccountState(prisma, { openPositionsCount: 10 });
+      mockPaperPortfolio(prisma);
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
+      const rejected = pendingIntent({ status: 'rejected', decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValue(rejected);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.getQuote).not.toHaveBeenCalled();
+      expect(realOrderService.submit).not.toHaveBeenCalled();
+      expect(result.status).toBe('rejected');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'rejected',
+            reject_reason: expect.stringContaining('max open positions reached (10/10)') as string,
+          }),
+        }),
       );
     });
 
@@ -1807,6 +2025,418 @@ describe('TradeIntentService', () => {
 
         expect(result.status).toBe('failed');
         expect(reconciliation.fastPollOrder).not.toHaveBeenCalled();
+      });
+    });
+
+    // ── Fix 1: stale RealNavSnapshot must fail closed exactly like a missing one ──
+    describe('real account state freshness (stale RealNavSnapshot fails closed)', () => {
+      it('real long with a RealNavSnapshot older than the default window (300_000ms) FAILS CLOSED', async () => {
+        enableReal(kv, prisma);
+        mockRealAccountState(prisma, { ts: new Date(Date.now() - 400_000) }); // 400s old > 300s default
+        prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
+        mockPaperPortfolio(prisma); // paper is healthy — must NOT be used
+        const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+        prisma.tradeIntent.update.mockResolvedValue(failed);
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(gateway.getQuote).not.toHaveBeenCalled();
+        expect(realOrderService.submit).not.toHaveBeenCalled();
+        expect(result.status).toBe('failed');
+        expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+          oc({
+            data: oc({
+              status: 'failed',
+              result_json: expect.stringContaining('real account state unavailable') as string,
+            }),
+          }),
+        );
+      });
+
+      it('real short with a stale RealNavSnapshot FAILS CLOSED', async () => {
+        enableReal(kv, prisma);
+        mockRealAccountState(prisma, { ts: new Date(Date.now() - 400_000) });
+        prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'short' }));
+        mockPaperPortfolio(prisma);
+        mockAaplQuote(gateway);
+        const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+        prisma.tradeIntent.update.mockResolvedValue(failed);
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(gateway.getQuote).not.toHaveBeenCalled();
+        expect(realOrderService.submit).not.toHaveBeenCalled();
+        expect(result.status).toBe('failed');
+      });
+
+      it('real long with a RealNavSnapshot WITHIN the default window proceeds normally (not rejected for staleness)', async () => {
+        enableReal(kv, prisma);
+        mockRealAccountState(prisma, { ts: new Date(Date.now() - 100_000) }); // 100s old < 300s default
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockPaperPortfolio(prisma);
+        mockAaplQuote(gateway);
+        realOrderService.submit.mockResolvedValue({
+          id: 'ro_fresh',
+          status: 'submitted',
+          client_order_id: 'nt-ti_001-fresh',
+          broker_order_id: 'order_fresh',
+          error: null,
+        });
+        prisma.tradeIntent.update.mockResolvedValue(
+          pendingIntent({
+            status: 'real_pending',
+            fill_price: null,
+            quantity: null,
+            decided_by: 'autonomous',
+          }),
+        );
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(result.status).toBe('real_pending');
+        expect(realOrderService.submit).toHaveBeenCalledTimes(1);
+      });
+
+      it('real exit with a STALE RealNavSnapshot still executes — exit is exempt, qty sourced from the broker', async () => {
+        enableReal(kv, prisma, 'alpaca-provider', 5000);
+        mockRealAccountState(prisma, { ts: new Date(Date.now() - 400_000) }); // stale
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+        );
+        mockAaplQuote(gateway);
+        mockPaperPortfolio(prisma);
+        gateway.getPortfolio.mockResolvedValue({
+          provider_id: 'alpaca-provider',
+          equity: 10_900,
+          cash: 10_000,
+          buying_power: 10_000,
+          positions: [
+            {
+              symbol: 'AAPL',
+              qty: 6,
+              avg_entry: 150,
+              market_value: 900,
+              unrealized_pnl: 0,
+              side: 'long',
+            },
+          ],
+          total_market_value: 900,
+          total_pnl: 0,
+          ts: new Date().toISOString(),
+        });
+        realOrderService.submit.mockResolvedValue({
+          id: 'ro_stale_exit',
+          status: 'submitted',
+          client_order_id: 'nt-ti_001-stale-exit',
+          broker_order_id: 'order_stale_exit',
+          error: null,
+        });
+        prisma.tradeIntent.update.mockResolvedValue(
+          pendingIntent({
+            status: 'real_pending',
+            fill_price: null,
+            quantity: null,
+            decided_by: 'autonomous',
+          }),
+        );
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(result.status).toBe('real_pending');
+        expect(realOrderService.submit).toHaveBeenCalledWith(
+          oc({ symbol: 'AAPL', side: 'sell', requestedQty: 6 }),
+        );
+      });
+
+      it('missing snapshot (no row at all) still fails closed as before (existing coverage re-confirmed)', async () => {
+        enableReal(kv, prisma);
+        mockNoRealAccountState(prisma);
+        prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
+        mockPaperPortfolio(prisma);
+        const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+        prisma.tradeIntent.update.mockResolvedValue(failed);
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(realOrderService.submit).not.toHaveBeenCalled();
+        expect(result.status).toBe('failed');
+      });
+
+      it('window is KV-configurable: execution.real_state_max_age_ms=900000 lets a 400s-old snapshot pass (past the 300s default, within the 900s custom window)', async () => {
+        kv.get.mockImplementation((key: string) => {
+          if (key === 'execution.real') return Promise.resolve('true');
+          if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+          if (key === 'execution.max_order_notional') return Promise.resolve('1000');
+          if (key === 'strategy.applied') return Promise.resolve('s_live');
+          if (key === 'execution.real_state_max_age_ms') return Promise.resolve('900000'); // 15min
+          return Promise.resolve(null);
+        });
+        mockRobustAppliedStrategy(prisma);
+        mockRealAccountState(prisma, { ts: new Date(Date.now() - 400_000) }); // 400s old
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockPaperPortfolio(prisma);
+        mockAaplQuote(gateway);
+        realOrderService.submit.mockResolvedValue({
+          id: 'ro_custom_window',
+          status: 'submitted',
+          client_order_id: 'nt-ti_001-custom',
+          broker_order_id: 'order_custom',
+          error: null,
+        });
+        prisma.tradeIntent.update.mockResolvedValue(
+          pendingIntent({
+            status: 'real_pending',
+            fill_price: null,
+            quantity: null,
+            decided_by: 'autonomous',
+          }),
+        );
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(result.status).toBe('real_pending');
+      });
+
+      it('window is clamped to a 30_000ms floor: a raw config of 1000ms still treats a 20_000ms-old snapshot as fresh', async () => {
+        kv.get.mockImplementation((key: string) => {
+          if (key === 'execution.real') return Promise.resolve('true');
+          if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+          if (key === 'execution.max_order_notional') return Promise.resolve('1000');
+          if (key === 'strategy.applied') return Promise.resolve('s_live');
+          if (key === 'execution.real_state_max_age_ms') return Promise.resolve('1000'); // below floor
+          return Promise.resolve(null);
+        });
+        mockRobustAppliedStrategy(prisma);
+        mockRealAccountState(prisma, { ts: new Date(Date.now() - 20_000) }); // 20s old
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockPaperPortfolio(prisma);
+        mockAaplQuote(gateway);
+        realOrderService.submit.mockResolvedValue({
+          id: 'ro_clamp_floor',
+          status: 'submitted',
+          client_order_id: 'nt-ti_001-clampfloor',
+          broker_order_id: 'order_clampfloor',
+          error: null,
+        });
+        prisma.tradeIntent.update.mockResolvedValue(
+          pendingIntent({
+            status: 'real_pending',
+            fill_price: null,
+            quantity: null,
+            decided_by: 'autonomous',
+          }),
+        );
+
+        const result = await service.autoProcess('ti_001');
+
+        // If the raw 1000ms had been used unclamped, a 20s-old snapshot would be stale and
+        // this order would be rejected. Clamping to the 30_000ms floor keeps it fresh.
+        expect(result.status).toBe('real_pending');
+      });
+
+      it('window is clamped to a 3_600_000ms ceiling: a raw config far above it still rejects a snapshot older than 1h', async () => {
+        kv.get.mockImplementation((key: string) => {
+          if (key === 'execution.real') return Promise.resolve('true');
+          if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+          if (key === 'execution.max_order_notional') return Promise.resolve('1000');
+          if (key === 'strategy.applied') return Promise.resolve('s_live');
+          if (key === 'execution.real_state_max_age_ms') return Promise.resolve('99999999'); // above ceiling
+          return Promise.resolve(null);
+        });
+        mockRobustAppliedStrategy(prisma);
+        mockRealAccountState(prisma, { ts: new Date(Date.now() - 4_000_000) }); // ~66.6 min old
+        prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
+        mockPaperPortfolio(prisma);
+        mockAaplQuote(gateway);
+        const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+        prisma.tradeIntent.update.mockResolvedValue(failed);
+
+        const result = await service.autoProcess('ti_001');
+
+        // Without the 3_600_000ms ceiling clamp, the raw 99_999_999ms config would treat this
+        // snapshot as fresh. Clamping to the ceiling correctly rejects it as stale.
+        expect(gateway.getQuote).not.toHaveBeenCalled();
+        expect(realOrderService.submit).not.toHaveBeenCalled();
+        expect(result.status).toBe('failed');
+      });
+
+      it('non-finite/garbage config falls back to the 300_000ms default window', async () => {
+        kv.get.mockImplementation((key: string) => {
+          if (key === 'execution.real') return Promise.resolve('true');
+          if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+          if (key === 'execution.max_order_notional') return Promise.resolve('1000');
+          if (key === 'strategy.applied') return Promise.resolve('s_live');
+          if (key === 'execution.real_state_max_age_ms') return Promise.resolve('not-a-number');
+          return Promise.resolve(null);
+        });
+        mockRobustAppliedStrategy(prisma);
+        mockRealAccountState(prisma, { ts: new Date(Date.now() - 400_000) }); // 400s old > 300s default
+        prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
+        mockPaperPortfolio(prisma);
+        mockAaplQuote(gateway);
+        const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+        prisma.tradeIntent.update.mockResolvedValue(failed);
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(gateway.getQuote).not.toHaveBeenCalled();
+        expect(realOrderService.submit).not.toHaveBeenCalled();
+        expect(result.status).toBe('failed');
+      });
+    });
+
+    // ── Fix 2: real sizing must be equity-based, capped by buying power, finite-guarded ──
+    describe('equity-based real sizing capped by buying power (Fix 2)', () => {
+      it('real long sizes to floor(equity * max_position_pct / price), NOT buying_power, even when buying_power is much larger', async () => {
+        enableReal(kv, prisma);
+        // equity=3_000, buying_power=30_000 (10x). If sized off buying_power, qty would be
+        // floor(30000*0.1/150)=20. Equity-based: floor(3000*0.1/150)=2.
+        mockRealAccountState(prisma, { equity: 3_000, hwm: 3_000, buying_power: 30_000 });
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockAaplQuote(gateway); // price=150
+        realOrderService.submit.mockResolvedValue({
+          id: 'ro_equity_sizing',
+          status: 'submitted',
+          client_order_id: 'nt-ti_001-equity',
+          broker_order_id: 'order_equity',
+          error: null,
+        });
+        prisma.tradeIntent.update.mockResolvedValue(
+          pendingIntent({
+            status: 'real_pending',
+            fill_price: null,
+            quantity: null,
+            decided_by: 'autonomous',
+          }),
+        );
+
+        await service.autoProcess('ti_001');
+
+        expect(realOrderService.submit).toHaveBeenCalledWith(
+          oc({ symbol: 'AAPL', side: 'buy', requestedQty: 2 }),
+        );
+      });
+
+      it('real short sizes to floor(equity * max_position_pct / price), NOT buying_power', async () => {
+        enableReal(kv, prisma);
+        mockRealAccountState(prisma, { equity: 3_000, hwm: 3_000, buying_power: 30_000 });
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'short', symbol: 'AAPL' }),
+        );
+        mockAaplQuote(gateway); // price=150
+        realOrderService.submit.mockResolvedValue({
+          id: 'ro_equity_sizing_short',
+          status: 'submitted',
+          client_order_id: 'nt-ti_001-equity-short',
+          broker_order_id: 'order_equity_short',
+          error: null,
+        });
+        prisma.tradeIntent.update.mockResolvedValue(
+          pendingIntent({
+            status: 'real_pending',
+            fill_price: null,
+            quantity: null,
+            decided_by: 'autonomous',
+          }),
+        );
+
+        await service.autoProcess('ti_001');
+
+        expect(realOrderService.submit).toHaveBeenCalledWith(
+          oc({ symbol: 'AAPL', side: 'sell', requestedQty: 2 }),
+        );
+      });
+
+      it('qty is capped down to floor(buying_power / price) when the equity-based qty would exceed buying_power (never increased above the equity ceiling)', async () => {
+        enableReal(kv, prisma);
+        // equity=100_000 (huge), buying_power=200 (tiny). Equity-based qty = floor(100000*0.1/150)=66,
+        // but buying_power only allows floor(200/150)=1. Must be capped down to 1.
+        mockRealAccountState(prisma, { equity: 100_000, hwm: 100_000, buying_power: 200 });
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockAaplQuote(gateway); // price=150
+        realOrderService.submit.mockResolvedValue({
+          id: 'ro_bp_cap',
+          status: 'submitted',
+          client_order_id: 'nt-ti_001-bpcap',
+          broker_order_id: 'order_bpcap',
+          error: null,
+        });
+        prisma.tradeIntent.update.mockResolvedValue(
+          pendingIntent({
+            status: 'real_pending',
+            fill_price: null,
+            quantity: null,
+            decided_by: 'autonomous',
+          }),
+        );
+
+        await service.autoProcess('ti_001');
+
+        expect(realOrderService.submit).toHaveBeenCalledWith(
+          oc({ symbol: 'AAPL', side: 'buy', requestedQty: 1 }),
+        );
+      });
+
+      it('non-finite equity (NaN) FAILS CLOSED before any arithmetic — no order placed', async () => {
+        enableReal(kv, prisma);
+        mockRealAccountState(prisma, { equity: Number.NaN, hwm: 10_000, buying_power: 10_000 });
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockAaplQuote(gateway);
+        const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+        prisma.tradeIntent.update.mockResolvedValue(failed);
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(realOrderService.submit).not.toHaveBeenCalled();
+        expect(result.status).toBe('failed');
+        expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+          oc({
+            data: oc({
+              status: 'failed',
+              result_json: expect.stringContaining('non-finite') as string,
+            }),
+          }),
+        );
+      });
+
+      it('non-finite buyingPower (Infinity) FAILS CLOSED — no order placed', async () => {
+        enableReal(kv, prisma);
+        mockRealAccountState(prisma, {
+          equity: 10_000,
+          hwm: 10_000,
+          buying_power: Number.POSITIVE_INFINITY,
+        });
+        prisma.tradeIntent.findUnique.mockResolvedValue(
+          pendingIntent({ action: 'long', symbol: 'AAPL' }),
+        );
+        mockAaplQuote(gateway);
+        const failed = pendingIntent({ status: 'failed', decided_by: 'autonomous' });
+        prisma.tradeIntent.update.mockResolvedValue(failed);
+
+        const result = await service.autoProcess('ti_001');
+
+        expect(realOrderService.submit).not.toHaveBeenCalled();
+        expect(result.status).toBe('failed');
+        expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+          oc({
+            data: oc({
+              status: 'failed',
+              result_json: expect.stringContaining('non-finite') as string,
+            }),
+          }),
+        );
       });
     });
   });
@@ -2037,6 +2667,7 @@ describe('TradeIntentService', () => {
     it('applied strategy ROBUSTO + fresh timestamp → effective mode real, real order placed', async () => {
       enableRealNoGate(kv, { 'strategy.applied': 's_live' });
       mockRobustAppliedStrategy(prisma, 'ROBUSTO', new Date());
+      mockRealAccountState(prisma);
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
       );
@@ -2131,6 +2762,7 @@ describe('TradeIntentService', () => {
         'execution.walk_forward_max_age_days': '60',
       });
       mockRobustAppliedStrategy(prisma, 'ROBUSTO', aged);
+      mockRealAccountState(prisma);
       prisma.tradeIntent.findUnique.mockResolvedValue(
         pendingIntent({ action: 'long', symbol: 'AAPL' }),
       );
