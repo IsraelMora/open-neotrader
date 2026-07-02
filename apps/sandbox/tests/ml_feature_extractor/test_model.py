@@ -15,8 +15,7 @@ import hashlib
 import importlib
 import importlib.util
 import io
-import os
-import sys
+import json
 from pathlib import Path
 from typing import Any
 
@@ -47,9 +46,6 @@ def model():
 # ---------------------------------------------------------------------------
 # Helpers to build minimal training rows
 # ---------------------------------------------------------------------------
-import json
-
-
 def _make_rows(n: int, plugin_ids: list[str], two_class: bool = True) -> list[dict]:
     """
     Build n synthetic MlSignalRow-like dicts for testing.
@@ -71,7 +67,9 @@ def _make_rows(n: int, plugin_ids: list[str], two_class: bool = True) -> list[di
                 "skill_vector": json.dumps(sv),
                 "action": "buy",
                 "outcome_pnl": pnl,
-                "active_skill_hash": hashlib.sha256(",".join(sorted(plugin_ids)).encode()).hexdigest()[:16],
+                "active_skill_hash": hashlib.sha256(
+                    ",".join(sorted(plugin_ids)).encode()
+                ).hexdigest()[:16],
             }
         )
     return rows
@@ -312,7 +310,7 @@ def test_active_skill_hash_parity(model):
     # Expected: sha256(','.join(sorted(['skill-a', 'skill-b', 'skill-c']))) hex [:16]
     # sorted(['skill-a', 'skill-b', 'skill-c']) → ['skill-a', 'skill-b', 'skill-c']
     # joined: 'skill-a,skill-b,skill-c'
-    expected = hashlib.sha256("skill-a,skill-b,skill-c".encode()).hexdigest()[:16]
+    expected = hashlib.sha256(b"skill-a,skill-b,skill-c").hexdigest()[:16]
 
     # Python model.py's compute_active_skill_hash must produce the same value
     result = model.compute_active_skill_hash(ids)
@@ -327,7 +325,7 @@ def test_active_skill_hash_parity(model):
     )
 
     # Edge case: empty id set
-    empty_expected = hashlib.sha256("".encode()).hexdigest()[:16]
+    empty_expected = hashlib.sha256(b"").hexdigest()[:16]
     assert model.compute_active_skill_hash([]) == empty_expected
 
     # Verify the hardcoded expected against the formula itself
@@ -360,7 +358,7 @@ def test_train_uses_row_hash_not_feature_names_hash(model):
     GREEN: model.py reads rows[0]['active_skill_hash'] verbatim.
     """
     # Use a realistic 16-char hash (simulating a set that includes a signal-silent skill)
-    stored_hash = hashlib.sha256("skill-a,skill-b,skill-silent".encode()).hexdigest()[:16]
+    stored_hash = hashlib.sha256(b"skill-a,skill-b,skill-silent").hexdigest()[:16]
     rows = _make_rows(60, ["skill-a", "skill-b"])
     # Stamp every row with the stored_hash (as s1 capture does)
     for r in rows:

@@ -12,16 +12,17 @@ Output contract:
 from __future__ import annotations
 
 import math
-import sys
 import os
-import pytest
+import sys
 
 
 # Load THIS plugin's cycle.py under a unique module name (every plugin's hook is
 # named cycle.py → a bare `from cycle import` collides via sys.modules across the
 # full pytest session, the same way runner.py avoids it with unique spec names).
 def _load_on_cycle(_plugin):
-    import importlib.util as _ilu, os as _os, sys as _sys
+    import importlib.util as _ilu
+    import os as _os
+    import sys as _sys
     _root = _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "..", "plugins", _plugin)
     _sc = _os.path.join(_root, "scripts")
     if _sc not in _sys.path:
@@ -45,7 +46,6 @@ sys.path.insert(0, os.path.join(PLUGIN_ROOT, "hooks"))
 
 def _spy_closes(n: int = 300, trend: str = "up") -> list[float]:
     """Generate synthetic SPY closes."""
-    import math
     closes = []
     for i in range(n):
         if trend == "up":
@@ -79,7 +79,9 @@ def _make_ctx(
 
     ctx: dict = {
         "config": config or {},
-        "provider_tools": {"get_ohlcv": fake_get_ohlcv} if provider_gives_data else {"get_ohlcv": None},
+        "provider_tools": (
+            {"get_ohlcv": fake_get_ohlcv} if provider_gives_data else {"get_ohlcv": None}
+        ),
         "emit_alerts": [],
     }
     if advances is not None:

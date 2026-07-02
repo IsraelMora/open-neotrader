@@ -133,8 +133,8 @@ def install_open_guard(allowed_roots: list[Path]) -> None:
         if isinstance(file, (str, Path, bytes)):
             try:
                 target = Path(file).resolve()
-            except Exception:
-                raise PermissionError(f"[sandbox] Cannot resolve path: {file!r}")
+            except Exception as exc:
+                raise PermissionError(f"[sandbox] Cannot resolve path: {file!r}") from exc
 
             # Allow reads under any allowed root
             if "w" not in mode and "a" not in mode and "x" not in mode:

@@ -5,7 +5,8 @@ STRICT TDD — RED first. These tests are written against the NEW contract BEFOR
 the implementation is updated.
 
 New contract:
-  INPUT  {"cmd":"run_cycle","active_ids":[...],"context":{"cycle_id":..,"universe":[...],"ohlcv":{SYM:[bar,...]},"portfolio":{...},"config":{...}}}
+  INPUT  {"cmd":"run_cycle","active_ids":[...],"context":{"cycle_id":..,"universe":[...],
+          "ohlcv":{SYM:[bar,...]},"portfolio":{...},"config":{...}}}
   LOGIC  skill plugins (type=skill, hooks/cycle.py on_cycle) → pending_signals
          discipline plugins (type=discipline, hooks/cycle.py on_cycle) → filter/size signals
   OUTPUT {"universe":[...],"pending_signals":[...],"signals":[...],"logs":[...],"errors":[]}
@@ -19,7 +20,6 @@ no network calls are made.
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
 from pathlib import Path
 
@@ -241,7 +241,9 @@ class TestRunCycleWithRealPlugins:
             },
         )
         # No errors — skipping is silent
-        assert result["errors"] == [], f"Expected no errors skipping decision; got {result['errors']}"
+        assert result["errors"] == [], (
+            f"Expected no errors skipping decision; got {result['errors']}"
+        )
         # No signals emitted (decision has no cycle hook)
         assert result["pending_signals"] == []
 
@@ -350,11 +352,10 @@ class TestRunCycleProviderTools:
         Run cmd_run_cycle with a fake skill plugin that captures provider_tools,
         then return the captured get_ohlcv callable.
         """
-        captured = {}
-
         # We monkeypatch PLUGINS_DIR to a fake tree with one plugin whose
         # hooks/cycle.py captures provider_tools
-        import tempfile, textwrap, tomllib
+        import tempfile
+        import textwrap
         from pathlib import Path
 
         tmp = Path(tempfile.mkdtemp())
@@ -411,7 +412,7 @@ class TestRunCycleProviderTools:
 
     def test_get_ohlcv_limit_slices_tail(self, tmp_path, monkeypatch):
         """get_ohlcv(symbol=X, limit=N) returns the LAST N bars of the injected data."""
-        import textwrap, tomllib
+        import textwrap
 
         pid = "limit-test"
         pdir = tmp_path / pid
@@ -539,7 +540,10 @@ class TestRunCycleErrorIsolation:
         (s_dir / "hooks" / "cycle.py").write_text(
             textwrap.dedent("""\
                 def on_cycle(ctx):
-                    return {"signals": [{"type": "t", "symbol": "AAA", "action": "long"}], "logs": []}
+                    return {
+                        "signals": [{"type": "t", "symbol": "AAA", "action": "long"}],
+                        "logs": [],
+                    }
             """),
             encoding="utf-8",
         )

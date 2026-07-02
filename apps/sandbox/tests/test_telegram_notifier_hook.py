@@ -8,7 +8,6 @@ D1.3: no signals in ctx → notify_intents absent or empty.
 from __future__ import annotations
 
 import importlib.util
-import sys
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).parents[3] / "plugins" / "telegram-notifier"
@@ -29,7 +28,7 @@ def _load_on_cycle():
 # ── D1.1 ──────────────────────────────────────────────────────────────────────
 
 def test_signal_above_threshold_emits_notify_intent():
-    """D1.1 — signal with confidence=0.85 above min_confidence=0.7 → notify_intents has telegram entry."""
+    """D1.1 — confidence=0.85 above min_confidence=0.7 → notify_intents has telegram entry."""
     mod = _load_on_cycle()
 
     ctx = {

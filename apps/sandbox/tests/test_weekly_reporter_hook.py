@@ -10,7 +10,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-
 PLUGIN_DIR = Path(__file__).parents[3] / "plugins" / "weekly-reporter"
 
 
@@ -41,7 +40,8 @@ def test_weekly_reporter_on_cycle_importable():
     """A1.6 — plugins/weekly-reporter/hooks/on_cycle.py must exist and expose on_cycle()."""
     mod = _load_on_cycle()
     assert hasattr(mod, "on_cycle"), (
-        "on_cycle function not found in hooks/on_cycle.py — was 'def run' renamed to 'def on_cycle'?"
+        "on_cycle function not found in hooks/on_cycle.py — "
+        "was 'def run' renamed to 'def on_cycle'?"
     )
 
 

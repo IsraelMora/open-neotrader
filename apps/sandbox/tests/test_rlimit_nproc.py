@@ -91,7 +91,12 @@ print(result)
 """
 
 
-def _run_script(script: str, env_overrides: dict | None = None, env_remove: list[str] | None = None, **kwargs):
+def _run_script(
+    script: str,
+    env_overrides: dict | None = None,
+    env_remove: list[str] | None = None,
+    **kwargs,
+):
     """Run a Python script string in a subprocess and return the result."""
     env = os.environ.copy()
     if env_overrides:
@@ -245,8 +250,8 @@ class TestRlimitNproc:
         if not _has_rlimit_nproc():
             pytest.skip("RLIMIT_NPROC not available on this platform")
 
-        import subprocess as _sp
         import os as _os
+        import subprocess as _sp
         try:
             uid_proc_count = int(_sp.check_output(
                 ["sh", "-c", f"ps -u {_os.getuid()} | wc -l"],

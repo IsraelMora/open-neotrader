@@ -1,9 +1,9 @@
 """Shared fixtures for backtester plugin tests."""
 from __future__ import annotations
 
-import sys
 import importlib
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest

@@ -33,7 +33,14 @@ def engine():
 
 
 def _bar(date: str, open_: float, close: float) -> dict:
-    return {"date": date, "open": open_, "high": max(open_, close) + 1, "low": min(open_, close) - 1, "close": close, "volume": 1000.0}
+    return {
+        "date": date,
+        "open": open_,
+        "high": max(open_, close) + 1,
+        "low": min(open_, close) - 1,
+        "close": close,
+        "volume": 1000.0,
+    }
 
 
 def _series(start: datetime.date, n: int, open_fn, close_fn) -> list[dict]:
@@ -270,7 +277,9 @@ class TestBuyAndHoldBenchmark:
         result = engine.run_backtest([], {"AAA": bars}, {"initial_capital": 10000})
         # Flat strategy (0%) in a +100% market ⇒ alpha ≈ -100%.
         assert result.buy_hold_return_pct == pytest.approx(100.0, abs=0.01)
-        assert result.alpha_pct == pytest.approx(result.total_return_pct - result.buy_hold_return_pct, abs=0.01)
+        assert result.alpha_pct == pytest.approx(
+            result.total_return_pct - result.buy_hold_return_pct, abs=0.01
+        )
         assert result.alpha_pct < 0.0
 
     def test_multi_symbol_buy_hold_is_equal_weight(self, engine):

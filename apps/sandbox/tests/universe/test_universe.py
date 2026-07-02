@@ -11,8 +11,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import pytest
-
 # ---------------------------------------------------------------------------
 # Helpers to load the plugin hook and scripts without installing the package
 # ---------------------------------------------------------------------------

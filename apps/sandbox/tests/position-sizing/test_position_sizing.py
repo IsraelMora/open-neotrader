@@ -14,8 +14,8 @@ Modes tested:
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 
 import pytest
 
@@ -32,16 +32,17 @@ _HOOKS = os.path.join(_PLUGIN_ROOT, "hooks")
 sys.path.insert(0, _SCRIPTS)
 sys.path.insert(0, _HOOKS)
 
-from sizing import compute_kelly, stats_from_trades, position_size  # noqa: E402
-from pyramid import calculate_tranches, evaluate_add                 # noqa: E402
-import cycle                                                          # noqa: E402
-
+import cycle  # noqa: E402
+from pyramid import calculate_tranches  # noqa: E402
+from sizing import compute_kelly, position_size, stats_from_trades  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers — synthetic trade history
 # ---------------------------------------------------------------------------
 
-def _trades(n_wins: int, n_losses: int, avg_win_pct: float = 3.0, avg_loss_pct: float = 1.5) -> list[dict]:
+def _trades(
+    n_wins: int, n_losses: int, avg_win_pct: float = 3.0, avg_loss_pct: float = 1.5
+) -> list[dict]:
     """Build a deterministic trade history with the given win/loss profile."""
     trades = []
     for _ in range(n_wins):
@@ -402,10 +403,15 @@ class TestEdgeCases:
 
         # At least one log must mention safety / insufficient history
         logs = result["logs"]
-        safety_logs = [l for l in logs if "seguro" in l["msg"].lower() or "safety" in l["msg"].lower()
-                       or "mínimo" in l["msg"].lower() or "minimum" in l["msg"].lower()
-                       or "insuficiente" in l["msg"].lower() or "insufficient" in l["msg"].lower()]
-        assert len(safety_logs) > 0, f"Expected a safety/warning log. Got: {[l['msg'] for l in logs]}"
+        safety_logs = [
+            log for log in logs
+            if "seguro" in log["msg"].lower() or "safety" in log["msg"].lower()
+            or "mínimo" in log["msg"].lower() or "minimum" in log["msg"].lower()
+            or "insuficiente" in log["msg"].lower() or "insufficient" in log["msg"].lower()
+        ]
+        assert len(safety_logs) > 0, (
+            f"Expected a safety/warning log. Got: {[log['msg'] for log in logs]}"
+        )
 
     def test_e_no_trade_history_fixed_mode_works(self) -> None:
         """Fixed mode must work with 0 trade history — no crash, correct sizing."""

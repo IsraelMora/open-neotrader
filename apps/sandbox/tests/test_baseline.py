@@ -7,7 +7,6 @@ This is the first TDD test for the sandbox test harness (F1 PR1).
 import importlib.util
 from pathlib import Path
 
-
 RUNNER_PATH = Path(__file__).parent.parent / "runner.py"
 
 

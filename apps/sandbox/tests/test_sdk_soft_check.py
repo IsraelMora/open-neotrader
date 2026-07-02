@@ -24,11 +24,8 @@ AC-13: check NEVER raises, NEVER sets ok:false
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
-import tomllib
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -243,7 +240,9 @@ class TestSdkVersionWarning:
             try:
                 mod._sdk_version_warning(m)
             except Exception as e:
-                pytest.fail(f"_sdk_version_warning raised {type(e).__name__}: {e!r} for manifest={m!r}")
+                pytest.fail(
+                    f"_sdk_version_warning raised {type(e).__name__}: {e!r} for manifest={m!r}"
+                )
 
 
 # ── Integration tests: cmd_run_hook + cmd_run_cycle ──────────────────────────
@@ -272,7 +271,7 @@ class TestSdkSoftCheckIntegration:
         return {"plugin": plugin_section}
 
     def test_run_hook_warns_when_min_greater_than_installed(self, monkeypatch):
-        """AC-9: cmd_run_hook with min_sdk_version > installed → warnings non-empty; hook still ran."""
+        """AC-9: cmd_run_hook with min_sdk_version > installed → warnings non-empty; hook ran."""
         mod = _load_runner()
         plugin_id = "sdk-check-test"
 
@@ -297,7 +296,9 @@ class TestSdkSoftCheckIntegration:
         result = mod.cmd_run_hook(req)
 
         assert "warnings" in result, f"Expected 'warnings' key; got: {list(result)}"
-        assert len(result["warnings"]) > 0, f"Expected non-empty warnings; got: {result['warnings']}"
+        assert len(result["warnings"]) > 0, (
+            f"Expected non-empty warnings; got: {result['warnings']}"
+        )
 
     def test_run_hook_no_warning_when_min_satisfied(self, monkeypatch):
         """AC-10: min_sdk_version == installed → no warnings."""
@@ -361,7 +362,7 @@ class TestSdkSoftCheckIntegration:
             pass
 
         fake_mod_inst = FakeMod()
-        setattr(fake_mod_inst, "run_discipline", fake_run_discipline)
+        fake_mod_inst.run_discipline = fake_run_discipline
         monkeypatch.setattr(mod, "_load_module", lambda _pid: fake_mod_inst)
 
         req = {"cmd": "run_cycle", "active_ids": [plugin_id], "context": {}}
