@@ -913,3 +913,363 @@ describe('RealBrokerReconciliationService — steady-state loop', () => {
     expect(reconcileAllSpy).toHaveBeenCalledTimes(1);
   });
 });
+
+// ── syncPortfolio / detectDrift ─────────────────────────────────────────────
+//
+// Slice 3: portfolio-level sync (full-replace RealPosition cache + monotonic
+// RealNavSnapshot) and unexplained-position drift detection. Uses a dedicated
+// prisma/tx mock builder (makePortfolioPrisma/makePortfolioTxClient) because
+// this area of the service touches realPosition/realNavSnapshot delegates the
+// order-reconciliation mocks above don't model.
+
+type BrokerPosition = {
+  symbol: string;
+  qty: number;
+  avg_entry: number;
+  market_value: number;
+  unrealized_pnl: number;
+  side: 'long' | 'short';
+};
+
+type Portfolio = {
+  provider_id: string;
+  equity: number;
+  cash: number;
+  buying_power: number;
+  positions: BrokerPosition[];
+  total_market_value: number;
+  total_pnl: number;
+  ts: string;
+};
+
+function makeBrokerPosition(overrides: Partial<BrokerPosition> = {}): BrokerPosition {
+  return {
+    symbol: 'AAPL',
+    qty: 10,
+    avg_entry: 150,
+    market_value: 1550,
+    unrealized_pnl: 50,
+    side: 'long',
+    ...overrides,
+  };
+}
+
+function makePortfolio(overrides: Partial<Portfolio> = {}): Portfolio {
+  return {
+    provider_id: 'alpaca',
+    equity: 10000,
+    cash: 5000,
+    buying_power: 10000,
+    positions: [],
+    total_market_value: 0,
+    total_pnl: 0,
+    ts: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+type PortfolioTxClient = {
+  realPosition: { deleteMany: jest.Mock; upsert: jest.Mock };
+  realNavSnapshot: { findFirst: jest.Mock; create: jest.Mock };
+};
+
+function makePortfolioTxClient(opts?: {
+  prevSnapshot?: { hwm: number } | null;
+}): PortfolioTxClient {
+  return {
+    realPosition: {
+      deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      upsert: jest.fn().mockResolvedValue(undefined),
+    },
+    realNavSnapshot: {
+      findFirst: jest.fn().mockResolvedValue(opts?.prevSnapshot ?? null),
+      create: jest.fn().mockResolvedValue(undefined),
+    },
+  };
+}
+
+function makePortfolioPrisma(opts?: {
+  txClient?: PortfolioTxClient;
+  realOrderFindFirstResult?: unknown;
+}): jest.Mocked<Pick<PrismaService, 'realOrder' | '$transaction'>> & {
+  _tx: PortfolioTxClient;
+} {
+  const txClient = opts?.txClient ?? makePortfolioTxClient();
+  const realOrderFindFirstResult =
+    opts && 'realOrderFindFirstResult' in opts
+      ? opts.realOrderFindFirstResult
+      : { id: 'ro_explained' };
+  const realOrder = {
+    findFirst: jest.fn().mockResolvedValue(realOrderFindFirstResult),
+  };
+  const $transaction = jest
+    .fn()
+    .mockImplementation(async (fn: (tx: PortfolioTxClient) => Promise<void>) => fn(txClient));
+
+  return {
+    realOrder,
+    $transaction,
+    _tx: txClient,
+  } as unknown as jest.Mocked<Pick<PrismaService, 'realOrder' | '$transaction'>> & {
+    _tx: PortfolioTxClient;
+  };
+}
+
+function makePortfolioGateway(opts?: {
+  getPortfolioResult?: Portfolio;
+  getPortfolioThrows?: Error;
+}): jest.Mocked<Pick<ProviderGatewayService, 'getPortfolio'>> {
+  const getPortfolio = opts?.getPortfolioThrows
+    ? jest.fn().mockRejectedValue(opts.getPortfolioThrows)
+    : jest.fn().mockResolvedValue(opts?.getPortfolioResult ?? makePortfolio());
+  return { getPortfolio };
+}
+
+function makePortfolioAlerts(opts?: {
+  getActiveResult?: { type: string; symbol: string | null }[];
+}): jest.Mocked<Pick<AlertsService, 'create' | 'getActive'>> {
+  return {
+    create: jest.fn().mockResolvedValue({ id: 'alert_1' }),
+    getActive: jest.fn().mockResolvedValue(opts?.getActiveResult ?? []),
+  };
+}
+
+/**
+ * Reuses makeService's generic (unknown-cast) constructor wiring — the
+ * portfolio-sync mocks (makePortfolioPrisma/makePortfolioGateway/
+ * makePortfolioAlerts) have a different shape than the order-reconciliation
+ * ones above, but makeService's signature is structural, not nominal, so it
+ * accepts either.
+ */
+function makePortfolioService(
+  prisma: ReturnType<typeof makePortfolioPrisma>,
+  gateway: ReturnType<typeof makePortfolioGateway>,
+  kv: ReturnType<typeof makeKv> = makeKv(),
+  alerts: ReturnType<typeof makePortfolioAlerts> = makePortfolioAlerts(),
+): RealBrokerReconciliationService {
+  return makeService(
+    prisma as unknown as ReturnType<typeof makePrisma>,
+    gateway as unknown as ReturnType<typeof makeGateway>,
+    kv,
+    alerts,
+  );
+}
+
+describe('RealBrokerReconciliationService.syncPortfolio — full-replace transaction', () => {
+  it('broker returns {A,B}, cache has stale {C} → after sync cache is upserted to {A,B} and C is deleted, all inside ONE $transaction call', async () => {
+    const txClient = makePortfolioTxClient();
+    const prisma = makePortfolioPrisma({ txClient });
+    const portfolio = makePortfolio({
+      positions: [makeBrokerPosition({ symbol: 'A' }), makeBrokerPosition({ symbol: 'B' })],
+    });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const svc = makePortfolioService(prisma, gateway);
+
+    await svc.syncPortfolio('alpaca', 'poll');
+
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(txClient.realPosition.deleteMany).toHaveBeenCalledWith({
+      where: { broker_plugin_id: 'alpaca', symbol: { notIn: ['A', 'B'] } },
+    });
+    expect(txClient.realPosition.upsert).toHaveBeenCalledTimes(2);
+    const upsertSymbols = txClient.realPosition.upsert.mock.calls.map(
+      (call: [{ where: { symbol: string } }]) => call[0].where.symbol,
+    );
+    expect(upsertSymbols).toEqual(['A', 'B']);
+  });
+});
+
+describe('RealBrokerReconciliationService.syncPortfolio — monotonic HWM', () => {
+  it('first sync (no prior snapshot) with equity 100 → hwm 100', async () => {
+    const txClient = makePortfolioTxClient({ prevSnapshot: null });
+    const prisma = makePortfolioPrisma({ txClient });
+    const gateway = makePortfolioGateway({ getPortfolioResult: makePortfolio({ equity: 100 }) });
+    const svc = makePortfolioService(prisma, gateway);
+
+    await svc.syncPortfolio('alpaca', 'poll');
+
+    const createArgs = callArg<{ data: { hwm: number; equity: number } }>(
+      txClient.realNavSnapshot.create,
+    );
+    expect(createArgs.data.equity).toBeCloseTo(100);
+    expect(createArgs.data.hwm).toBeCloseTo(100);
+  });
+
+  it('equity drops to 80 with prior hwm 100 → snapshot hwm stays 100 (never regresses)', async () => {
+    const txClient = makePortfolioTxClient({ prevSnapshot: { hwm: 100 } });
+    const prisma = makePortfolioPrisma({ txClient });
+    const gateway = makePortfolioGateway({ getPortfolioResult: makePortfolio({ equity: 80 }) });
+    const svc = makePortfolioService(prisma, gateway);
+
+    await svc.syncPortfolio('alpaca', 'poll');
+
+    const createArgs = callArg<{ data: { hwm: number; equity: number } }>(
+      txClient.realNavSnapshot.create,
+    );
+    expect(createArgs.data.equity).toBeCloseTo(80);
+    expect(createArgs.data.hwm).toBeCloseTo(100);
+  });
+
+  it('equity rises to 120 with prior hwm 100 → snapshot hwm advances to 120', async () => {
+    const txClient = makePortfolioTxClient({ prevSnapshot: { hwm: 100 } });
+    const prisma = makePortfolioPrisma({ txClient });
+    const gateway = makePortfolioGateway({ getPortfolioResult: makePortfolio({ equity: 120 }) });
+    const svc = makePortfolioService(prisma, gateway);
+
+    await svc.syncPortfolio('alpaca', 'poll');
+
+    const createArgs = callArg<{ data: { hwm: number; equity: number } }>(
+      txClient.realNavSnapshot.create,
+    );
+    expect(createArgs.data.equity).toBeCloseTo(120);
+    expect(createArgs.data.hwm).toBeCloseTo(120);
+  });
+});
+
+describe('RealBrokerReconciliationService.syncPortfolio — fail-soft on broker error', () => {
+  it('getPortfolio throws → no RealPosition/RealNavSnapshot writes, no exception escapes', async () => {
+    const txClient = makePortfolioTxClient();
+    const prisma = makePortfolioPrisma({ txClient });
+    const gateway = makePortfolioGateway({ getPortfolioThrows: new Error('broker down') });
+    const svc = makePortfolioService(prisma, gateway);
+
+    const result = await svc.syncPortfolio('alpaca', 'poll');
+
+    expect(result).toEqual({ driftedSymbols: [] });
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(txClient.realPosition.upsert).not.toHaveBeenCalled();
+    expect(txClient.realPosition.deleteMany).not.toHaveBeenCalled();
+    expect(txClient.realNavSnapshot.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('RealBrokerReconciliationService.detectDrift', () => {
+  it('broker position with no filled/partially_filled RealOrder history → CRITICAL BROKER_DRIFT alert with symbol+qty, RealPosition cache still updated', async () => {
+    const txClient = makePortfolioTxClient();
+    const prisma = makePortfolioPrisma({ txClient, realOrderFindFirstResult: null });
+    const portfolio = makePortfolio({
+      positions: [makeBrokerPosition({ symbol: 'X', qty: 7 })],
+    });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const alerts = makePortfolioAlerts();
+    const svc = makePortfolioService(prisma, gateway, makeKv(), alerts);
+
+    const result = await svc.syncPortfolio('alpaca', 'poll');
+
+    expect(result.driftedSymbols).toEqual(['X']);
+    expect(alerts.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'BROKER_DRIFT',
+        severity: 'CRITICAL',
+        symbol: 'X',
+        message: expect.stringContaining('7') as unknown,
+      }) as unknown,
+    );
+    // Cache still updated to broker truth regardless of drift.
+    expect(txClient.realPosition.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { symbol: 'X' } }) as unknown,
+    );
+  });
+
+  it('an explained position (filled RealOrder exists for the symbol) is never flagged as drift', async () => {
+    const txClient = makePortfolioTxClient();
+    const prisma = makePortfolioPrisma({ txClient, realOrderFindFirstResult: { id: 'ro_1' } });
+    const portfolio = makePortfolio({ positions: [makeBrokerPosition({ symbol: 'Y' })] });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const alerts = makePortfolioAlerts();
+    const svc = makePortfolioService(prisma, gateway, makeKv(), alerts);
+
+    const result = await svc.syncPortfolio('alpaca', 'poll');
+
+    expect(result.driftedSymbols).toEqual([]);
+    expect(alerts.create).not.toHaveBeenCalled();
+  });
+
+  it('re-running sync with the same still-open drift does NOT create a duplicate alert', async () => {
+    const txClient = makePortfolioTxClient();
+    const prisma = makePortfolioPrisma({ txClient, realOrderFindFirstResult: null });
+    const portfolio = makePortfolio({ positions: [makeBrokerPosition({ symbol: 'X' })] });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    // Simulates the alert already existing/unresolved from a prior sync.
+    const alerts = makePortfolioAlerts({
+      getActiveResult: [{ type: 'BROKER_DRIFT', symbol: 'X' }],
+    });
+    const svc = makePortfolioService(prisma, gateway, makeKv(), alerts);
+
+    const result = await svc.syncPortfolio('alpaca', 'poll');
+
+    expect(result.driftedSymbols).toEqual(['X']);
+    expect(alerts.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('RealBrokerReconciliationService — portfolio sync wiring into the reconciliation loop', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('no broker configured (execution.broker_plugin_id empty) → onModuleInit skips syncPortfolio cleanly: no getPortfolio call, no alert calls', async () => {
+    const prisma = makePortfolioPrisma();
+    const gateway = makePortfolioGateway();
+    const kv = makeKv({ 'execution.broker_plugin_id': '' });
+    const alerts = makePortfolioAlerts();
+    const svc = makePortfolioService(prisma, gateway, kv, alerts);
+    jest.spyOn(svc, 'reconcileAllOpenOrders').mockResolvedValue(undefined);
+
+    await svc.onModuleInit();
+
+    expect(gateway.getPortfolio).not.toHaveBeenCalled();
+    expect(alerts.create).not.toHaveBeenCalled();
+    expect(alerts.getActive).not.toHaveBeenCalled();
+
+    svc.onModuleDestroy();
+  });
+
+  it('broker configured → onModuleInit calls syncPortfolio once at startup with source=startup_reconcile', async () => {
+    const prisma = makePortfolioPrisma();
+    const gateway = makePortfolioGateway({ getPortfolioResult: makePortfolio() });
+    const kv = makeKv({ 'execution.broker_plugin_id': 'alpaca' });
+    const svc = makePortfolioService(prisma, gateway, kv);
+    jest.spyOn(svc, 'reconcileAllOpenOrders').mockResolvedValue(undefined);
+    const syncSpy = jest.spyOn(svc, 'syncPortfolio');
+
+    await svc.onModuleInit();
+
+    expect(syncSpy).toHaveBeenCalledWith('alpaca', 'startup_reconcile');
+    expect(syncSpy).toHaveBeenCalledTimes(1);
+
+    svc.onModuleDestroy();
+  });
+
+  it('steady-state ticks throttle syncPortfolio to roughly once per 60s even with a faster reconciliation interval', async () => {
+    const prisma = makePortfolioPrisma();
+    const gateway = makePortfolioGateway({ getPortfolioResult: makePortfolio() });
+    const kv = makeKv({
+      'execution.broker_plugin_id': 'alpaca',
+      'execution.real_reconciliation_interval_ms': '15000',
+    });
+    const svc = makePortfolioService(prisma, gateway, kv);
+    jest.spyOn(svc, 'reconcileAllOpenOrders').mockResolvedValue(undefined);
+    const syncSpy = jest.spyOn(svc, 'syncPortfolio');
+
+    await svc.onModuleInit(); // 1 startup_reconcile call
+    expect(syncSpy).toHaveBeenCalledTimes(1);
+
+    // Three 15s ticks (45s elapsed) — still under the 60s throttle window, no new poll sync.
+    await jest.advanceTimersByTimeAsync(15_000);
+    await jest.advanceTimersByTimeAsync(15_000);
+    await jest.advanceTimersByTimeAsync(15_000);
+    expect(syncSpy).toHaveBeenCalledTimes(1);
+
+    // Fourth tick crosses the 60s mark since the startup sync — a poll sync fires.
+    await jest.advanceTimersByTimeAsync(15_000);
+    expect(syncSpy).toHaveBeenCalledTimes(2);
+    expect(syncSpy).toHaveBeenLastCalledWith('alpaca', 'poll');
+
+    svc.onModuleDestroy();
+  });
+});

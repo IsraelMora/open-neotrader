@@ -41,9 +41,13 @@
  */
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { ProviderGatewayService, OrderStatusResult } from '../providers/provider-gateway.service';
+import {
+  ProviderGatewayService,
+  OrderStatusResult,
+  Position,
+} from '../providers/provider-gateway.service';
 import { KvService } from '../common/kv.service';
-import { kvNum } from '../common/kv.util';
+import { kvNum, kvStr } from '../common/kv.util';
 import { normalizeBrokerStatus } from '../common/broker-status.util';
 import { AlertsService } from '../alerts/alerts.service';
 import type { RealOrder } from '@prisma/client';
@@ -92,6 +96,21 @@ const CB_KEY = 'real_reconciliation:circuit_breaker';
 /** Cooldown before a half-open retry attempt — mirrors CycleSchedulerService's CB_HALF_OPEN_MS. */
 const CB_HALF_OPEN_MS = 5 * 60_000;
 
+/** KV key for the active broker plugin id — same key _effectiveMode (TradeIntentService) reads. */
+const BROKER_PLUGIN_ID_KEY = 'execution.broker_plugin_id';
+
+/** RealOrder statuses that count as evidence explaining a broker position (see detectDrift). */
+const FILL_EVIDENCE_STATUSES = ['filled', 'partially_filled'];
+
+/**
+ * Minimum spacing between steady-state-tick-triggered portfolio syncs. The
+ * reconciliation interval (default 15s, min-clamped 5s) is much finer-grained
+ * than a full portfolio/NAV snapshot needs to be — this throttles poll-sourced
+ * syncPortfolio calls to roughly once a minute via a lastPortfolioSyncAt
+ * timestamp check. Does NOT apply to the one startup_reconcile call.
+ */
+const PORTFOLIO_SYNC_THROTTLE_MS = 60_000;
+
 @Injectable()
 export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDestroy {
   private readonly log = new Logger(RealBrokerReconciliationService.name);
@@ -99,6 +118,8 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
   private ticker: ReturnType<typeof setInterval> | null = null;
   /** Overlap guard — true while a tick's reconcileAllOpenOrders() call is in flight. */
   private tickRunning = false;
+  /** Wall-clock ms of the last syncPortfolio() call — drives the poll-tick throttle. */
+  private lastPortfolioSyncAt: number | null = null;
 
   constructor(
     private readonly db: PrismaService,
@@ -405,6 +426,10 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
    * then starts a KV-configured setInterval loop.
    */
   async onModuleInit(): Promise<void> {
+    // Runs BEFORE tick(): primes lastPortfolioSyncAt so tick()'s own
+    // _maybeSyncPortfolioOnTick() (poll-throttled) does not double-sync on
+    // the very first tick.
+    await this._syncPortfolioAtStartup();
     await this.tick();
     const intervalMs = await this._readIntervalMs();
     this.ticker = setInterval(() => void this.tick(), intervalMs);
@@ -451,6 +476,12 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
    * not just a silent stop.
    */
   private async tick(): Promise<void> {
+    // Portfolio sync is a separate concern from order reconciliation (own
+    // internal throttle + fail-soft handling) — runs independently of the
+    // overlap guard/circuit breaker below, which only govern
+    // reconcileAllOpenOrders().
+    await this._maybeSyncPortfolioOnTick();
+
     if (this.tickRunning) return;
 
     let cb = await this.getCircuitBreaker();
@@ -547,5 +578,208 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
 
   private async _saveCb(state: ReconciliationCircuitBreakerState): Promise<void> {
     await this.kv.set(CB_KEY, JSON.stringify(state));
+  }
+
+  // ── syncPortfolio / detectDrift ───────────────────────────────────────────
+
+  /**
+   * Reconciles the FULL broker position/equity snapshot — a different concern
+   * from reconcileOrder (single-order fill status). Sequence:
+   *   1. getPortfolio(brokerPluginId) — broker truth. Fail-soft: a throw here
+   *      is logged and this method returns cleanly with NO writes (no partial
+   *      RealPosition/RealNavSnapshot state) and does not propagate.
+   *   2. Full-replace RealPosition rows for this broker inside ONE
+   *      `$transaction` (interactive callback form — see class doc): upsert
+   *      every broker position, delete rows for this broker whose symbol is
+   *      no longer reported. Readers never observe a half-updated set.
+   *   3. Inside the SAME transaction, append one RealNavSnapshot row. HWM is
+   *      read from the most recent prior RealNavSnapshot for this broker
+   *      (order by ts desc, take 1) INSIDE the transaction — reading it
+   *      outside would open a race window where a concurrent sync could
+   *      commit a higher hwm between the read and this write. `hwm =
+   *      max(previousHwm, equity)`; if no prior snapshot exists, `hwm =
+   *      equity`. Never regresses.
+   *   4. AFTER the transaction commits (so detectDrift's alerting reflects
+   *      the just-committed cache, not a pre-commit view), detectDrift()
+   *      checks each broker position for unexplained history and alerts.
+   *      driftedSymbols is returned untouched by anything above — broker
+   *      truth always wins on cache state regardless of drift.
+   *
+   * Future work: R8 (auto-kill-switch) will consume the returned
+   * driftedSymbols to halt trading when an unexplained broker position is
+   * detected. Not implemented in this slice — this return shape is the seam.
+   */
+  async syncPortfolio(
+    brokerPluginId: string,
+    source: 'poll' | 'startup_reconcile',
+  ): Promise<{ driftedSymbols: string[] }> {
+    let portfolio: Awaited<ReturnType<ProviderGatewayService['getPortfolio']>>;
+    try {
+      portfolio = await this.gateway.getPortfolio(brokerPluginId);
+    } catch (err) {
+      this.log.warn(
+        `syncPortfolio: getPortfolio failed for broker=${brokerPluginId}: ${String(err)}`,
+      );
+      return { driftedSymbols: [] };
+    }
+
+    const brokerSymbols = portfolio.positions.map((p) => p.symbol);
+
+    await this.db.$transaction(async (tx) => {
+      await tx.realPosition.deleteMany({
+        where: { broker_plugin_id: brokerPluginId, symbol: { notIn: brokerSymbols } },
+      });
+
+      for (const pos of portfolio.positions) {
+        await tx.realPosition.upsert({
+          where: { symbol: pos.symbol },
+          create: {
+            symbol: pos.symbol,
+            broker_plugin_id: brokerPluginId,
+            qty: pos.qty,
+            avg_entry: pos.avg_entry,
+            market_value: pos.market_value,
+            unrealized_pnl: pos.unrealized_pnl,
+            side: pos.side,
+          },
+          update: {
+            broker_plugin_id: brokerPluginId,
+            qty: pos.qty,
+            avg_entry: pos.avg_entry,
+            market_value: pos.market_value,
+            unrealized_pnl: pos.unrealized_pnl,
+            side: pos.side,
+          },
+        });
+      }
+
+      const prevSnapshot = await tx.realNavSnapshot.findFirst({
+        where: { broker_plugin_id: brokerPluginId },
+        orderBy: { ts: 'desc' },
+      });
+      const prevHwm = prevSnapshot?.hwm ?? portfolio.equity;
+      const hwm = Math.max(prevHwm, portfolio.equity);
+
+      await tx.realNavSnapshot.create({
+        data: {
+          broker_plugin_id: brokerPluginId,
+          equity: portfolio.equity,
+          cash: portfolio.cash,
+          buying_power: portfolio.buying_power,
+          positions: JSON.stringify(portfolio.positions),
+          total_pnl: portfolio.total_pnl,
+          hwm,
+          source,
+        },
+      });
+    });
+
+    const driftedSymbols = await this.detectDrift(portfolio.positions, brokerPluginId);
+    return { driftedSymbols };
+  }
+
+  /**
+   * Flags broker positions with no explaining fill history. A broker position
+   * is "drift" when no RealOrder row exists for that symbol+broker with
+   * status filled or partially_filled (FILL_EVIDENCE_STATUSES) — i.e. this
+   * platform never placed/tracked an order that could explain the position.
+   *
+   * On drift, emits ONE CRITICAL BROKER_DRIFT AlertEntry (via AlertsService,
+   * same path as RECONCILIATION_HALTED). Alert-spam guard: an already-open
+   * (unresolved) BROKER_DRIFT alert for the same symbol is not duplicated —
+   * checked via alerts.getActive() rather than a direct AlertEntry query, so
+   * this service's only write/read surface onto the alerts table stays
+   * AlertsService (mirrors how the circuit-breaker alert works).
+   *
+   * The RealPosition cache is updated to broker truth by syncPortfolio
+   * BEFORE this runs, unconditionally — drift only ever affects alerting.
+   */
+  async detectDrift(brokerPositions: Position[], brokerPluginId: string): Promise<string[]> {
+    if (brokerPositions.length === 0) return [];
+
+    const activeAlerts = await this.alerts.getActive();
+    const drifted: string[] = [];
+
+    for (const pos of brokerPositions) {
+      const explained = await this.db.realOrder.findFirst({
+        where: {
+          symbol: pos.symbol,
+          broker_plugin_id: brokerPluginId,
+          status: { in: FILL_EVIDENCE_STATUSES },
+        },
+      });
+      if (explained) continue;
+
+      drifted.push(pos.symbol);
+
+      const alreadyOpen = activeAlerts.some(
+        (a) => a.type === 'BROKER_DRIFT' && a.symbol === pos.symbol,
+      );
+      if (alreadyOpen) continue;
+
+      try {
+        await this.alerts.create({
+          type: 'BROKER_DRIFT',
+          severity: 'CRITICAL',
+          symbol: pos.symbol,
+          message:
+            `Unexplained broker position: symbol=${pos.symbol} qty=${pos.qty} has no ` +
+            `filled/partially_filled RealOrder history on this platform`,
+        });
+      } catch (err) {
+        this.log.error(
+          `detectDrift: failed to emit BROKER_DRIFT alert for ${pos.symbol}: ${String(err)}`,
+        );
+      }
+    }
+
+    // Future work: R8 will consume the caller's driftedSymbols to trigger an
+    // auto-kill-switch here. Not implemented in this slice.
+    return drifted;
+  }
+
+  /** Reads the active broker plugin id the same way TradeIntentService._effectiveMode does. */
+  private async _resolveBrokerPluginId(): Promise<string> {
+    let raw: string | null;
+    try {
+      raw = await this.kv.get(BROKER_PLUGIN_ID_KEY);
+    } catch {
+      raw = null;
+    }
+    return (kvStr(raw) ?? '').trim();
+  }
+
+  /** One-time startup sync — not throttled, source='startup_reconcile'. Paper-only deploys skip cleanly. */
+  private async _syncPortfolioAtStartup(): Promise<void> {
+    const brokerPluginId = await this._resolveBrokerPluginId();
+    if (!brokerPluginId) return;
+
+    this.lastPortfolioSyncAt = Date.now();
+    try {
+      await this.syncPortfolio(brokerPluginId, 'startup_reconcile');
+    } catch (err) {
+      this.log.warn(`_syncPortfolioAtStartup: syncPortfolio failed: ${String(err)}`);
+    }
+  }
+
+  /** Steady-state-tick sync — throttled to PORTFOLIO_SYNC_THROTTLE_MS, source='poll'. Paper-only deploys skip cleanly. */
+  private async _maybeSyncPortfolioOnTick(): Promise<void> {
+    const brokerPluginId = await this._resolveBrokerPluginId();
+    if (!brokerPluginId) return;
+
+    const now = Date.now();
+    if (
+      this.lastPortfolioSyncAt !== null &&
+      now - this.lastPortfolioSyncAt < PORTFOLIO_SYNC_THROTTLE_MS
+    ) {
+      return;
+    }
+
+    this.lastPortfolioSyncAt = now;
+    try {
+      await this.syncPortfolio(brokerPluginId, 'poll');
+    } catch (err) {
+      this.log.warn(`_maybeSyncPortfolioOnTick: syncPortfolio failed: ${String(err)}`);
+    }
   }
 }
