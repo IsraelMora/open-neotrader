@@ -3,7 +3,7 @@
     {
       "name": "run_diagnostics",
       "description": "Ejecuta un diagnóstico completo del sistema. Verifica plugins activos, credenciales requeridas y salud del contexto. Devuelve un reporte con los checks individuales y un resumen de errores.",
-      "input_schema": {
+      "parameters": {
         "type": "object",
         "properties": {
           "active_plugin_ids": {

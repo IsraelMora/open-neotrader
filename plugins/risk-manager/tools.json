@@ -4,7 +4,7 @@
     "description": "Apply the unified risk-manager exposure layer to a list of trade proposals. Enforces per-trade notional cap, per-asset position cap, max open positions, and total exposure cap. Returns which signals were approved, rescaled, or hard-vetoed, with reasons. This is the AI-facing skill for pre-execution risk gate.",
     "script": "scripts/risk_manager_core.py",
     "function": "apply_exposure_layer",
-    "input_schema": {
+    "parameters": {
       "type": "object",
       "properties": {
         "signals": {
@@ -51,7 +51,7 @@
     "description": "Diagnose the current portfolio against risk-manager limits. Returns violations (hard breaches), warnings (near-limit), sector exposure breakdown, and an overall healthy flag. Useful for the AI to report portfolio health before proposing trades.",
     "script": "scripts/risk_manager_core.py",
     "function": "check_portfolio_health",
-    "input_schema": {
+    "parameters": {
       "type": "object",
       "properties": {
         "portfolio_value": { "type": "number" },

@@ -2,7 +2,7 @@
   {
     "name": "get_ohlcv",
     "description": "Obtiene datos OHLCV históricos para un símbolo de renta variable.",
-    "input_schema": {
+    "parameters": {
       "type": "object",
       "properties": {
         "symbol": { "type": "string", "description": "Ticker (ej. AAPL, SPY)" },
@@ -15,7 +15,7 @@
   {
     "name": "get_quote",
     "description": "Obtiene la cotización actual (bid/ask/last) de un símbolo.",
-    "input_schema": {
+    "parameters": {
       "type": "object",
       "properties": {
         "symbol": { "type": "string" }
@@ -26,7 +26,7 @@
   {
     "name": "place_order",
     "description": "Envía una orden de compra o venta (paper o live según configuración).",
-    "input_schema": {
+    "parameters": {
       "type": "object",
       "properties": {
         "symbol": { "type": "string" },

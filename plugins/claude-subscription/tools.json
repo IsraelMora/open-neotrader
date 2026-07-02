@@ -3,7 +3,7 @@
     {
       "name": "subscription_status",
       "description": "Devuelve el estado del backend de suscripción de Claude tal como lo ve la plataforma: nombre del backend, modelo configurado y notas operativas. No accede a la red (el CLI corre en la capa NestJS, no en el sandbox).",
-      "input_schema": {
+      "parameters": {
         "type": "object",
         "properties": {
           "model": {
