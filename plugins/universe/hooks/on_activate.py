@@ -21,7 +21,7 @@ from pathlib import Path
 _SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from curated import get_universe  # noqa: E402  (dynamic path insert above)
+from curated import UNIVERSE_SNAPSHOT_DATE, get_universe  # noqa: E402  (dynamic path insert above)
 
 DEFAULT_MARKETS = ["nasdaq100"]
 
@@ -43,6 +43,9 @@ def on_activate(ctx: dict) -> dict:
             f"Universe activado: {len(symbols)} símbolos"
             f" [{markets_label}]"
         ),
+        # Present-day snapshot date — disclosed so historical backtests over
+        # this list can flag survivorship bias (see curated.py).
+        "as_of": UNIVERSE_SNAPSHOT_DATE,
     }
 
 

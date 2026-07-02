@@ -34,6 +34,8 @@ export interface BacktestMetrics {
   largest_win_pct: number;
   largest_loss_pct: number;
   time_in_market_pct: number;
+  /** Present when the backtested symbols came from a curated universe (see isCuratedUniverse). */
+  survivorship_warning?: string | null;
 }
 
 export interface BacktestTrade {
@@ -71,6 +73,8 @@ export interface CrossSectionalResponse {
   final_holdings: string[];
   n_dates: number;
   universe_size: number;
+  /** Present when the backtested symbols came from a curated universe (see isCuratedUniverse). */
+  survivorship_warning?: string | null;
 }
 
 /** Walk-forward (anchored) validation result — overfit detection. */
@@ -84,6 +88,41 @@ export interface WalkForwardResponse {
   total_windows: number;
   windows: Record<string, unknown>[];
   summary?: Record<string, unknown>;
+  /** Present when the backtested symbols came from a curated universe (see isCuratedUniverse). */
+  survivorship_warning?: string | null;
+}
+
+/**
+ * Present-day snapshot date for curated universe lists (plugins/universe/scripts/curated.py,
+ * UNIVERSE_SNAPSHOT_DATE). Kept in sync manually — the universe plugin is Python and this
+ * service is TypeScript, so there is no shared runtime import across the language boundary.
+ */
+const UNIVERSE_SNAPSHOT_DATE = '2026-06-30';
+
+const SURVIVORSHIP_WARNING =
+  `Universe membership is present-day (as of ${UNIVERSE_SNAPSHOT_DATE}); historical backtests ` +
+  'over this list are subject to survivorship bias — pre-snapshot returns are optimistic.';
+
+/**
+ * Heuristic for survivorship-bias disclosure. There is no per-request flag telling us whether
+ * `symbols` came from a curated universe (e.g. the "universe" plugin's nasdaq100/crypto-defi
+ * lists, or this service's own DEFAULT_UNIVERSE fallback) or was hand-typed by the caller as an
+ * explicit ad-hoc list. The cheapest reliable signal available here is an exact match against
+ * DEFAULT_UNIVERSE, the one curated symbol set this file already knows about (used by
+ * compareStrategies when a strategy has no cycle.universe config). Any other symbol set —
+ * including a strategy's own cycle.universe list — is treated as an explicit, caller-typed
+ * list and does NOT get the warning. When in doubt this heuristic favors correctness over
+ * silence: it only ever *adds* the disclosure, never suppresses one that should be there for
+ * the known curated list.
+ */
+function isCuratedUniverse(symbols: string[]): boolean {
+  if (symbols.length !== DEFAULT_UNIVERSE.length) return false;
+  const defaultSet = new Set(DEFAULT_UNIVERSE);
+  return symbols.every((s) => defaultSet.has(s));
+}
+
+function survivorshipWarningFor(symbols: string[]): string | null {
+  return isCuratedUniverse(symbols) ? SURVIVORSHIP_WARNING : null;
 }
 
 @Injectable()
@@ -207,7 +246,7 @@ export class BacktestService {
 
     return {
       ok: true,
-      metrics: result.metrics!,
+      metrics: { ...result.metrics!, survivorship_warning: survivorshipWarningFor(dto.symbols) },
       equity_curve: result.equity_curve ?? [],
       trades: result.trades ?? [],
     };
@@ -258,7 +297,7 @@ export class BacktestService {
       }
     }
 
-    return result;
+    return { ...result, survivorship_warning: survivorshipWarningFor(dto.symbols) };
   }
 
   /**
@@ -292,7 +331,7 @@ export class BacktestService {
     if (!result.ok) {
       throw new BadGatewayException(`Cross-sectional error: ${result.error ?? 'unknown error'}`);
     }
-    return result;
+    return { ...result, survivorship_warning: survivorshipWarningFor(dto.symbols) };
   }
 
   private _buildConfig(dto: RunBacktestDto) {

@@ -333,6 +333,30 @@ describe('BacktestService — configurable strategy params', () => {
   });
 });
 
+describe('BacktestService — survivorship_warning disclosure', () => {
+  // Mirrors the module-level DEFAULT_UNIVERSE curated fallback list in backtest.service.ts.
+  const CURATED_DEFAULT_UNIVERSE = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META'];
+
+  it('runBacktest includes survivorship_warning when symbols match the curated default universe', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox } = makeSandbox();
+    const svc = makeService(gateway, sandbox);
+    const result = await svc.runBacktest(makeDto({ symbols: CURATED_DEFAULT_UNIVERSE }));
+
+    expect(result.metrics.survivorship_warning).toBeTruthy();
+    expect(result.metrics.survivorship_warning).toContain('survivorship bias');
+  });
+
+  it('runBacktest does NOT include survivorship_warning for an explicit ad-hoc symbol list', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox } = makeSandbox();
+    const svc = makeService(gateway, sandbox);
+    const result = await svc.runBacktest(makeDto({ symbols: ['AAPL'] }));
+
+    expect(result.metrics.survivorship_warning).toBeFalsy();
+  });
+});
+
 describe('BacktestService — runCrossSectional', () => {
   const CS_OK = {
     ok: true,

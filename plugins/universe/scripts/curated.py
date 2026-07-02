@@ -12,6 +12,14 @@ Sources:
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
+# Snapshot vintage — all curated lists below are present-day membership as of
+# this date. Backtests over these lists are subject to survivorship bias for
+# any period before this date (delisted/removed constituents are absent).
+# ---------------------------------------------------------------------------
+
+UNIVERSE_SNAPSHOT_DATE = "2026-06-30"
+
+# ---------------------------------------------------------------------------
 # Nasdaq-100 (June 2026, by market cap)
 # ---------------------------------------------------------------------------
 
