@@ -1,0 +1,83 @@
+# NeuroTrader CI — main build/test pipeline for the TypeScript monorepo and Python sandbox.
+#
+# Runs on every push to master and on every pull request.
+# Two independent jobs:
+#   - ts:     pnpm workspace lint + build + test (with Prisma clients generated)
+#   - python: ruff lint + pytest for apps/sandbox and packages/plugin-sdk
+
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  ts:
+    name: TypeScript (lint + build + test)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client (api)
+        run: pnpm --filter=@neurotrader/api exec prisma generate
+
+      - name: Generate Prisma client (store)
+        run: pnpm --filter=neurotrader-store exec prisma generate
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test
+
+  python:
+    name: Python (ruff + pytest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ruff pytest
+          python3 -m pip install -r apps/sandbox/requirements.txt
+
+      - name: Ruff check (apps/sandbox)
+        run: ruff check apps/sandbox
+
+      - name: Ruff check (packages/plugin-sdk)
+        run: ruff check packages/plugin-sdk
+
+      - name: Pytest (apps/sandbox)
+        run: python3 -m pytest
+        working-directory: apps/sandbox
+
+      - name: Pytest (packages/plugin-sdk)
+        run: python3 -m pytest
+        working-directory: packages/plugin-sdk
