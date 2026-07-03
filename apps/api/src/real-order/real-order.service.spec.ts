@@ -646,6 +646,99 @@ describe('RealOrderService.submit — per-intent idempotency', () => {
   });
 });
 
+// ── submit — symbol-scoped guard (Fix 4) ─────────────────────────────────────────
+//
+// Production incident: the LLM emitted "exit SPY" every cycle. Per-intent idempotency
+// alone does not catch this — each cycle creates a NEW TradeIntent (new id), so
+// findActiveOrderForIntent never finds a match even though an order for the SAME
+// symbol+broker is still open. This caused a real SPY sell to be resubmitted every
+// cycle, hitting Alpaca 403 "insufficient qty" repeatedly. The fix: after the
+// per-intent check, also check for any non-terminal order on the same symbol+broker,
+// regardless of trade_intent_id.
+
+describe('RealOrderService.submit — symbol-scoped guard (Fix 4)', () => {
+  it('an active order for the SAME symbol+broker but a DIFFERENT trade_intent_id blocks resubmit: placeOrder is never called and the existing row is returned', async () => {
+    const openSymbolOrder = makeRow({
+      id: 'ro_open_spy',
+      trade_intent_id: 'ti_previous_cycle',
+      symbol: 'SPY',
+      broker_plugin_id: 'alpaca',
+      status: 'submitted',
+    });
+    const prisma = makePrisma();
+    // First findFirst call: per-intent guard for the NEW trade_intent_id — no active row.
+    // Second findFirst call: symbol-scoped guard — finds the still-open SPY order from
+    // a previous cycle's (different) trade_intent_id.
+    (prisma.realOrder.findFirst as jest.Mock)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(openSymbolOrder);
+    const gateway = makeGateway();
+    const svc = makeService(prisma, gateway);
+
+    const result = await svc.submit({
+      tradeIntentId: 'ti_new_cycle',
+      brokerPluginId: 'alpaca',
+      symbol: 'SPY',
+      side: 'sell',
+      requestedQty: 10,
+    });
+
+    expect(result).toEqual(openSymbolOrder);
+    expect(gateway.placeOrder).not.toHaveBeenCalled();
+    expect((prisma.realOrder.create as jest.Mock).mock.calls).toHaveLength(0);
+  });
+
+  it('no active order exists for the symbol — submit proceeds normally (create + placeOrder called)', async () => {
+    const prisma = makePrisma({ createResult: makeRow({ id: 'ro_fresh' }) });
+    (prisma.realOrder.findFirst as jest.Mock)
+      .mockResolvedValueOnce(null) // per-intent guard
+      .mockResolvedValueOnce(null); // symbol-scoped guard
+    const gateway = makeGateway({ placeOrderResult: { id: 'broker_order_fresh' } });
+    const svc = makeService(prisma, gateway);
+
+    await svc.submit({
+      tradeIntentId: 'ti_fresh',
+      brokerPluginId: 'alpaca',
+      symbol: 'AAPL',
+      side: 'buy',
+      requestedQty: 10,
+    });
+
+    expect((prisma.realOrder.create as jest.Mock).mock.calls).toHaveLength(1);
+    expect(gateway.placeOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it('the symbol-scoped guard query is scoped to symbol + broker_plugin_id and excludes terminal statuses', async () => {
+    const prisma = makePrisma();
+    (prisma.realOrder.findFirst as jest.Mock)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    const gateway = makeGateway();
+    const svc = makeService(prisma, gateway);
+
+    await svc.submit({
+      tradeIntentId: 'ti_1',
+      brokerPluginId: 'alpaca',
+      symbol: 'SPY',
+      side: 'sell',
+      requestedQty: 5,
+    });
+
+    const findFirstCalls = (prisma.realOrder.findFirst as jest.Mock).mock.calls as unknown[][];
+    expect(findFirstCalls.length).toBeGreaterThanOrEqual(2);
+    const symbolGuardArgs = findFirstCalls[1][0] as {
+      where: { symbol: string; broker_plugin_id: string; status: { notIn: string[] } };
+    };
+    expect(symbolGuardArgs.where.symbol).toBe('SPY');
+    expect(symbolGuardArgs.where.broker_plugin_id).toBe('alpaca');
+    const actualSorted = [...symbolGuardArgs.where.status.notIn].sort((a, b) => a.localeCompare(b));
+    const expectedSorted = ['canceled', 'expired', 'filled', 'rejected', 'submit_failed'].sort(
+      (a, b) => a.localeCompare(b),
+    );
+    expect(actualSorted).toEqual(expectedSorted);
+  });
+});
+
 // ── onModuleInit — bootstrap recovery wiring (Fix 2) ──────────────────────────────
 
 describe('RealOrderService.onModuleInit', () => {

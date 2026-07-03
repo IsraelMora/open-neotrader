@@ -91,6 +91,16 @@ const RECONCILE_INTERVAL_KEY = 'execution.real_reconciliation_interval_ms';
 const DEFAULT_RECONCILE_INTERVAL_MS = 15_000;
 const MIN_RECONCILE_INTERVAL_MS = 5_000;
 
+/**
+ * KV key for the stale-open-order cancel timeout (Fix 5). Deliberately
+ * CONSERVATIVE (default 30min) — this must never cancel a legitimately
+ * slow-filling order. Mirrors the guarded KV read pattern used for
+ * RECONCILE_INTERVAL_KEY above: a missing/invalid value falls back to the
+ * default rather than throwing or using an unsafe value.
+ */
+const STALE_ORDER_TIMEOUT_KEY = 'execution.real_order_stale_timeout_ms';
+const DEFAULT_STALE_ORDER_TIMEOUT_MS = 30 * 60_000;
+
 /** Consecutive tick failures before the circuit breaker opens. */
 const CB_MAX_FAILURES = 3;
 /** KV key the circuit breaker state is persisted under (survives process restarts). */
@@ -458,6 +468,12 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
       this.log.warn(`reconcileAllOpenOrders: in-flight sweep failed: ${String(err)}`);
     }
 
+    try {
+      await this._cancelStaleOpenOrders();
+    } catch (err) {
+      this.log.warn(`reconcileAllOpenOrders: stale-order cancel sweep failed: ${String(err)}`);
+    }
+
     const rows = await this.db.realOrder.findMany({
       where: { status: { in: OPEN_STATUSES } },
     });
@@ -471,6 +487,92 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
         );
       }
     }
+  }
+
+  /**
+   * Fix 5 (hardening, conservative): cancels RealOrder rows stuck open at the
+   * broker for longer than a configurable timeout (default 30min — see
+   * STALE_ORDER_TIMEOUT_KEY doc). Production incident this addresses: a real
+   * SPY sell order stayed status="submitted" forever because reconciliation
+   * only ever mirrors broker truth — it never times out a stuck open order on
+   * its own.
+   *
+   * Money-critical invariant preserved: this method NEVER writes
+   * RealOrder.status = 'canceled' directly. It only calls
+   * gateway.cancelOrder() — the broker-side cancel request. The row's status
+   * is left untouched; the NEXT reconcileOrder() tick observes the broker's
+   * now-canceled status and applies the terminal transition through the
+   * single $transaction that keeps RealOrder and TradeIntent in sync (see
+   * applyBrokerOrder's rejected/canceled/expired branch). This keeps
+   * reconcileOrder() the ONLY writer of terminal RealOrder status.
+   *
+   * Fail-soft per row: one row's cancelOrder failure (e.g. broker already
+   * filled/canceled it, network error) never blocks canceling the rest.
+   * Rows with a null broker_order_id are skipped — there is nothing at the
+   * broker to cancel yet (the order never reached "submitted" with a broker
+   * id, which recoverInflight()/the pending_submit sweep already handles).
+   */
+  private async _cancelStaleOpenOrders(): Promise<void> {
+    const timeoutMs = await this._readStaleTimeoutMs();
+    const cutoff = new Date(Date.now() - timeoutMs);
+
+    const staleRows = await this.db.realOrder.findMany({
+      where: {
+        status: { in: OPEN_STATUSES },
+        submitted_at: { lt: cutoff },
+      },
+    });
+
+    for (const row of staleRows) {
+      if (!row.broker_order_id) {
+        this.log.warn(
+          `_cancelStaleOpenOrders: RealOrder ${row.id} is stale (submitted_at=${String(
+            row.submitted_at,
+          )}) but has no broker_order_id yet — skipping (nothing to cancel at the broker)`,
+        );
+        continue;
+      }
+
+      try {
+        await this.gateway.cancelOrder(row.broker_plugin_id, row.broker_order_id);
+        this.log.warn(
+          `_cancelStaleOpenOrders: canceled stale RealOrder ${row.id} (symbol=${row.symbol}, ` +
+            `broker=${row.broker_plugin_id}, broker_order_id=${row.broker_order_id}, ` +
+            `submitted_at=${String(row.submitted_at)}, timeout_ms=${timeoutMs}) — ` +
+            `status transition will be applied by the next reconcileOrder() tick`,
+        );
+        try {
+          await this.alerts.create({
+            type: 'CUSTOM',
+            severity: 'HIGH',
+            symbol: row.symbol,
+            message:
+              `Stale real order auto-canceled: RealOrder ${row.id} (${row.symbol}) was still ` +
+              `open ${timeoutMs / 60_000}min after submission — broker cancel requested`,
+          });
+        } catch (alertErr) {
+          this.log.error(
+            `_cancelStaleOpenOrders: failed to emit audit alert for RealOrder ${row.id}: ${String(alertErr)}`,
+          );
+        }
+      } catch (err) {
+        this.log.warn(
+          `_cancelStaleOpenOrders: gateway.cancelOrder failed for RealOrder ${row.id} ` +
+            `(broker_order_id=${row.broker_order_id}): ${String(err)}`,
+        );
+      }
+    }
+  }
+
+  /** Reads the stale-order cancel timeout from KV, defaulting to 30 minutes (see STALE_ORDER_TIMEOUT_KEY doc). */
+  private async _readStaleTimeoutMs(): Promise<number> {
+    let raw: string | null;
+    try {
+      raw = await this.kv.get(STALE_ORDER_TIMEOUT_KEY);
+    } catch {
+      raw = null;
+    }
+    return kvNum(raw, DEFAULT_STALE_ORDER_TIMEOUT_MS);
   }
 
   // ── steady-state loop ─────────────────────────────────────────────────────

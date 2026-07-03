@@ -149,6 +149,28 @@ export class RealOrderService implements OnModuleInit {
       return existingActive;
     }
 
+    // Symbol-scoped guard (production incident: the LLM emitted "exit SPY" every
+    // cycle — each cycle creates a NEW TradeIntent, so the per-intent guard above
+    // never matches even though an order for the SAME symbol is still open at the
+    // broker). If ANY non-terminal order already exists for this symbol+broker,
+    // regardless of which trade_intent_id created it, skip the resubmit entirely —
+    // one open order per symbol is enough; a second one (entry or exit) is always
+    // redundant while the first is still live.
+    const existingActiveForSymbol = await this.findActiveOrderForSymbol(
+      args.symbol,
+      args.brokerPluginId,
+    );
+    if (existingActiveForSymbol) {
+      this.log.warn(
+        `submit: duplicate real order for open symbol — skipping resubmit ` +
+          `(symbol=${args.symbol}, broker=${args.brokerPluginId}, ` +
+          `existing_id=${existingActiveForSymbol.id}, existing_status=${existingActiveForSymbol.status}, ` +
+          `existing_trade_intent_id=${existingActiveForSymbol.trade_intent_id}, ` +
+          `new_trade_intent_id=${args.tradeIntentId})`,
+      );
+      return existingActiveForSymbol;
+    }
+
     const clientOrderId = this.generateClientOrderId(args.tradeIntentId);
 
     let row: RealOrder;
@@ -271,6 +293,25 @@ export class RealOrderService implements OnModuleInit {
     });
   }
 
+  /**
+   * Finds the NON-TERMINAL RealOrder row for a symbol+broker, if any, regardless of
+   * trade_intent_id. See submit()'s symbol-scoped guard doc for why this exists
+   * alongside findActiveOrderForIntent — the per-intent guard alone misses a
+   * resubmit for the SAME symbol from a freshly-created TradeIntent.
+   */
+  private async findActiveOrderForSymbol(
+    symbol: string,
+    brokerPluginId: string,
+  ): Promise<RealOrder | null> {
+    return this.db.realOrder.findFirst({
+      where: {
+        symbol,
+        broker_plugin_id: brokerPluginId,
+        status: { notIn: TERMINAL_STATUSES },
+      },
+      orderBy: { created_at: 'desc' },
+    });
+  }
   /**
    * Startup/crash recovery for orders left in an in-flight state (pending_submit or
    * submit_failed). For each such row, asks the broker for truth via
