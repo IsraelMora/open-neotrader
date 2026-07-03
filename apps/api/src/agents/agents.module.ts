@@ -16,6 +16,7 @@ import { ProvidersModule } from '../providers/providers.module';
 import { MlSignalRecordModule } from '../ml-signal-record/ml-signal-record.module';
 import { MlSignalRecordService } from '../ml-signal-record/ml-signal-record.service';
 import { TradeIntentModule } from '../trade-intent/trade-intent.module';
+import { WebSearchModule } from '../web-search/web-search.module';
 
 @Module({
   imports: [
@@ -42,6 +43,9 @@ import { TradeIntentModule } from '../trade-intent/trade-intent.module';
     // TradeIntentModule exports TradeIntentService → AgentsService persists a
     // pending TradeIntent (HITL, paper-only) when the LLM emits a decision.
     TradeIntentModule,
+    // WebSearchModule is a leaf (ConfigService only) — no circular dep risk. Exports
+    // WebSearchService, backing the kernel__web_search tool.
+    WebSearchModule,
   ],
   providers: [AgentsService, KvService, DebateService, MlSignalRecordService],
   exports: [AgentsService],

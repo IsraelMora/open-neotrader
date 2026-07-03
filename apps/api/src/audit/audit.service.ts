@@ -45,7 +45,9 @@ export type AuditEventType =
   | 'param_tuned'
   // measurable-veto-shield: real→paper demotion because the applied strategy lacks a
   // recent ROBUSTO walk-forward verdict (walk-forward gate before live trading)
-  | 'walk_forward_gate_demotion';
+  | 'walk_forward_gate_demotion'
+  // kernel web search: benign, read-only info event — never a decision/signal.
+  | 'kernel_web_search';
 
 export interface AuditPayload {
   cycle_id?: string;

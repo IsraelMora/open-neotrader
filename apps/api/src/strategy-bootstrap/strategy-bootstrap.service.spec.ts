@@ -148,6 +148,21 @@ describe('StrategyBootstrapService', () => {
     }
   });
 
+  it('deactivates sentiment-analysis (news now comes from the kernel web_search tool, not the plugin)', async () => {
+    const { kv } = makeKv();
+    const { db, updateMany } = makeDb();
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(PLUGINS_TO_DEACTIVATE).toContain('sentiment-analysis');
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: 'sentiment-analysis' },
+      data: { active: false },
+    });
+  });
+
   it('sets PAPER mode (execution.real=false) and enables the scheduler with a sane interval', async () => {
     const { kv, store } = makeKv();
     const { db } = makeDb();

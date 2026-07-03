@@ -57,6 +57,9 @@ export const PLUGINS_TO_DEACTIVATE = [
   'session-breakout',
   'mean-reversion',
   'vwap-reversion',
+  // News now comes from the kernel__web_search tool (LLM-driven, on-demand), not this
+  // always-on plugin — see apps/api/src/agents/agents.service.ts KERNEL_WEB_SEARCH_TOOL.
+  'sentiment-analysis',
 ] as const;
 
 export const BOOTSTRAP_APPLIED_KEY = 'bootstrap.momentum_v1_applied';

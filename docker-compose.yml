@@ -55,6 +55,16 @@ services:
       # contenedor, y @nestjs/config NO deja que /data/.env pise una env ya presente →
       # la credencial real del volumen queda TAPADA ("no configurada"). Se cargan por
       # POST /api/credentials, que las persiste en /data/.env (DOTENV_PATH).
+      # Kernel web_search tool (agents.service.ts KERNEL_WEB_SEARCH_TOOL). Default
+      # provider 'gemini' reuses LLM_API_KEY above — no extra credential needed. Only
+      # alternative providers (e.g. tavily) need their own WEB_SEARCH_API_KEY, which —
+      # like WEB_SEARCH_PROVIDER/WEB_SEARCH_BASE_URL/WEB_SEARCH_MODEL — is NOT in
+      # CredentialsService's PLATFORM_PROVIDERS list, so wiring it here directly (same
+      # pattern as LLM_API_KEY above) is safe.
+      WEB_SEARCH_PROVIDER: ${WEB_SEARCH_PROVIDER:-}
+      WEB_SEARCH_MODEL: ${WEB_SEARCH_MODEL:-}
+      WEB_SEARCH_BASE_URL: ${WEB_SEARCH_BASE_URL:-}
+      WEB_SEARCH_API_KEY: ${WEB_SEARCH_API_KEY:-}
       # Tienda comunitaria de plugins: la API hace proxy a este servicio interno.
       # El store usa setGlobalPrefix('api'), por eso la URL incluye /api.
       STORE_URL: ${STORE_URL:-http://store:3002/api}
