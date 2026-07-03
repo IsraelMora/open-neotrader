@@ -15,6 +15,17 @@ function makeConfig(overrides: Record<string, string> = {}): ConfigService {
   return { get: (k: string, d?: unknown) => values[k] ?? d } as unknown as ConfigService;
 }
 
+/** Config sin LLM_BACKEND en absoluto — a diferencia de makeConfig(), que siempre
+ *  fija 'anthropic' como valor presente. Sirve para probar el default real del
+ *  constructor vía cfg.get('LLM_BACKEND', <default>). */
+function makeConfigNoBackend(overrides: Record<string, string> = {}): ConfigService {
+  const values: Record<string, string> = {
+    LLM_MODEL: 'test-model',
+    ...overrides,
+  };
+  return { get: (k: string, d?: unknown) => values[k] ?? d } as unknown as ConfigService;
+}
+
 function makePlugins(): PluginsService {
   return {
     isExtraActive: jest.fn().mockResolvedValue(false),
@@ -572,5 +583,73 @@ describe('LlmService.getReadiness — diagnóstico de credencial del LLM', () =>
     const r = svc.getReadiness();
     expect(r.credentialPresent).toBe(true);
     expect(r.requiredEnv).toBeNull();
+  });
+});
+
+describe('LlmService — default backend sin LLM_BACKEND configurado', () => {
+  it('sin LLM_BACKEND, el backend resuelve a "openai" (cliente genérico OpenAI-compatible)', () => {
+    const svc = new LlmService(
+      makeConfigNoBackend({ LLM_API_KEY: 'generic-key' }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    expect(svc.getConfig().backend).toBe('openai');
+  });
+
+  it('sin LLM_BACKEND, getReadiness() resuelve la credencial vía LLM_API_KEY/OPENAI_API_KEY (no exige ANTHROPIC_API_KEY)', () => {
+    const svc = new LlmService(
+      makeConfigNoBackend({ LLM_API_KEY: 'generic-key' }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const r = svc.getReadiness();
+    expect(r.backend).toBe('openai');
+    expect(r.requiredEnv).toBe('LLM_API_KEY');
+    expect(r.credentialPresent).toBe(true);
+  });
+});
+
+describe('LlmService.getReadiness — detail no debe decir "openai" engañosamente para providers genéricos', () => {
+  it('detail incluye el host real del endpoint (Gemini vía su endpoint OpenAI-compatible) y el modelo, no un "backend=openai" desnudo', () => {
+    const svc = new LlmService(
+      makeConfig({
+        LLM_BACKEND: 'openai',
+        LLM_API_KEY: 'generic-key',
+        LLM_BASE_URL: 'https://generativelanguage.googleapis.com/v1beta/openai',
+        LLM_MODEL: 'gemini-3.5-flash',
+      }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const r = svc.getReadiness();
+    expect(r.detail).toContain('gemini-3.5-flash');
+    expect(r.detail).toContain('generativelanguage.googleapis.com');
+    expect(r.detail).not.toBe('LLM listo (backend=openai, model=gemini-3.5-flash)');
+  });
+
+  it('detail para el cliente genérico sin LLM_BASE_URL cae al host por defecto de OpenAI', () => {
+    const svc = new LlmService(
+      makeConfig({ LLM_BACKEND: 'openai', LLM_API_KEY: 'k', LLM_MODEL: 'gpt-4o-mini' }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const r = svc.getReadiness();
+    expect(r.detail).toContain('api.openai.com');
+    expect(r.detail).toContain('gpt-4o-mini');
+  });
+
+  it('detail para backend nativo (anthropic) sigue mostrando el nombre del backend', () => {
+    const svc = new LlmService(
+      makeConfig({
+        LLM_BACKEND: 'anthropic',
+        ANTHROPIC_API_KEY: 'sk-ant-x',
+        LLM_MODEL: 'claude-x',
+      }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const r = svc.getReadiness();
+    expect(r.detail).toContain('anthropic');
+    expect(r.detail).toContain('claude-x');
   });
 });

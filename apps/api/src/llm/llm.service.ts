@@ -119,7 +119,13 @@ export class LlmService implements OnModuleInit {
     private readonly kv: KvService,
   ) {
     this._model = cfg.get<string>('LLM_MODEL', 'claude-haiku-4-5-20251001');
-    this._backend = (cfg.get<string>('LLM_BACKEND', 'anthropic') as LlmBackend) ?? 'anthropic';
+    // Default = 'openai', the generic OpenAI-compatible client (completeViaOpenAi).
+    // This makes LLM_BACKEND OPTIONAL: an operator only needs LLM_BASE_URL + LLM_API_KEY
+    // + LLM_MODEL to point at any OpenAI-compatible provider (OpenAI, Gemini's openai
+    // endpoint, OpenRouter, Groq, Ollama...). Native non-OpenAI-compatible backends
+    // (anthropic, gemini, subscription, custom) remain available but must be selected
+    // explicitly via LLM_BACKEND.
+    this._backend = (cfg.get<string>('LLM_BACKEND', 'openai') as LlmBackend) ?? 'openai';
   }
 
   /**
@@ -187,11 +193,34 @@ export class LlmService implements OnModuleInit {
       credentialPresent = requiredEnv !== null && !!this.cfg.get<string>(requiredEnv);
     }
 
+    // For the generic OpenAI-compatible backend, "backend=openai" is misleading — it's
+    // NOT necessarily the OpenAI company, just an OpenAI-compatible transport. Show the
+    // real provider host (from the effective base URL) instead, so operators pointing
+    // at Gemini/OpenRouter/etc. via LLM_BASE_URL see their actual provider, not "openai".
+    const readyLabel =
+      this._backend === 'openai'
+        ? `openai-compatible · model=${this._model} · endpoint=${this._resolveOpenAiHost()}`
+        : `backend=${this._backend}, model=${this._model}`;
+
     const detail = credentialPresent
-      ? `LLM listo (backend=${this._backend}, model=${this._model})`
+      ? `LLM listo (${readyLabel})`
       : `${requiredEnv ?? 'credencial'} no configurada — el agente NO podrá decidir ni operar`;
 
     return { backend: this._backend, model: this._model, credentialPresent, requiredEnv, detail };
+  }
+
+  /** Resolves the effective host for the generic OpenAI-compatible backend, for
+   *  human-readable readiness labels only (not used for the actual request URL). */
+  private _resolveOpenAiHost(): string {
+    const baseUrl =
+      this.cfg.get<string>('LLM_BASE_URL') ||
+      this.cfg.get<string>('OPENAI_BASE_URL') ||
+      'https://api.openai.com/v1';
+    try {
+      return new URL(baseUrl).host;
+    } catch {
+      return baseUrl;
+    }
   }
 
   /** Devuelve la configuración activa del LLM: modelo, backend y capacidades. */

@@ -33,8 +33,10 @@ services:
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET requerido en .env}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
       TOTP_ISSUER: ${TOTP_ISSUER:-OpenNeoTrader}
-      # LLM — cliente genérico OpenAI-compatible (OpenAI, OpenRouter, Gemini vía su
-      # endpoint openai, Groq, Together, Ollama...). Config vía 3 vars genéricas:
+      # LLM — LLM_BACKEND es OPCIONAL (default = cliente genérico OpenAI-compatible:
+      # OpenAI, OpenRouter, Gemini vía su endpoint openai, Groq, Together, Ollama...).
+      # Solo hace falta setearlo para backends nativos no-OpenAI-compatible (anthropic,
+      # gemini nativo, subscription). Config vía 3 vars genéricas:
       # LLM_BASE_URL + LLM_API_KEY + LLM_MODEL sirven para CUALQUIER provider
       # OpenAI-compatible, p.ej. Gemini = https://generativelanguage.googleapis.com/v1beta/openai.
       # OPENAI_BASE_URL/OPENAI_API_KEY se mantienen como fallback de compatibilidad
