@@ -5889,11 +5889,13 @@ async function callExecuteToolCallsFull(
   cycleId: string,
   calls: import('../llm/llm.service').ToolCallRequest[],
   budget = Number.MAX_SAFE_INTEGER,
+  webSearchBudget?: number,
 ): Promise<{
   decisions: import('./agents.service').Decision[];
   sandbox_results: import('./agents.service').SandboxResult[];
   signalsEmitted: { symbol: string; action: string }[];
   executedCount: number;
+  webSearchExecutedCount: number;
 }> {
   return (
     service as unknown as {
@@ -5901,14 +5903,16 @@ async function callExecuteToolCallsFull(
         c: string,
         t: import('../llm/llm.service').ToolCallRequest[],
         b: number,
+        wsb?: number,
       ) => Promise<{
         decisions: import('./agents.service').Decision[];
         sandbox_results: import('./agents.service').SandboxResult[];
         signalsEmitted: { symbol: string; action: string }[];
         executedCount: number;
+        webSearchExecutedCount: number;
       }>;
     }
-  )._executeToolCalls(cycleId, calls, budget);
+  )._executeToolCalls(cycleId, calls, budget, webSearchBudget);
 }
 
 describe('kernel__web_search — _validateToolCalls source gate', () => {
@@ -6167,6 +6171,243 @@ describe('kernel__web_search — dispatch (_dispatchKernelTool / _executeToolCal
     await callExecuteToolCalls(service, CYCLE_ID, calls);
 
     expect(webSearch.search.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it('caps web_search calls at the given per-cycle budget within a single iteration, dropping the rest gracefully', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const webSearch = makeWebSearchStub();
+    const service = makeWebSearchAgentsService(audit, plugins, webSearch);
+
+    const calls: import('../llm/llm.service').ToolCallRequest[] = Array.from(
+      { length: 10 },
+      (_, i) => ({
+        plugin_id: 'kernel',
+        function: 'web_search',
+        args: { query: `query ${String(i)}` },
+      }),
+    );
+
+    // webSearchBudget=2 is tighter than MAX_WEB_SEARCH_CALLS_PER_ITERATION (3) — the
+    // cycle-level cap must win when it's the smaller of the two.
+    const { webSearchExecutedCount } = await callExecuteToolCallsFull(
+      service,
+      CYCLE_ID,
+      calls,
+      Number.MAX_SAFE_INTEGER,
+      2,
+    );
+
+    expect(webSearch.search).toHaveBeenCalledTimes(2);
+    expect(webSearchExecutedCount).toBe(2);
+    expect(findAuditEvent(audit, 'web_search_cycle_cap_reached')).toBeDefined();
+  });
+
+  it('does not throw and never blocks the cycle when webSearchBudget is 0', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const webSearch = makeWebSearchStub();
+    const service = makeWebSearchAgentsService(audit, plugins, webSearch);
+
+    const calls: import('../llm/llm.service').ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'web_search', args: { query: 'anything' } },
+    ];
+
+    const { webSearchExecutedCount, decisions } = await callExecuteToolCallsFull(
+      service,
+      CYCLE_ID,
+      calls,
+      Number.MAX_SAFE_INTEGER,
+      0,
+    );
+
+    expect(webSearch.search).not.toHaveBeenCalled();
+    expect(webSearchExecutedCount).toBe(0);
+    expect(decisions).toHaveLength(0);
+  });
+});
+
+describe('kernel__web_search — per-CYCLE cap across the whole ReAct loop (MAX_WEB_SEARCH_CALLS_PER_CYCLE)', () => {
+  /**
+   * Builds an LlmResponse that requests a single kernel__web_search call.
+   */
+  function webSearchTurn(query: string): LlmResponse {
+    return {
+      text:
+        '<tool_calls>[' +
+        `{"tool":"kernel__web_search","args":{"query":"${query}"}}` +
+        ']</tool_calls>',
+      tool_calls: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+    };
+  }
+
+  it('never dispatches more than MAX_WEB_SEARCH_CALLS_PER_CYCLE (5) web_search calls across N ReAct turns, dropping the (N+1)-th gracefully', async () => {
+    const audit = makeAudit();
+    // 4 ReAct turns available (kv override), each turn requests exactly 1 web_search
+    // — well under MAX_WEB_SEARCH_CALLS_PER_ITERATION (3) per turn, so only the
+    // per-CYCLE cap (5) can be the thing that bites here. Use enough turns that the
+    // cumulative total across turns (up to maxTurns * 1) would exceed 5 if uncapped.
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'react.max_turns') return Promise.resolve('7');
+        return Promise.resolve(null);
+      }),
+    };
+    const plugins = makeFullPlugins('Use tools.', []);
+    const webSearch = makeWebSearchStub();
+
+    const llmComplete = jest
+      .fn()
+      .mockResolvedValueOnce(webSearchTurn('q1'))
+      .mockResolvedValueOnce(webSearchTurn('q2'))
+      .mockResolvedValueOnce(webSearchTurn('q3'))
+      .mockResolvedValueOnce(webSearchTurn('q4'))
+      .mockResolvedValueOnce(webSearchTurn('q5'))
+      .mockResolvedValueOnce(webSearchTurn('q6'))
+      .mockResolvedValueOnce(makeLlmText('done'));
+
+    const service = makeWebSearchAgentsService(
+      audit,
+      plugins,
+      webSearch,
+      { complete: llmComplete },
+      kv,
+    );
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'context' });
+
+    // Exactly MAX_WEB_SEARCH_CALLS_PER_CYCLE (5) dispatched, never 6 — the 6th turn's
+    // web_search call is dropped gracefully (no throw, cycle completes normally).
+    expect(webSearch.search).toHaveBeenCalledTimes(5);
+    expect(findAuditEvent(audit, 'web_search_cycle_cap_reached')).toBeDefined();
+  });
+
+  it('a real trade tool call still executes in the same cycle after the web_search cap is reached', async () => {
+    const audit = makeAudit();
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'react.max_turns') return Promise.resolve('7');
+        return Promise.resolve(null);
+      }),
+    };
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+    const webSearch = makeWebSearchStub();
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const tradeTurn: LlmResponse = {
+      text:
+        '<tool_calls>[' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","action":"buy"}}' +
+        ']</tool_calls>',
+      tool_calls: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+    };
+
+    const llmComplete = jest
+      .fn()
+      .mockResolvedValueOnce(webSearchTurn('q1'))
+      .mockResolvedValueOnce(webSearchTurn('q2'))
+      .mockResolvedValueOnce(webSearchTurn('q3'))
+      .mockResolvedValueOnce(webSearchTurn('q4'))
+      .mockResolvedValueOnce(webSearchTurn('q5'))
+      .mockResolvedValueOnce(webSearchTurn('q6')) // cap already reached — dropped
+      .mockResolvedValueOnce(tradeTurn); // real trade call — must still execute
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+      longTermMemory: unknown,
+      debate: unknown,
+      providerGateway: unknown,
+      mlSignalRecord: unknown,
+      tradeIntent: unknown,
+      prisma: unknown,
+      webSearch: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      sandbox,
+      plugins,
+      makeMemory(),
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      webSearch,
+    );
+
+    await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'context',
+      _activePlugins: [
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    expect(webSearch.search).toHaveBeenCalledTimes(5);
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+  });
+
+  it('a cycle made ENTIRELY of web_search calls (no trade tool) still completes normally once the cap is hit', async () => {
+    const audit = makeAudit();
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'react.max_turns') return Promise.resolve('7');
+        return Promise.resolve(null);
+      }),
+    };
+    const plugins = makeFullPlugins('Use tools.', []);
+    const webSearch = makeWebSearchStub();
+
+    const llmComplete = jest
+      .fn()
+      .mockResolvedValueOnce(webSearchTurn('q1'))
+      .mockResolvedValueOnce(webSearchTurn('q2'))
+      .mockResolvedValueOnce(webSearchTurn('q3'))
+      .mockResolvedValueOnce(webSearchTurn('q4'))
+      .mockResolvedValueOnce(webSearchTurn('q5'))
+      .mockResolvedValueOnce(webSearchTurn('q6'))
+      .mockResolvedValue(makeLlmText('done'));
+
+    const service = makeWebSearchAgentsService(
+      audit,
+      plugins,
+      webSearch,
+      { complete: llmComplete },
+      kv,
+    );
+
+    await expect(
+      service.runGovernedTurn({ source: 'cycle', context: 'context' }),
+    ).resolves.toBeDefined();
+    expect(webSearch.search).toHaveBeenCalledTimes(5);
   });
 });
 

@@ -47,7 +47,10 @@ export type AuditEventType =
   // recent ROBUSTO walk-forward verdict (walk-forward gate before live trading)
   | 'walk_forward_gate_demotion'
   // kernel web search: benign, read-only info event — never a decision/signal.
-  | 'kernel_web_search';
+  | 'kernel_web_search'
+  // kernel web search: per-cycle defense-in-depth cap reached (MAX_WEB_SEARCH_CALLS_PER_CYCLE)
+  // — one or more web_search calls dropped gracefully in this iteration, cycle unaffected.
+  | 'web_search_cycle_cap_reached';
 
 export interface AuditPayload {
   cycle_id?: string;

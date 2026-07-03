@@ -43,6 +43,12 @@ type SearchProviderFn = (query: string, cfg: ConfigService) => Promise<WebSearch
 const SEARCH_TIMEOUT_MS = 15_000;
 /** Hard cap on the final text block handed back to the ReAct loop as a tool observation. */
 const TEXT_BLOCK_CAP = 2000;
+/**
+ * Hard cap on the gemini `sources` array derived from grounding chunks. Unlike `text`
+ * (bounded by TEXT_BLOCK_CAP), groundingChunks has no inherent size limit — a heavily
+ * grounded response could return dozens of chunks. Mirrors the Tavily MAX_RESULTS cap.
+ */
+const MAX_GEMINI_SOURCES = 8;
 
 // ── gemini provider (default) — native Google Search grounding ────────────────
 
@@ -138,7 +144,8 @@ async function searchGemini(query: string, cfg: ConfigService): Promise<WebSearc
       if (!uri) return null;
       return title ? `${title} — ${uri}` : uri;
     })
-    .filter((s): s is string => s !== null);
+    .filter((s): s is string => s !== null)
+    .slice(0, MAX_GEMINI_SOURCES);
 
   return { ok: true, text, sources };
 }

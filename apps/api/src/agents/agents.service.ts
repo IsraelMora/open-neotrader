@@ -366,6 +366,17 @@ const KERNEL_ALWAYS_ALLOWED_TOOLS: Set<string> = new Set(['web_search']);
  */
 const MAX_WEB_SEARCH_CALLS_PER_ITERATION = 3;
 
+/**
+ * Defense-in-depth cap on web_search calls dispatched across the WHOLE ReAct cycle
+ * (all iterations of a single runGovernedTurn call), mirroring how `toolCallsExecuted`
+ * bounds the trade-tool budget across turns. MAX_WEB_SEARCH_CALLS_PER_ITERATION alone
+ * only bounds a single iteration — react.max_turns (up to 10) could still let a
+ * misbehaving LLM rack up maxTurns × 3 sequential searches in one cycle. Once this
+ * ceiling is reached, later web_search calls are dropped gracefully (never dispatched,
+ * never throw, never affect the trade path) — see _executeToolCalls.
+ */
+const MAX_WEB_SEARCH_CALLS_PER_CYCLE = 5;
+
 /** Plugin id of the ML discipline — used for opt-in injection and ML-first sort. */
 const ML_PLUGIN_ID = 'ml-feature-extractor';
 
@@ -572,6 +583,12 @@ export class AgentsService {
      * total tool calls this iteration may EXECUTE. Threaded across turns by the caller.
      */
     toolCallBudget: number;
+    /**
+     * Remaining web_search allowance for the WHOLE cycle (not per-turn), mirroring
+     * toolCallBudget. Threaded across turns by runGovernedTurn — see
+     * MAX_WEB_SEARCH_CALLS_PER_CYCLE.
+     */
+    webSearchBudget: number;
   }): Promise<{
     text: string;
     tool_calls: import('../llm/llm.service').ToolCallRequest[];
@@ -583,6 +600,7 @@ export class AgentsService {
     skills_written: string[];
     hadToolCalls: boolean;
     executedCount: number;
+    webSearchExecutedCount: number;
   }> {
     const { cycle_id, source, effectiveTools, visibleTools, decisionPrompt } = args;
 
@@ -644,8 +662,13 @@ export class AgentsService {
       args.virtual_only,
       source,
     );
-    const { decisions, sandbox_results, signalsEmitted, executedCount } =
-      await this._executeToolCalls(cycle_id, validatedCalls, args.toolCallBudget);
+    const { decisions, sandbox_results, signalsEmitted, executedCount, webSearchExecutedCount } =
+      await this._executeToolCalls(
+        cycle_id,
+        validatedCalls,
+        args.toolCallBudget,
+        args.webSearchBudget,
+      );
 
     // hadToolCalls is measured on post-validation calls (not raw parsed calls).
     // An all-dropped iteration counts as no valid intent → natural exit (safe direction).
@@ -700,6 +723,7 @@ export class AgentsService {
       skills_written,
       hadToolCalls,
       executedCount,
+      webSearchExecutedCount,
     };
   }
 
@@ -777,6 +801,8 @@ export class AgentsService {
     // counted across every turn (not per-turn). See REACT_MAX_TOOL_CALLS_DEFAULT.
     const maxToolCalls = await this._resolveMaxToolCalls();
     let toolCallsExecuted = 0;
+    // Per-cycle web_search cap (defense in depth) — see MAX_WEB_SEARCH_CALLS_PER_CYCLE.
+    let webSearchCallsExecuted = 0;
 
     // ── Accumulators ─────────────────────────────────────────────────────────
     const allDecisions: Decision[] = [];
@@ -792,6 +818,7 @@ export class AgentsService {
       turn++;
       const iterContext = this._composeIterationContext(input.context, observations);
       const toolCallBudget = Math.max(0, maxToolCalls - toolCallsExecuted);
+      const webSearchBudget = Math.max(0, MAX_WEB_SEARCH_CALLS_PER_CYCLE - webSearchCallsExecuted);
       last = await this._runSingleIteration({
         cycle_id,
         source: input.source,
@@ -803,8 +830,10 @@ export class AgentsService {
         virtual_only: input.virtual_only,
         decisionPrompt,
         toolCallBudget,
+        webSearchBudget,
       });
       toolCallsExecuted += last.executedCount;
+      webSearchCallsExecuted += last.webSearchExecutedCount;
 
       // Accumulate results
       allDecisions.push(...last.decisions);
@@ -2976,16 +3005,25 @@ export class AgentsService {
    * without touching the documented "max 3 tool calls per cycle" trade-call invariant.
    * `executedCount` (fed back into the caller's cross-turn budget accounting) reflects
    * ONLY budgeted calls, never read-only ones.
+   *
+   * `webSearchBudget` is the remaining web_search allowance for the WHOLE cycle (not just
+   * this iteration) — the caller (runGovernedTurn) threads it across ReAct turns the same
+   * way it threads the trade-tool budget. Defaults to MAX_WEB_SEARCH_CALLS_PER_CYCLE so
+   * direct/legacy callers (e.g. existing tests calling _executeToolCalls in isolation)
+   * keep their prior behavior. Calls beyond the cycle cap are dropped gracefully — never
+   * dispatched, never throw, audited once as 'web_search_cycle_cap_reached'.
    */
   private async _executeToolCalls(
     cycle_id: string,
     toolCalls: import('../llm/llm.service').ToolCallRequest[],
     budget: number,
+    webSearchBudget: number = MAX_WEB_SEARCH_CALLS_PER_CYCLE,
   ): Promise<{
     decisions: Decision[];
     sandbox_results: SandboxResult[];
     signalsEmitted: { symbol: string; action: string }[];
     executedCount: number;
+    webSearchExecutedCount: number;
   }> {
     const decisions: Decision[] = [];
     const sandbox_results: SandboxResult[] = [];
@@ -2994,9 +3032,13 @@ export class AgentsService {
     const isReadOnlyKernelTool = (tc: import('../llm/llm.service').ToolCallRequest): boolean =>
       tc.plugin_id === 'kernel' && KERNEL_ALWAYS_ALLOWED_TOOLS.has(tc.function);
 
-    const readOnlyCalls = toolCalls
-      .filter(isReadOnlyKernelTool)
-      .slice(0, MAX_WEB_SEARCH_CALLS_PER_ITERATION);
+    const allReadOnlyCalls = toolCalls.filter(isReadOnlyKernelTool);
+    const safeWebSearchBudget = Math.max(0, webSearchBudget);
+    const readOnlyCalls = allReadOnlyCalls.slice(
+      0,
+      Math.min(MAX_WEB_SEARCH_CALLS_PER_ITERATION, safeWebSearchBudget),
+    );
+    const droppedByWebSearchCycleCap = allReadOnlyCalls.length - readOnlyCalls.length;
     const budgetedCalls = toolCalls.filter((tc) => !isReadOnlyKernelTool(tc));
 
     const safeBudget = Math.max(0, budget);
@@ -3007,6 +3049,22 @@ export class AgentsService {
     // Read-only info tools first — never counted against safeBudget/droppedByCap.
     for (const tc of readOnlyCalls) {
       await this._dispatchOne(cycle_id, tc, decisions, sandbox_results, signalsEmitted);
+    }
+
+    if (droppedByWebSearchCycleCap > 0) {
+      // Fail-soft: audit-only, never throws, never blocks the cycle or the trade path.
+      this.log.warn(
+        `web_search per-cycle cap reached [${cycle_id}]: ${String(droppedByWebSearchCycleCap)} search call(s) skipped this iteration (webSearchBudget=${String(safeWebSearchBudget)})`,
+      );
+      await this.audit.log({
+        cycle_id,
+        event_type: 'web_search_cycle_cap_reached',
+        meta: {
+          web_search_budget: safeWebSearchBudget,
+          executed: readOnlyCalls.length,
+          dropped: droppedByWebSearchCycleCap,
+        },
+      });
     }
 
     for (const tc of toExecute) {
@@ -3029,7 +3087,13 @@ export class AgentsService {
       });
     }
 
-    return { decisions, sandbox_results, signalsEmitted, executedCount: toExecute.length };
+    return {
+      decisions,
+      sandbox_results,
+      signalsEmitted,
+      executedCount: toExecute.length,
+      webSearchExecutedCount: readOnlyCalls.length,
+    };
   }
 
   /**

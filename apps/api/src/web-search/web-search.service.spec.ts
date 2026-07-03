@@ -90,6 +90,32 @@ describe('WebSearchService — gemini provider (default)', () => {
     });
   });
 
+  it('caps the sources array at 8 even when groundingChunks returns many more', async () => {
+    const svc = makeService({ LLM_API_KEY: 'gm-secret-key' });
+    const manyChunks = Array.from({ length: 20 }, (_, i) => ({
+      web: { title: `Source ${String(i)}`, uri: `https://example.com/${String(i)}` },
+    }));
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve({
+          candidates: [
+            {
+              content: { parts: [{ text: 'summary' }] },
+              groundingMetadata: { groundingChunks: manyChunks },
+            },
+          ],
+        }),
+    });
+
+    const result = await svc.search('fed rate decision');
+
+    expect(result.ok).toBe(true);
+    expect(result.sources?.length).toBeLessThanOrEqual(8);
+    expect(result.sources).toHaveLength(8);
+  });
+
   it('honors WEB_SEARCH_MODEL override', async () => {
     const svc = makeService({ LLM_API_KEY: 'gm-secret-key', WEB_SEARCH_MODEL: 'gemini-3.5-flash' });
     fetchMock.mockResolvedValue({
