@@ -23,7 +23,9 @@ import os
 import sys
 
 _PLUGIN_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "plugins", "momentum-factor-12-1")
+    os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "..", "plugins", "momentum-factor-12-1"
+    )
 )
 _SCRIPTS = os.path.join(_PLUGIN_ROOT, "scripts")
 sys.path.insert(0, _SCRIPTS)

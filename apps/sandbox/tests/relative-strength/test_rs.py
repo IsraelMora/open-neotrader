@@ -17,7 +17,9 @@ import os
 import sys
 
 _SCRIPTS = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "plugins", "relative-strength", "scripts")
+    os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "..", "plugins", "relative-strength", "scripts"
+    )
 )
 sys.path.insert(0, _SCRIPTS)
 
