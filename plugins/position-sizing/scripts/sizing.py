@@ -118,6 +118,43 @@ def stats_from_trades(
     )
 
 
+def compute_inverse_vol_weights(
+    volatilities: dict[str, float],
+    vol_floor: float = 0.01,
+) -> dict[str, float]:
+    """
+    Inverse-volatility (risk-parity) weighting across a batch of candidates.
+
+    w_i = (1 / vol_i) / sum_j(1 / vol_j)
+
+    Lower-volatility assets get a larger weight — no single high-vol position
+    dominates the sleeve. This is the sizing half of dual/time-series momentum
+    (see docs/design/trading-strategy.md step 4: "volatility-targeted sizing").
+
+    Args:
+        volatilities: { symbol: annualized volatility (fraction, e.g. 0.20) }
+        vol_floor:    minimum volatility used in the division, guards against
+                      div/0 or a runaway weight for a near-zero-vol asset.
+
+    Returns:
+        { symbol: weight } — weights sum to 1.0 (empty dict if no input).
+        Caller is responsible for clamping each weight against the kernel's
+        max_position_pct — this function only expresses the relative
+        risk-parity allocation.
+    """
+    if not volatilities:
+        return {}
+
+    inv_vol = {symbol: 1.0 / max(vol, vol_floor) for symbol, vol in volatilities.items()}
+    total = sum(inv_vol.values())
+    if total <= 0:
+        # Degenerate case (shouldn't happen given the floor) — split evenly.
+        n = len(volatilities)
+        return dict.fromkeys(volatilities, 1.0 / n)
+
+    return {symbol: raw / total for symbol, raw in inv_vol.items()}
+
+
 def position_size(
     capital: float,
     price: float,

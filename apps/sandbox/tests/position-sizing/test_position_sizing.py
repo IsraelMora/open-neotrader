@@ -34,7 +34,12 @@ sys.path.insert(0, _HOOKS)
 
 import cycle  # noqa: E402
 from pyramid import calculate_tranches  # noqa: E402
-from sizing import compute_kelly, position_size, stats_from_trades  # noqa: E402
+from sizing import (  # noqa: E402
+    compute_inverse_vol_weights,
+    compute_kelly,
+    position_size,
+    stats_from_trades,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers — synthetic trade history
@@ -487,6 +492,107 @@ class TestEdgeCases:
         }
         result = cycle.on_cycle(ctx)
         assert result["signals"] == []
+
+
+# ---------------------------------------------------------------------------
+# (f) mode="vol_target" — inverse-vol / risk-parity weighting
+# (design doc: docs/design/trading-strategy.md step 4 — w_i ∝ 1/σ_i)
+# ---------------------------------------------------------------------------
+
+class TestVolTargetMode:
+
+    def _ctx(self, signals: list[dict], config_override: dict | None = None) -> dict:
+        config = {
+            "mode": "vol_target",
+            "max_position_pct": 50.0,  # loose cap so the math isn't clipped in tests
+            "default_volatility_pct": 20.0,
+        }
+        if config_override:
+            config.update(config_override)
+        return {
+            "pending_signals": signals,
+            "portfolio_value": 10_000.0,
+            "portfolio": {},
+            "trade_history": [],
+            "config": config,
+        }
+
+    def test_f_higher_vol_asset_gets_smaller_weight(self) -> None:
+        low_vol = {**_long_signal("LOWVOL"), "volatility_12m": 0.10}
+        high_vol = {**_long_signal("HIGHVOL"), "volatility_12m": 0.30}
+        ctx = self._ctx([low_vol, high_vol])
+        result = cycle.on_cycle(ctx)
+
+        by_symbol = {s["symbol"]: s for s in result["signals"]}
+        low = by_symbol["LOWVOL"]["vol_target"]
+        high = by_symbol["HIGHVOL"]["vol_target"]
+
+        assert low["weight"] > high["weight"], (
+            "lower-vol asset must receive a LARGER inverse-vol weight"
+        )
+        assert low["position_pct"] > high["position_pct"]
+
+    def test_f_weights_sum_to_one_before_capping(self) -> None:
+        sigs = [
+            {**_long_signal("A"), "volatility_12m": 0.10},
+            {**_long_signal("B"), "volatility_12m": 0.20},
+            {**_long_signal("C"), "volatility_12m": 0.30},
+        ]
+        ctx = self._ctx(sigs)
+        result = cycle.on_cycle(ctx)
+        total_weight = sum(s["vol_target"]["weight"] for s in result["signals"])
+        assert total_weight == pytest.approx(1.0, abs=1e-6)
+
+    def test_f_position_pct_respects_max_position_pct_cap(self) -> None:
+        # A single signal would get 100% weight uncapped — must be clamped.
+        sigs = [{**_long_signal("A"), "volatility_12m": 0.10}]
+        ctx = self._ctx(sigs, {"max_position_pct": 12.0})
+        result = cycle.on_cycle(ctx)
+        sig = result["signals"][0]
+        assert sig["vol_target"]["position_pct"] <= 12.0
+
+    def test_f_missing_volatility_falls_back_safely_with_a_log(self) -> None:
+        sigs = [{**_long_signal("NOVOL")}]  # no volatility_12m field
+        ctx = self._ctx(sigs)
+        result = cycle.on_cycle(ctx)
+        sig = result["signals"][0]
+        assert "vol_target" in sig  # must not crash / must still size the signal
+        assert any("volatility" in log["msg"].lower() for log in result["logs"])
+
+    def test_f_non_long_signals_pass_through_unchanged(self) -> None:
+        ctx = self._ctx([{"action": "exit", "symbol": "AAPL"}])
+        result = cycle.on_cycle(ctx)
+        assert len(result["signals"]) == 1
+        assert "vol_target" not in result["signals"][0]
+        assert result["signals"][0]["action"] == "exit"
+
+
+class TestComputeInverseVolWeights:
+
+    def test_pinned_two_asset_weights(self) -> None:
+        # vol A=0.10 -> raw 10, vol B=0.20 -> raw 5, sum=15
+        weights = compute_inverse_vol_weights({"A": 0.10, "B": 0.20})
+        assert weights["A"] == pytest.approx(10 / 15, abs=1e-6)
+        assert weights["B"] == pytest.approx(5 / 15, abs=1e-6)
+
+    def test_equal_vol_gives_equal_weights(self) -> None:
+        weights = compute_inverse_vol_weights({"A": 0.15, "B": 0.15, "C": 0.15})
+        assert weights["A"] == pytest.approx(1 / 3, abs=1e-6)
+        assert weights["B"] == pytest.approx(1 / 3, abs=1e-6)
+        assert weights["C"] == pytest.approx(1 / 3, abs=1e-6)
+
+    def test_weights_sum_to_one(self) -> None:
+        weights = compute_inverse_vol_weights({"A": 0.05, "B": 0.40, "C": 0.12, "D": 0.25})
+        assert sum(weights.values()) == pytest.approx(1.0, abs=1e-9)
+
+    def test_zero_volatility_does_not_crash(self) -> None:
+        """Zero/negative vol must fall back to a small epsilon, not raise ZeroDivisionError."""
+        weights = compute_inverse_vol_weights({"A": 0.0, "B": 0.20})
+        assert weights["A"] > weights["B"], "near-zero vol asset gets the largest weight"
+        assert sum(weights.values()) == pytest.approx(1.0, abs=1e-9)
+
+    def test_empty_input_returns_empty(self) -> None:
+        assert compute_inverse_vol_weights({}) == {}
 
 
 # ---------------------------------------------------------------------------

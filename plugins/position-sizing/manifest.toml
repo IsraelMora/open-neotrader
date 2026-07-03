@@ -3,7 +3,7 @@ id          = "position-sizing"
 name        = "Position Sizing (Unified)"
 version     = "1.0.0"
 type        = "discipline"
-description = "Unified position-sizing discipline with selectable modes: Kelly Criterion (optimal fraction from trade history), Van Tharp Pyramiding (tranches + add to winners), and Fixed Fractional. Consolidates kelly-criterion and position-sizing-pyramid plugins."
+description = "Unified position-sizing discipline with selectable modes: Kelly Criterion (optimal fraction from trade history), Van Tharp Pyramiding (tranches + add to winners), Fixed Fractional, and Vol-Target (inverse-vol / risk-parity weighting for momentum-rotation strategies). Consolidates kelly-criterion and position-sizing-pyramid plugins."
 author      = "OpenNeoTrader"
 license     = "MIT"
 
@@ -23,12 +23,16 @@ description = "Return Kelly statistics from trade history: win_rate, payoff_rati
 name        = "evaluate_add"
 description = "Given an open position's state, determine whether the next pyramid tranche should be added now."
 
+[[tools]]
+name        = "compute_inverse_vol_weights"
+description = "Compute inverse-vol / risk-parity weights across a batch of candidate symbols given their volatilities. Lower-vol assets get more weight."
+
 [config]
 [config.mode]
 type        = "string"
 default     = "kelly"
 label       = "Sizing mode"
-description = "Which sizing algorithm to use: 'kelly' (optimal fraction from trade history), 'pyramid' (Van Tharp tranches), 'fixed' (fixed % of capital)."
+description = "Which sizing algorithm to use: 'kelly' (optimal fraction from trade history), 'pyramid' (Van Tharp tranches), 'fixed' (fixed % of capital), 'vol_target' (inverse-vol / risk-parity weighting)."
 
 [config.kelly_fraction_cap]
 type        = "number"
@@ -107,6 +111,14 @@ type        = "boolean"
 default     = true
 label       = "Trail stop on add"
 description = "Move stop loss to breakeven after adding the second tranche. Used only in pyramid mode."
+
+[config.default_volatility_pct]
+type        = "number"
+default     = 20
+min         = 1
+max         = 100
+label       = "Default volatility (%)"
+description = "Fallback annualized volatility used when a signal doesn't carry volatility_12m/volatility. Used only in vol_target mode."
 
 [hooks]
 on_cycle = "hooks/cycle.py"
