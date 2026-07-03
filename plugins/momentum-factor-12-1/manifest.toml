@@ -32,6 +32,20 @@ max     = 50
 label   = "% top a comprar"
 description = "Porcentaje superior del universo a incluir en la posición larga (ej. 20 = top 20%)."
 
+[config.enable_short]
+type    = "boolean"
+default = false
+label   = "Habilitar señales short (opt-in)"
+description = "Cuando está desactivado (default) el plugin se comporta exactamente igual que antes: solo long/exit. Al activarlo, emite señales 'short' para el peor short_bottom_pct del universo con momentum absoluto negativo."
+
+[config.short_bottom_pct]
+type    = "number"
+default = 10
+min     = 5
+max     = 50
+label   = "% inferior a shortear"
+description = "Porcentaje inferior del universo candidato a short (ej. 10 = peor 10%). Solo aplica si enable_short=true, y solo a símbolos con retorno 12-1 negativo."
+
 [config.rebalance_frequency]
 type    = "string"
 enum    = ["weekly", "monthly", "quarterly"]

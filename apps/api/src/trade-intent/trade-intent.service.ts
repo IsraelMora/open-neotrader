@@ -85,6 +85,22 @@ export interface ExecutionPolicy {
   broker_plugin_id: string;
   /** Hard ceiling per real order in notional value (qty * price). Default 1000. */
   max_order_notional: number;
+  /**
+   * Additional, short-specific ceiling: a short entry's notional can never exceed
+   * this fraction of equity. Applied ON TOP OF (never instead of) the same
+   * max_position_pct ceiling long entries use — shorts are always AT LEAST as
+   * restricted as longs, never looser. Default mirrors max_position_pct's default.
+   */
+  max_short_notional_pct: number;
+  /**
+   * Real-money short-selling is OFF by default (opt-in). Only literal 'true' (string)
+   * enables it. When a "short" intent would otherwise resolve to real-mode
+   * (policy.real + broker_plugin_id + walk-forward gate all pass), this flag is
+   * checked LAST — if not explicitly true, the intent is DEMOTED to paper instead
+   * of ever placing a real short order. This is in addition to (never a replacement
+   * for) the existing real gates.
+   */
+  allow_real_short: boolean;
 }
 
 /**
@@ -100,6 +116,8 @@ const DEFAULT_EXECUTION_POLICY: ExecutionPolicy = {
   real: false,
   broker_plugin_id: '',
   max_order_notional: 1_000,
+  max_short_notional_pct: 0.1,
+  allow_real_short: false,
 };
 
 /** Default capital for the shared paper portfolio if it doesn't exist yet. */
@@ -312,10 +330,14 @@ export class TradeIntentService {
     // Risk gate — only for opening trades. Real mode gates the REAL account (realState,
     // non-null here — see fail-closed check above); paper mode gates paperState, unchanged.
     if (action === 'long' || action === 'short') {
+      // Paper entries are gated against a FRESH mark-to-market of every open position
+      // (not just the just-traded symbol) — see _passesPaperEntryGate doc comment for
+      // the safety-gap this closes. Real mode is unaffected (realState already reflects
+      // the broker's live account).
       const { pass, reason } =
         effectiveMode === 'real'
           ? this._passesAutoRisk(realState as RealAccountState, policy, 'real')
-          : this._passesAutoRisk(paperState, policy, 'paper');
+          : await this._passesPaperEntryGate(paperState, policy);
       if (!pass) {
         return this.db.tradeIntent.update({
           where: { id },
@@ -348,6 +370,7 @@ export class TradeIntentService {
       'autonomous',
       policy.max_position_pct,
       policy.max_position_pct,
+      policy.max_short_notional_pct,
     );
   }
 
@@ -453,10 +476,14 @@ export class TradeIntentService {
     // even during an active halt. Real mode gates the REAL account (realState, non-null
     // here — see fail-closed check above); paper mode gates the paper state, unchanged.
     if (action === 'long' || action === 'short') {
+      // Paper entries are gated against a FRESH mark-to-market of every open position
+      // (not just the just-traded symbol) — see _passesPaperEntryGate doc comment for
+      // the safety-gap this closes. Real mode is unaffected (realState already reflects
+      // the broker's live account).
       const { pass, reason } =
         effectiveMode === 'real'
           ? this._passesAutoRisk(realState as RealAccountState, policy, 'real')
-          : this._passesAutoRisk(state, policy, 'paper');
+          : await this._passesPaperEntryGate(state, policy);
       if (!pass) {
         return this.db.tradeIntent.update({
           where: { id },
@@ -481,6 +508,7 @@ export class TradeIntentService {
       decided_by,
       SIZING_PCT,
       policy.max_position_pct,
+      policy.max_short_notional_pct,
     );
   }
 
@@ -523,6 +551,8 @@ export class TradeIntentService {
       rawReal,
       rawBrokerId,
       rawMaxNotional,
+      rawMaxShortNotionalPct,
+      rawAllowRealShort,
     ] = await Promise.all([
       this.kv.get('execution.autonomous'),
       this.kv.get('execution.max_position_pct'),
@@ -531,6 +561,8 @@ export class TradeIntentService {
       this.kv.get('execution.real'),
       this.kv.get('execution.broker_plugin_id'),
       this.kv.get('execution.max_order_notional'),
+      this.kv.get('execution.max_short_notional_pct'),
+      this.kv.get('execution.allow_real_short'),
     ]);
 
     // autonomous: only an explicit false disables it (default on). kvBool tolera el
@@ -568,6 +600,21 @@ export class TradeIntentService {
     let max_order_notional = kvNum(rawMaxNotional, DEFAULT_EXECUTION_POLICY.max_order_notional);
     if (max_order_notional <= 0) max_order_notional = DEFAULT_EXECUTION_POLICY.max_order_notional;
 
+    // max_short_notional_pct: additional short-specific ceiling, must be in (0, 1].
+    let max_short_notional_pct = kvNum(
+      rawMaxShortNotionalPct,
+      DEFAULT_EXECUTION_POLICY.max_short_notional_pct,
+    );
+    if (max_short_notional_pct <= 0 || max_short_notional_pct > 1) {
+      this.log.warn(
+        `execution.max_short_notional_pct out of range (${max_short_notional_pct}) — falling back to default ${DEFAULT_EXECUTION_POLICY.max_short_notional_pct}`,
+      );
+      max_short_notional_pct = DEFAULT_EXECUTION_POLICY.max_short_notional_pct;
+    }
+
+    // allow_real_short: only literal 'true' enables real short-selling (default false).
+    const allow_real_short = kvBool(rawAllowRealShort, DEFAULT_EXECUTION_POLICY.allow_real_short);
+
     return {
       autonomous,
       max_position_pct,
@@ -576,6 +623,8 @@ export class TradeIntentService {
       real,
       broker_plugin_id,
       max_order_notional,
+      max_short_notional_pct,
+      allow_real_short,
     };
   }
 
@@ -604,6 +653,10 @@ export class TradeIntentService {
       await this.kv.set('execution.max_drawdown_halt_pct', String(patch.max_drawdown_halt_pct));
     if (patch.max_order_notional !== undefined)
       await this.kv.set('execution.max_order_notional', String(patch.max_order_notional));
+    if (patch.max_short_notional_pct !== undefined)
+      await this.kv.set('execution.max_short_notional_pct', String(patch.max_short_notional_pct));
+    if (patch.allow_real_short !== undefined)
+      await this.kv.set('execution.allow_real_short', String(patch.allow_real_short));
     return this._readExecutionPolicy();
   }
 
@@ -664,6 +717,21 @@ export class TradeIntentService {
         `REAL DEMOTED TO PAPER [${contextId}]: walk-forward gate failed — ${gate.reason}`,
       );
       await this._auditDemotion(contextId, gate.reason ?? 'walk-forward gate failed');
+      return 'paper';
+    }
+
+    // Real short-selling is OFF by default (opt-in, checked LAST): even with real=true,
+    // a broker configured, and a passing walk-forward gate, a "short" intent is demoted
+    // to paper unless the operator has explicitly set execution.allow_real_short=true.
+    // Never enabled implicitly by turning on real execution for longs.
+    if (action === 'short' && !policy.allow_real_short) {
+      this.log.warn(
+        `REAL DEMOTED TO PAPER [${contextId}]: real short-selling requires execution.allow_real_short=true`,
+      );
+      await this._auditDemotion(
+        contextId,
+        'real short-selling requires execution.allow_real_short=true',
+      );
       return 'paper';
     }
     return 'real';
@@ -1079,6 +1147,28 @@ export class TradeIntentService {
       };
     }
 
+    // Defensive: real short-selling re-check (belt-and-suspenders beyond _effectiveMode).
+    // In the normal flow _effectiveMode already demoted a short without allow_real_short
+    // to paper, so this never fires; if it ever does, fail safe — no real short is placed.
+    if (action === 'short' && !policy.allow_real_short) {
+      this.log.warn(
+        `REAL ORDER REJECTED [${id}]: real short-selling requires execution.allow_real_short=true — safety guard`,
+      );
+      return {
+        failedUpdate: this.db.tradeIntent.update({
+          where: { id },
+          data: {
+            status: 'failed',
+            decided_at: new Date(),
+            decided_by,
+            result_json: JSON.stringify({
+              error: 'real short-selling requires execution.allow_real_short=true',
+            }),
+          },
+        }),
+      };
+    }
+
     // Defensive walk-forward gate re-check (belt-and-suspenders beyond _effectiveMode) so
     // no future caller can reach real execution without a recent ROBUSTO verdict on the
     // applied strategy. In the normal flow _effectiveMode already demoted to paper, so this
@@ -1203,6 +1293,20 @@ export class TradeIntentService {
       id,
       action === 'long' ? 'real long' : 'real short',
     );
+
+    // Short-specific additional ceiling (never looser than the long ceiling above) —
+    // mirrors the paper path's _clampToShortNotionalCeiling. Real shorting stays gated
+    // off by default via execution.allow_real_short; this only tightens sizing further
+    // for the rare case an operator has explicitly opted in.
+    if (action === 'short') {
+      qty = this._clampToShortNotionalCeiling(
+        qty,
+        realState.equity,
+        price,
+        policy.max_short_notional_pct,
+        id,
+      );
+    }
 
     // Second, independent cap: notional must never exceed the broker's actual buying power.
     // This is a MIN, never a substitute for the equity-based ceiling above — it can only
@@ -1512,6 +1616,97 @@ export class TradeIntentService {
     return { pass: true };
   }
 
+  // ── _markToMarketPaper ────────────────────────────────────────────────────────
+
+  /**
+   * Mark-to-market of ALL open paper positions against CURRENT prices — CRITICAL
+   * safety fix (adversarial-review finding): the drawdown circuit-breaker used to gate
+   * against `paperState.equity`, but that field was only ever recomputed as a side effect
+   * of executing a trade on the SPECIFIC symbol just traded (see _positionsValue/
+   * _executePaper). An OPEN position moving against the book (a rallying SHORT —
+   * unbounded loss — or a falling LONG) while no new trade touches that symbol was
+   * therefore INVISIBLE to the halt. This recomputes equity fresh over every open
+   * position, one batched round of quote fetches per gate evaluation, mirroring the
+   * pattern in PretestService._updateEquityMetrics.
+   *
+   * `equity = cash + Σ(current_price * signed_quantity)` — quantity is already SIGNED
+   * (negative for shorts), so a rising price on a short correctly REDUCES equity without
+   * any special-casing. hwm is updated to max(previous hwm, fresh equity) so a new
+   * all-time high is still recognized, exactly like the existing per-trade path.
+   *
+   * Fail-CLOSED, never fail-soft: unlike PretestService's MTM (which falls back to a
+   * stale price so a long-running simulation keeps ticking), a FAILURE to price any
+   * single open position here means `ok: false` — the caller MUST refuse the entry
+   * rather than gate against a partially-stale or fabricated equity number. This
+   * function is only ever called before an ENTRY (long/short) decision — "exit"/"hold"
+   * never call it, preserving the closeability invariant (a position must always be
+   * closeable even when the book can't be fully valued).
+   */
+  private async _markToMarketPaper(
+    state: PaperState,
+  ): Promise<{ equity: number; hwm: number; ok: boolean }> {
+    const baseHwm = state.hwm ?? state.equity;
+
+    if (state.positions.length === 0) {
+      return { equity: state.equity, hwm: Math.max(baseHwm, state.equity), ok: true };
+    }
+
+    let ok = true;
+    let positionsValue = 0;
+    // One batched round of quote fetches — never a new outbound-HTTP path, reuses the
+    // same ProviderGatewayService.getQuote already used everywhere else in this service.
+    await Promise.all(
+      state.positions.map(async (pos) => {
+        try {
+          const quote = await this.gateway.getQuote(null, pos.symbol);
+          if (!quote || !isFinite(quote.last) || quote.last <= 0) {
+            ok = false;
+            return;
+          }
+          positionsValue += quote.last * pos.quantity;
+        } catch {
+          ok = false;
+        }
+      }),
+    );
+
+    if (!ok) {
+      // Fail closed: do not return a partially-priced/fabricated equity — caller must
+      // refuse the entry outright.
+      return { equity: state.equity, hwm: baseHwm, ok: false };
+    }
+
+    const equity = state.cash + positionsValue;
+    return { equity, hwm: Math.max(baseHwm, equity), ok: true };
+  }
+
+  /**
+   * Combines `_markToMarketPaper` with the existing `_passesAutoRisk` gate for a PAPER
+   * entry (long/short). A mark-to-market failure blocks the entry (fail-closed) with a
+   * dedicated reason distinct from the drawdown/max-positions reasons, so an operator can
+   * tell "book valued fine, but risk limit hit" apart from "couldn't value the book at
+   * all". Never mutates the caller's `state` — the fresh equity/hwm are only used for this
+   * gate decision; the persisted paper portfolio still updates the normal way on trade
+   * execution.
+   */
+  private async _passesPaperEntryGate(
+    state: PaperState,
+    policy: ExecutionPolicy,
+  ): Promise<{ pass: boolean; reason?: string }> {
+    const mtm = await this._markToMarketPaper(state);
+    if (!mtm.ok) {
+      this.log.warn(
+        'PAPER ENTRY BLOCKED: mark-to-market failed for one or more open positions — refusing new entry (fail-closed)',
+      );
+      return {
+        pass: false,
+        reason: 'mark-to-market unavailable for one or more open positions — refusing new entry',
+      };
+    }
+    const freshState: PaperState = { ...state, equity: mtm.equity, hwm: mtm.hwm };
+    return this._passesAutoRisk(freshState, policy, 'paper');
+  }
+
   // ── _clampToPositionCeiling ───────────────────────────────────────────────────
 
   /**
@@ -1555,6 +1750,7 @@ export class TradeIntentService {
     decided_by: string,
     sizingPct: number,
     maxPositionPct: number,
+    maxShortNotionalPct: number = DEFAULT_EXECUTION_POLICY.max_short_notional_pct,
   ) {
     // Fetch live quote (fail-soft on error).
     let fillPrice: number;
@@ -1595,6 +1791,7 @@ export class TradeIntentService {
       state,
       sizingPct,
       maxPositionPct,
+      maxShortNotionalPct,
     );
 
     // Persist updated portfolio state.
@@ -1637,9 +1834,20 @@ export class TradeIntentService {
    * Returns the executed quantity, any realized_pnl (for exit), and the updated state.
    *
    * "long"  → buy floor(cash * sizingPct / fill_price) shares, hard-clamped to the
-   *           policy.max_position_pct ceiling; avg_price cost-basis.
-   * "exit"  → close entire existing position; realized_pnl = (fill - avg) * qty.
-   * "short" → not really executable in simple paper mode; records qty=0, no state change.
+   *           policy.max_position_pct ceiling; avg_price cost-basis. Refuses to open a
+   *           long on top of an existing SHORT in the same symbol (mixed long/short
+   *           per symbol is not modeled — use "exit" to cover first).
+   * "short" → sell-to-open floor(cash * sizingPct / fill_price) shares, gated by the
+   *           SAME max_position_pct ceiling as "long" (never looser) PLUS an
+   *           additional max_short_notional_pct ceiling. Position quantity goes
+   *           NEGATIVE. Refuses to open a short on top of an existing LONG.
+   * "exit"  → close the ENTIRE existing position, long or short. Quantity is SIGNED
+   *           (negative for a short), so realized_pnl = (fill - avg) * quantity and
+   *           cash += fill * quantity generalize correctly to both: covering a short
+   *           (a negative quantity) naturally debits cash and credits profit when
+   *           fill < avg. This is the ONLY path that closes a short — "exit" always
+   *           bypasses the risk gate (see autoProcess/approve), so a short is ALWAYS
+   *           closeable, mirroring the long-exit invariant.
    * "hold"  → no trade; qty=0.
    *
    * hwm (high-water-mark) is recomputed on every return path as max(previous hwm,
@@ -1653,6 +1861,7 @@ export class TradeIntentService {
     state: PaperState,
     sizingPct: number,
     maxPositionPct: number,
+    maxShortNotionalPct: number = DEFAULT_EXECUTION_POLICY.max_short_notional_pct,
   ): { quantity: number; realized_pnl: number | null; newState: PaperState } {
     // Deep-copy positions so we don't mutate the original.
     const newState: PaperState = {
@@ -1664,35 +1873,30 @@ export class TradeIntentService {
     const baseHwm = state.hwm ?? state.equity;
 
     if (action === 'long') {
-      const budget = newState.cash * sizingPct;
-      const quantity = this._clampToPositionCeiling(
-        Math.floor(budget / fillPrice),
-        state.equity,
-        fillPrice,
-        maxPositionPct,
+      return this._executePaperLong(
         id,
-        'paper long',
+        symbol,
+        fillPrice,
+        newState,
+        baseHwm,
+        sizingPct,
+        maxPositionPct,
+        state.equity,
       );
-      if (quantity <= 0) {
-        newState.hwm = Math.max(baseHwm, newState.equity);
-        return { quantity: 0, realized_pnl: null, newState };
-      }
-      const cost = fillPrice * quantity;
-      newState.cash -= cost;
+    }
 
-      const existing = newState.positions.find((p) => p.symbol === symbol);
-      if (existing) {
-        const totalQty = existing.quantity + quantity;
-        existing.avg_price =
-          (existing.avg_price * existing.quantity + fillPrice * quantity) / totalQty;
-        existing.quantity = totalQty;
-      } else {
-        newState.positions.push({ symbol, quantity, avg_price: fillPrice });
-      }
-
-      newState.equity = newState.cash + this._positionsValue(newState.positions, fillPrice, symbol);
-      newState.hwm = Math.max(baseHwm, newState.equity);
-      return { quantity, realized_pnl: null, newState };
+    if (action === 'short') {
+      return this._executePaperShort(
+        id,
+        symbol,
+        fillPrice,
+        newState,
+        baseHwm,
+        sizingPct,
+        maxPositionPct,
+        maxShortNotionalPct,
+        state.equity,
+      );
     }
 
     if (action === 'exit') {
@@ -1703,6 +1907,11 @@ export class TradeIntentService {
         return { quantity: 0, realized_pnl: null, newState };
       }
       const pos = newState.positions[posIdx];
+      // quantity is SIGNED (negative for a short). This single formula generalizes to
+      // both a long exit AND a short cover: proceeds = fill * quantity is negative for
+      // a short (cash correctly debited to buy back), and realized_pnl = (fill - avg) *
+      // quantity is positive when a short is covered BELOW its entry price. See doc
+      // comment above.
       const quantity = pos.quantity;
       const proceeds = fillPrice * quantity;
       const realized_pnl = (fillPrice - pos.avg_price) * quantity;
@@ -1713,9 +1922,151 @@ export class TradeIntentService {
       return { quantity, realized_pnl, newState };
     }
 
-    // "short" and "hold": no portfolio mutation in simple paper mode.
+    // "hold": no portfolio mutation.
     newState.hwm = Math.max(baseHwm, newState.equity);
     return { quantity: 0, realized_pnl: null, newState };
+  }
+
+  /**
+   * "long" branch of _executePaper — extracted to keep that function's cognitive
+   * complexity within the sonarjs limit. See _executePaper's doc comment for the
+   * full contract (including the mixed long/short refusal).
+   */
+  private _executePaperLong(
+    id: string,
+    symbol: string,
+    fillPrice: number,
+    newState: PaperState,
+    baseHwm: number,
+    sizingPct: number,
+    maxPositionPct: number,
+    baseEquity: number,
+  ): { quantity: number; realized_pnl: number | null; newState: PaperState } {
+    const existing = newState.positions.find((p) => p.symbol === symbol);
+    if (existing && existing.quantity < 0) {
+      // Refuse to open a long on top of an existing short — cover it first via "exit".
+      newState.hwm = Math.max(baseHwm, newState.equity);
+      return { quantity: 0, realized_pnl: null, newState };
+    }
+
+    const budget = newState.cash * sizingPct;
+    const quantity = this._clampToPositionCeiling(
+      Math.floor(budget / fillPrice),
+      baseEquity,
+      fillPrice,
+      maxPositionPct,
+      id,
+      'paper long',
+    );
+    if (quantity <= 0) {
+      newState.hwm = Math.max(baseHwm, newState.equity);
+      return { quantity: 0, realized_pnl: null, newState };
+    }
+    const cost = fillPrice * quantity;
+    newState.cash -= cost;
+
+    if (existing) {
+      const totalQty = existing.quantity + quantity;
+      existing.avg_price =
+        (existing.avg_price * existing.quantity + fillPrice * quantity) / totalQty;
+      existing.quantity = totalQty;
+    } else {
+      newState.positions.push({ symbol, quantity, avg_price: fillPrice });
+    }
+
+    newState.equity = newState.cash + this._positionsValue(newState.positions, fillPrice, symbol);
+    newState.hwm = Math.max(baseHwm, newState.equity);
+    return { quantity, realized_pnl: null, newState };
+  }
+
+  /**
+   * "short" branch of _executePaper — extracted to keep that function's cognitive
+   * complexity within the sonarjs limit. See _executePaper's doc comment for the
+   * full contract (including the max_short_notional_pct ceiling and the mixed
+   * long/short refusal).
+   */
+  private _executePaperShort(
+    id: string,
+    symbol: string,
+    fillPrice: number,
+    newState: PaperState,
+    baseHwm: number,
+    sizingPct: number,
+    maxPositionPct: number,
+    maxShortNotionalPct: number,
+    baseEquity: number,
+  ): { quantity: number; realized_pnl: number | null; newState: PaperState } {
+    const existing = newState.positions.find((p) => p.symbol === symbol);
+    if (existing && existing.quantity > 0) {
+      // Refuse to open a short on top of an existing long — exit it first.
+      newState.hwm = Math.max(baseHwm, newState.equity);
+      return { quantity: 0, realized_pnl: null, newState };
+    }
+
+    const budget = newState.cash * sizingPct;
+    // Same base ceiling as "long" (never looser), PLUS an additional short-specific
+    // notional ceiling — see class-level risk-kernel doc.
+    let quantity = this._clampToPositionCeiling(
+      Math.floor(budget / fillPrice),
+      baseEquity,
+      fillPrice,
+      maxPositionPct,
+      id,
+      'paper short',
+    );
+    quantity = this._clampToShortNotionalCeiling(
+      quantity,
+      baseEquity,
+      fillPrice,
+      maxShortNotionalPct,
+      id,
+    );
+    if (quantity <= 0) {
+      newState.hwm = Math.max(baseHwm, newState.equity);
+      return { quantity: 0, realized_pnl: null, newState };
+    }
+
+    // Sell-to-open: cash is credited with proceeds; the negative position quantity
+    // represents the liability, so equity (cash + Σ price*quantity) is correct for free.
+    const proceeds = fillPrice * quantity;
+    newState.cash += proceeds;
+
+    if (existing) {
+      const existingAbs = Math.abs(existing.quantity);
+      const totalQty = existingAbs + quantity;
+      existing.avg_price = (existing.avg_price * existingAbs + fillPrice * quantity) / totalQty;
+      existing.quantity = -totalQty;
+    } else {
+      newState.positions.push({ symbol, quantity: -quantity, avg_price: fillPrice });
+    }
+
+    newState.equity = newState.cash + this._positionsValue(newState.positions, fillPrice, symbol);
+    newState.hwm = Math.max(baseHwm, newState.equity);
+    return { quantity, realized_pnl: null, newState };
+  }
+
+  /**
+   * Additional, short-specific ceiling ON TOP OF _clampToPositionCeiling: a short's
+   * notional can never exceed max_short_notional_pct of equity. Only ever REDUCES qty
+   * further — never raises it — so shorts stay at least as restricted as longs.
+   */
+  private _clampToShortNotionalCeiling(
+    qty: number,
+    equity: number,
+    price: number,
+    maxShortNotionalPct: number,
+    id: string,
+  ): number {
+    if (qty <= 0) return qty;
+    const maxQty = Math.floor((equity * maxShortNotionalPct) / price);
+    if (qty > maxQty) {
+      this.log.warn(
+        `SHORT SIZE CLAMPED [${id}]: qty ${qty} → ${maxQty} ` +
+          `(ceiling: equity=${equity} * max_short_notional_pct=${maxShortNotionalPct} / price=${price})`,
+      );
+      return maxQty;
+    }
+    return qty;
   }
 
   /** Computes total position value using fillPrice for the traded symbol, avg_price for others. */

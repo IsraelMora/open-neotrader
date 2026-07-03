@@ -34,6 +34,10 @@ def on_cycle(ctx: dict) -> dict:
     top_pct = config.get("top_pct", 20) / 100.0
     lookback_months = config.get("lookback_months", 12)
     market_trend_up: bool = ctx.get("market_trend_up", True)
+    # Short-selling es OPT-IN — default False, comportamiento long/exit-only
+    # idéntico al original cuando no se activa explícitamente por config.
+    enable_short: bool = bool(config.get("enable_short", False))
+    short_bottom_pct = config.get("short_bottom_pct", 10) / 100.0
 
     signals = []
     logs = []
@@ -95,12 +99,17 @@ def on_cycle(ctx: dict) -> dict:
 
     current_positions = set(portfolio.keys())
     ranks = compute_momentum_ranks(
-        universe_data, top_pct, lookback_months, current_positions=current_positions
+        universe_data,
+        top_pct,
+        lookback_months,
+        current_positions=current_positions,
+        enable_short=enable_short,
+        short_bottom_pct=short_bottom_pct,
     )
     ranks = apply_trend_filter(ranks, market_trend_up)
 
     for r in ranks:
-        if r.signal in ("long", "exit"):
+        if r.signal in ("long", "exit", "short"):
             signals.append(
                 {
                     "type": "momentum_signal",
@@ -117,12 +126,13 @@ def on_cycle(ctx: dict) -> dict:
 
     long_count = sum(1 for s in signals if s["action"] == "long")
     exit_count = sum(1 for s in signals if s["action"] == "exit")
+    short_count = sum(1 for s in signals if s["action"] == "short")
     logs.append(
         {
             "level": "info",
             "msg": (
                 f"Momentum 12-1 | universo={len(universe_data)} | "
-                f"long={long_count} | exit={exit_count} | "
+                f"long={long_count} | exit={exit_count} | short={short_count} | "
                 f"trend={'up' if market_trend_up else 'DOWN (filtro activo)'}"
             ),
         }
