@@ -798,3 +798,137 @@ class TestRunCycleErrorIsolation:
         assert len(result["pending_signals"]) == 1, (
             f"Expected skill signal from {s_pid} to pass through; got {result['pending_signals']}"
         )
+
+
+class TestRunCyclePerPluginConfig:
+    """
+    Bug A (pretest ignores per-portfolio plugin config): cmd_run_cycle must let a
+    caller pass DIFFERENT effective config to different active plugins in the SAME
+    cycle via context["plugin_configs"][plugin_id], layered on top of the manifest
+    [config] defaults and the legacy global context["config"] dict (still supported
+    for backward compatibility with callers that only set one global config).
+    """
+
+    def _write_echo_plugin(self, root: Path, pid: str) -> None:
+        import textwrap
+
+        pdir = root / pid
+        (pdir / "hooks").mkdir(parents=True)
+        (pdir / "plugin.py").write_text("", encoding="utf-8")
+        (pdir / "manifest.toml").write_text(
+            textwrap.dedent(f"""\
+                [plugin]
+                id = "{pid}"
+                type = "skill"
+                [hooks]
+                on_cycle = "hooks/cycle.py"
+                [skills]
+                keys = []
+                [config.top_pct]
+                type = "number"
+                default = 10
+            """),
+            encoding="utf-8",
+        )
+        (pdir / "hooks" / "cycle.py").write_text(
+            textwrap.dedent("""\
+                def on_cycle(ctx):
+                    cfg = ctx.get("config", {})
+                    return {
+                        "signals": [{
+                            "type": "config_echo",
+                            "symbol": "X",
+                            "action": "long",
+                            "top_pct": cfg.get("top_pct"),
+                        }],
+                        "logs": [],
+                    }
+            """),
+            encoding="utf-8",
+        )
+
+    def test_plugin_configs_gives_each_plugin_its_own_config_in_the_same_cycle(
+        self, tmp_path, monkeypatch
+    ):
+        """Two portfolios' worth of plugins (same plugin id family, different top_pct)
+        must each see their OWN top_pct, not a single shared value."""
+        self._write_echo_plugin(tmp_path, "echo-a")
+        self._write_echo_plugin(tmp_path, "echo-b")
+
+        mod = _load_runner()
+        monkeypatch.setattr(mod, "PLUGINS_DIR", tmp_path)
+
+        req = {
+            "cmd": "run_cycle",
+            "active_ids": ["echo-a", "echo-b"],
+            "context": {
+                "universe": [],
+                "ohlcv": {},
+                "portfolio": {},
+                "config": {},
+                "plugin_configs": {
+                    "echo-a": {"top_pct": 20},
+                    "echo-b": {"top_pct": 50},
+                },
+            },
+        }
+        result = mod.cmd_run_cycle(req)
+
+        assert result["errors"] == [], f"Unexpected errors: {result['errors']}"
+        by_plugin = {s["_plugin"]: s["top_pct"] for s in result["pending_signals"]}
+        assert by_plugin == {"echo-a": 20, "echo-b": 50}, (
+            f"Expected per-plugin config to differentiate top_pct; got {by_plugin}"
+        )
+
+    def test_plugin_without_a_plugin_configs_entry_falls_back_to_manifest_default(
+        self, tmp_path, monkeypatch
+    ):
+        """A plugin with no entry in plugin_configs must still get its manifest default
+        (10), not crash and not silently inherit another plugin's override."""
+        self._write_echo_plugin(tmp_path, "echo-a")
+        self._write_echo_plugin(tmp_path, "echo-c")
+
+        mod = _load_runner()
+        monkeypatch.setattr(mod, "PLUGINS_DIR", tmp_path)
+
+        req = {
+            "cmd": "run_cycle",
+            "active_ids": ["echo-a", "echo-c"],
+            "context": {
+                "universe": [],
+                "ohlcv": {},
+                "portfolio": {},
+                "config": {},
+                "plugin_configs": {"echo-a": {"top_pct": 99}},
+            },
+        }
+        result = mod.cmd_run_cycle(req)
+
+        assert result["errors"] == [], f"Unexpected errors: {result['errors']}"
+        by_plugin = {s["_plugin"]: s["top_pct"] for s in result["pending_signals"]}
+        assert by_plugin == {"echo-a": 99, "echo-c": 10}
+
+    def test_legacy_global_config_still_applies_when_plugin_configs_is_absent(
+        self, tmp_path, monkeypatch
+    ):
+        """Backward compatibility: callers (e.g. the live agent cycle) that only set
+        the global context["config"] and never send plugin_configs keep working."""
+        self._write_echo_plugin(tmp_path, "echo-a")
+
+        mod = _load_runner()
+        monkeypatch.setattr(mod, "PLUGINS_DIR", tmp_path)
+
+        req = {
+            "cmd": "run_cycle",
+            "active_ids": ["echo-a"],
+            "context": {
+                "universe": [],
+                "ohlcv": {},
+                "portfolio": {},
+                "config": {"top_pct": 33},
+            },
+        }
+        result = mod.cmd_run_cycle(req)
+
+        assert result["errors"] == [], f"Unexpected errors: {result['errors']}"
+        assert result["pending_signals"][0]["top_pct"] == 33

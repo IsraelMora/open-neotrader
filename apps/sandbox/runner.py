@@ -886,12 +886,20 @@ def cmd_run_cycle(req: dict) -> dict:
     provider_tools = {"get_ohlcv": _get_ohlcv}
 
     # ── Config defaults from manifest ────────────────────────────────────────
-    def _config_for(manifest: dict) -> dict:
+    # Precedence (lowest → highest): manifest [config] defaults, then the global
+    # `context["config"]` (legacy single-config-for-all-plugins path, kept for
+    # backward compatibility), then `context["plugin_configs"][pid]` — an optional
+    # per-plugin override map keyed by plugin id. This lets a caller (e.g. the
+    # pretest engine, which runs N portfolios with different per-plugin params in
+    # the SAME cycle) differentiate config per plugin without breaking callers
+    # that only ever set the global `config` dict.
+    def _config_for(pid: str, manifest: dict) -> dict:
         config_defaults = {
             field: (spec_data.get("default") if isinstance(spec_data, dict) else spec_data)
             for field, spec_data in manifest.get("config", {}).items()
         }
-        return {**config_defaults, **context.get("config", {})}
+        per_plugin = context.get("plugin_configs", {}).get(pid, {})
+        return {**config_defaults, **context.get("config", {}), **per_plugin}
 
     # ── Step 1: skill plugins ────────────────────────────────────────────────
     hook_counter = 0
@@ -927,7 +935,7 @@ def cmd_run_cycle(req: dict) -> dict:
             hook_ctx = {
                 **context,
                 "universe": universe,
-                "config": _config_for(info["manifest"]),
+                "config": _config_for(pid, info["manifest"]),
                 "portfolio": context.get("portfolio", {}),
                 "provider_tools": provider_tools,
                 "pending_signals": pending_signals,

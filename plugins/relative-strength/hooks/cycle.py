@@ -10,6 +10,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from rs import analyze_relative_strength, compute_composite_rs
 
 
+def _closes(ohlcv: dict, symbol: str) -> list[float]:
+    """Extracts closing prices, oldest→newest, from ctx["ohlcv"][symbol].
+
+    ctx["ohlcv"][symbol] is a LIST of bar dicts ({open,high,low,close,volume,date}),
+    not a dict with a "closes" key — mirrors how momentum-factor-12-1 and
+    trend-following read bars. Missing/empty/malformed symbol data safely yields [].
+    """
+    bars = ohlcv.get(symbol, [])
+    if not isinstance(bars, list):
+        return []
+    closes: list[float] = []
+    for bar in bars:
+        if isinstance(bar, dict) and "close" in bar and bar["close"] is not None:
+            closes.append(bar["close"])
+    return closes
+
+
 def on_cycle(ctx: dict) -> dict:
     config = ctx.get("config", {})
     universe = ctx.get("universe", [])
@@ -21,8 +38,7 @@ def on_cycle(ctx: dict) -> dict:
     rs_threshold = float(config.get("rs_threshold", 1.05))
     top_percentile = float(config.get("top_percentile", 80.0))
 
-    benchmark_data = ohlcv.get(benchmark, {})
-    benchmark_prices = benchmark_data.get("closes", [])
+    benchmark_prices = _closes(ohlcv, benchmark)
 
     if not benchmark_prices:
         return {"signals": [], "meta": {"error": f"benchmark {benchmark} sin datos OHLCV"}}
@@ -34,8 +50,7 @@ def on_cycle(ctx: dict) -> dict:
     for symbol in universe:
         if symbol == benchmark:
             continue
-        data = ohlcv.get(symbol, {})
-        prices = data.get("closes", [])
+        prices = _closes(ohlcv, symbol)
         result = compute_composite_rs(prices, benchmark_prices, periods, weights)
         if result:
             composite = result["composite_rs"]
@@ -49,8 +64,7 @@ def on_cycle(ctx: dict) -> dict:
     for symbol in universe:
         if symbol == benchmark:
             continue
-        data = ohlcv.get(symbol, {})
-        prices = data.get("closes", [])
+        prices = _closes(ohlcv, symbol)
 
         if not prices:
             skipped.append(symbol)

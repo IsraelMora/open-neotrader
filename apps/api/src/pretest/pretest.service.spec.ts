@@ -1469,6 +1469,126 @@ describe('PretestService.runCycle — cycleCtx carries universe + ohlcv (risk po
   });
 });
 
+// ── Bug A fix: pretest must pass PER-PORTFOLIO plugin config to the sandbox ───
+// Previously cycleCtx.config was hardcoded to {} regardless of
+// portfolio.plugin_configs, so every portfolio ran momentum-factor-12-1 (or any
+// plugin) with pure manifest defaults — portfolio-specific top_pct/lookback_months
+// were silently dropped. Fixed by passing a plugin_configs map (keyed by plugin id)
+// built from portfolio.plugin_configs, which cmd_run_cycle (apps/sandbox/runner.py)
+// now layers on top of manifest defaults per-plugin.
+describe('PretestService.runCycle — per-portfolio plugin config reaches the sandbox (Bug A)', () => {
+  function makePortfolioRow(overrides: { id: string; plugin_configs: Record<string, unknown> }): {
+    id: string;
+    name: string;
+    description: string | null;
+    initial_capital: number;
+    plugin_ids: string;
+    plugin_configs: string;
+    state: string;
+    run_count: number;
+    last_run_at: Date | null;
+    is_active: boolean;
+    created_at: Date;
+    updated_at: Date;
+  } {
+    return {
+      id: overrides.id,
+      name: `Portfolio ${overrides.id}`,
+      description: null,
+      initial_capital: 100_000,
+      plugin_ids: JSON.stringify(['momentum-factor-12-1']),
+      plugin_configs: JSON.stringify(overrides.plugin_configs),
+      state: JSON.stringify(makeState({ equity: 100_000, cash: 100_000 })),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+  }
+
+  it('passes each portfolio its OWN momentum-factor-12-1 config (top_pct/lookback_months), not {}', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', 150)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([{ id: 'momentum-factor-12-1', config: {} }]),
+    } as unknown as PluginsService;
+    const kv = makeStubKv();
+    const audit = makeStubAudit();
+
+    // Portfolio 1: top_pct=10, lookback_months=6
+    const sandboxRunCycle1 = jest
+      .fn()
+      .mockResolvedValue({ ok: true, result: { pending_signals: [] } });
+    const sandbox1 = { runCycle: sandboxRunCycle1 } as unknown as SandboxGateway;
+    const row1 = makePortfolioRow({
+      id: 'port-a',
+      plugin_configs: { 'momentum-factor-12-1': { top_pct: 10, lookback_months: 6 } },
+    });
+    const db1 = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row1),
+        update: jest.fn().mockResolvedValue(row1),
+      },
+    } as unknown as PrismaService;
+    const svc1 = new PretestService(
+      db1,
+      sandbox1,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeStubAgents(),
+      kv,
+      audit,
+    );
+    await svc1.runCycle('port-a');
+
+    // Portfolio 2: top_pct=40, lookback_months=18 (DIFFERENT config, same plugin)
+    const sandboxRunCycle2 = jest
+      .fn()
+      .mockResolvedValue({ ok: true, result: { pending_signals: [] } });
+    const sandbox2 = { runCycle: sandboxRunCycle2 } as unknown as SandboxGateway;
+    const row2 = makePortfolioRow({
+      id: 'port-b',
+      plugin_configs: { 'momentum-factor-12-1': { top_pct: 40, lookback_months: 18 } },
+    });
+    const db2 = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row2),
+        update: jest.fn().mockResolvedValue(row2),
+      },
+    } as unknown as PrismaService;
+    const svc2 = new PretestService(
+      db2,
+      sandbox2,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeStubAgents(),
+      kv,
+      audit,
+    );
+    await svc2.runCycle('port-b');
+
+    const [, ctx1] = sandboxRunCycle1.mock.calls[0] as [string[], Record<string, unknown>];
+    const [, ctx2] = sandboxRunCycle2.mock.calls[0] as [string[], Record<string, unknown>];
+
+    // Neither cycle must fall back to the old hardcoded {} global config.
+    const pluginConfigs1 = ctx1['plugin_configs'] as Record<string, Record<string, unknown>>;
+    const pluginConfigs2 = ctx2['plugin_configs'] as Record<string, Record<string, unknown>>;
+    expect(pluginConfigs1['momentum-factor-12-1']).toEqual({ top_pct: 10, lookback_months: 6 });
+    expect(pluginConfigs2['momentum-factor-12-1']).toEqual({ top_pct: 40, lookback_months: 18 });
+    // The two portfolios' effective config must genuinely differ.
+    expect(pluginConfigs1['momentum-factor-12-1']).not.toEqual(
+      pluginConfigs2['momentum-factor-12-1'],
+    );
+  });
+});
+
 // ── Phase 4.1: RED tests — significance gate (PR4) ───────────────────────────
 
 /**
