@@ -70,8 +70,12 @@ const SCHEDULER_KEY = 'scheduler';
  * on every boot until GEMINI_API_KEY is present, even after the momentum bootstrap
  * has already been applied once.
  */
-export const LLM_GEMINI_APPLIED_KEY = 'bootstrap.llm_gemini_v1_applied';
-const GEMINI_MODEL = 'gemini-3.5-flash';
+// v2: 'gemini-3.5-flash' does not exist in the Gemini API; the real newest flash
+// is 'gemini-3-flash-preview' (verified via the models list + a live call). The
+// flag is bumped to v2 so instances that already applied the invalid v1 model
+// re-apply the corrected one on next boot.
+export const LLM_GEMINI_APPLIED_KEY = 'bootstrap.llm_gemini_v2_applied';
+const GEMINI_MODEL = 'gemini-3-flash-preview';
 
 /** Spec for a single seeded pretest (virtual) portfolio. */
 interface PretestPortfolioSeed {
