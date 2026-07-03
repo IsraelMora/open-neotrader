@@ -307,6 +307,87 @@ class TestRunCycleWithRealPlugins:
         # it should still work (and emit signals) since 130 >= bars_needed (~88).
         assert result["errors"] == []
 
+    # ── momentum-factor-12-1 strategy plugin (Fix A regression coverage) ─────
+
+    def _make_daily_bars_with_monthly_step(
+        self, symbol: str, start: float, monthly_step: float, n_months: int = 20
+    ) -> list[dict]:
+        """~21 trading days/month for n_months months; each MONTH's close increases by
+        monthly_step vs the previous month's close (mild daily noise within the month
+        so month-end != any arbitrary daily close, but the monthly TREND is unambiguous).
+        """
+        bars = []
+        year, month = 2023, 1
+        month_base = start
+        for _m in range(n_months):
+            for day in range(1, 22):
+                # Small within-month drift toward month_base + monthly_step so the
+                # month-end (last day) close lands near month_base + monthly_step.
+                close = month_base + monthly_step * (day / 21.0)
+                bars.append(
+                    {
+                        "date": f"{year:04d}-{month:02d}-{day:02d}",
+                        "open": round(close - 0.1, 4),
+                        "high": round(close + 0.2, 4),
+                        "low": round(close - 0.2, 4),
+                        "close": round(close, 4),
+                        "volume": 1_000,
+                    }
+                )
+            month_base += monthly_step
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+        return bars
+
+    def test_momentum_factor_12_1_computes_sensible_signals_from_daily_bars(self):
+        """Regression for Fix A: momentum-factor-12-1 asks for timeframe="1Month" —
+        given ~400 DAILY bars (real cycle.bars default), it must compute momentum
+        over the RESAMPLED MONTHLY series (a genuine ~20-month trend), not over the
+        last ~14 DAILY bars (~3 weeks), and emit long/exit signals accordingly.
+        """
+        # AAA: strong sustained monthly uptrend. BBB: sustained monthly downtrend.
+        # CCC/DDD/EEE: flat/mild, filler so universe >= 5 (plugin requirement).
+        aaa = self._make_daily_bars_with_monthly_step("AAA", start=100.0, monthly_step=5.0)
+        bbb = self._make_daily_bars_with_monthly_step("BBB", start=100.0, monthly_step=-4.0)
+        ccc = self._make_daily_bars_with_monthly_step("CCC", start=100.0, monthly_step=0.2)
+        ddd = self._make_daily_bars_with_monthly_step("DDD", start=100.0, monthly_step=0.1)
+        eee = self._make_daily_bars_with_monthly_step("EEE", start=100.0, monthly_step=0.3)
+
+        assert len(aaa) > 300, "fixture must resemble the real cycle.bars=400 default"
+
+        result = self._run(
+            active_ids=["momentum-factor-12-1"],
+            context={
+                "universe": ["AAA", "BBB", "CCC", "DDD", "EEE"],
+                "ohlcv": {"AAA": aaa, "BBB": bbb, "CCC": ccc, "DDD": ddd, "EEE": eee},
+                "portfolio": {},
+                "market_trend_up": True,
+                "config": {"top_pct": 20, "lookback_months": 12},
+            },
+        )
+
+        assert result["errors"] == [], f"Unexpected errors: {result['errors']}"
+        signals = {s["symbol"]: s for s in result["pending_signals"]}
+
+        # If timeframe were still ignored, get_ohlcv(timeframe="1Month", limit=14) would
+        # get 14 DAILY bars (~3 weeks) instead of ~14 MONTHLY bars — AAA's clean uptrend
+        # would not reliably surface as the top long signal from raw daily noise-free data,
+        # AND (more decisively) with only 14 raw daily bars this daily fixture would look
+        # like a single trading month, not the ~20-month history the plugin asked for.
+        assert "AAA" in signals, (
+            f"Expected AAA (sustained monthly uptrend) to get a momentum signal; "
+            f"got signals={list(signals)} logs={result['logs']}"
+        )
+        aaa_sig = signals["AAA"]
+        assert aaa_sig["action"] == "long", (
+            f"Expected AAA to rank as 'long' on a clean ~20-month monthly uptrend, "
+            f"got action={aaa_sig['action']!r} — resample likely broken (Fix A)."
+        )
+        assert aaa_sig["return_12_1"] > 0
+        assert aaa_sig["rank"] == 1
+
     # ── unique module names prevent cross-plugin collision ────────────────────
 
     def test_no_sys_modules_collision_between_plugins(self):
@@ -464,6 +545,139 @@ class TestRunCycleProviderTools:
         assert sig["full_len"] == 10, f"Expected 10 bars (no limit), got {sig['full_len']}"
         # Last 3 bars — the close of the last sliced bar must equal the last bar in full set
         assert sig["_sliced_last_close"] == bars[-1]["close"]
+
+
+def _make_daily_bars_across_months(
+    start_year: int = 2024, start_month: int = 1, n_months: int = 14
+) -> list[dict]:
+    """~21 trading days per month, oldest-first, spanning n_months calendar months.
+
+    Each day's close increases monotonically so month-end closes are easy to assert on.
+    """
+    bars = []
+    year, month = start_year, start_month
+    price = 100.0
+    for _m in range(n_months):
+        days_in_month = 21
+        for day in range(1, days_in_month + 1):
+            price += 1.0
+            bars.append(
+                {
+                    "date": f"{year:04d}-{month:02d}-{day:02d}",
+                    "open": round(price - 0.5, 4),
+                    "high": round(price + 0.5, 4),
+                    "low": round(price - 1.0, 4),
+                    "close": round(price, 4),
+                    "volume": 1_000,
+                }
+            )
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return bars
+
+
+class TestGetOhlcvResample:
+    """provider_tools.get_ohlcv must RESAMPLE the injected daily bars to the
+    requested timeframe instead of ignoring it (see Fix A — momentum-factor-12-1
+    was computing "12-1 momentum" over ~14 DAILY closes instead of ~14 MONTHLY
+    closes because timeframe was silently discarded)."""
+
+    @pytest.fixture(autouse=True)
+    def _load(self, monkeypatch):
+        mod = _load_runner()
+        monkeypatch.setattr(mod, "PLUGINS_DIR", REAL_PLUGINS_DIR)
+        self.mod = mod
+
+    def test_resample_bars_monthly_keeps_last_bar_of_each_month(self):
+        daily = _make_daily_bars_across_months(n_months=3)
+        monthly = self.mod._resample_bars(daily, "1Month")
+
+        assert len(monthly) == 3
+        # Each monthly bar's close must equal the LAST daily close of that month
+        month_1_days = [b for b in daily if b["date"].startswith("2024-01")]
+        month_2_days = [b for b in daily if b["date"].startswith("2024-02")]
+        month_3_days = [b for b in daily if b["date"].startswith("2024-03")]
+        assert monthly[0]["close"] == month_1_days[-1]["close"]
+        assert monthly[1]["close"] == month_2_days[-1]["close"]
+        assert monthly[2]["close"] == month_3_days[-1]["close"]
+        # open = first day of month, high/low = extremes, volume = sum
+        assert monthly[0]["open"] == month_1_days[0]["open"]
+        assert monthly[0]["high"] == max(d["high"] for d in month_1_days)
+        assert monthly[0]["low"] == min(d["low"] for d in month_1_days)
+        assert monthly[0]["volume"] == sum(d["volume"] for d in month_1_days)
+        # Oldest-first order preserved
+        assert monthly[0]["date"] < monthly[1]["date"] < monthly[2]["date"]
+
+    def test_resample_bars_weekly_groups_by_iso_week(self):
+        # 21 daily bars spanning ~3 ISO weeks
+        daily = _make_daily_bars_across_months(n_months=1)[:21]
+        weekly = self.mod._resample_bars(daily, "1Week")
+
+        assert 1 < len(weekly) < len(daily), "weekly resample must reduce bar count"
+        # Every weekly close must be one of the injected daily closes (last-of-week)
+        daily_closes = {d["close"] for d in daily}
+        assert all(w["close"] in daily_closes for w in weekly)
+
+    def test_resample_bars_daily_passthrough_unchanged(self):
+        daily = _make_daily_bars_across_months(n_months=1)
+        assert self.mod._resample_bars(daily, "1d") == daily
+        assert self.mod._resample_bars(daily, None) == daily
+        assert self.mod._resample_bars(daily, "1day") == daily
+
+    def test_get_ohlcv_resamples_before_applying_limit(self, tmp_path, monkeypatch):
+        """End-to-end: injecting ~14 months of daily bars, a plugin calling
+        get_ohlcv(timeframe='1Month', limit=14) must receive ~14 MONTHLY bars,
+        not 14 DAILY bars."""
+        import textwrap
+
+        pid = "resample-test"
+        pdir = tmp_path / pid
+        (pdir / "hooks").mkdir(parents=True)
+        (pdir / "plugin.py").write_text("", encoding="utf-8")
+        (pdir / "manifest.toml").write_text(
+            textwrap.dedent("""\
+                [plugin]
+                id = "resample-test"
+                type = "skill"
+                [hooks]
+                on_cycle = "hooks/cycle.py"
+                [skills]
+                keys = []
+            """),
+            encoding="utf-8",
+        )
+        (pdir / "hooks" / "cycle.py").write_text(
+            textwrap.dedent("""\
+                def on_cycle(ctx):
+                    pt = ctx.get("provider_tools", {})
+                    get_ohlcv = pt.get("get_ohlcv")
+                    bars = get_ohlcv(symbol="AAA", timeframe="1Month", limit=14)
+                    sig = {"type": "t", "symbol": "AAA", "action": "long",
+                           "bars_len": len(bars)}
+                    return {"signals": [sig], "logs": []}
+            """),
+            encoding="utf-8",
+        )
+
+        mod = _load_runner()
+        monkeypatch.setattr(mod, "PLUGINS_DIR", tmp_path)
+
+        daily = _make_daily_bars_across_months(n_months=14)  # ~294 daily bars
+        req = {
+            "cmd": "run_cycle",
+            "active_ids": [pid],
+            "context": {"universe": [], "ohlcv": {"AAA": daily}, "portfolio": {}, "config": {}},
+        }
+        result = mod.cmd_run_cycle(req)
+
+        assert result["errors"] == [], f"Unexpected errors: {result['errors']}"
+        sig = result["pending_signals"][0]
+        assert sig["bars_len"] == 14, (
+            f"Expected 14 MONTHLY bars (resampled + limited), got {sig['bars_len']} — "
+            "timeframe is likely being ignored"
+        )
 
 
 class TestRunCycleErrorIsolation:

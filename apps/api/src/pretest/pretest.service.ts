@@ -958,7 +958,10 @@ export class PretestService {
     universe = universe.slice(0, 30);
 
     const timeframe = (await this.kv.get('cycle.timeframe')) || '1d';
-    const bars = Number((await this.kv.get('cycle.bars')) || 0) || 300;
+    // Default 400 (~19 months of daily bars) — mirrors AgentsService._buildMarketContext.
+    // See that method's comment for the rationale (Fix A: momentum-factor-12-1 needs
+    // ~14 MONTHLY bars resampled from daily history; 300 was too tight).
+    const bars = Number((await this.kv.get('cycle.bars')) || 0) || 400;
     const dataProvider = (await this.kv.get('cycle.data_provider')) || 'yahoo-finance-provider';
 
     const ohlcv: Record<string, unknown[]> = {};

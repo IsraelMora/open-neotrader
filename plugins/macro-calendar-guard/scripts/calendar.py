@@ -10,7 +10,7 @@ usando read_skill + emit_signal o la herramienta inject_event.
 
 import contextlib
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 
 @dataclass
@@ -184,6 +184,7 @@ def get_active_blackouts(
             event.event_date.day,
             h,
             m,
+            tzinfo=UTC,
         )
 
         win_start = event_dt - timedelta(hours=hours_before)

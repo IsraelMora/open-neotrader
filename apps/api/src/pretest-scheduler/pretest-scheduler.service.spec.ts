@@ -53,7 +53,7 @@ describe('PretestSchedulerService — interval + defaults', () => {
     expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
   });
 
-  it('defaults to a 60-minute interval when KV is unset', async () => {
+  it('defaults to a 6-hour interval when KV is unset', async () => {
     const kv = makeKv();
     const pretest = makePretest();
     const service = makeService(kv, pretest);
@@ -62,8 +62,28 @@ describe('PretestSchedulerService — interval + defaults', () => {
 
     await callTick(service);
 
-    // 1000ms elapsed is nowhere near the 60-min default → must NOT run yet.
+    // 1000ms elapsed is nowhere near the 6h default → must NOT run yet.
     expect(pretest.runAllActive).not.toHaveBeenCalled();
+  });
+
+  it('Fix B — default interval is exactly 6 hours (raised from 60min to cut pretest LLM calls 6x)', async () => {
+    const kv = makeKv();
+    const pretest = makePretest();
+    const service = makeService(kv, pretest);
+
+    const SIX_HOURS_MS = 6 * 60 * 60_000;
+
+    // Just under 6h elapsed → must NOT run yet.
+    (service as unknown as { lastRunAt: number | null }).lastRunAt =
+      Date.now() - (SIX_HOURS_MS - 1000);
+    await callTick(service);
+    expect(pretest.runAllActive).not.toHaveBeenCalled();
+
+    // Just over 6h elapsed → must run.
+    (service as unknown as { lastRunAt: number | null }).lastRunAt =
+      Date.now() - (SIX_HOURS_MS + 1000);
+    await callTick(service);
+    expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
   });
 
   it('does NOT run before the interval has elapsed', async () => {

@@ -4382,8 +4382,8 @@ describe('F6-S1 T7 — _resolveMaxTurns clamp and fail-safe', () => {
   }
 
   it.each([
-    ['null (missing key)', null, 4],
-    ['"abc" (invalid)', 'abc', 4],
+    ['null (missing key)', null, 2],
+    ['"abc" (invalid)', 'abc', 2],
     ['"0" → clamped to 1', '0', 1],
     ['"999" → clamped to 10', '999', 10],
     ['"2"', '2', 2],
@@ -4394,7 +4394,7 @@ describe('F6-S1 T7 — _resolveMaxTurns clamp and fail-safe', () => {
     },
   );
 
-  it('T7.6 — kv absent (null service) → 4', async () => {
+  it('T7.6 — kv absent (null service) → 2', async () => {
     const plugins = makeFullPlugins(null, []);
     const service = new (AgentsService as unknown as new (
       llm: unknown,
@@ -4425,7 +4425,7 @@ describe('F6-S1 T7 — _resolveMaxTurns clamp and fail-safe', () => {
     const result = await (
       service as unknown as { _resolveMaxTurns: () => Promise<number> }
     )._resolveMaxTurns();
-    expect(result).toBe(4);
+    expect(result).toBe(2);
   });
 });
 
@@ -5244,8 +5244,8 @@ describe('F6-S1 T10 — existing suite regression: _executeCycle reads accumulat
     const sandbox = makeFullSandbox();
     const memory = makeMemory();
 
-    // Build service with kv null (default 4 turns), but LLM returns no-tool text on iter1 after executing once
-    const kv = makeKv(null); // → maxTurns=4, but natural exit after iter1 execution
+    // Build service with kv null (default 2 turns), but LLM returns no-tool text on iter1 after executing once
+    const kv = makeKv(null); // → maxTurns=2 (default), but natural exit after iter1 execution
 
     const service = makeKvAgentsService({ llm, kv, plugins, sandbox, audit, memory });
 
@@ -6472,6 +6472,61 @@ function makeGatewayStub(opts: {
         }),
   };
 }
+
+// ── Fix A — _buildMarketContext bars default (bumped 300 → 400) ──────────────
+
+describe('Fix A — _buildMarketContext bars default', () => {
+  async function callBuildMarketContext(
+    getOhlcv: jest.Mock,
+    kv?: jest.Mocked<Pick<KvService, 'get'>>,
+  ): Promise<void> {
+    const gateway = {
+      getQuote: jest.fn(),
+      getPortfolio: jest.fn(),
+      getOhlcv,
+    } as unknown as ProviderGatewayService;
+
+    const service = makeDebateAgentsService({
+      gateway: gateway as unknown as ReturnType<typeof makeGatewayStub>,
+      kv: kv ?? makeKv(null),
+    });
+
+    await (
+      service as unknown as {
+        _buildMarketContext: () => Promise<{
+          universe: string[];
+          ohlcv: Record<string, unknown[]>;
+        }>;
+      }
+    )._buildMarketContext();
+  }
+
+  it('requests 400 bars per symbol when KV cycle.bars is unset (bumped from 300 for monthly-resample margin)', async () => {
+    const getOhlcv = jest.fn().mockResolvedValue([]);
+    await callBuildMarketContext(getOhlcv);
+
+    expect(getOhlcv).toHaveBeenCalled();
+    for (const call of getOhlcv.mock.calls as unknown[][]) {
+      expect(call[3]).toBe(400);
+    }
+  });
+
+  it('KV cycle.bars still overrides the default', async () => {
+    const getOhlcv = jest.fn().mockResolvedValue([]);
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'cycle.bars') return Promise.resolve('50');
+        return Promise.resolve(null);
+      }),
+    };
+    await callBuildMarketContext(getOhlcv, kv);
+
+    expect(getOhlcv).toHaveBeenCalled();
+    for (const call of getOhlcv.mock.calls as unknown[][]) {
+      expect(call[3]).toBe(50);
+    }
+  });
+});
 
 /**
  * Build an AgentsService with 14 constructor args (adds debate + providerGateway as 13th/14th).

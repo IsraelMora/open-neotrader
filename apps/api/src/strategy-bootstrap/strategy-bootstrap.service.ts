@@ -62,7 +62,7 @@ export const PLUGINS_TO_DEACTIVATE = [
   'sentiment-analysis',
 ] as const;
 
-export const BOOTSTRAP_APPLIED_KEY = 'bootstrap.momentum_v1_applied';
+export const BOOTSTRAP_APPLIED_KEY = 'bootstrap.momentum_v2_applied';
 const UNIVERSE_KEY = 'cycle.universe';
 const EXECUTION_REAL_KEY = 'execution.real';
 const SCHEDULER_KEY = 'scheduler';
@@ -96,6 +96,25 @@ interface PretestPortfolioSeed {
  */
 export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
   {
+    name: 'Ultra-Conservador Momentum',
+    description:
+      'Máxima defensa: top 40% del universo (muy diversificado), lookback 12 meses, tamaño de posición ≤5%, con macro-guard.',
+    initial_capital: 100_000,
+    plugin_ids: [
+      'momentum-factor-12-1',
+      'trend-following',
+      'relative-strength',
+      'position-sizing',
+      'risk-manager',
+      'macro-calendar-guard',
+    ],
+    plugin_configs: {
+      'momentum-factor-12-1': { top_pct: 40, lookback_months: 12 },
+      'position-sizing': { mode: 'vol_target', max_position_pct: 5 },
+      __pretest_policy__: { sizing_pct: 0.03, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
     name: 'Conservador Momentum',
     description:
       'Momentum de baja rotación: top 30% del universo, lookback 12 meses, tamaño de posición acotado al 8%.',
@@ -115,6 +134,25 @@ export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
     },
   },
   {
+    name: 'Balanceado Momentum',
+    description:
+      'Punto medio: top 20% del universo, lookback 9 meses, tamaño de posición hasta 12%, con macro-guard.',
+    initial_capital: 100_000,
+    plugin_ids: [
+      'momentum-factor-12-1',
+      'trend-following',
+      'relative-strength',
+      'position-sizing',
+      'risk-manager',
+      'macro-calendar-guard',
+    ],
+    plugin_configs: {
+      'momentum-factor-12-1': { top_pct: 20, lookback_months: 9 },
+      'position-sizing': { mode: 'vol_target', max_position_pct: 12 },
+      __pretest_policy__: { sizing_pct: 0.1, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
     name: 'Agresivo Momentum',
     description:
       'Momentum concentrado: top 10% del universo, lookback 6 meses, tamaño de posición hasta 25%.',
@@ -127,12 +165,35 @@ export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
     },
   },
   {
+    name: 'Ultra-Agresivo Momentum',
+    description:
+      'Máxima concentración y reactividad: top 5% del universo, lookback 3 meses, tamaño de posición al máximo (25%), sin frenos macro.',
+    initial_capital: 100_000,
+    plugin_ids: ['momentum-factor-12-1', 'position-sizing', 'risk-manager'],
+    plugin_configs: {
+      'momentum-factor-12-1': { top_pct: 5, lookback_months: 3 },
+      'position-sizing': { mode: 'vol_target', max_position_pct: 25 },
+      __pretest_policy__: { sizing_pct: 0.3, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
     name: 'Trend Puro',
     description: 'Solo trend-following (sin factor de momentum), tamaño de posición hasta 15%.',
     initial_capital: 100_000,
     plugin_ids: ['trend-following', 'position-sizing', 'risk-manager'],
     plugin_configs: {
       'position-sizing': { mode: 'vol_target', max_position_pct: 15 },
+      __pretest_policy__: { sizing_pct: 0.1, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
+    name: 'Relative-Strength Puro',
+    description:
+      'Solo fuerza relativa cross-sectional (familia distinta al momentum absoluto), tamaño de posición hasta 12%.',
+    initial_capital: 100_000,
+    plugin_ids: ['relative-strength', 'position-sizing', 'risk-manager'],
+    plugin_configs: {
+      'position-sizing': { mode: 'vol_target', max_position_pct: 12 },
       __pretest_policy__: { sizing_pct: 0.1, slippage_pct: 0.0005, commission_pct: 0 },
     },
   },

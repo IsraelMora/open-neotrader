@@ -311,12 +311,13 @@ describe('StrategyBootstrapService', () => {
 
 // ── Risk-differentiated pretest portfolios ────────────────────────────────────
 //
-// Bootstrap also seeds 3 virtual pretest portfolios (Conservative/Aggressive/Trend-only)
-// that all trade the same global ETF universe seeded above, at different risk profiles.
-// Idempotency reuses the SAME bootstrap.momentum_v1_applied flag — no separate KV key.
+// Bootstrap also seeds 7 virtual pretest portfolios spanning a full risk spectrum
+// (Ultra-Conservative → Ultra-Aggressive momentum, plus Trend-only and Relative-Strength
+// families) that all trade the same global ETF universe seeded above.
+// Idempotency reuses the SAME bootstrap.momentum_v2_applied flag — no separate KV key.
 
 describe('StrategyBootstrapService — pretest portfolio seeding', () => {
-  it('seeds exactly 3 risk-differentiated pretest portfolios on first run', async () => {
+  it('seeds exactly 7 risk-differentiated pretest portfolios on first run', async () => {
     const { kv } = makeKv();
     const { db, pretestCreate } = makeDb();
     const { llm } = makeLlm();
@@ -324,12 +325,20 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
 
     await svc.run();
 
-    expect(pretestCreate).toHaveBeenCalledTimes(3);
+    expect(pretestCreate).toHaveBeenCalledTimes(7);
     const names = (pretestCreate.mock.calls as Array<[{ data: { name: string } }]>).map(
       (c) => c[0].data.name,
     );
     expect(names).toEqual(
-      expect.arrayContaining(['Conservador Momentum', 'Agresivo Momentum', 'Trend Puro']),
+      expect.arrayContaining([
+        'Ultra-Conservador Momentum',
+        'Conservador Momentum',
+        'Balanceado Momentum',
+        'Agresivo Momentum',
+        'Ultra-Agresivo Momentum',
+        'Trend Puro',
+        'Relative-Strength Puro',
+      ]),
     );
   });
 
@@ -429,11 +438,15 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
     );
   });
 
-  it('PRETEST_PORTFOLIOS_TO_SEED exposes exactly the 3 expected specs', () => {
+  it('PRETEST_PORTFOLIOS_TO_SEED exposes exactly the 7 expected specs', () => {
     expect(PRETEST_PORTFOLIOS_TO_SEED.map((p) => p.name)).toEqual([
+      'Ultra-Conservador Momentum',
       'Conservador Momentum',
+      'Balanceado Momentum',
       'Agresivo Momentum',
+      'Ultra-Agresivo Momentum',
       'Trend Puro',
+      'Relative-Strength Puro',
     ]);
   });
 });

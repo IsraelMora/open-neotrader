@@ -1305,6 +1305,90 @@ describe('PretestService.runCycle — cycleCtx carries universe + ohlcv (risk po
     );
   });
 
+  it('Fix A — requests 400 bars per symbol when KV cycle.bars is unset (bumped from 300)', async () => {
+    const PORTFOLIO_ID = 'portfolio-bars-default';
+    const UNIVERSE = 'SPY,QQQ';
+
+    const mockAgents = {
+      runGovernedTurn: jest.fn().mockResolvedValue({
+        cycle_id: 'c',
+        text: '',
+        tool_calls: [],
+        decisions: [],
+        sandbox_results: [],
+        backend: 'api' as const,
+        skills_read: [],
+        skills_written: [],
+        llm_response: {
+          text: '',
+          tool_calls: [],
+          backend: 'api' as const,
+          skills_read: [],
+          skills_written: [],
+        },
+        signalsEmitted: [],
+      }),
+    } as unknown as AgentsService;
+
+    const getOhlcv = jest.fn().mockResolvedValue([]);
+    const gateway = {
+      getQuote: jest.fn().mockResolvedValue(makeQuote('AAPL', 150)),
+      getOhlcv,
+    } as unknown as ProviderGatewayService;
+
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = { findActive: jest.fn().mockResolvedValue([]) } as unknown as PluginsService;
+    const sandboxRunCycle = jest
+      .fn()
+      .mockResolvedValue({ ok: true, result: { pending_signals: [] } });
+    const sandbox = { runCycle: sandboxRunCycle } as unknown as SandboxGateway;
+
+    const portfolioRow = {
+      id: PORTFOLIO_ID,
+      name: 'Bars Default Portfolio',
+      description: null,
+      initial_capital: 100000,
+      plugin_ids: JSON.stringify(['momentum-factor-12-1']),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(makeState({ equity: 100000, cash: 100000 })),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        update: jest.fn().mockResolvedValue(portfolioRow),
+      },
+    } as unknown as PrismaService;
+
+    const kv = makeStubKv({ 'cycle.universe': UNIVERSE });
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      mockAgents,
+      kv,
+      makeStubAudit(),
+    );
+
+    await svc.runCycle(PORTFOLIO_ID);
+
+    expect(getOhlcv).toHaveBeenCalled();
+    for (const call of getOhlcv.mock.calls as unknown[][]) {
+      expect(call[3]).toBe(400);
+    }
+  });
+
   it('falls back to a default universe when KV cycle.universe is unset', async () => {
     const PORTFOLIO_ID = 'portfolio-default-universe';
 
