@@ -64,19 +64,6 @@ const UNIVERSE_KEY = 'cycle.universe';
 const EXECUTION_REAL_KEY = 'execution.real';
 const SCHEDULER_KEY = 'scheduler';
 
-/**
- * Idempotency flag for the Gemini LLM backend switch (see applyGeminiBackend()).
- * Independent from BOOTSTRAP_APPLIED_KEY on purpose: this step must keep retrying
- * on every boot until GEMINI_API_KEY is present, even after the momentum bootstrap
- * has already been applied once.
- */
-// v2: 'gemini-3.5-flash' does not exist in the Gemini API; the real newest flash
-// is 'gemini-3-flash-preview' (verified via the models list + a live call). The
-// flag is bumped to v2 so instances that already applied the invalid v1 model
-// re-apply the corrected one on next boot.
-export const LLM_GEMINI_APPLIED_KEY = 'bootstrap.llm_gemini_v2_applied';
-const GEMINI_MODEL = 'gemini-3-flash-preview';
-
 /** Spec for a single seeded pretest (virtual) portfolio. */
 interface PretestPortfolioSeed {
   name: string;
@@ -192,9 +179,11 @@ export class StrategyBootstrapService implements OnModuleInit {
     }
 
     try {
-      await this.applyGeminiBackend();
+      this.applyLlmConfigFromEnv();
     } catch (err: unknown) {
-      this.log.warn(`Bootstrap: fallo en applyGeminiBackend (no bloquea el resto): ${String(err)}`);
+      this.log.warn(
+        `Bootstrap: fallo en applyLlmConfigFromEnv (no bloquea el resto): ${String(err)}`,
+      );
     }
   }
 
@@ -325,36 +314,41 @@ export class StrategyBootstrapService implements OnModuleInit {
   }
 
   /**
-   * Idempotent, deploy-time switch of the LLM backend to Google Gemini once a
-   * GEMINI_API_KEY is present in the environment.
+   * Provider-agnostic, deploy-time sync of the LLM backend/model from env vars
+   * (LLM_BACKEND, LLM_MODEL). Env is the deployment source of truth for this
+   * config, so — unlike the momentum bootstrap — this step has NO version flag
+   * and runs on EVERY boot: if the operator changes LLM_BACKEND/LLM_MODEL and
+   * redeploys, the change takes effect on next boot without any manual KV reset.
    *
-   * Guarded by LLM_GEMINI_APPLIED_KEY, separate from BOOTSTRAP_APPLIED_KEY: this
-   * step must be able to run (and eventually succeed) on a deploy AFTER the
-   * momentum bootstrap has already been marked applied. Only reads whether the
-   * env var is present — never its value — and never logs the key itself.
+   * Provider-agnostic by design: it never inspects or requires any provider's
+   * API key (e.g. GEMINI_API_KEY/ANTHROPIC_API_KEY/OPENAI_API_KEY) — that stays
+   * the operator's concern at call time. If the credential for the configured
+   * backend is missing, LlmService.getReadiness() already fails loud on its own
+   * onModuleInit, which is a separate, existing signal.
    *
-   * Ordering: the KV flag is set ONLY after LlmService.patchConfig() succeeds, so
-   * a failure here leaves the flag unset and the step retries on the next boot.
-   * Fail-soft: never throws out of onModuleInit (see run()).
+   * Idempotent without a flag: reads the CURRENT live config via
+   * LlmService.getConfig() and only calls patchConfig() when the env values
+   * differ from what's already active — a plain no-op otherwise.
+   *
+   * Fail-soft: never throws out of onModuleInit (see run()). Never logs any
+   * secret — only the backend/model strings, which are not credentials.
    */
-  private async applyGeminiBackend(): Promise<void> {
-    const alreadyApplied = kvBool(await this.kv.get(LLM_GEMINI_APPLIED_KEY), false);
-    if (alreadyApplied) {
-      this.log.log('Bootstrap llm_gemini_v1 ya aplicado — no-op');
+  private applyLlmConfigFromEnv(): void {
+    const envBackend = process.env.LLM_BACKEND?.trim();
+    const envModel = process.env.LLM_MODEL?.trim();
+
+    if (!envBackend || !envModel) {
+      this.log.log('LLM_BACKEND/LLM_MODEL no configurados en env — LLM sin cambios');
       return;
     }
 
-    const geminiKeyPresent = !!process.env.GEMINI_API_KEY;
-    if (!geminiKeyPresent) {
-      this.log.log(
-        'GEMINI_API_KEY no presente — LLM sin cambios (se reintentará en el próximo deploy)',
-      );
+    const current = this.llm.getConfig();
+    if (current.backend === envBackend && current.model === envModel) {
+      this.log.debug(`LLM ya coincide con env (backend=${envBackend} model=${envModel}) — no-op`);
       return;
     }
 
-    this.llm.patchConfig({ backend: 'gemini', model: GEMINI_MODEL });
-    this.log.log(`LLM cambiado a ${GEMINI_MODEL}`);
-
-    await this.kv.set(LLM_GEMINI_APPLIED_KEY, 'true');
+    this.llm.patchConfig({ backend: envBackend, model: envModel });
+    this.log.log(`LLM configurado desde env: backend=${envBackend} model=${envModel}`);
   }
 }
