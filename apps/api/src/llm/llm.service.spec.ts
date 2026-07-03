@@ -300,6 +300,107 @@ describe('LlmService.completeViaOpenAi — native tool_calls', () => {
   });
 });
 
+// ── Generic OpenAI-compatible config: LLM_BASE_URL / LLM_API_KEY ──────────────
+
+describe('LlmService.completeViaOpenAi — generic LLM_BASE_URL / LLM_API_KEY config', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('uses LLM_BASE_URL and LLM_API_KEY when set (generic OpenAI-compatible client)', async () => {
+    const svc = new LlmService(
+      makeConfig({
+        LLM_BACKEND: 'openai',
+        LLM_BASE_URL: 'https://generativelanguage.googleapis.com/v1beta/openai',
+        LLM_API_KEY: 'generic-key',
+        // legacy vars present too — generic ones must win
+        OPENAI_BASE_URL: 'https://legacy.example.com/v1',
+        OPENAI_API_KEY: 'legacy-key',
+        LLM_MODEL: 'gpt-4o-mini',
+      }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const fetchMock = mockOpenAiFetch('ok');
+
+    await svc.complete({ context: 'test' });
+
+    const callArgs = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(callArgs[0]).toBe(
+      'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+    );
+    const headers = callArgs[1].headers as Record<string, string>;
+    expect(headers['Authorization']).toBe('Bearer generic-key');
+  });
+
+  it('sends the configured model AS-IS (never forces gpt-4o-mini) for a non-gpt model', async () => {
+    const svc = new LlmService(
+      makeConfig({
+        LLM_BACKEND: 'openai',
+        LLM_BASE_URL: 'https://generativelanguage.googleapis.com/v1beta/openai',
+        LLM_API_KEY: 'generic-key',
+        LLM_MODEL: 'gemini-3.5-flash',
+      }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const fetchMock = mockOpenAiFetch('ok');
+
+    await svc.complete({ context: 'test' });
+
+    const callArgs = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(callArgs[1].body as string) as { model: string };
+    expect(body.model).toBe('gemini-3.5-flash');
+  });
+
+  it('falls back to OPENAI_BASE_URL / OPENAI_API_KEY when generic vars are unset (backward compat)', async () => {
+    const svc = new LlmService(
+      makeConfig({
+        LLM_BACKEND: 'openai',
+        OPENAI_BASE_URL: 'https://legacy.example.com/v1',
+        OPENAI_API_KEY: 'legacy-key',
+        LLM_MODEL: 'gpt-4o-mini',
+      }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const fetchMock = mockOpenAiFetch('ok');
+
+    await svc.complete({ context: 'test' });
+
+    const callArgs = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(callArgs[0]).toBe('https://legacy.example.com/v1/chat/completions');
+    const headers = callArgs[1].headers as Record<string, string>;
+    expect(headers['Authorization']).toBe('Bearer legacy-key');
+  });
+
+  it('defaults to https://api.openai.com/v1 when neither base URL var is set', async () => {
+    const svc = new LlmService(
+      makeConfig({ LLM_BACKEND: 'openai', OPENAI_API_KEY: 'legacy-key', LLM_MODEL: 'gpt-4o-mini' }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const fetchMock = mockOpenAiFetch('ok');
+
+    await svc.complete({ context: 'test' });
+
+    const callArgs = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(callArgs[0]).toBe('https://api.openai.com/v1/chat/completions');
+  });
+
+  it('throws ServiceUnavailableException when neither LLM_API_KEY nor OPENAI_API_KEY is set', async () => {
+    const svc = new LlmService(
+      makeConfig({ LLM_BACKEND: 'openai', OPENAI_API_KEY: '', LLM_MODEL: 'gpt-4o-mini' }),
+      makePlugins(),
+      makeKvStub(),
+    );
+
+    await expect(svc.complete({ context: 'test' })).rejects.toThrow(
+      'LLM_API_KEY (u OPENAI_API_KEY) no configurada',
+    );
+  });
+});
+
 // ── Native tool calls — completeViaCustom ─────────────────────────────────────
 
 describe('LlmService.completeViaCustom — native tool_calls', () => {
@@ -416,7 +517,7 @@ describe('LlmService — persistencia de config en KV', () => {
 });
 
 describe('LlmService.getReadiness — diagnóstico de credencial del LLM', () => {
-  it('backend openai SIN OPENAI_API_KEY → no listo (la causa del "no opera")', () => {
+  it('backend openai SIN LLM_API_KEY ni OPENAI_API_KEY → no listo (la causa del "no opera")', () => {
     const svc = new LlmService(
       makeConfig({ LLM_BACKEND: 'openai', OPENAI_API_KEY: '' }),
       makePlugins(),
@@ -425,7 +526,29 @@ describe('LlmService.getReadiness — diagnóstico de credencial del LLM', () =>
     const r = svc.getReadiness();
     expect(r.backend).toBe('openai');
     expect(r.credentialPresent).toBe(false);
-    expect(r.requiredEnv).toBe('OPENAI_API_KEY');
+    expect(r.requiredEnv).toBe('LLM_API_KEY');
+  });
+
+  it('backend openai CON solo LLM_API_KEY (genérica) → listo', () => {
+    const svc = new LlmService(
+      makeConfig({ LLM_BACKEND: 'openai', OPENAI_API_KEY: '', LLM_API_KEY: 'generic-key' }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const r = svc.getReadiness();
+    expect(r.credentialPresent).toBe(true);
+    expect(r.requiredEnv).toBe('LLM_API_KEY');
+  });
+
+  it('backend openai CON solo OPENAI_API_KEY (legacy) → listo (backward compat)', () => {
+    const svc = new LlmService(
+      makeConfig({ LLM_BACKEND: 'openai', OPENAI_API_KEY: 'legacy-key' }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const r = svc.getReadiness();
+    expect(r.credentialPresent).toBe(true);
+    expect(r.requiredEnv).toBe('LLM_API_KEY');
   });
 
   it('backend anthropic CON key → listo', () => {

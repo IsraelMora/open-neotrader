@@ -5,7 +5,6 @@ import {
   PLUGINS_TO_ACTIVATE,
   PLUGINS_TO_DEACTIVATE,
   BOOTSTRAP_APPLIED_KEY,
-  LLM_GEMINI_APPLIED_KEY,
   PRETEST_PORTFOLIOS_TO_SEED,
 } from './strategy-bootstrap.service';
 import type { PrismaService } from '../prisma/prisma.service';
@@ -30,10 +29,17 @@ function makeKv(initial: Record<string, string> = {}): {
   return { kv, store, setMock };
 }
 
-/** Minimal LlmService mock — only patchConfig is exercised by the bootstrap step. */
-function makeLlm(opts: { throwOnPatch?: boolean } = {}): {
+/** Minimal LlmService mock — patchConfig and getConfig are exercised by the bootstrap step. */
+function makeLlm(
+  opts: {
+    throwOnPatch?: boolean;
+    currentBackend?: string;
+    currentModel?: string;
+  } = {},
+): {
   llm: LlmService;
   patchConfig: jest.Mock;
+  getConfig: jest.Mock;
 } {
   const patchConfig = jest.fn((_patch: { model?: string; backend?: string }) => {
     if (opts.throwOnPatch) {
@@ -41,8 +47,12 @@ function makeLlm(opts: { throwOnPatch?: boolean } = {}): {
     }
     return {};
   });
-  const llm = { patchConfig } as unknown as LlmService;
-  return { llm, patchConfig };
+  const getConfig = jest.fn(() => ({
+    backend: opts.currentBackend ?? 'anthropic',
+    model: opts.currentModel ?? 'claude-haiku-4-5-20251001',
+  }));
+  const llm = { patchConfig, getConfig } as unknown as LlmService;
+  return { llm, patchConfig, getConfig };
 }
 
 function makeDb(
@@ -413,57 +423,61 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
   });
 });
 
-// ── LLM Gemini backend switch ─────────────────────────────────────────────────
+// ── LLM config from env (provider-agnostic) ───────────────────────────────────
 //
-// Independent idempotent step, gated by its own KV flag (LLM_GEMINI_APPLIED_KEY),
-// so it keeps retrying on every boot until GEMINI_API_KEY is present — even after
-// the momentum bootstrap has already been marked applied.
+// Runs on EVERY boot (no version flag) — env is the deployment source of truth
+// for backend/model. Provider-agnostic: works for gemini, anthropic, or any
+// other backend the operator sets via LLM_BACKEND/LLM_MODEL. Never reads or
+// logs any API key — that stays the operator's concern at call time.
 
-describe('StrategyBootstrapService — Gemini LLM backend switch', () => {
-  const ORIGINAL_GEMINI_KEY = process.env.GEMINI_API_KEY;
+describe('StrategyBootstrapService — LLM config from env', () => {
+  const ORIGINAL_BACKEND = process.env.LLM_BACKEND;
+  const ORIGINAL_MODEL = process.env.LLM_MODEL;
 
   afterEach(() => {
-    if (ORIGINAL_GEMINI_KEY === undefined) {
-      delete process.env.GEMINI_API_KEY;
+    if (ORIGINAL_BACKEND === undefined) {
+      delete process.env.LLM_BACKEND;
     } else {
-      process.env.GEMINI_API_KEY = ORIGINAL_GEMINI_KEY;
+      process.env.LLM_BACKEND = ORIGINAL_BACKEND;
+    }
+    if (ORIGINAL_MODEL === undefined) {
+      delete process.env.LLM_MODEL;
+    } else {
+      process.env.LLM_MODEL = ORIGINAL_MODEL;
     }
   });
 
-  it('switches the LLM backend to gemini and marks the flag when GEMINI_API_KEY is present', async () => {
-    process.env.GEMINI_API_KEY = 'test-key-value';
-    const { kv, store } = makeKv();
+  it.each([
+    { backend: 'gemini', model: 'gemini-3.5-flash' },
+    { backend: 'anthropic', model: 'claude-x' },
+  ])(
+    'applies env config ($backend/$model) when it differs from the current live config',
+    async ({ backend, model }) => {
+      process.env.LLM_BACKEND = backend;
+      process.env.LLM_MODEL = model;
+      const { kv } = makeKv();
+      const { db } = makeDb();
+      const { llm, patchConfig } = makeLlm({
+        currentBackend: 'anthropic',
+        currentModel: 'claude-haiku-4-5-20251001',
+      });
+      const svc = new StrategyBootstrapService(db, kv, llm);
+
+      await svc.run();
+
+      expect(patchConfig).toHaveBeenCalledWith({ backend, model });
+    },
+  );
+
+  it('is a no-op when the current live config already matches env', async () => {
+    process.env.LLM_BACKEND = 'gemini';
+    process.env.LLM_MODEL = 'gemini-3.5-flash';
+    const { kv } = makeKv();
     const { db } = makeDb();
-    const { llm, patchConfig } = makeLlm();
-    const svc = new StrategyBootstrapService(db, kv, llm);
-
-    await svc.run();
-
-    expect(patchConfig).toHaveBeenCalledWith({
-      backend: 'gemini',
-      model: 'gemini-3-flash-preview',
+    const { llm, patchConfig } = makeLlm({
+      currentBackend: 'gemini',
+      currentModel: 'gemini-3.5-flash',
     });
-    expect(store[LLM_GEMINI_APPLIED_KEY]).toBe('true');
-  });
-
-  it('skips the switch and does NOT set the flag when GEMINI_API_KEY is absent', async () => {
-    delete process.env.GEMINI_API_KEY;
-    const { kv, store } = makeKv();
-    const { db } = makeDb();
-    const { llm, patchConfig } = makeLlm();
-    const svc = new StrategyBootstrapService(db, kv, llm);
-
-    await svc.run();
-
-    expect(patchConfig).not.toHaveBeenCalled();
-    expect(store[LLM_GEMINI_APPLIED_KEY]).toBeUndefined();
-  });
-
-  it('is idempotent: no-ops on a second run once the flag is already set', async () => {
-    process.env.GEMINI_API_KEY = 'test-key-value';
-    const { kv } = makeKv({ [LLM_GEMINI_APPLIED_KEY]: 'true' });
-    const { db } = makeDb();
-    const { llm, patchConfig } = makeLlm();
     const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
@@ -471,50 +485,112 @@ describe('StrategyBootstrapService — Gemini LLM backend switch', () => {
     expect(patchConfig).not.toHaveBeenCalled();
   });
 
-  it('retries on a later boot once the key appears, even if the momentum bootstrap already applied', async () => {
-    process.env.GEMINI_API_KEY = 'test-key-value';
-    const { kv, store } = makeKv({ [BOOTSTRAP_APPLIED_KEY]: 'true' });
-    const { db } = makeDb();
-    const { llm, patchConfig } = makeLlm();
-    const svc = new StrategyBootstrapService(db, kv, llm);
-
-    await svc.run();
-
-    expect(patchConfig).toHaveBeenCalledWith({
-      backend: 'gemini',
-      model: 'gemini-3-flash-preview',
-    });
-    expect(store[LLM_GEMINI_APPLIED_KEY]).toBe('true');
-  });
-
-  it('is fail-soft: does not set the flag and does not throw if patchConfig throws', async () => {
-    process.env.GEMINI_API_KEY = 'test-key-value';
-    const { kv, store } = makeKv();
-    const { db } = makeDb();
-    const { llm } = makeLlm({ throwOnPatch: true });
-    const svc = new StrategyBootstrapService(db, kv, llm);
-
-    await expect(svc.run()).resolves.not.toThrow();
-    expect(store[LLM_GEMINI_APPLIED_KEY]).toBeUndefined();
-  });
-
-  it('never logs or embeds the API key value itself', async () => {
-    process.env.GEMINI_API_KEY = 'super-secret-value-should-not-leak';
+  it('skips (no patchConfig) when LLM_BACKEND is unset', async () => {
+    delete process.env.LLM_BACKEND;
+    process.env.LLM_MODEL = 'gemini-3.5-flash';
     const { kv } = makeKv();
     const { db } = makeDb();
     const { llm, patchConfig } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(patchConfig).not.toHaveBeenCalled();
+  });
+
+  it('skips (no patchConfig) when LLM_MODEL is unset', async () => {
+    process.env.LLM_BACKEND = 'gemini';
+    delete process.env.LLM_MODEL;
+    const { kv } = makeKv();
+    const { db } = makeDb();
+    const { llm, patchConfig } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(patchConfig).not.toHaveBeenCalled();
+  });
+
+  it('skips (no patchConfig) when LLM_BACKEND/LLM_MODEL are blank/whitespace', async () => {
+    process.env.LLM_BACKEND = '   ';
+    process.env.LLM_MODEL = 'gemini-3.5-flash';
+    const { kv } = makeKv();
+    const { db } = makeDb();
+    const { llm, patchConfig } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(patchConfig).not.toHaveBeenCalled();
+  });
+
+  it('re-applies on every boot (no version flag) as long as env differs from live config', async () => {
+    process.env.LLM_BACKEND = 'gemini';
+    process.env.LLM_MODEL = 'gemini-3.5-flash';
+    const { kv } = makeKv();
+    const { db } = makeDb();
+    const { llm, patchConfig } = makeLlm({
+      currentBackend: 'anthropic',
+      currentModel: 'claude-haiku-4-5-20251001',
+    });
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+    await svc.run();
+
+    expect(patchConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it('is fail-soft when patchConfig throws (never propagates)', async () => {
+    process.env.LLM_BACKEND = 'gemini';
+    process.env.LLM_MODEL = 'gemini-3.5-flash';
+    const { kv, store } = makeKv();
+    const { db } = makeDb();
+    const { llm } = makeLlm({
+      throwOnPatch: true,
+      currentBackend: 'anthropic',
+      currentModel: 'claude-haiku-4-5-20251001',
+    });
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await expect(svc.run()).resolves.not.toThrow();
+    expect(store[BOOTSTRAP_APPLIED_KEY]).toBe('true');
+  });
+
+  it('the momentum bootstrap still runs independently of the LLM env step', async () => {
+    process.env.LLM_BACKEND = 'gemini';
+    process.env.LLM_MODEL = 'gemini-3.5-flash';
+    const { kv, store } = makeKv();
+    const { db } = makeDb();
+    const { llm } = makeLlm({
+      currentBackend: 'anthropic',
+      currentModel: 'claude-haiku-4-5-20251001',
+    });
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(store[BOOTSTRAP_APPLIED_KEY]).toBe('true');
+    expect(store['cycle.universe']).toBe(MOMENTUM_UNIVERSE);
+  });
+
+  it('never logs any env value that could be a secret-bearing field name', async () => {
+    process.env.LLM_BACKEND = 'gemini';
+    process.env.LLM_MODEL = 'gemini-3.5-flash';
+    const { kv } = makeKv();
+    const { db } = makeDb();
+    const { llm } = makeLlm({
+      currentBackend: 'anthropic',
+      currentModel: 'claude-haiku-4-5-20251001',
+    });
     const svc = new StrategyBootstrapService(db, kv, llm);
     const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
 
     await svc.run();
 
     for (const call of logSpy.mock.calls) {
-      expect(JSON.stringify(call)).not.toContain('super-secret-value-should-not-leak');
+      expect(JSON.stringify(call)).not.toMatch(/api[_-]?key/i);
     }
-    expect(patchConfig).toHaveBeenCalledWith({
-      backend: 'gemini',
-      model: 'gemini-3-flash-preview',
-    });
     logSpy.mockRestore();
   });
 });
