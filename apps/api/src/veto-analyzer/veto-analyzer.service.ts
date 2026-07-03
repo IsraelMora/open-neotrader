@@ -11,9 +11,11 @@
  *   processing of the other rows in the same batch (mirrors _persistVetoDecisions'
  *   per-row try/catch style).
  */
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProviderGatewayService, type OhlcvBar } from '../providers/provider-gateway.service';
+import { KvService } from '../common/kv.service';
+import { kvNum } from '../common/kv.util';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -121,6 +123,16 @@ export interface PluginValueReport {
 const DEFAULT_HORIZON_BARS = 5;
 const DEFAULT_TIMEFRAME = '1d';
 const DEFAULT_COST_BPS = 10;
+
+/**
+ * KV key controlling the automatic backfill sweep cadence (ms). A missing/invalid value
+ * falls back to DEFAULT_BACKFILL_INTERVAL_MS; a value <= 0 explicitly DISABLES the
+ * scheduler (no timer is started at all) so an operator can turn the sweep off from KV
+ * without a redeploy. Mirrors the guarded kvNum read used by RealBrokerReconciliationService.
+ */
+const BACKFILL_INTERVAL_KEY = 'veto.backfill_interval_ms';
+/** Default cadence for the automatic backfill sweep — 6 hours. cf_pnl is not time-sensitive. */
+const DEFAULT_BACKFILL_INTERVAL_MS = 6 * 60 * 60_000;
 /** Extra bars fetched beyond the strict decision-to-now need, to absorb non-trading gaps. */
 const FETCH_LIMIT_BUFFER = 20;
 /** Hard cap on a single fetch's bar count — protects providers from unbounded requests for old decisions. */
@@ -257,13 +269,77 @@ function finalizePluginValueEntry(entry: PluginValueEntry): void {
 }
 
 @Injectable()
-export class VetoAnalyzerService {
+export class VetoAnalyzerService implements OnModuleInit, OnModuleDestroy {
   private readonly log = new Logger(VetoAnalyzerService.name);
+
+  /** Steady-state backfill ticker; null when the scheduler is disabled or shut down. */
+  private backfillTicker: ReturnType<typeof setInterval> | null = null;
+  /** Overlap guard — true while a scheduled backfill() sweep is still in flight. */
+  private backfillRunning = false;
 
   constructor(
     private readonly db: PrismaService,
     private readonly providerGateway: ProviderGatewayService,
+    private readonly kv: KvService,
   ) {}
+
+  /**
+   * Starts the automatic backfill scheduler: a KV-configured setInterval loop that
+   * periodically calls backfill() so cf_pnl is populated without an operator manually
+   * hitting POST /veto-metrics/backfill. Mirrors RealBrokerReconciliationService's
+   * steady-state loop pattern (guarded kvNum read, OnModuleInit/OnModuleDestroy timer,
+   * overlap guard, fail-soft tick). Deliberately does NOT run a sweep at startup — the
+   * first sweep happens one interval later, so app boot stays fast and does not fan out
+   * a provider OHLCV burst. A KV interval <= 0 disables the loop entirely (no timer).
+   */
+  async onModuleInit(): Promise<void> {
+    const intervalMs = await this._readBackfillIntervalMs();
+    if (intervalMs <= 0) {
+      this.log.log(`[veto-analyzer] backfill scheduler disabled (${BACKFILL_INTERVAL_KEY} <= 0)`);
+      return;
+    }
+    this.backfillTicker = setInterval(() => void this._backfillTick(), intervalMs);
+    this.log.log(`[veto-analyzer] backfill scheduler started (interval=${intervalMs}ms)`);
+  }
+
+  onModuleDestroy(): void {
+    if (this.backfillTicker) {
+      clearInterval(this.backfillTicker);
+      this.backfillTicker = null;
+    }
+  }
+
+  /** Reads the backfill interval from KV, defaulting to 6h (see BACKFILL_INTERVAL_KEY doc). */
+  private async _readBackfillIntervalMs(): Promise<number> {
+    let raw: string | null;
+    try {
+      raw = await this.kv.get(BACKFILL_INTERVAL_KEY);
+    } catch {
+      raw = null;
+    }
+    return kvNum(raw, DEFAULT_BACKFILL_INTERVAL_MS);
+  }
+
+  /**
+   * One scheduled sweep: overlap guard (skip if the previous sweep is still running) +
+   * fail-soft (a throwing backfill() is caught and logged, NEVER escapes the timer
+   * callback — the loop must keep ticking regardless of a transient provider/DB error).
+   */
+  private async _backfillTick(): Promise<void> {
+    if (this.backfillRunning) return;
+    this.backfillRunning = true;
+    try {
+      const summary = await this.backfill();
+      this.log.log(
+        `[veto-analyzer] scheduled backfill: evaluated=${summary.evaluated} ` +
+          `pending=${summary.pending} errors=${summary.errors}`,
+      );
+    } catch (e) {
+      this.log.warn(`[veto-analyzer] scheduled backfill tick failed (loop continues): ${e}`);
+    } finally {
+      this.backfillRunning = false;
+    }
+  }
 
   /**
    * Backfills cf_pnl / cf_method / cf_evaluated_at for all unevaluated veto_decisions
