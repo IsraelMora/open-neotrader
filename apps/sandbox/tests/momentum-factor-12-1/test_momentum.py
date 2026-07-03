@@ -272,3 +272,129 @@ class TestTrendFilter:
 
         ranks = apply_trend_filter(ranks, market_trend_up=False)
         assert ranks[0].signal != "long"
+
+
+class TestShortSellingOptIn:
+    """
+    OPT-IN short-selling extension. Default behavior (enable_short=False) must
+    be byte-identical to the pre-existing long/exit-only behavior — no short
+    signals ever appear unless explicitly enabled.
+
+    When enabled, only the bottom `short_bottom_pct` of the ranked universe
+    with NEGATIVE absolute momentum (return_12_1 < 0) gets a "short" signal.
+    This avoids shorting names that are merely the worst performers of an
+    otherwise-positive universe (2nd-best-in-a-bull-market problem).
+    """
+
+    def test_enable_short_false_default_produces_no_short_signals(self) -> None:
+        # 5-symbol universe, mixed positive/negative momentum.
+        aaa = _series_oldest_first(start=100.0, monthly_step=5.0)  # positive
+        bbb = _series_oldest_first(start=100.0, monthly_step=3.0)  # positive
+        ccc = _series_oldest_first(start=100.0, monthly_step=-1.0)  # negative
+        ddd = _series_oldest_first(start=100.0, monthly_step=-3.0)  # negative
+        eee = _series_oldest_first(start=100.0, monthly_step=-5.0)  # negative, worst
+
+        universe = {"AAA": aaa, "BBB": bbb, "CCC": ccc, "DDD": ddd, "EEE": eee}
+
+        ranks_default = compute_momentum_ranks(universe, top_pct=0.2)
+        ranks_explicit_off = compute_momentum_ranks(
+            universe, top_pct=0.2, enable_short=False, short_bottom_pct=0.2
+        )
+
+        assert all(r.signal != "short" for r in ranks_default)
+        assert all(r.signal != "short" for r in ranks_explicit_off)
+        # byte-identical: same signals/ranks regardless of the (unused) short knobs
+        assert [(r.symbol, r.signal, r.rank) for r in ranks_default] == [
+            (r.symbol, r.signal, r.rank) for r in ranks_explicit_off
+        ]
+
+    def test_enable_short_true_shorts_bottom_negative_names_only(self) -> None:
+        aaa = _series_oldest_first(start=100.0, monthly_step=5.0)  # positive, top
+        bbb = _series_oldest_first(start=100.0, monthly_step=3.0)  # positive
+        ccc = _series_oldest_first(start=100.0, monthly_step=-1.0)  # mild negative
+        ddd = _series_oldest_first(start=100.0, monthly_step=-3.0)  # negative
+        eee = _series_oldest_first(start=100.0, monthly_step=-5.0)  # worst, negative
+
+        universe = {"AAA": aaa, "BBB": bbb, "CCC": ccc, "DDD": ddd, "EEE": eee}
+
+        # top_pct=0.2 -> only AAA long. short_bottom_pct=0.2 -> only EEE (worst) short.
+        ranks = compute_momentum_ranks(
+            universe, top_pct=0.2, enable_short=True, short_bottom_pct=0.2
+        )
+        by_symbol = {r.symbol: r for r in ranks}
+
+        assert by_symbol["AAA"].signal == "long"
+        assert by_symbol["EEE"].signal == "short"
+        assert by_symbol["EEE"].return_12_1 < 0
+        # only the bottom name gets shorted, not every negative-momentum name
+        assert by_symbol["DDD"].signal != "short"
+        assert by_symbol["CCC"].signal != "short"
+        assert by_symbol["BBB"].signal != "short"
+
+    def test_enable_short_true_never_shorts_positive_momentum(self) -> None:
+        # All positive momentum universe — even the worst-ranked name must
+        # never get "short" because its absolute momentum is positive.
+        aaa = _series_oldest_first(start=100.0, monthly_step=5.0)
+        bbb = _series_oldest_first(start=100.0, monthly_step=4.0)
+        ccc = _series_oldest_first(start=100.0, monthly_step=3.0)
+        ddd = _series_oldest_first(start=100.0, monthly_step=2.0)
+        eee = _series_oldest_first(start=100.0, monthly_step=1.0)  # worst, but still positive
+
+        universe = {"AAA": aaa, "BBB": bbb, "CCC": ccc, "DDD": ddd, "EEE": eee}
+        ranks = compute_momentum_ranks(
+            universe, top_pct=0.2, enable_short=True, short_bottom_pct=0.5
+        )
+        assert all(r.signal != "short" for r in ranks)
+
+    def test_cycle_hook_emits_short_signals_when_enabled(self) -> None:
+        aaa = _series_oldest_first(start=100.0, monthly_step=5.0, n=8)
+        bbb = _series_oldest_first(start=100.0, monthly_step=3.0, n=8)
+        ccc = _series_oldest_first(start=100.0, monthly_step=-1.0, n=8)
+        ddd = _series_oldest_first(start=100.0, monthly_step=-3.0, n=8)
+        eee = _series_oldest_first(start=100.0, monthly_step=-5.0, n=8)
+
+        ctx = {
+            "universe": ["AAA", "BBB", "CCC", "DDD", "EEE"],
+            "config": {
+                "top_pct": 20,
+                "lookback_months": 6,
+                "enable_short": True,
+                "short_bottom_pct": 20,
+            },
+            "portfolio": {},
+            "market_trend_up": True,
+            "provider_tools": {
+                "get_ohlcv": TestCycleHookSignalShape()._get_ohlcv_factory(
+                    {"AAA": aaa, "BBB": bbb, "CCC": ccc, "DDD": ddd, "EEE": eee}
+                )
+            },
+        }
+
+        result = on_cycle(ctx)
+        signals = {s["symbol"]: s for s in result["signals"]}
+
+        assert "EEE" in signals
+        assert signals["EEE"]["action"] == "short"
+
+    def test_cycle_hook_emits_no_short_signals_when_disabled_by_default(self) -> None:
+        aaa = _series_oldest_first(start=100.0, monthly_step=5.0, n=8)
+        bbb = _series_oldest_first(start=100.0, monthly_step=3.0, n=8)
+        ccc = _series_oldest_first(start=100.0, monthly_step=-1.0, n=8)
+        ddd = _series_oldest_first(start=100.0, monthly_step=-3.0, n=8)
+        eee = _series_oldest_first(start=100.0, monthly_step=-5.0, n=8)
+
+        ctx = {
+            "universe": ["AAA", "BBB", "CCC", "DDD", "EEE"],
+            "config": {"top_pct": 20, "lookback_months": 6},
+            "portfolio": {},
+            "market_trend_up": True,
+            "provider_tools": {
+                "get_ohlcv": TestCycleHookSignalShape()._get_ohlcv_factory(
+                    {"AAA": aaa, "BBB": bbb, "CCC": ccc, "DDD": ddd, "EEE": eee}
+                )
+            },
+        }
+
+        result = on_cycle(ctx)
+        actions = {s["action"] for s in result["signals"]}
+        assert "short" not in actions

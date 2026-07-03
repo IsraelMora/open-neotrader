@@ -21,7 +21,7 @@ class MomentumRank:
     rank: int  # 1 = mejor momentum
     percentile: float  # 0.0 = peor, 1.0 = mejor
     in_top_pct: bool  # True si está en el top_pct configurado
-    signal: str  # "long" | "neutral" | "exit"
+    signal: str  # "long" | "neutral" | "exit" | "short"
 
 
 def compute_momentum_ranks(
@@ -29,6 +29,8 @@ def compute_momentum_ranks(
     top_pct: float = 0.20,
     lookback_months: int = 12,
     current_positions: set[str] | None = None,
+    enable_short: bool = False,
+    short_bottom_pct: float = 0.10,
 ) -> list[MomentumRank]:
     """
     Calcula rankings de momentum para un universo de activos.
@@ -50,6 +52,15 @@ def compute_momentum_ranks(
                       [config.lookback_months]). Con lookback_months=12 este cálculo
                       reproduce exactamente el 12-1 canónico (Jegadeesh & Titman).
         current_positions: set de símbolos actualmente en cartera
+        enable_short: OPT-IN (default False). Cuando está en False el
+                      comportamiento es idéntico al long/exit-only original —
+                      nunca se emite signal="short". Cuando está en True, se
+                      emite "short" para el peor `short_bottom_pct` del
+                      universo, PERO solo para símbolos con momentum absoluto
+                      NEGATIVO (return_12_1 < 0) — evita shortear un activo
+                      que simplemente es el "2do mejor" de un universo alcista.
+        short_bottom_pct: fracción inferior del universo candidata a short
+                      (ej. 0.10 = peor 10%). Ignorado si enable_short=False.
 
     Returns:
         lista de MomentumRank ordenada por rank (mejor primero)
@@ -101,9 +112,17 @@ def compute_momentum_ranks(
     top_n = max(1, int(n * top_pct))
     top_symbols = {s[0] for s in scores[:top_n]}
 
+    # Candidatos a short: el peor `short_bottom_pct` del universo (cola de la
+    # lista ordenada desc por retorno). Solo se calcula/usa si enable_short.
+    bottom_symbols: set[str] = set()
+    if enable_short:
+        bottom_n = max(1, int(n * short_bottom_pct))
+        bottom_symbols = {s[0] for s in scores[-bottom_n:]}
+
     results: list[MomentumRank] = []
     for rank_idx, (symbol, ret, vol) in enumerate(scores, start=1):
         in_top = symbol in top_symbols
+        in_bottom = symbol in bottom_symbols
         percentile = 1.0 - (rank_idx - 1) / n
 
         # Vol-adjusted score: mejor measure para weighting dentro del portfolio
@@ -116,6 +135,12 @@ def compute_momentum_ranks(
         # aun así recibir una señal de compra.
         if in_top and ret > 0:
             signal = "long"
+        elif enable_short and in_bottom and ret < 0:
+            # Mismo filtro de momentum absoluto pero espejado: solo shortear
+            # si el activo tiene momentum absoluto NEGATIVO, no solo el peor
+            # relativo del universo (evita shortear el "2do mejor" en un
+            # mercado alcista).
+            signal = "short"
         elif symbol in current_positions:
             signal = "exit"  # estaba en cartera pero salió del top o del filtro absoluto
         else:
@@ -164,9 +189,16 @@ if __name__ == "__main__":
     lookback_months = data.get("lookback_months", 12)
     current_positions = set(data.get("current_positions", []))
     market_trend_up = data.get("market_trend_up", True)
+    enable_short = data.get("enable_short", False)
+    short_bottom_pct = data.get("short_bottom_pct", 0.10)
 
     ranks = compute_momentum_ranks(
-        universe_data, top_pct, lookback_months, current_positions=current_positions
+        universe_data,
+        top_pct,
+        lookback_months,
+        current_positions=current_positions,
+        enable_short=enable_short,
+        short_bottom_pct=short_bottom_pct,
     )
     ranks = apply_trend_filter(ranks, market_trend_up)
 
@@ -178,6 +210,7 @@ if __name__ == "__main__":
                     "rankings": [asdict(r) for r in ranks],
                     "long_signals": [r.symbol for r in ranks if r.signal == "long"],
                     "exit_signals": [r.symbol for r in ranks if r.signal == "exit"],
+                    "short_signals": [r.symbol for r in ranks if r.signal == "short"],
                     "market_trend_up": market_trend_up,
                     "n_universe": len(ranks),
                 },

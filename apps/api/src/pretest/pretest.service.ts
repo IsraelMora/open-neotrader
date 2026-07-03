@@ -37,12 +37,19 @@ export interface PretestPolicy {
   sizing_pct: number; // fraction of cash per buy order (default 0.05)
   slippage_pct: number; // adverse price adjustment on fill (default 0)
   commission_pct: number; // fee on notional, charged to cash (default 0)
+  /** Borrow-cost accrual on open short notional, charged to cash each
+   * _updateEquityMetrics tick (fraction of |short_qty| * mark_price).
+   * Default is a small per-cycle drag, mirroring a stock-loan fee. Only ever
+   * has an effect when a short position is actually open — zero impact on
+   * long-only portfolios (default enable_short=false everywhere). */
+  borrow_cost_pct: number;
 }
 
 const POLICY_DEFAULTS: PretestPolicy = {
   sizing_pct: 0.05,
   slippage_pct: 0,
   commission_pct: 0,
+  borrow_cost_pct: 0.0001,
 };
 
 /** Buy & hold benchmark for the alpha gate. SPY = broad US-equity index proxy. */
@@ -69,17 +76,23 @@ const DEFAULT_UNIVERSE = [
 export interface PretestTrade {
   ts: string;
   symbol: string;
-  action: 'buy' | 'sell' | 'close';
+  /**
+   * 'short' = sell-to-open (opens/adds to a short position, negative qty).
+   * 'cover' = buy-to-close (closes a short position, an exit-class action).
+   */
+  action: 'buy' | 'sell' | 'close' | 'short' | 'cover';
   price: number;
   quantity: number;
   pnl?: number;
-  /** Cost basis per share at entry (avg_price of position when trade was closed). Stored by _applySell. */
+  /** Cost basis per share at entry (avg_price of position when trade was closed). Stored by _applySell/_applyCover. */
   entry_price?: number;
 }
 
 export interface PretestPosition {
   symbol: string;
+  /** Signed quantity: positive = long, NEGATIVE = short (shares owed). */
   quantity: number;
+  /** Entry price. For shorts this is the effective sell-to-open price (net of commission). */
   avg_price: number;
   current_price?: number;
   unrealized_pnl?: number;
@@ -426,7 +439,7 @@ export class PretestService {
 
     // Actualizar estado virtual (sync trade application + commission, async MTM equity)
     const newState = this._applyTrades(portfolio.state, trades, policy);
-    await this._updateEquityMetrics(newState);
+    await this._updateEquityMetrics(newState, policy);
 
     await this.db.pretestPortfolio.update({
       where: { id },
@@ -1043,8 +1056,12 @@ export class PretestService {
       0,
       Math.min(1, coerce(raw['commission_pct'], POLICY_DEFAULTS.commission_pct)),
     );
+    const borrow_cost_pct = Math.max(
+      0,
+      Math.min(1, coerce(raw['borrow_cost_pct'], POLICY_DEFAULTS.borrow_cost_pct)),
+    );
 
-    return { sizing_pct, slippage_pct, commission_pct };
+    return { sizing_pct, slippage_pct, commission_pct, borrow_cost_pct };
   }
 
   /**
@@ -1066,8 +1083,11 @@ export class PretestService {
         | 'buy'
         | 'sell'
         | 'close'
+        | 'short'
+        | 'cover'
         | undefined;
-      if (!symbol || !action || !['buy', 'sell', 'close'].includes(action)) continue;
+      if (!symbol || !action || !['buy', 'sell', 'close', 'short', 'cover'].includes(action))
+        continue;
 
       let last: number;
       try {
@@ -1080,9 +1100,12 @@ export class PretestService {
 
       if (last <= 0) continue;
 
-      // Apply slippage: buy fills at a higher price, sell fills at a lower price
+      // Apply slippage: buy/cover (both buy-side executions) fill at a higher
+      // price; sell/close/short (both sell-side executions) fill at a lower price.
       const price =
-        action === 'buy' ? last * (1 + policy.slippage_pct) : last * (1 - policy.slippage_pct);
+        action === 'buy' || action === 'cover'
+          ? last * (1 + policy.slippage_pct)
+          : last * (1 - policy.slippage_pct);
 
       const quantity = this._calcQuantity(action, symbol, price, state, policy);
       if (quantity <= 0) continue;
@@ -1093,7 +1116,7 @@ export class PretestService {
   }
 
   private _calcQuantity(
-    action: 'buy' | 'sell' | 'close',
+    action: 'buy' | 'sell' | 'close' | 'short' | 'cover',
     symbol: string,
     price: number,
     state: PretestState,
@@ -1106,8 +1129,21 @@ export class PretestService {
       const cost_per_share = price * (1 + policy.commission_pct);
       return cost_per_share > 0 ? Math.floor(budget / cost_per_share) : 0;
     }
+    if (action === 'short') {
+      // Same sizing_pct-of-cash budget as buy: uses available cash as a proxy
+      // for the margin/notional the paper account is willing to risk on the
+      // short. Never opens a short on top of an existing long (guarded in _applyShort).
+      const budget = state.cash * policy.sizing_pct;
+      const notional_per_share = price * (1 + policy.commission_pct);
+      return notional_per_share > 0 ? Math.floor(budget / notional_per_share) : 0;
+    }
+    if (action === 'cover') {
+      const pos = state.positions.find((p) => p.symbol === symbol);
+      return pos && pos.quantity < 0 ? Math.abs(pos.quantity) : 0;
+    }
+    // sell / close (long exits)
     const pos = state.positions.find((p) => p.symbol === symbol);
-    return pos?.quantity ?? 0;
+    return pos && pos.quantity > 0 ? pos.quantity : 0;
   }
 
   private _applyTrades(
@@ -1127,6 +1163,10 @@ export class PretestService {
         this._applyBuy(next, trade, policy.commission_pct);
       } else if (trade.action === 'sell' || trade.action === 'close') {
         this._applySell(next, trade, policy.commission_pct);
+      } else if (trade.action === 'short') {
+        this._applyShort(next, trade, policy.commission_pct);
+      } else if (trade.action === 'cover') {
+        this._applyCover(next, trade, policy.commission_pct);
       }
     }
 
@@ -1184,12 +1224,84 @@ export class PretestService {
   }
 
   /**
+   * Short entry (sell-to-open). Position quantity goes NEGATIVE (shares owed).
+   * Cash is credited with the (commission-net) sale proceeds, mirroring a sell —
+   * but this cash is a liability offset by the short's mark-to-market value,
+   * which _updateEquityMetrics accounts for via the position's signed quantity.
+   * Guarded against opening a short on top of an existing LONG position in the
+   * same symbol (mixed long/short per symbol is not modeled) — skips instead.
+   */
+  private _applyShort(state: PretestState, trade: PretestTrade, commission_pct = 0): void {
+    const existing = state.positions.find((p) => p.symbol === trade.symbol);
+    if (existing && existing.quantity > 0) return; // cannot short while long the same symbol
+    const notional = trade.price * trade.quantity;
+    const sell_commission = notional * commission_pct;
+    const net_proceeds = notional - sell_commission;
+    if (net_proceeds <= 0 || trade.quantity <= 0) return;
+    state.cash += net_proceeds;
+    state.trades.push(trade);
+    // Effective short-entry price nets out commission (worse execution price),
+    // mirroring how _applyBuy embeds buy commission into cost basis.
+    const cost_basis_price = net_proceeds / trade.quantity;
+    if (existing) {
+      const existing_abs = Math.abs(existing.quantity);
+      const total_qty = existing_abs + trade.quantity;
+      existing.avg_price =
+        (existing.avg_price * existing_abs + cost_basis_price * trade.quantity) / total_qty;
+      existing.quantity = -total_qty;
+    } else {
+      state.positions.push({
+        symbol: trade.symbol,
+        quantity: -trade.quantity,
+        avg_price: cost_basis_price,
+      });
+    }
+  }
+
+  /**
+   * Cover (buy-to-close a short) — an EXIT-class action, mirroring _applySell for
+   * longs. Short P&L = (entry_price − cover_price) × qty − commission: profit
+   * when covered lower than the entry short price, loss when covered higher.
+   */
+  private _applyCover(state: PretestState, trade: PretestTrade, commission_pct = 0): void {
+    const posIdx = state.positions.findIndex((p) => p.symbol === trade.symbol && p.quantity < 0);
+    if (posIdx < 0) return; // no short position to cover — skip, do NOT record to state.trades
+    const pos = state.positions[posIdx];
+    const qty = Math.min(trade.quantity, Math.abs(pos.quantity));
+    if (qty <= 0) return;
+    const cost = trade.price * qty;
+    const commission_cost = cost * commission_pct;
+    const pnl = (pos.avg_price - trade.price) * qty - commission_cost;
+    trade.pnl = pnl;
+    trade.entry_price = pos.avg_price;
+    state.cash -= cost + commission_cost;
+    state.realized_pnl += pnl;
+    if (pnl > 0) state.win_trades++;
+    else state.loss_trades++;
+    pos.quantity += qty; // moves toward 0 (never overshoots into long: qty is capped above)
+    if (pos.quantity >= 0) state.positions.splice(posIdx, 1);
+    // Record only after the cover executes
+    state.trades.push(trade);
+  }
+
+  /**
    * Mark-to-market equity: for each open position fetch live quote and compute
    * current_price + unrealized_pnl. Falls back to last-known current_price
    * (or avg_price if no current_price) on getQuote rejection.
    * Never throws — failures are logged as warnings.
+   *
+   * Equity formula generalizes to shorts for free: posValue sums
+   * (current_price * quantity) with quantity SIGNED (negative for shorts), so
+   * equity = cash + long_MTM − short_liability automatically.
+   *
+   * Short positions also accrue a borrow-cost fee each tick (policy.borrow_cost_pct
+   * of |quantity| * mark_price), charged to cash — a stock-loan fee approximation.
+   * Zero effect on long-only portfolios (no short positions ever exist there).
    */
-  async _updateEquityMetrics(state: PretestState): Promise<void> {
+  async _updateEquityMetrics(
+    state: PretestState,
+    policy: PretestPolicy = POLICY_DEFAULTS,
+  ): Promise<void> {
     await Promise.all(
       state.positions.map(async (pos) => {
         let marketPrice: number;
@@ -1216,10 +1328,18 @@ export class PretestService {
 
         pos.current_price = marketPrice;
         pos.unrealized_pnl = (marketPrice - pos.avg_price) * pos.quantity;
+
+        // Borrow-cost accrual on open short notional (quantity < 0), charged to cash.
+        if (pos.quantity < 0 && policy.borrow_cost_pct > 0) {
+          const borrow_cost = Math.abs(pos.quantity) * marketPrice * policy.borrow_cost_pct;
+          state.cash -= borrow_cost;
+        }
       }),
     );
 
-    // MTM equity = cash + Σ(current_price * quantity) for all open positions
+    // MTM equity = cash + Σ(current_price * quantity) for all open positions.
+    // quantity is SIGNED (negative for shorts) so this is simultaneously
+    // cash + long_MTM − short_liability without special-casing shorts.
     const posValue = state.positions.reduce(
       (sum, p) => sum + (p.current_price ?? p.avg_price) * p.quantity,
       0,

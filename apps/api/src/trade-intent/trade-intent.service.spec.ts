@@ -534,10 +534,14 @@ describe('TradeIntentService', () => {
     });
 
     it('kernel risk gate applies on approve() too: max_open_positions rejects a human-approved LONG', async () => {
+      // avg_price=500 * qty=1 each = 5_000 positions value + 5_000 cash = 10_000 equity,
+      // matching the declared equity/no-hwm baseline exactly — the entry gate mark-to-markets
+      // all 10 positions FIRST (see _passesPaperEntryGate), priced flat (no gain/loss) so the
+      // drawdown component stays at 0% and max_open_positions is the gate that actually fires.
       const positions = Array.from({ length: 10 }, (_, i) => ({
         symbol: `SYM${i}`,
         quantity: 1,
-        avg_price: 100,
+        avg_price: 500,
       }));
       const intent = pendingIntent({ action: 'long', symbol: 'AAPL' });
       prisma.tradeIntent.findUnique.mockResolvedValue(intent);
@@ -546,13 +550,25 @@ describe('TradeIntentService', () => {
         data: JSON.stringify({ equity: 10_000, cash: 5_000, positions }),
         updatedAt: new Date(),
       });
+      gateway.getQuote.mockImplementation((_provider: unknown, symbol: string) =>
+        Promise.resolve({ symbol, bid: 499, ask: 501, last: 500, ts: new Date().toISOString() }),
+      );
       const rejected = pendingIntent({ status: 'rejected', decided_by: 'alice' });
       prisma.tradeIntent.update.mockResolvedValue(rejected);
 
       const result = await service.approve('ti_001', 'alice');
 
-      expect(gateway.getQuote).not.toHaveBeenCalled();
+      // MTM now fetches a quote for each of the 10 open positions before the gate runs.
+      expect(gateway.getQuote).toHaveBeenCalledTimes(10);
       expect(result.status).toBe('rejected');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'rejected',
+            reject_reason: expect.stringContaining('max open positions') as string,
+          }),
+        }),
+      );
     });
 
     it('kernel risk gate on approve() never blocks "exit", even during an active halt', async () => {
@@ -1010,10 +1026,14 @@ describe('TradeIntentService', () => {
     it('max_open_positions reached → opening trade auto-rejected', async () => {
       kv.get.mockResolvedValue(null); // autonomous=true, max_open_positions=10 (default)
 
+      // avg_price=500 * qty=1 each = 5_000 positions value + 5_000 cash = 10_000 equity,
+      // matching the declared equity/no-hwm baseline exactly — the entry gate mark-to-markets
+      // all 10 positions FIRST (see _passesPaperEntryGate), priced flat (no gain/loss) so the
+      // drawdown component stays at 0% and max_open_positions is the gate that actually fires.
       const positions = Array.from({ length: 10 }, (_, i) => ({
         symbol: `SYM${i}`,
         quantity: 1,
-        avg_price: 100,
+        avg_price: 500,
       }));
       const portfolioFull = JSON.stringify({ equity: 10_000, cash: 5_000, positions });
 
@@ -1023,6 +1043,9 @@ describe('TradeIntentService', () => {
         data: portfolioFull,
         updatedAt: new Date(),
       });
+      gateway.getQuote.mockImplementation((_provider: unknown, symbol: string) =>
+        Promise.resolve({ symbol, bid: 499, ask: 501, last: 500, ts: new Date().toISOString() }),
+      );
       const rejected = pendingIntent({
         status: 'rejected',
         decided_by: 'autonomous',
@@ -1032,7 +1055,8 @@ describe('TradeIntentService', () => {
 
       await service.autoProcess('ti_001');
 
-      expect(gateway.getQuote).not.toHaveBeenCalled();
+      // MTM now fetches a quote for each of the 10 open positions before the gate runs.
+      expect(gateway.getQuote).toHaveBeenCalledTimes(10);
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
         oc({
           data: oc({
@@ -1202,6 +1226,11 @@ describe('TradeIntentService', () => {
       prismaMock: MockPrisma,
       brokerPluginId = 'alpaca-provider',
       maxOrderNotional = 1000,
+      // Existing tests in this describe block exercise real short-selling explicitly
+      // (pre-dating the execution.allow_real_short opt-in gate) — default true here so
+      // they keep testing the real-mode short path unchanged. Dedicated tests below
+      // (describe('real short-selling opt-in gate')) verify the actual default (false).
+      allowRealShort = true,
     ) {
       kvMock.get.mockImplementation((key: string) => {
         if (key === 'execution.real') return Promise.resolve('true');
@@ -1209,6 +1238,7 @@ describe('TradeIntentService', () => {
         if (key === 'execution.max_order_notional')
           return Promise.resolve(String(maxOrderNotional));
         if (key === 'strategy.applied') return Promise.resolve('s_live');
+        if (key === 'execution.allow_real_short') return Promise.resolve(String(allowRealShort));
         return Promise.resolve(null); // all other keys → defaults (autonomous=true, etc.)
       });
       mockRobustAppliedStrategy(prismaMock); // fresh ROBUSTO verdict → gate passes
@@ -2591,6 +2621,7 @@ describe('TradeIntentService', () => {
         if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
         if (key === 'execution.max_order_notional') return Promise.resolve('1000');
         if (key === 'strategy.applied') return Promise.resolve('s_live');
+        if (key === 'execution.allow_real_short') return Promise.resolve('true');
         if (key === 'real_execution.halted') return Promise.resolve('true');
         if (key === 'real_execution.halt_reason') return Promise.resolve(reason);
         return Promise.resolve(null);
@@ -3415,6 +3446,734 @@ describe('TradeIntentService', () => {
       );
       const approveResult = (await service.approve('ti_001', 'alice')) as { quantity: number };
       expect(approveResult.quantity).toBeLessThanOrEqual(ceilingQty);
+    });
+  });
+
+  // ── Paper-first short-selling: kernel risk floor ────────────────────────────
+  //
+  // "short" is a real, OPT-IN, PAPER-FIRST capability. Real-money shorting stays
+  // gated (execution.allow_real_short defaults false — see the dedicated describe
+  // block further below). These tests cover the PAPER-mode kernel gates: shorts
+  // are entries (gated like longs — drawdown halt + size ceiling, never looser)
+  // and covers are exits (always allowed, mirroring the long-exit invariant).
+
+  describe('paper short-selling (kernel risk floor)', () => {
+    it('opens a short position: negative quantity, cash credited with sell-to-open proceeds', async () => {
+      kv.get.mockResolvedValue(null); // defaults
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'short', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma); // equity=10_000, cash=10_000, positions=[]
+      mockAaplQuote(gateway); // price=150
+      prisma.portfolio.upsert.mockImplementation(
+        (args: { update: { data: string } }) =>
+          Promise.resolve({
+            name: 'paper',
+            data: args.update.data,
+            updatedAt: new Date(),
+          }) as unknown,
+      );
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'executed', ...args.data })) as unknown,
+      );
+
+      const result = (await service.autoProcess('ti_001')) as { quantity: number };
+
+      expect(result.quantity).toBeGreaterThan(0); // executed qty is reported positive
+      expect(prisma.portfolio.upsert).toHaveBeenCalled();
+      const [[upsertCall]] = prisma.portfolio.upsert.mock.calls as [[{ update: { data: string } }]];
+      const newState = JSON.parse(upsertCall.update.data) as {
+        cash: number;
+        positions: Array<{ symbol: string; quantity: number; avg_price: number }>;
+      };
+      expect(newState.positions).toHaveLength(1);
+      expect(newState.positions[0].symbol).toBe('AAPL');
+      expect(newState.positions[0].quantity).toBeLessThan(0); // SIGNED negative for a short
+      // 6 shares (floor(10000*0.1/150)=6) sold-to-open at 150 → +900 cash credited
+      expect(newState.cash).toBeCloseTo(10_000 + 6 * 150);
+    });
+
+    it('short entries are GATED like longs: drawdown halt rejects a new short', async () => {
+      kv.get.mockResolvedValue(null); // max_drawdown_halt_pct=25 (default)
+      const portfolioAtDrawdown = JSON.stringify({
+        equity: 7_000,
+        cash: 7_000,
+        positions: [],
+        hwm: 10_000, // drawdown = 30% >= 25%
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'short' }));
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioAtDrawdown,
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'rejected', decided_by: 'autonomous' }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.getQuote).not.toHaveBeenCalled();
+      expect(result.status).toBe('rejected');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'rejected',
+            reject_reason: expect.stringMatching(/circuit|drawdown/i) as string,
+          }),
+        }),
+      );
+    });
+
+    it('short entries are GATED like longs: max_open_positions rejects a new short', async () => {
+      kv.get.mockResolvedValue(null); // max_open_positions=10 (default)
+      // avg_price=500 * qty=1 each = 5_000 positions value + 5_000 cash = 10_000 equity,
+      // matching the declared equity/no-hwm baseline exactly — the entry gate mark-to-markets
+      // all 10 positions FIRST (see _passesPaperEntryGate), priced flat (no gain/loss) so the
+      // drawdown component stays at 0% and max_open_positions is the gate that actually fires.
+      const positions = Array.from({ length: 10 }, (_, i) => ({
+        symbol: `SYM${i}`,
+        quantity: 1,
+        avg_price: 500,
+      }));
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'short' }));
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: JSON.stringify({ equity: 10_000, cash: 5_000, positions }),
+        updatedAt: new Date(),
+      });
+      gateway.getQuote.mockImplementation((_provider: unknown, symbol: string) =>
+        Promise.resolve({ symbol, bid: 499, ask: 501, last: 500, ts: new Date().toISOString() }),
+      );
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'rejected', decided_by: 'autonomous' }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      // MTM now fetches a quote for each of the 10 open positions before the gate runs.
+      expect(gateway.getQuote).toHaveBeenCalledTimes(10);
+      expect(result.status).toBe('rejected');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'rejected',
+            reject_reason: expect.stringContaining('max open positions') as string,
+          }),
+        }),
+      );
+    });
+
+    it('short size is clamped by max_position_pct (same ceiling as long — never looser)', async () => {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.max_position_pct') return Promise.resolve('0.05');
+        if (key === 'execution.max_short_notional_pct') return Promise.resolve('1'); // wide open, isolate this ceiling
+        return Promise.resolve(null);
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'short', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma); // equity=10_000, cash=10_000
+      mockAaplQuote(gateway); // price=150
+      prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}' });
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'executed', ...args.data })) as unknown,
+      );
+
+      const result = (await service.autoProcess('ti_001')) as { quantity: number };
+
+      // floor(10000*0.05/150) = 3
+      expect(result.quantity).toBe(3);
+    });
+
+    it('short size is clamped by max_short_notional_pct even when max_position_pct is wide open', async () => {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.max_position_pct') return Promise.resolve('1'); // wide open
+        if (key === 'execution.max_short_notional_pct') return Promise.resolve('0.02');
+        return Promise.resolve(null);
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'short', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma); // equity=10_000, cash=10_000
+      mockAaplQuote(gateway); // price=150
+      prisma.portfolio.upsert.mockResolvedValue({ name: 'paper', data: '{}' });
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'executed', ...args.data })) as unknown,
+      );
+
+      const result = (await service.autoProcess('ti_001')) as { quantity: number };
+
+      // Without the short-notional ceiling: floor(10000*1/150)=66 (sizingPct==max_position_pct
+      // in autoProcess). With max_short_notional_pct=0.02: floor(10000*0.02/150)=1.
+      expect(result.quantity).toBe(1);
+    });
+
+    it('refuses to open a short on top of an existing LONG position (mixed long/short unsupported)', async () => {
+      kv.get.mockResolvedValue(null);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'short', symbol: 'AAPL' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: JSON.stringify({
+          equity: 10_000,
+          cash: 8_500,
+          positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 150 }],
+        }),
+        updatedAt: new Date(),
+      });
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockImplementation(
+        (args: { update: { data: string } }) =>
+          Promise.resolve({
+            name: 'paper',
+            data: args.update.data,
+            updatedAt: new Date(),
+          }) as unknown,
+      );
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'executed', ...args.data })) as unknown,
+      );
+
+      const result = (await service.autoProcess('ti_001')) as { quantity: number };
+
+      expect(result.quantity).toBe(0); // refused — still executed as a no-op, not rejected
+      const [[upsertCall]] = prisma.portfolio.upsert.mock.calls as [[{ update: { data: string } }]];
+      const newState = JSON.parse(upsertCall.update.data) as {
+        positions: Array<{ symbol: string; quantity: number }>;
+      };
+      expect(newState.positions[0].quantity).toBe(10); // unchanged — still long
+    });
+
+    it('covering a short is an EXIT-class action — ALWAYS allowed, even during an active drawdown halt', async () => {
+      kv.get.mockResolvedValue(null); // max_drawdown_halt_pct=25 (default)
+      // A pre-existing short: -10 AAPL @ avg_price=150. Portfolio is well past the halt threshold.
+      const portfolioAtDrawdown = JSON.stringify({
+        equity: 7_000,
+        cash: 8_500,
+        positions: [{ symbol: 'AAPL', quantity: -10, avg_price: 150 }],
+        hwm: 10_000, // drawdown = 30% >= 25% — an OPENING trade would be rejected here
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioAtDrawdown,
+        updatedAt: new Date(),
+      });
+      mockAaplQuote(gateway); // price=150 (flat — covers at entry price for a clean assertion)
+      prisma.portfolio.upsert.mockImplementation(
+        (args: { update: { data: string } }) =>
+          Promise.resolve({
+            name: 'paper',
+            data: args.update.data,
+            updatedAt: new Date(),
+          }) as unknown,
+      );
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'executed', ...args.data })) as unknown,
+      );
+
+      await service.autoProcess('ti_001');
+
+      // Exit always bypasses the risk gate — never 'rejected', even mid-halt.
+      expect(gateway.getQuote).toHaveBeenCalled();
+      const [[upsertCall]] = prisma.portfolio.upsert.mock.calls as [[{ update: { data: string } }]];
+      const newState = JSON.parse(upsertCall.update.data) as {
+        positions: unknown[];
+      };
+      expect(newState.positions).toHaveLength(0); // short fully covered/closed
+    });
+
+    it('short then cover LOWER realizes profit; short then cover HIGHER realizes a loss', async () => {
+      kv.get.mockResolvedValue(null);
+      let portfolioData = EMPTY_PORTFOLIO_DATA; // equity=10_000, cash=10_000
+      prisma.portfolio.findUnique.mockImplementation(() =>
+        Promise.resolve({ name: 'paper', data: portfolioData, updatedAt: new Date() }),
+      );
+      prisma.portfolio.upsert.mockImplementation((args: { update: { data: string } }) => {
+        portfolioData = args.update.data;
+        return Promise.resolve({ name: 'paper', data: portfolioData, updatedAt: new Date() });
+      });
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { where: { id: string }; data: Record<string, unknown> }) =>
+          Promise.resolve(
+            pendingIntent({ id: args.where.id, status: 'executed', ...args.data }),
+          ) as unknown,
+      );
+
+      // Open: short 6 AAPL @ 150 (floor(10000*0.1/150)=6). Cash: 10000 + 900 = 10900.
+      prisma.tradeIntent.findUnique.mockResolvedValueOnce(
+        pendingIntent({ id: 'ti_open', action: 'short', symbol: 'AAPL' }),
+      );
+      gateway.getQuote.mockResolvedValueOnce({
+        symbol: 'AAPL',
+        bid: 149,
+        ask: 151,
+        last: 150,
+        ts: new Date().toISOString(),
+      });
+      const opened = await service.autoProcess('ti_open');
+      expect(opened.status).toBe('executed');
+
+      // Cover lower @ 100 → profit = (150-100)*6 = 300. cash = 10900 - 600 = 10300.
+      prisma.tradeIntent.findUnique.mockResolvedValueOnce(
+        pendingIntent({ id: 'ti_cover', action: 'exit', symbol: 'AAPL' }),
+      );
+      gateway.getQuote.mockResolvedValueOnce({
+        symbol: 'AAPL',
+        bid: 99,
+        ask: 101,
+        last: 100,
+        ts: new Date().toISOString(),
+      });
+      const covered = (await service.autoProcess('ti_cover')) as {
+        status: string;
+        realized_pnl: number;
+      };
+      expect(covered.status).toBe('executed');
+      expect(covered.realized_pnl).toBeCloseTo(300);
+      const afterProfit = JSON.parse(portfolioData) as { cash: number; positions: unknown[] };
+      expect(afterProfit.cash).toBeCloseTo(10_300);
+      expect(afterProfit.positions).toHaveLength(0);
+    });
+  });
+
+  // ── Mark-to-market gap fix: the drawdown halt must see UNTOUCHED open positions ──
+  // moving against the book, not just the just-traded symbol (CRITICAL safety gap
+  // found by adversarial review — see class-level doc comment). Covers: a rallying
+  // short (unbounded loss), a falling long, MTM failure fail-closed on entries, and
+  // exit/cover staying reachable even when MTM can't be computed.
+
+  describe('paper mark-to-market before the entry gate (kernel risk floor)', () => {
+    it('a rallying SHORT with no retrade on its symbol reduces equity and trips the drawdown halt on the next entry', async () => {
+      kv.get.mockResolvedValue(null); // max_drawdown_halt_pct=25 (default)
+
+      // Short 10 TSLA @ 100 was opened earlier: cash=10_000+1_000=11_000, positions=[-10@100],
+      // equity recorded at open time = 11_000 + (-10*100) = 10_000, hwm=10_000. TSLA has since
+      // rallied hard to 400 with NO retrade on TSLA — the stale `equity` field still says
+      // 10_000 (the bug this fix closes). True MTM equity = 11_000 + (-10*400) = 7_000, a 30%
+      // drawdown from hwm — past the 25% halt.
+      const portfolioWithStaleShort = JSON.stringify({
+        equity: 10_000,
+        cash: 11_000,
+        positions: [{ symbol: 'TSLA', quantity: -10, avg_price: 100 }],
+        hwm: 10_000,
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioWithStaleShort,
+        updatedAt: new Date(),
+      });
+      gateway.getQuote.mockImplementation((_provider: unknown, symbol: string) =>
+        Promise.resolve({
+          symbol,
+          bid: symbol === 'TSLA' ? 399 : 149,
+          ask: symbol === 'TSLA' ? 401 : 151,
+          last: symbol === 'TSLA' ? 400 : 150,
+          ts: new Date().toISOString(),
+        }),
+      );
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'rejected', decided_by: 'autonomous' }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(result.status).toBe('rejected');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'rejected',
+            reject_reason: expect.stringMatching(/circuit|drawdown/i) as string,
+          }),
+        }),
+      );
+      // MTM must have priced the untouched TSLA short before the gate ran.
+      expect(gateway.getQuote).toHaveBeenCalledWith(null, 'TSLA');
+      // Entry is blocked before ever pricing the AAPL trade itself.
+      expect(gateway.getQuote).not.toHaveBeenCalledWith(null, 'AAPL');
+    });
+
+    it('a falling LONG with no retrade on its symbol reduces equity and trips the drawdown halt on the next entry', async () => {
+      kv.get.mockResolvedValue(null); // max_drawdown_halt_pct=25 (default)
+
+      // Long 50 AAPL @ 100 was opened earlier: cash=5_000, positions=[50@100],
+      // equity recorded at open time = 5_000 + 50*100 = 10_000, hwm=10_000. AAPL has since
+      // fallen hard to 20 with NO retrade — stale `equity` still says 10_000. True MTM
+      // equity = 5_000 + 50*20 = 6_000, a 40% drawdown from hwm — past the 25% halt.
+      const portfolioWithStaleLong = JSON.stringify({
+        equity: 10_000,
+        cash: 5_000,
+        positions: [{ symbol: 'AAPL', quantity: 50, avg_price: 100 }],
+        hwm: 10_000,
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'short', symbol: 'MSFT' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioWithStaleLong,
+        updatedAt: new Date(),
+      });
+      gateway.getQuote.mockImplementation((_provider: unknown, symbol: string) =>
+        Promise.resolve({
+          symbol,
+          bid: symbol === 'AAPL' ? 19 : 199,
+          ask: symbol === 'AAPL' ? 21 : 201,
+          last: symbol === 'AAPL' ? 20 : 200,
+          ts: new Date().toISOString(),
+        }),
+      );
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'rejected', decided_by: 'autonomous' }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(result.status).toBe('rejected');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'rejected',
+            reject_reason: expect.stringMatching(/circuit|drawdown/i) as string,
+          }),
+        }),
+      );
+      expect(gateway.getQuote).toHaveBeenCalledWith(null, 'AAPL');
+      expect(gateway.getQuote).not.toHaveBeenCalledWith(null, 'MSFT');
+    });
+
+    it('fails CLOSED on a new entry when mark-to-market cannot price an open position', async () => {
+      kv.get.mockResolvedValue(null);
+
+      const portfolioWithUnpriceable = JSON.stringify({
+        equity: 10_000,
+        cash: 11_000,
+        positions: [{ symbol: 'TSLA', quantity: -10, avg_price: 100 }],
+        hwm: 10_000,
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioWithUnpriceable,
+        updatedAt: new Date(),
+      });
+      // Price feed is down for the open position's symbol.
+      gateway.getQuote.mockRejectedValue(new Error('provider outage'));
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'rejected', decided_by: 'autonomous' }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(result.status).toBe('rejected');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'rejected',
+            reject_reason: expect.stringMatching(/mark-to-market|mtm|unavailable/i) as string,
+          }),
+        }),
+      );
+      // Refusing to guess: the trade's own symbol must never be priced either.
+      expect(gateway.getQuote).not.toHaveBeenCalledWith(null, 'AAPL');
+    });
+
+    it('exit/cover is still allowed even when mark-to-market of OTHER open positions cannot be computed', async () => {
+      kv.get.mockResolvedValue(null);
+
+      // Two open positions: AAPL (unpriceable — provider outage) and TSLA (the exit target,
+      // priceable). Closing TSLA must never be blocked by AAPL's MTM failure — exit always
+      // bypasses the risk gate (and, by construction, never runs MTM at all).
+      const portfolioWithTwoPositions = JSON.stringify({
+        equity: 10_000,
+        cash: 8_000,
+        positions: [
+          { symbol: 'AAPL', quantity: 10, avg_price: 100 },
+          { symbol: 'TSLA', quantity: -5, avg_price: 200 },
+        ],
+        hwm: 10_000,
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'TSLA' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioWithTwoPositions,
+        updatedAt: new Date(),
+      });
+      gateway.getQuote.mockImplementation((_provider: unknown, symbol: string) => {
+        if (symbol === 'AAPL') return Promise.reject(new Error('provider outage'));
+        return Promise.resolve({
+          symbol,
+          bid: 199,
+          ask: 201,
+          last: 200,
+          ts: new Date().toISOString(),
+        });
+      });
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'executed', decided_by: 'autonomous' }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(result.status).toBe('executed');
+    });
+
+    it('healthy book with open positions unchanged: no false halt when MTM equity still equals recorded equity', async () => {
+      kv.get.mockResolvedValue(null); // max_drawdown_halt_pct=25 (default)
+
+      // Open long AAPL@150, price unchanged at MTM time → equity == recorded equity == hwm.
+      const healthyPortfolio = JSON.stringify({
+        equity: 10_000,
+        cash: 8_500,
+        positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 150 }],
+        hwm: 10_000,
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'MSFT' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: healthyPortfolio,
+        updatedAt: new Date(),
+      });
+      gateway.getQuote.mockImplementation((_provider: unknown, symbol: string) =>
+        Promise.resolve({
+          symbol,
+          bid: symbol === 'AAPL' ? 149 : 199,
+          ask: symbol === 'AAPL' ? 151 : 201,
+          last: symbol === 'AAPL' ? 150 : 200,
+          ts: new Date().toISOString(),
+        }),
+      );
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'executed', decided_by: 'autonomous' }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(result.status).toBe('executed');
+    });
+  });
+
+  // ── Real short-selling: OFF by default, opt-in via execution.allow_real_short ──
+
+  describe('real short-selling opt-in gate (execution.allow_real_short)', () => {
+    it('DEFAULT (allow_real_short unset): a would-be-real short DEMOTES to paper, never places a real order', async () => {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        if (key === 'strategy.applied') return Promise.resolve('s_live');
+        // execution.allow_real_short intentionally unset → defaults false
+        return Promise.resolve(null);
+      });
+      prisma.strategy.findUnique.mockResolvedValue({
+        id: 's_live',
+        walk_forward_verdict: 'ROBUSTO',
+        walk_forward_checked_at: new Date(),
+      });
+      prisma.realNavSnapshot.findFirst.mockResolvedValue({
+        id: 'nav_1',
+        ts: new Date(),
+        broker_plugin_id: 'alpaca-provider',
+        equity: 10_000,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: '[]',
+        total_pnl: 0,
+        hwm: 10_000,
+        source: 'poll',
+        meta: null,
+      });
+      prisma.realPosition.count.mockResolvedValue(0);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'short', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'executed', ...args.data })) as unknown,
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(realOrderService.submit).not.toHaveBeenCalled();
+      expect(result.status).toBe('executed'); // demoted to paper, executed there instead
+    });
+
+    it('explicit execution.allow_real_short=false behaves the same as unset — still demotes', async () => {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        if (key === 'strategy.applied') return Promise.resolve('s_live');
+        if (key === 'execution.allow_real_short') return Promise.resolve('false');
+        return Promise.resolve(null);
+      });
+      prisma.strategy.findUnique.mockResolvedValue({
+        id: 's_live',
+        walk_forward_verdict: 'ROBUSTO',
+        walk_forward_checked_at: new Date(),
+      });
+      prisma.realNavSnapshot.findFirst.mockResolvedValue({
+        id: 'nav_1',
+        ts: new Date(),
+        broker_plugin_id: 'alpaca-provider',
+        equity: 10_000,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: '[]',
+        total_pnl: 0,
+        hwm: 10_000,
+        source: 'poll',
+        meta: null,
+      });
+      prisma.realPosition.count.mockResolvedValue(0);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'short', symbol: 'AAPL' }),
+      );
+      mockPaperPortfolio(prisma);
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'executed', ...args.data })) as unknown,
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(realOrderService.submit).not.toHaveBeenCalled();
+      expect(result.status).toBe('executed');
+    });
+
+    it('a real LONG intent is unaffected by allow_real_short (still executes for real)', async () => {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        if (key === 'strategy.applied') return Promise.resolve('s_live');
+        // allow_real_short unset — must not matter for "long"
+        return Promise.resolve(null);
+      });
+      prisma.strategy.findUnique.mockResolvedValue({
+        id: 's_live',
+        walk_forward_verdict: 'ROBUSTO',
+        walk_forward_checked_at: new Date(),
+      });
+      prisma.realNavSnapshot.findFirst.mockResolvedValue({
+        id: 'nav_1',
+        ts: new Date(),
+        broker_plugin_id: 'alpaca-provider',
+        equity: 10_000,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: '[]',
+        total_pnl: 0,
+        hwm: 10_000,
+        source: 'poll',
+        meta: null,
+      });
+      prisma.realPosition.count.mockResolvedValue(0);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_long_unaffected',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-long',
+        broker_order_id: 'order_long',
+        error: null,
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'real_pending', fill_price: null, quantity: null }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(realOrderService.submit).toHaveBeenCalledWith(oc({ side: 'buy' }));
+      expect(result.status).toBe('real_pending');
+    });
+
+    it('allow_real_short=true PLUS all other real gates passing → real short is actually placed', async () => {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        if (key === 'strategy.applied') return Promise.resolve('s_live');
+        if (key === 'execution.allow_real_short') return Promise.resolve('true');
+        return Promise.resolve(null);
+      });
+      prisma.strategy.findUnique.mockResolvedValue({
+        id: 's_live',
+        walk_forward_verdict: 'ROBUSTO',
+        walk_forward_checked_at: new Date(),
+      });
+      prisma.realNavSnapshot.findFirst.mockResolvedValue({
+        id: 'nav_1',
+        ts: new Date(),
+        broker_plugin_id: 'alpaca-provider',
+        equity: 10_000,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: '[]',
+        total_pnl: 0,
+        hwm: 10_000,
+        source: 'poll',
+        meta: null,
+      });
+      prisma.realPosition.count.mockResolvedValue(0);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'short', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_real_short_opt_in',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-real-short',
+        broker_order_id: 'order_real_short',
+        error: null,
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ status: 'real_pending', fill_price: null, quantity: null }),
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(realOrderService.submit).toHaveBeenCalledWith(oc({ side: 'sell' }));
+      expect(result.status).toBe('real_pending');
     });
   });
 });

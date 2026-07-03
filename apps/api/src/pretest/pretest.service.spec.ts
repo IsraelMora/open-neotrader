@@ -127,10 +127,12 @@ type PrivateMethods = {
     s: PretestState,
     policy?: PretestPolicy,
   ) => Promise<PretestTrade[]>;
-  _updateEquityMetrics: (s: PretestState) => Promise<void>;
-  _applyTrades: (s: PretestState, trades: PretestTrade[]) => PretestState;
+  _updateEquityMetrics: (s: PretestState, policy?: PretestPolicy) => Promise<void>;
+  _applyTrades: (s: PretestState, trades: PretestTrade[], policy?: PretestPolicy) => PretestState;
   _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
   _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+  _applyShort: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
+  _applyCover: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
   _readPolicy: (p: import('./pretest.service').PretestPortfolio) => PretestPolicy;
   _readGateThresholds: () => Promise<{
     min_trades: number;
@@ -485,14 +487,19 @@ import { PretestPolicy } from './pretest.service';
 
 describe('PretestService._readPolicy (Phase 2)', () => {
   describe('2.1.1 — no __pretest_policy__ key returns defaults', () => {
-    it('returns { sizing_pct:0.05, slippage_pct:0, commission_pct:0 } when plugin_configs has no policy key', () => {
+    it('returns { sizing_pct:0.05, slippage_pct:0, commission_pct:0, borrow_cost_pct:0.0001 } when plugin_configs has no policy key', () => {
       const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
       const svc = makeService(gateway);
       const portfolio = makePortfolioWithPolicy();
 
       const policy = asPrivate(svc)._readPolicy(portfolio);
 
-      expect(policy).toEqual({ sizing_pct: 0.05, slippage_pct: 0, commission_pct: 0 });
+      expect(policy).toEqual({
+        sizing_pct: 0.05,
+        slippage_pct: 0,
+        commission_pct: 0,
+        borrow_cost_pct: 0.0001,
+      });
     });
   });
 
@@ -3712,5 +3719,310 @@ describe('PretestService._updateEquityMetrics — benchmark tracking', () => {
     await expect(svc._updateEquityMetrics(state)).resolves.toBeUndefined();
     expect(state.benchmark_return_pct).toBeUndefined();
     expect(state.benchmark_start_price).toBeUndefined();
+  });
+});
+
+// ── Short-selling fill model (paper-first) ─────────────────────────────────────
+//
+// Adds sell-to-open ('short') and buy-to-close ('cover') fills. Short P&L =
+// (entry − cover) × qty; equity = cash + long MTM − short liability, achieved
+// for free by keeping position quantity SIGNED (negative = short) and reusing
+// the existing Σ(current_price * quantity) equity formula.
+
+describe('PretestService — short-selling fill model', () => {
+  describe('_applyShort — sell-to-open', () => {
+    it('opens a short position with negative quantity and credits cash with proceeds', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({ cash: 10_000 });
+      const trade = makeTrade({ action: 'short', symbol: 'TSLA', price: 200, quantity: 10 });
+
+      asPrivate(svc)._applyShort(state, trade, 0);
+
+      expect(state.positions).toHaveLength(1);
+      expect(state.positions[0].quantity).toBe(-10);
+      expect(state.positions[0].avg_price).toBeCloseTo(200);
+      expect(state.cash).toBeCloseTo(10_000 + 2000);
+      expect(state.trades).toContain(trade);
+    });
+
+    it('nets commission into the effective short-entry price (cost-basis parity with buy)', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({ cash: 10_000 });
+      const trade = makeTrade({ action: 'short', symbol: 'TSLA', price: 200, quantity: 10 });
+
+      asPrivate(svc)._applyShort(state, trade, 0.01); // 1% commission
+
+      const notional = 2000;
+      const commission = notional * 0.01;
+      expect(state.cash).toBeCloseTo(10_000 + notional - commission);
+      expect(state.positions[0].avg_price).toBeCloseTo((notional - commission) / 10);
+    });
+
+    it('refuses to open a short on top of an existing LONG position in the same symbol', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        cash: 10_000,
+        positions: [{ symbol: 'TSLA', quantity: 5, avg_price: 150 }],
+      });
+      const trade = makeTrade({ action: 'short', symbol: 'TSLA', price: 200, quantity: 10 });
+
+      asPrivate(svc)._applyShort(state, trade, 0);
+
+      expect(state.positions).toHaveLength(1);
+      expect(state.positions[0].quantity).toBe(5); // unchanged — still long
+      expect(state.cash).toBe(10_000); // no proceeds credited
+      expect(state.trades).not.toContain(trade); // ghost-trade guard
+    });
+
+    it('adds to an existing short, weighting the average entry price', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        cash: 10_000,
+        positions: [{ symbol: 'TSLA', quantity: -10, avg_price: 200 }],
+      });
+      const trade = makeTrade({ action: 'short', symbol: 'TSLA', price: 220, quantity: 10 });
+
+      asPrivate(svc)._applyShort(state, trade, 0);
+
+      expect(state.positions[0].quantity).toBe(-20);
+      expect(state.positions[0].avg_price).toBeCloseTo((200 * 10 + 220 * 10) / 20); // 210
+    });
+  });
+
+  describe('_applyCover — buy-to-close (exit-class action)', () => {
+    it('realizes PROFIT when covered LOWER than the short entry price', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        cash: 12_000, // 10k initial + 2k short-entry proceeds
+        positions: [{ symbol: 'TSLA', quantity: -10, avg_price: 200 }],
+      });
+      const trade = makeTrade({ action: 'cover', symbol: 'TSLA', price: 150, quantity: 10 });
+
+      asPrivate(svc)._applyCover(state, trade, 0);
+
+      expect(trade.pnl).toBeCloseTo((200 - 150) * 10); // 500 profit
+      expect(state.realized_pnl).toBeCloseTo(500);
+      expect(state.win_trades).toBe(1);
+      expect(state.cash).toBeCloseTo(12_000 - 150 * 10); // pay back the buy-to-close cost
+      expect(state.positions).toHaveLength(0); // fully covered, position closed
+    });
+
+    it('realizes LOSS when covered HIGHER than the short entry price', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        cash: 12_000,
+        positions: [{ symbol: 'TSLA', quantity: -10, avg_price: 200 }],
+      });
+      const trade = makeTrade({ action: 'cover', symbol: 'TSLA', price: 260, quantity: 10 });
+
+      asPrivate(svc)._applyCover(state, trade, 0);
+
+      expect(trade.pnl).toBeCloseTo((200 - 260) * 10); // -600 loss
+      expect(state.realized_pnl).toBeCloseTo(-600);
+      expect(state.loss_trades).toBe(1);
+    });
+
+    it('deducts commission from cover P&L', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        cash: 12_000,
+        positions: [{ symbol: 'TSLA', quantity: -10, avg_price: 200 }],
+      });
+      const trade = makeTrade({ action: 'cover', symbol: 'TSLA', price: 150, quantity: 10 });
+
+      asPrivate(svc)._applyCover(state, trade, 0.01);
+
+      const commission = 150 * 10 * 0.01;
+      expect(trade.pnl).toBeCloseTo((200 - 150) * 10 - commission);
+    });
+
+    it('is a no-op ghost-trade guard when there is no short position to cover', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({ cash: 10_000 });
+      const trade = makeTrade({ action: 'cover', symbol: 'TSLA', price: 150, quantity: 10 });
+
+      asPrivate(svc)._applyCover(state, trade, 0);
+
+      expect(state.trades).not.toContain(trade);
+      expect(state.cash).toBe(10_000);
+    });
+
+    it('partial cover reduces the short quantity without closing the position', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        cash: 12_000,
+        positions: [{ symbol: 'TSLA', quantity: -10, avg_price: 200 }],
+      });
+      const trade = makeTrade({ action: 'cover', symbol: 'TSLA', price: 150, quantity: 4 });
+
+      asPrivate(svc)._applyCover(state, trade, 0);
+
+      expect(state.positions).toHaveLength(1);
+      expect(state.positions[0].quantity).toBe(-6);
+    });
+  });
+
+  describe('_updateEquityMetrics — MTM equity correct while a short is open', () => {
+    it('equity = cash + long MTM − short liability (short position marked to market)', async () => {
+      const gw = makeGateway((_p, symbol) =>
+        Promise.resolve(makeQuote(symbol, symbol === 'TSLA' ? 180 : 100)),
+      );
+      const svc = makeService(gw);
+      // Short 10 TSLA @ 200 entry; cash already credited with the 2000 proceeds.
+      const state = makeState({
+        cash: 12_000,
+        positions: [{ symbol: 'TSLA', quantity: -10, avg_price: 200 }],
+      });
+
+      await svc._updateEquityMetrics(state, {
+        sizing_pct: 0.05,
+        slippage_pct: 0,
+        commission_pct: 0,
+        borrow_cost_pct: 0, // isolate MTM from borrow-cost accrual for this assertion
+      });
+
+      // TSLA dropped to 180: short is profitable. Liability = 10*180=1800.
+      // equity = cash(12000) + (-10 * 180) = 12000 - 1800 = 10200
+      expect(state.equity).toBeCloseTo(10_200);
+      expect(state.positions[0].unrealized_pnl).toBeCloseTo((180 - 200) * -10); // +200 profit
+    });
+
+    it('accrues borrow cost on open short notional, reducing cash', async () => {
+      const gw = makeGateway((_p, symbol) =>
+        Promise.resolve(makeQuote(symbol, symbol === 'TSLA' ? 200 : 100)),
+      );
+      const svc = makeService(gw);
+      const state = makeState({
+        cash: 12_000,
+        positions: [{ symbol: 'TSLA', quantity: -10, avg_price: 200 }],
+      });
+
+      await svc._updateEquityMetrics(state, {
+        sizing_pct: 0.05,
+        slippage_pct: 0,
+        commission_pct: 0,
+        borrow_cost_pct: 0.001, // 0.1% of short notional per tick
+      });
+
+      const expected_borrow_cost = 10 * 200 * 0.001; // |qty| * mark_price * rate
+      expect(state.cash).toBeCloseTo(12_000 - expected_borrow_cost);
+    });
+
+    it('never accrues borrow cost on long positions', async () => {
+      const gw = makeGateway(() => Promise.resolve(makeQuote('AAPL', 100)));
+      const svc = makeService(gw);
+      const state = makeState({
+        cash: 5_000,
+        positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 100 }],
+      });
+
+      await svc._updateEquityMetrics(state, {
+        sizing_pct: 0.05,
+        slippage_pct: 0,
+        commission_pct: 0,
+        borrow_cost_pct: 0.001,
+      });
+
+      expect(state.cash).toBe(5_000); // unchanged — no short, no borrow fee
+    });
+  });
+
+  describe('_simulateFills — short/cover fills via getQuote, slippage direction', () => {
+    it('short fills at getQuote.last with sell-side slippage (worse = lower price)', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('TSLA', 200)));
+      const svc = makeService(gateway);
+      const state = makeState({ cash: 10_000 });
+      const policy = asPrivate(svc)._readPolicy(makePortfolioWithPolicy({ slippage_pct: 0.01 }));
+
+      const trades = await asPrivate(svc)._simulateFills(
+        [makeToolCall('TSLA', 'short')],
+        state,
+        policy,
+      );
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('short');
+      expect(trades[0].price).toBeCloseTo(200 * (1 - 0.01));
+    });
+
+    it('cover fills at getQuote.last with buy-side slippage (worse = higher price)', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('TSLA', 150)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        cash: 12_000,
+        positions: [{ symbol: 'TSLA', quantity: -10, avg_price: 200 }],
+      });
+      const policy = asPrivate(svc)._readPolicy(makePortfolioWithPolicy({ slippage_pct: 0.01 }));
+
+      const trades = await asPrivate(svc)._simulateFills(
+        [makeToolCall('TSLA', 'cover')],
+        state,
+        policy,
+      );
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('cover');
+      expect(trades[0].price).toBeCloseTo(150 * (1 + 0.01));
+    });
+  });
+
+  describe('End-to-end round trip: short opened then covered', () => {
+    it('short then cover lower realizes profit and updates equity correctly', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      let state = makeState({ cash: 10_000 });
+
+      const shortTrade = makeTrade({ action: 'short', symbol: 'TSLA', price: 200, quantity: 10 });
+      const coverTrade = makeTrade({ action: 'cover', symbol: 'TSLA', price: 150, quantity: 10 });
+
+      state = asPrivate(svc)._applyTrades(state, [shortTrade, coverTrade]);
+
+      expect(state.positions).toHaveLength(0);
+      expect(state.realized_pnl).toBeCloseTo((200 - 150) * 10); // 500 profit
+      // cash: 10000 + short proceeds(2000) - cover cost(1500) = 10500
+      expect(state.cash).toBeCloseTo(10_500);
+      expect(state.win_trades).toBe(1);
+    });
+
+    it('short then cover higher realizes loss', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      let state = makeState({ cash: 10_000 });
+
+      const shortTrade = makeTrade({ action: 'short', symbol: 'TSLA', price: 200, quantity: 10 });
+      const coverTrade = makeTrade({ action: 'cover', symbol: 'TSLA', price: 250, quantity: 10 });
+
+      state = asPrivate(svc)._applyTrades(state, [shortTrade, coverTrade]);
+
+      expect(state.positions).toHaveLength(0);
+      expect(state.realized_pnl).toBeCloseTo((200 - 250) * 10); // -500 loss
+      expect(state.loss_trades).toBe(1);
+    });
+  });
+
+  describe('Long-only behavior stays byte-identical when no short/cover actions are used', () => {
+    it('buy/sell round trip is unaffected by the new short/cover branches', () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+      const svc = makeService(gateway);
+      let state = makeState({ cash: 10_000 });
+
+      const buyTrade = makeTrade({ action: 'buy', symbol: 'AAPL', price: 100, quantity: 10 });
+      const sellTrade = makeTrade({ action: 'sell', symbol: 'AAPL', price: 120, quantity: 10 });
+
+      state = asPrivate(svc)._applyTrades(state, [buyTrade, sellTrade]);
+
+      expect(state.positions).toHaveLength(0);
+      expect(state.realized_pnl).toBeCloseTo((120 - 100) * 10); // 200 profit
+      expect(state.cash).toBeCloseTo(10_000 - 1000 + 1200);
+    });
   });
 });
