@@ -159,10 +159,15 @@ export class ContextMemoryService {
     if (observations.length === 0) return '';
     const lines = ['[OBSERVACIONES PREVIAS (últimas 5)]'];
     for (const obs of observations.slice(0, 5)) {
+      // Defensive: legacy/corrupted KV blobs may be missing fields — coerce
+      // before slicing so one malformed observation doesn't crash the cycle.
+      const ts = typeof obs.ts === 'string' ? obs.ts : '';
+      const cycleId = typeof obs.cycle_id === 'string' ? obs.cycle_id : '';
+      const text = typeof obs.text === 'string' ? obs.text : '';
       lines.push(
-        `  [${obs.ts.slice(0, 16)}] ciclo=${obs.cycle_id.slice(0, 8)} señales=${obs.signals_count}`,
+        `  [${ts.slice(0, 16)}] ciclo=${cycleId.slice(0, 8)} señales=${obs.signals_count}`,
       );
-      if (obs.text) lines.push(`    "${obs.text.slice(0, 200)}"`);
+      if (text) lines.push(`    "${text.slice(0, 200)}"`);
     }
     return lines.join('\n');
   }
@@ -172,9 +177,9 @@ export class ContextMemoryService {
     if (entries.length === 0) return '';
     const lines = ['[HISTORIAL DE SEÑALES]'];
     for (const [sym, info] of entries.slice(0, 15)) {
-      lines.push(
-        `  ${sym}: última=${info.last_action} (${info.last_ts.slice(0, 10)}, ${info.count}x)`,
-      );
+      // Defensive: same rationale as buildObservationsSection above.
+      const lastTs = typeof info.last_ts === 'string' ? info.last_ts : '';
+      lines.push(`  ${sym}: última=${info.last_action} (${lastTs.slice(0, 10)}, ${info.count}x)`);
     }
     return lines.join('\n');
   }

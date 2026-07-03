@@ -1563,12 +1563,18 @@ export class AgentsService {
   }
 
   /**
-   * Resolves the source plugin id off a signal object. Mirrors _mlCaptureSignals'
-   * resolution order (plugin_id, falling back to source) — the real field name
-   * emitted by strategy/skill plugins, confirmed against signal-aggregator's
-   * aggregator.py (`plugin_id = s.get("plugin_id") or s.get("type", "unknown")`).
+   * Resolves the source plugin id off a signal object. Checks `_plugin` FIRST —
+   * the sandbox (apps/sandbox/runner.py:~844) tags EVERY skill-plugin signal
+   * with `sig['_plugin'] = pid` before it reaches the veto layer, and this
+   * trusted sandbox tag takes priority over plugin-supplied `plugin_id`/`source`.
+   * Falls back to plugin_id, then source — mirroring _mlCaptureSignals'
+   * resolution order, the real field name emitted by strategy/skill plugins,
+   * confirmed against signal-aggregator's aggregator.py
+   * (`plugin_id = s.get("plugin_id") or s.get("type", "unknown")`).
    */
   private _resolveSignalSource(sig: Record<string, unknown>): string {
+    const rawPlugin = sig['_plugin'];
+    if (typeof rawPlugin === 'string') return rawPlugin;
     const rawPluginId = sig['plugin_id'];
     if (typeof rawPluginId === 'string') return rawPluginId;
     const rawSource = sig['source'];
