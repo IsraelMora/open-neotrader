@@ -52,6 +52,7 @@ import { normalizeBrokerStatus } from '../common/broker-status.util';
 import { AlertsService } from '../alerts/alerts.service';
 import { haltRealExecution } from '../common/real-execution-halt.util';
 import { RealOrderService } from '../real-order/real-order.service';
+import { randomUUID } from 'crypto';
 import type { RealOrder } from '@prisma/client';
 
 /** Persisted circuit-breaker state — mirrors CycleSchedulerService.CircuitBreakerState. */
@@ -90,6 +91,16 @@ const FAST_POLL_DELAYS_MS = [2_000, 4_000, 8_000, 16_000];
 const RECONCILE_INTERVAL_KEY = 'execution.real_reconciliation_interval_ms';
 const DEFAULT_RECONCILE_INTERVAL_MS = 15_000;
 const MIN_RECONCILE_INTERVAL_MS = 5_000;
+
+/**
+ * KV key for the stale-open-order cancel timeout (Fix 5). Deliberately
+ * CONSERVATIVE (default 30min) — this must never cancel a legitimately
+ * slow-filling order. Mirrors the guarded KV read pattern used for
+ * RECONCILE_INTERVAL_KEY above: a missing/invalid value falls back to the
+ * default rather than throwing or using an unsafe value.
+ */
+const STALE_ORDER_TIMEOUT_KEY = 'execution.real_order_stale_timeout_ms';
+const DEFAULT_STALE_ORDER_TIMEOUT_MS = 30 * 60_000;
 
 /** Consecutive tick failures before the circuit breaker opens. */
 const CB_MAX_FAILURES = 3;
@@ -458,6 +469,12 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
       this.log.warn(`reconcileAllOpenOrders: in-flight sweep failed: ${String(err)}`);
     }
 
+    try {
+      await this._cancelStaleOpenOrders();
+    } catch (err) {
+      this.log.warn(`reconcileAllOpenOrders: stale-order cancel sweep failed: ${String(err)}`);
+    }
+
     const rows = await this.db.realOrder.findMany({
       where: { status: { in: OPEN_STATUSES } },
     });
@@ -471,6 +488,92 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
         );
       }
     }
+  }
+
+  /**
+   * Fix 5 (hardening, conservative): cancels RealOrder rows stuck open at the
+   * broker for longer than a configurable timeout (default 30min — see
+   * STALE_ORDER_TIMEOUT_KEY doc). Production incident this addresses: a real
+   * SPY sell order stayed status="submitted" forever because reconciliation
+   * only ever mirrors broker truth — it never times out a stuck open order on
+   * its own.
+   *
+   * Money-critical invariant preserved: this method NEVER writes
+   * RealOrder.status = 'canceled' directly. It only calls
+   * gateway.cancelOrder() — the broker-side cancel request. The row's status
+   * is left untouched; the NEXT reconcileOrder() tick observes the broker's
+   * now-canceled status and applies the terminal transition through the
+   * single $transaction that keeps RealOrder and TradeIntent in sync (see
+   * applyBrokerOrder's rejected/canceled/expired branch). This keeps
+   * reconcileOrder() the ONLY writer of terminal RealOrder status.
+   *
+   * Fail-soft per row: one row's cancelOrder failure (e.g. broker already
+   * filled/canceled it, network error) never blocks canceling the rest.
+   * Rows with a null broker_order_id are skipped — there is nothing at the
+   * broker to cancel yet (the order never reached "submitted" with a broker
+   * id, which recoverInflight()/the pending_submit sweep already handles).
+   */
+  private async _cancelStaleOpenOrders(): Promise<void> {
+    const timeoutMs = await this._readStaleTimeoutMs();
+    const cutoff = new Date(Date.now() - timeoutMs);
+
+    const staleRows = await this.db.realOrder.findMany({
+      where: {
+        status: { in: OPEN_STATUSES },
+        submitted_at: { lt: cutoff },
+      },
+    });
+
+    for (const row of staleRows) {
+      if (!row.broker_order_id) {
+        this.log.warn(
+          `_cancelStaleOpenOrders: RealOrder ${row.id} is stale (submitted_at=${String(
+            row.submitted_at,
+          )}) but has no broker_order_id yet — skipping (nothing to cancel at the broker)`,
+        );
+        continue;
+      }
+
+      try {
+        await this.gateway.cancelOrder(row.broker_plugin_id, row.broker_order_id);
+        this.log.warn(
+          `_cancelStaleOpenOrders: canceled stale RealOrder ${row.id} (symbol=${row.symbol}, ` +
+            `broker=${row.broker_plugin_id}, broker_order_id=${row.broker_order_id}, ` +
+            `submitted_at=${String(row.submitted_at)}, timeout_ms=${timeoutMs}) — ` +
+            `status transition will be applied by the next reconcileOrder() tick`,
+        );
+        try {
+          await this.alerts.create({
+            type: 'CUSTOM',
+            severity: 'HIGH',
+            symbol: row.symbol,
+            message:
+              `Stale real order auto-canceled: RealOrder ${row.id} (${row.symbol}) was still ` +
+              `open ${timeoutMs / 60_000}min after submission — broker cancel requested`,
+          });
+        } catch (alertErr) {
+          this.log.error(
+            `_cancelStaleOpenOrders: failed to emit audit alert for RealOrder ${row.id}: ${String(alertErr)}`,
+          );
+        }
+      } catch (err) {
+        this.log.warn(
+          `_cancelStaleOpenOrders: gateway.cancelOrder failed for RealOrder ${row.id} ` +
+            `(broker_order_id=${row.broker_order_id}): ${String(err)}`,
+        );
+      }
+    }
+  }
+
+  /** Reads the stale-order cancel timeout from KV, defaulting to 30 minutes (see STALE_ORDER_TIMEOUT_KEY doc). */
+  private async _readStaleTimeoutMs(): Promise<number> {
+    let raw: string | null;
+    try {
+      raw = await this.kv.get(STALE_ORDER_TIMEOUT_KEY);
+    } catch {
+      raw = null;
+    }
+    return kvNum(raw, DEFAULT_STALE_ORDER_TIMEOUT_MS);
   }
 
   // ── steady-state loop ─────────────────────────────────────────────────────
@@ -824,6 +927,131 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
     }
 
     return drifted;
+  }
+
+  // ── adoptBrokerPosition ───────────────────────────────────────────────────
+
+  /**
+   * Reconciles a REAL broker position that already exists at the broker but has
+   * no explaining fill history on this platform into the ledger — the resolution
+   * for a BROKER_DRIFT halt caused by legacy fire-and-forget orders (a position
+   * held at the broker with no filled RealOrder row). Without this, clearing the
+   * kill-switch is futile: the next syncPortfolio tick re-detects the unexplained
+   * position and re-trips the halt (a permanent dead end).
+   *
+   * NEVER fabricates a position: it re-fetches broker truth via getPortfolio and
+   * refuses (throws, with NO writes) if the symbol is not currently reported by
+   * the broker. This is pure LEDGER reconciliation to an already-existing broker
+   * position — it does NOT place or cancel any order.
+   *
+   * Writes, in ONE `$transaction`:
+   *   - a companion TradeIntent (status 'executed', mode 'real') — the RealOrder
+   *     schema requires a non-null trade_intent_id FK, and this row documents the
+   *     adoption as an executed real-mode intent.
+   *   - ONE RealOrder with status 'filled', filled_qty = |broker qty| (> 0 so it
+   *     satisfies detectDrift's `filled_qty>0` query with NO change to
+   *     detectDrift), filled_avg_price = broker avg_entry, a unique
+   *     `adopted-<uuid>` client_order_id, null broker_order_id, and the adoption
+   *     marked in broker_raw_json ({adopted, adopted_at, note}).
+   *
+   * The adopted RealOrder is TERMINAL ('filled'), so reconcileAllOpenOrders'
+   * OPEN_STATUSES query (submitted/accepted/partially_filled) never selects it
+   * and reconcileOrder() short-circuits on its already-terminal guard — a real
+   * broker call is never made for it again.
+   *
+   * Adopting does NOT itself clear the halt (that stays a human/TOTP action) — it
+   * removes the reason drift re-trips. As a convenience it re-runs
+   * syncPortfolio()+detectDrift() so the caller sees drift cleared in the same
+   * request; the returned driftedSymbols reflects the post-adoption state.
+   */
+  async adoptBrokerPosition(
+    symbol: string,
+    brokerPluginId: string,
+    note?: string,
+  ): Promise<{ adopted: RealOrder; driftedSymbols: string[] }> {
+    const portfolio = await this.gateway.getPortfolio(brokerPluginId);
+    const pos = portfolio.positions.find((p) => p.symbol === symbol);
+    if (!pos) {
+      // No-fabrication invariant: only adopt a position that currently exists at
+      // the broker. Refuse with NO writes when the symbol is not reported.
+      throw new Error(
+        `adoptBrokerPosition: broker=${brokerPluginId} does not currently report a position ` +
+          `for symbol=${symbol} — refusing to fabricate a position (nothing written)`,
+      );
+    }
+
+    const now = new Date();
+    // filled_qty must be strictly positive to satisfy detectDrift; the broker
+    // reports a negative qty for a short, so the size is |qty| and direction is
+    // carried by `side` instead.
+    const qty = Math.abs(pos.qty);
+    const side = pos.side === 'short' ? 'sell' : 'buy';
+    const action = pos.side === 'short' ? 'short' : 'long';
+    const clientOrderId = `adopted-${randomUUID()}`;
+    const noteSuffix = note ? `: ${note}` : '';
+    const brokerRawJson = JSON.stringify({
+      adopted: true,
+      adopted_at: now.toISOString(),
+      note: note ?? null,
+    });
+
+    const adopted = await this.db.$transaction(async (tx) => {
+      const intent = await tx.tradeIntent.create({
+        data: {
+          symbol,
+          action,
+          confidence: 1,
+          rationale: `Adopted pre-existing broker position (${symbol})${noteSuffix}`,
+          mode: 'real',
+          status: 'executed',
+          fill_price: pos.avg_entry,
+          quantity: qty,
+        },
+      });
+
+      return tx.realOrder.create({
+        data: {
+          trade_intent_id: intent.id,
+          broker_plugin_id: brokerPluginId,
+          client_order_id: clientOrderId,
+          broker_order_id: null,
+          symbol,
+          side,
+          order_type: 'market',
+          requested_qty: qty,
+          status: 'filled',
+          filled_qty: qty,
+          filled_avg_price: pos.avg_entry,
+          submitted_at: now,
+          filled_at: now,
+          last_reconciled_at: now,
+          broker_raw_json: brokerRawJson,
+        },
+      });
+    });
+
+    this.log.warn(
+      `adoptBrokerPosition: adopted broker position symbol=${symbol} qty=${qty} side=${side} ` +
+        `avg_entry=${pos.avg_entry} broker=${brokerPluginId} into RealOrder ${adopted.id} ` +
+        `(client_order_id=${clientOrderId}) — drift will no longer re-trip; the halt still ` +
+        `requires a human/TOTP clear`,
+    );
+
+    // Re-run the portfolio sync so the caller sees drift cleared in this same
+    // request (the adopted row now explains the position). Fail-soft: a sync
+    // failure here never undoes the adoption above.
+    const { driftedSymbols } = await this.syncPortfolio(brokerPluginId, 'poll');
+    return { adopted, driftedSymbols };
+  }
+
+  /**
+   * Public accessor for the active broker plugin id (KV) — used by the operator
+   * adoption endpoint, which receives only {symbol, note} and must resolve the
+   * broker the same way the reconciliation loop does. Empty string when no
+   * broker is configured (adoptBrokerPosition then refuses on getPortfolio).
+   */
+  async getActiveBrokerPluginId(): Promise<string> {
+    return this._resolveBrokerPluginId();
   }
 
   /** Reads the active broker plugin id the same way TradeIntentService._effectiveMode does. */

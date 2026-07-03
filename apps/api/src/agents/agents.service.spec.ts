@@ -11204,3 +11204,120 @@ describe('veto-ledger-persist-fix — one bad row does not suppress the rest of 
     expect(symbols).toEqual(['AAA', 'BBB', 'CCC']);
   });
 });
+
+// ── F3(a): veto ledger records empty source_plugin ───────────────────────────
+//
+// apps/sandbox/runner.py (cmd_run_cycle, ~line 844) tags EVERY skill-plugin
+// signal with `sig['_plugin'] = pid` before it reaches _runVetoLayer. Only the
+// sentiment-analysis plugin happens to also echo `plugin_id`/`source`, so for
+// every other strategy plugin `_resolveSignalSource` (agents.service.ts:~1571)
+// was falling through to '' — VetoDecision.source_plugin persisted as ''.
+// `_plugin` must be checked FIRST (trusted sandbox tag), THEN plugin_id, THEN
+// source, THEN ''.
+
+describe('F3(a) veto-ledger-source-plugin-fix — _resolveSignalSource must prefer sandbox _plugin tag', () => {
+  it('a. a signal tagged only with _plugin (no plugin_id/source) resolves source_plugin from _plugin, not ""', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [{ symbol: 'SPY', action: 'long', qty: 10 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    // Real sandbox shape: strategy plugins are tagged with `_plugin`, not
+    // `plugin_id`/`source` (see apps/sandbox/runner.py:844).
+    const pendingSignals = [
+      { symbol: 'SPY', action: 'long', qty: 10, confidence: 0.8, _plugin: 'trend-following' },
+    ];
+
+    await callRunVetoLayerS3(
+      service,
+      'cycle-f3a-plugin-tag',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data['source_plugin']).toBe('trend-following');
+  });
+
+  it('b. regression: _plugin takes priority over plugin_id when both are present', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [{ symbol: 'QQQ', action: 'buy', qty: 5 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [
+      {
+        symbol: 'QQQ',
+        action: 'buy',
+        qty: 5,
+        confidence: 0.6,
+        _plugin: 'mean-reversion',
+        plugin_id: 'stale-plugin-id',
+      },
+    ];
+
+    await callRunVetoLayerS3(
+      service,
+      'cycle-f3a-priority',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data['source_plugin']).toBe('mean-reversion');
+  });
+
+  it('c. plugin_id-only signals (already-correct case) are unaffected', async () => {
+    const prisma = makePrismaVetoMock();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [{ symbol: 'AAPL', action: 'buy', qty: 3 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [
+      { symbol: 'AAPL', action: 'buy', qty: 3, confidence: 0.9, plugin_id: 'sentiment-analysis' },
+    ];
+
+    await callRunVetoLayerS3(
+      service,
+      'cycle-f3a-unaffected',
+      disciplinePlugins,
+      {},
+      pendingSignals,
+      {},
+    );
+
+    expect(prisma.vetoDecision.create).toHaveBeenCalledTimes(1);
+    const args = (prisma.vetoDecision.create.mock.calls as Array<[VetoDecisionCreateArgs]>)[0][0];
+    expect(args.data['source_plugin']).toBe('sentiment-analysis');
+  });
+});

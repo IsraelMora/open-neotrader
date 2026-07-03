@@ -93,10 +93,15 @@ function makeTxClient(): TxClient {
  * method with an implicit `this`, and that lint rule flags any bare reference to it (even
  * behind an `as jest.Mock` cast) as unsafe to detach from its object.
  */
+/** Shared shape for the hand-built Prisma delegate mocks used across these suites. */
+type ReconPrismaMock = jest.Mocked<
+  Pick<PrismaService, 'realOrder' | 'tradeIntent' | '$transaction'>
+>;
+
 function makePrisma(opts?: {
   findUniqueResult?: RealOrderRow | null;
   txClient?: TxClient;
-}): jest.Mocked<Pick<PrismaService, 'realOrder' | 'tradeIntent' | '$transaction'>> & {
+}): ReconPrismaMock & {
   _realOrderFindMany: jest.Mock;
 } {
   const txClient = opts?.txClient ?? makeTxClient();
@@ -119,7 +124,7 @@ function makePrisma(opts?: {
     tradeIntent,
     $transaction,
     _realOrderFindMany: realOrderFindMany,
-  } as unknown as jest.Mocked<Pick<PrismaService, 'realOrder' | 'tradeIntent' | '$transaction'>> & {
+  } as unknown as ReconPrismaMock & {
     _realOrderFindMany: jest.Mock;
   };
 }
@@ -129,7 +134,10 @@ function makeGateway(opts?: {
   getOrderStatusThrows?: Error;
   getOrderByClientIdResult?: unknown;
   getOrderByClientIdThrows?: Error;
-}): jest.Mocked<Pick<ProviderGatewayService, 'getOrderStatus' | 'getOrderByClientId'>> {
+  cancelOrderThrows?: Error;
+}): jest.Mocked<
+  Pick<ProviderGatewayService, 'getOrderStatus' | 'getOrderByClientId' | 'cancelOrder'>
+> {
   const getOrderStatus = opts?.getOrderStatusThrows
     ? jest.fn().mockRejectedValue(opts.getOrderStatusThrows)
     : jest.fn().mockResolvedValue(opts?.getOrderStatusResult ?? null);
@@ -138,7 +146,11 @@ function makeGateway(opts?: {
     ? jest.fn().mockRejectedValue(opts.getOrderByClientIdThrows)
     : jest.fn().mockResolvedValue(opts?.getOrderByClientIdResult ?? null);
 
-  return { getOrderStatus, getOrderByClientId };
+  const cancelOrder = opts?.cancelOrderThrows
+    ? jest.fn().mockRejectedValue(opts.cancelOrderThrows)
+    : jest.fn().mockResolvedValue(undefined);
+
+  return { getOrderStatus, getOrderByClientId, cancelOrder };
 }
 
 /**
@@ -889,7 +901,9 @@ describe('RealBrokerReconciliationService.reconcileAllOpenOrders — Fix 1: in-f
     await svc.reconcileAllOpenOrders();
 
     expect(realOrderService.recoverInflight).toHaveBeenCalledTimes(1);
-    expect(callOrder).toEqual(['recoverInflight', 'findMany']);
+    // Two findMany calls: the Fix 5 stale-order sweep runs after recoverInflight and
+    // before the OPEN_STATUSES query.
+    expect(callOrder).toEqual(['recoverInflight', 'findMany', 'findMany']);
   });
 
   it('recoverInflight throwing does not prevent the OPEN_STATUSES sweep from still running (fail-soft)', async () => {
@@ -904,6 +918,126 @@ describe('RealBrokerReconciliationService.reconcileAllOpenOrders — Fix 1: in-f
     await expect(svc.reconcileAllOpenOrders()).resolves.toBeUndefined();
 
     expect(reconcileSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Fix 5 — cancel stale open orders (hardening) ─────────────────────────────
+//
+// Production incident: the first SPY sell order stayed "submitted" forever —
+// reconciliation only mirrors broker truth and never times out a stuck open
+// order. This adds a conservative (default 30min) stale-order sweep: rows in
+// OPEN_STATUSES whose submitted_at is older than the configured timeout get a
+// gateway.cancelOrder() call. The row's own status is NEVER written directly
+// to "canceled" here — that stays reconcileOrder()'s exclusive job, preserving
+// the "reconcileOrder is the only writer of terminal status" invariant.
+
+describe('RealBrokerReconciliationService.reconcileAllOpenOrders — Fix 5: cancel stale open orders', () => {
+  const NOW = new Date('2026-07-02T12:00:00.000Z');
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  function makeStaleRow(overrides: Partial<RealOrderRow> = {}): RealOrderRow {
+    return makeRow({
+      id: 'ro_stale',
+      status: 'submitted',
+      broker_order_id: 'broker_order_stale',
+      submitted_at: new Date(NOW.getTime() - 31 * 60_000), // 31 min old
+      ...overrides,
+    });
+  }
+
+  it('a submitted row older than the (default 30min) timeout triggers exactly one gateway.cancelOrder call and an audit alert — no direct status write', async () => {
+    const staleRow = makeStaleRow();
+    const prisma = makePrisma();
+    // Call order inside reconcileAllOpenOrders: recoverInflight (no findMany), then the
+    // stale sweep's findMany, then the OPEN_STATUSES findMany.
+    prisma._realOrderFindMany.mockResolvedValueOnce([staleRow]).mockResolvedValueOnce([]);
+    const gateway = makeGateway();
+    const alerts = makeAlerts();
+    const svc = makeService(prisma, gateway, undefined, alerts);
+
+    await svc.reconcileAllOpenOrders();
+
+    expect(gateway.cancelOrder).toHaveBeenCalledTimes(1);
+    expect(gateway.cancelOrder).toHaveBeenCalledWith('alpaca', 'broker_order_stale');
+    expect(alerts.create).toHaveBeenCalledTimes(1);
+    // Never writes RealOrder.status = 'canceled' directly — reconcileOrder() owns that.
+    expect((prisma.realOrder.update as jest.Mock).mock.calls).toHaveLength(0);
+    expect((prisma.realOrder.updateMany as jest.Mock).mock.calls).toHaveLength(0);
+  });
+
+  it('a fresh row (submitted_at within the timeout) is left alone — cancelOrder is never called', async () => {
+    // The stale-sweep query filters by submitted_at at the DB layer (asserted separately
+    // below via the cutoff test) — a fresh row simply never comes back from that query.
+    const prisma = makePrisma();
+    prisma._realOrderFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    const gateway = makeGateway();
+    const svc = makeService(prisma, gateway);
+
+    await svc.reconcileAllOpenOrders();
+
+    expect(gateway.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it('a stale row with a null broker_order_id is skipped — nothing to cancel yet', async () => {
+    const staleRowNoBrokerId = makeStaleRow({ id: 'ro_stale_no_broker_id', broker_order_id: null });
+    const prisma = makePrisma();
+    prisma._realOrderFindMany.mockResolvedValueOnce([staleRowNoBrokerId]).mockResolvedValueOnce([]);
+    const gateway = makeGateway();
+    const svc = makeService(prisma, gateway);
+
+    await svc.reconcileAllOpenOrders();
+
+    expect(gateway.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it('gateway.cancelOrder throwing for one row is fail-soft and does not block the rest of the tick', async () => {
+    const staleRow1 = makeStaleRow({ id: 'ro_stale_1', broker_order_id: 'broker_order_1' });
+    const staleRow2 = makeStaleRow({ id: 'ro_stale_2', broker_order_id: 'broker_order_2' });
+    const prisma = makePrisma();
+    prisma._realOrderFindMany
+      .mockResolvedValueOnce([staleRow1, staleRow2])
+      .mockResolvedValueOnce([]);
+    const gateway = makeGateway();
+    (gateway.cancelOrder as jest.Mock)
+      .mockRejectedValueOnce(new Error('broker cancel failed'))
+      .mockResolvedValueOnce(undefined);
+    const svc = makeService(prisma, gateway);
+
+    await expect(svc.reconcileAllOpenOrders()).resolves.toBeUndefined();
+
+    expect(gateway.cancelOrder).toHaveBeenCalledTimes(2);
+  });
+
+  it('reads the timeout from KV key execution.real_order_stale_timeout_ms; with no key set, defaults to 30 minutes', async () => {
+    // Row is exactly 29 minutes old — must NOT be canceled under the 30min default.
+    const almostStaleRow = makeStaleRow({
+      id: 'ro_almost_stale',
+      submitted_at: new Date(NOW.getTime() - 29 * 60_000),
+    });
+    const prisma = makePrisma();
+    prisma._realOrderFindMany.mockResolvedValueOnce([almostStaleRow]).mockResolvedValueOnce([]);
+    const gateway = makeGateway();
+    const kv = makeKv(); // no execution.real_order_stale_timeout_ms key set
+    const svc = makeService(prisma, gateway, kv);
+
+    await svc.reconcileAllOpenOrders();
+
+    // The row selection itself is a DB-level filter in real usage; here we assert the
+    // service computed a cutoff consistent with the 30min default by checking the
+    // findMany call args used for the stale sweep.
+    const staleSweepCallArgs = callArg<{ where: { submitted_at: { lt: Date } } }>(
+      prisma._realOrderFindMany,
+    );
+    const cutoff = staleSweepCallArgs.where.submitted_at.lt;
+    expect(cutoff.getTime()).toBe(NOW.getTime() - 30 * 60_000);
   });
 });
 
@@ -1812,5 +1946,134 @@ describe('RealBrokerReconciliationService — portfolio sync wiring into the rec
     expect(syncSpy).toHaveBeenLastCalledWith('alpaca', 'poll');
 
     svc.onModuleDestroy();
+  });
+});
+
+// ── adoptBrokerPosition ─────────────────────────────────────────────────────
+//
+// Broker-position adoption: writes ONE filled RealOrder (filled_qty>0) for a
+// position that already exists at the broker but has NO explaining fill history
+// (legacy fire-and-forget era). This satisfies detectDrift's `filled_qty>0`
+// query with no change to detectDrift, so drift stops re-tripping the halt on
+// the next syncPortfolio tick. NEVER fabricates: a symbol the broker does not
+// currently report is refused with no writes.
+
+type AdoptTxClient = {
+  tradeIntent: { create: jest.Mock };
+  realOrder: { create: jest.Mock };
+  realPosition: { deleteMany: jest.Mock; upsert: jest.Mock };
+  realNavSnapshot: { findFirst: jest.Mock; create: jest.Mock };
+};
+
+function makeAdoptTxClient(): AdoptTxClient {
+  return {
+    tradeIntent: { create: jest.fn().mockResolvedValue({ id: 'ti_adopted' }) },
+    realOrder: {
+      create: jest
+        .fn()
+        .mockImplementation((args: { data: Record<string, unknown> }) =>
+          Promise.resolve({ id: 'ro_adopted', ...args.data }),
+        ),
+    },
+    realPosition: {
+      deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      upsert: jest.fn().mockResolvedValue(undefined),
+    },
+    realNavSnapshot: {
+      findFirst: jest.fn().mockResolvedValue(null),
+      create: jest.fn().mockResolvedValue(undefined),
+    },
+  };
+}
+
+function makeAdoptPrisma(opts?: {
+  txClient?: AdoptTxClient;
+  realOrderFindFirstResult?: unknown;
+}): ReconPrismaMock & {
+  _tx: AdoptTxClient;
+} {
+  const txClient = opts?.txClient ?? makeAdoptTxClient();
+  // detectDrift (run by the follow-up syncPortfolio) looks up an explaining
+  // RealOrder — a truthy result models "the adopted row now explains it".
+  const realOrderFindFirstResult =
+    opts && 'realOrderFindFirstResult' in opts
+      ? opts.realOrderFindFirstResult
+      : { id: 'ro_adopted' };
+  const realOrder = {
+    findFirst: jest.fn().mockResolvedValue(realOrderFindFirstResult),
+    create: txClient.realOrder.create,
+  };
+  const tradeIntent = { create: txClient.tradeIntent.create };
+  const $transaction = jest
+    .fn()
+    .mockImplementation(async (fn: (tx: AdoptTxClient) => Promise<unknown>) => fn(txClient));
+
+  return {
+    realOrder,
+    tradeIntent,
+    $transaction,
+    _tx: txClient,
+  } as unknown as ReconPrismaMock & {
+    _tx: AdoptTxClient;
+  };
+}
+
+describe('RealBrokerReconciliationService.adoptBrokerPosition', () => {
+  it('writes ONE filled RealOrder (filled_qty=broker qty) that explains the position, clearing drift', async () => {
+    const txClient = makeAdoptTxClient();
+    const prisma = makeAdoptPrisma({ txClient, realOrderFindFirstResult: { id: 'ro_adopted' } });
+    const portfolio = makePortfolio({
+      positions: [makeBrokerPosition({ symbol: 'SPY', qty: 4, avg_entry: 500, side: 'long' })],
+    });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const alerts = makePortfolioAlerts();
+    const svc = makePortfolioService(prisma, gateway, makeKv(), alerts);
+
+    const result = await svc.adoptBrokerPosition('SPY', 'alpaca', 'legacy fire-and-forget');
+
+    expect(txClient.realOrder.create).toHaveBeenCalledTimes(1);
+    const roArgs = callArg<{ data: Record<string, unknown> }>(txClient.realOrder.create);
+    expect(roArgs.data['status']).toBe('filled');
+    expect(roArgs.data['filled_qty']).toBe(4);
+    expect(roArgs.data['filled_avg_price']).toBeCloseTo(500, 5);
+    expect(roArgs.data['symbol']).toBe('SPY');
+    expect(roArgs.data['broker_plugin_id']).toBe('alpaca');
+    expect(roArgs.data['side']).toBe('buy');
+    expect(roArgs.data['broker_order_id']).toBeNull();
+    expect(String(roArgs.data['client_order_id'])).toMatch(/^adopted-/);
+    expect(String(roArgs.data['broker_raw_json'])).toContain('"adopted":true');
+    expect(String(roArgs.data['broker_raw_json'])).toContain('legacy fire-and-forget');
+
+    // Follow-up sync re-runs detectDrift; the adopted row now explains the position.
+    expect(result.driftedSymbols).toEqual([]);
+  });
+
+  it('adopts a short position: filled_qty is the absolute size and side is sell', async () => {
+    const txClient = makeAdoptTxClient();
+    const prisma = makeAdoptPrisma({ txClient });
+    const portfolio = makePortfolio({
+      positions: [makeBrokerPosition({ symbol: 'UUP', qty: -3, avg_entry: 28, side: 'short' })],
+    });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const svc = makePortfolioService(prisma, gateway);
+
+    await svc.adoptBrokerPosition('UUP', 'alpaca');
+
+    const roArgs = callArg<{ data: Record<string, unknown> }>(txClient.realOrder.create);
+    expect(roArgs.data['filled_qty']).toBe(3);
+    expect(roArgs.data['side']).toBe('sell');
+  });
+
+  it('throws and writes nothing when the symbol is not currently a broker position (never fabricates)', async () => {
+    const txClient = makeAdoptTxClient();
+    const prisma = makeAdoptPrisma({ txClient });
+    const portfolio = makePortfolio({ positions: [makeBrokerPosition({ symbol: 'SPY' })] });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const svc = makePortfolioService(prisma, gateway);
+
+    await expect(svc.adoptBrokerPosition('QQQ', 'alpaca')).rejects.toThrow(/QQQ/);
+
+    expect(txClient.tradeIntent.create).not.toHaveBeenCalled();
+    expect(txClient.realOrder.create).not.toHaveBeenCalled();
   });
 });

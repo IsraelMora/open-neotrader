@@ -9,8 +9,18 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { IsBoolean, IsInt, IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
+import {
+  IsBoolean,
+  IsInt,
+  IsNotEmpty,
+  IsNumber,
+  IsOptional,
+  IsString,
+  Max,
+  Min,
+} from 'class-validator';
 import { TradeIntentService } from './trade-intent.service';
+import { RealBrokerReconciliationService } from '../real-reconciliation/real-broker-reconciliation.service';
 import { TotpRequiredGuard } from '../auth/guards/totp-required.guard';
 
 /**
@@ -34,11 +44,20 @@ class UpdateExecutionPolicyDto {
   @IsOptional() @IsNumber() @Min(0) max_order_notional?: number;
 }
 
+/** Body for the operator-only broker-position adoption endpoint. */
+class AdoptPositionDto {
+  @IsString() @IsNotEmpty() symbol!: string;
+  @IsOptional() @IsString() note?: string;
+}
+
 @ApiTags('execution')
 @ApiBearerAuth()
 @Controller('execution')
 export class ExecutionController {
-  constructor(private readonly svc: TradeIntentService) {}
+  constructor(
+    private readonly svc: TradeIntentService,
+    private readonly reconciliation: RealBrokerReconciliationService,
+  ) {}
 
   @Get('config')
   @ApiOperation({ summary: 'Política de ejecución actual (autonomía, riesgo, real on/off)' })
@@ -81,5 +100,29 @@ export class ExecutionController {
   })
   clearRealHalt() {
     return this.svc.clearRealExecutionHalt();
+  }
+
+  /**
+   * Adopts a REAL broker position that exists at the broker with no explaining
+   * fill history into the ledger (see RealBrokerReconciliationService.
+   * adoptBrokerPosition). This resolves a BROKER_DRIFT halt caused by legacy
+   * fire-and-forget orders: without it, clearing the kill-switch is futile
+   * because the next sync re-detects the unexplained position and re-trips.
+   *
+   * Money-ledger admin action — same class as clearRealHalt above, so it
+   * requires TOTP. It NEVER fabricates: the service refuses if the symbol is not
+   * currently reported by the broker. Adopting does NOT clear the halt itself
+   * (still a human/TOTP action) — it removes the reason drift re-trips.
+   */
+  @Post('adopt-position')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TotpRequiredGuard)
+  @ApiOperation({
+    summary:
+      'Adopta una posición real del broker sin historial de fills al ledger (solo humano, TOTP requerido)',
+  })
+  async adoptPosition(@Body() dto: AdoptPositionDto) {
+    const brokerPluginId = await this.reconciliation.getActiveBrokerPluginId();
+    return this.reconciliation.adoptBrokerPosition(dto.symbol, brokerPluginId, dto.note);
   }
 }

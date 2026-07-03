@@ -11,6 +11,7 @@
 import { VetoAnalyzerService, type VetoDecisionRow } from './veto-analyzer.service';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { ProviderGatewayService, OhlcvBar } from '../providers/provider-gateway.service';
+import type { KvService } from '../common/kv.service';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -794,5 +795,184 @@ describe('VetoAnalyzerService.getPluginValue', () => {
     expect(unknown).toBeDefined();
     expect(unknown?.net_value).toBeCloseTo(20, 6);
     expect(report.totals.evaluated_count).toBe(2);
+  });
+});
+
+// ── backfill scheduler: onModuleInit / onModuleDestroy / KV interval / fail-soft / overlap ──
+
+function makeKv(
+  kvData: Record<string, string | null> = {},
+): jest.Mocked<Pick<KvService, 'get' | 'set'>> {
+  const store: Record<string, string | null> = { ...kvData };
+  return {
+    get: jest.fn().mockImplementation((key: string) => Promise.resolve(store[key] ?? null)),
+    set: jest.fn().mockImplementation((key: string, value: string) => {
+      store[key] = value;
+      return Promise.resolve();
+    }),
+  };
+}
+
+function makeServiceWithKv(
+  prisma: ReturnType<typeof makePrisma>,
+  gateway: ReturnType<typeof makeGateway>,
+  kv: ReturnType<typeof makeKv>,
+): VetoAnalyzerService {
+  return new (VetoAnalyzerService as unknown as new (
+    db: unknown,
+    gateway: unknown,
+    kv: unknown,
+  ) => VetoAnalyzerService)(prisma, gateway, kv);
+}
+
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+
+describe('VetoAnalyzerService — backfill scheduler', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('onModuleInit schedules a KV-configured interval that calls backfill() on each tick', async () => {
+    const svc = makeServiceWithKv(
+      makePrisma([]),
+      makeGateway([]),
+      makeKv({ 'veto.backfill_interval_ms': '10000' }),
+    );
+    const backfillSpy = jest.spyOn(svc, 'backfill').mockResolvedValue({
+      evaluated: 0,
+      insufficientData: 0,
+      unsupportedAction: 0,
+      invalidRefPrice: 0,
+      pending: 0,
+      errors: 0,
+    });
+
+    await svc.onModuleInit();
+    // Deliberately does NOT run at startup — only on the interval.
+    expect(backfillSpy).toHaveBeenCalledTimes(0);
+
+    await jest.advanceTimersByTimeAsync(10_000);
+    expect(backfillSpy).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(10_000);
+    expect(backfillSpy).toHaveBeenCalledTimes(2);
+
+    svc.onModuleDestroy();
+  });
+
+  it('uses the default interval (6h) when the KV key is absent', async () => {
+    const svc = makeServiceWithKv(makePrisma([]), makeGateway([]), makeKv({}));
+    const backfillSpy = jest.spyOn(svc, 'backfill').mockResolvedValue({
+      evaluated: 0,
+      insufficientData: 0,
+      unsupportedAction: 0,
+      invalidRefPrice: 0,
+      pending: 0,
+      errors: 0,
+    });
+
+    await svc.onModuleInit();
+
+    // Just before 6h → no tick yet.
+    await jest.advanceTimersByTimeAsync(SIX_HOURS_MS - 1000);
+    expect(backfillSpy).toHaveBeenCalledTimes(0);
+
+    // At 6h → exactly one tick.
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(backfillSpy).toHaveBeenCalledTimes(1);
+
+    svc.onModuleDestroy();
+  });
+
+  it('a KV interval of 0 disables the scheduler (no timer, backfill never ticks)', async () => {
+    const svc = makeServiceWithKv(
+      makePrisma([]),
+      makeGateway([]),
+      makeKv({ 'veto.backfill_interval_ms': '0' }),
+    );
+    const backfillSpy = jest.spyOn(svc, 'backfill').mockResolvedValue({
+      evaluated: 0,
+      insufficientData: 0,
+      unsupportedAction: 0,
+      invalidRefPrice: 0,
+      pending: 0,
+      errors: 0,
+    });
+
+    await svc.onModuleInit();
+    await jest.advanceTimersByTimeAsync(SIX_HOURS_MS * 2);
+    expect(backfillSpy).toHaveBeenCalledTimes(0);
+
+    // onModuleDestroy must be safe even when no timer was ever started.
+    expect(() => svc.onModuleDestroy()).not.toThrow();
+  });
+
+  it('fail-soft: a throwing backfill() never escapes the tick and the loop keeps ticking', async () => {
+    const svc = makeServiceWithKv(
+      makePrisma([]),
+      makeGateway([]),
+      makeKv({ 'veto.backfill_interval_ms': '5000' }),
+    );
+    const backfillSpy = jest.spyOn(svc, 'backfill').mockRejectedValue(new Error('db down'));
+
+    await svc.onModuleInit();
+
+    // First tick throws internally but must not reject out of the timer callback.
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(backfillSpy).toHaveBeenCalledTimes(1);
+
+    // Loop survives the failure and keeps ticking.
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(backfillSpy).toHaveBeenCalledTimes(2);
+
+    svc.onModuleDestroy();
+  });
+
+  it('overlap guard: a still-running backfill is not started again on the next tick', async () => {
+    const svc = makeServiceWithKv(
+      makePrisma([]),
+      makeGateway([]),
+      makeKv({ 'veto.backfill_interval_ms': '5000' }),
+    );
+
+    let resolveSlow: () => void = () => undefined;
+    const slow = new Promise<void>((resolve) => {
+      resolveSlow = resolve;
+    });
+    const emptySummary = {
+      evaluated: 0,
+      insufficientData: 0,
+      unsupportedAction: 0,
+      invalidRefPrice: 0,
+      pending: 0,
+      errors: 0,
+    };
+    const backfillSpy = jest
+      .spyOn(svc, 'backfill')
+      .mockImplementationOnce(() => slow.then(() => emptySummary))
+      .mockResolvedValue(emptySummary);
+
+    await svc.onModuleInit();
+
+    // First interval fire starts the slow backfill.
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(backfillSpy).toHaveBeenCalledTimes(1);
+
+    // Timer fires again while the first tick is still in flight — overlap guard skips it.
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(backfillSpy).toHaveBeenCalledTimes(1);
+
+    // Let the slow tick finish, then the next timer fire runs a fresh backfill.
+    resolveSlow();
+    await Promise.resolve();
+    await Promise.resolve();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(backfillSpy).toHaveBeenCalledTimes(2);
+
+    svc.onModuleDestroy();
   });
 });
