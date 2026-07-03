@@ -25,8 +25,102 @@ import os
 import sys
 import tomllib
 import traceback
+from datetime import date as _date
 from pathlib import Path
 from typing import Any
+
+# Timeframe aliases accepted by provider_tools.get_ohlcv (see _resample_bars).
+_MONTHLY_TIMEFRAMES = {"1month", "1mo", "1m", "month", "monthly"}
+_WEEKLY_TIMEFRAMES = {"1week", "1w", "week", "weekly"}
+_DAILY_TIMEFRAMES = {"1d", "1day", "day", "daily", ""}
+
+
+def _bar_date(bar: dict) -> _date | None:
+    """Extract the calendar date of a bar, keying on 'date' (preferred) or 'ts'.
+
+    Both fields are expected to start with 'YYYY-MM-DD' (see
+    AgentsService._buildMarketContext, which normalizes injected bars to
+    {date, open, high, low, close, volume} with date sliced to 10 chars).
+    Returns None if the bar has no parseable date (fail-soft: caller skips it).
+    """
+    raw = bar.get("date")
+    if raw is None:
+        raw = bar.get("ts")
+    if raw is None:
+        return None
+    s = str(raw)
+    try:
+        return _date(int(s[0:4]), int(s[5:7]), int(s[8:10]))
+    except (ValueError, IndexError):
+        return None
+
+
+def _resample_bars(bars: list[dict], timeframe: str | None) -> list[dict]:
+    """Resample a daily bar series to the requested timeframe.
+
+    The sandbox is injected DAILY bars only (see cmd_run_cycle). Strategy
+    plugins can ask provider_tools.get_ohlcv for "1Month"/"1Week"/etc — before
+    this function existed that request was silently ignored and the caller got
+    raw daily bars regardless of what it asked for (Fix A: momentum-factor-12-1
+    computing "12-1 MONTH momentum" over ~14 DAILY closes instead of ~14
+    MONTHLY closes).
+
+    "1Month"/"1M"/"1mo"  → group by calendar month, keep the LAST bar of each
+                            month (month-end OHLC: open=first day's open,
+                            high=max, low=min, close=last day's close,
+                            volume=sum).
+    "1Week"/"1W"          → same grouping by ISO week.
+    "1d"/"1day"/None/""  → returned unchanged (current behavior).
+    Unknown timeframe strings are treated as daily (fail-soft passthrough).
+
+    Bars without a parseable date are dropped from resampled output (they
+    can't be grouped) but never raise — fail-soft per project convention.
+    Input order (oldest-first) is preserved in the output.
+    """
+    tf = (timeframe or "1d").strip().lower()
+    if tf in _DAILY_TIMEFRAMES:
+        return bars
+    if tf in _MONTHLY_TIMEFRAMES:
+        def _key(d: _date) -> tuple[int, int]:
+            return (d.year, d.month)
+    elif tf in _WEEKLY_TIMEFRAMES:
+        def _key(d: _date) -> tuple[int, int]:
+            iso = d.isocalendar()
+            return (iso[0], iso[1])
+    else:
+        # Unknown timeframe: fail-soft, behave like daily rather than raising.
+        return bars
+
+    groups: dict[tuple[int, int], list[dict]] = {}
+    order: list[tuple[int, int]] = []
+    for b in bars:
+        d = _bar_date(b)
+        if d is None:
+            continue
+        k = _key(d)
+        if k not in groups:
+            groups[k] = []
+            order.append(k)
+        groups[k].append(b)
+
+    resampled: list[dict] = []
+    for k in order:
+        group = groups[k]
+        first, last = group[0], group[-1]
+        highs = [g["high"] for g in group if g.get("high") is not None]
+        lows = [g["low"] for g in group if g.get("low") is not None]
+        volumes = [g["volume"] for g in group if g.get("volume") is not None]
+        resampled.append(
+            {
+                "date": last.get("date") or last.get("ts"),
+                "open": first.get("open"),
+                "high": max(highs) if highs else last.get("high"),
+                "low": min(lows) if lows else last.get("low"),
+                "close": last.get("close"),
+                "volume": sum(volumes) if volumes else last.get("volume"),
+            }
+        )
+    return resampled
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +878,7 @@ def cmd_run_cycle(req: dict) -> dict:
 
     def _get_ohlcv(symbol=None, timeframe=None, limit=None, **kw):
         bars = _ohlcv_data.get(symbol, [])
+        bars = _resample_bars(bars, timeframe)
         if limit is not None and len(bars) > limit:
             return bars[-limit:]
         return bars

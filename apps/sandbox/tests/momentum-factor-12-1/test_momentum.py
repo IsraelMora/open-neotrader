@@ -197,6 +197,73 @@ class TestCycleHookSignalShape:
         assert isinstance(sig["volatility_12m"], float)
 
 
+class TestLookbackMonthsConfigurable:
+    """
+    compute_momentum_ranks must honor a configurable lookback_months instead of
+    hardcoding the canonical 12-1 window. Portfolios with lookback_months < 12
+    (e.g. Balanceado=9, Agresivo=6, Ultra-Agresivo=6) request lookback+2 monthly
+    bars and must still get real signals, not a silent empty result.
+    """
+
+    def test_lookback_6_with_8_bars_returns_real_signal(self) -> None:
+        # 8 monthly bars = lookback_months(6) + 2 — the minimum required.
+        prices = _series_oldest_first(start=100.0, monthly_step=5.0, n=8)
+        ranks = compute_momentum_ranks({"AAA": prices}, top_pct=1.0, lookback_months=6)
+
+        assert len(ranks) == 1
+        # window_start = prices[-8] = prices[0] = 100; skip_1m = prices[-2]
+        expected = prices[-2] / prices[0] - 1.0
+        assert ranks[0].return_12_1 == round(expected, 4)
+        assert ranks[0].signal == "long"
+
+    def test_lookback_6_with_7_bars_is_skipped_insufficient_data(self) -> None:
+        # 7 bars < lookback_months(6) + 2 = 8 — must safely skip, not crash.
+        prices = _series_oldest_first(start=100.0, monthly_step=5.0, n=7)
+        ranks = compute_momentum_ranks({"AAA": prices}, top_pct=1.0, lookback_months=6)
+
+        assert ranks == []
+
+    def test_lookback_12_default_matches_prior_canonical_output(self) -> None:
+        # Same series/expectation as TestReturn12_1Pinned — default lookback_months=12
+        # must reproduce the exact prior 12-1 behavior.
+        prices = _series_oldest_first(start=100.0, monthly_step=5.0)
+        ranks_default = compute_momentum_ranks({"AAA": prices}, top_pct=1.0)
+        ranks_explicit_12 = compute_momentum_ranks(
+            {"AAA": prices}, top_pct=1.0, lookback_months=12
+        )
+
+        assert ranks_default[0].return_12_1 == 0.6
+        assert ranks_explicit_12[0].return_12_1 == 0.6
+
+    def test_cycle_hook_emits_signals_with_lookback_6(self) -> None:
+        aaa = _series_oldest_first(start=100.0, monthly_step=5.0, n=8)
+        bbb = _series_oldest_first(start=100.0, monthly_step=-3.0, n=8)
+
+        ctx = {
+            "universe": ["AAA", "BBB", "CCC", "DDD", "EEE"],
+            "config": {"top_pct": 20, "lookback_months": 6},
+            "portfolio": {},
+            "market_trend_up": True,
+            "provider_tools": {
+                "get_ohlcv": TestCycleHookSignalShape()._get_ohlcv_factory(
+                    {
+                        "AAA": aaa,
+                        "BBB": bbb,
+                        "CCC": bbb,
+                        "DDD": bbb,
+                        "EEE": bbb,
+                    }
+                )
+            },
+        }
+
+        result = on_cycle(ctx)
+        signals = {s["symbol"]: s for s in result["signals"]}
+
+        assert "AAA" in signals, "lookback_months=6 must not silently drop every symbol"
+        assert signals["AAA"]["action"] == "long"
+
+
 class TestTrendFilter:
     def test_downtrend_cancels_all_long_signals(self) -> None:
         prices = _series_oldest_first(start=100.0, monthly_step=5.0)

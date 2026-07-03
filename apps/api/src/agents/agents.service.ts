@@ -148,8 +148,14 @@ export interface ReflectionTurnResult {
 /**
  * Default maximum number of ReAct loop iterations per runGovernedTurn call.
  * Overridable via KV key 'react.max_turns'. Clamped 1..10 at parse time.
+ *
+ * Lowered from 4 to 2 (Fix B): the main cycle + 3 pretests each run the LLM,
+ * and at 4 turns per call the worst-case daily LLM call volume blew through
+ * the Gemini free-tier quota (~60% of production cycles hit 429s over an 11h
+ * run). 2 turns is enough for decide (+ optional web_search) and roughly
+ * halves worst-case calls. KV 'react.max_turns' still overrides this default.
  */
-const REACT_MAX_TURNS_DEFAULT = 4;
+const REACT_MAX_TURNS_DEFAULT = 2;
 
 /**
  * Anti-amplification hard cap: maximum number of tool calls EXECUTED per cycle,
@@ -953,9 +959,14 @@ export class AgentsService {
     universe = universe.slice(0, 30);
 
     const timeframe = (this.kv ? await this.kv.get('cycle.timeframe') : null) || '1d';
-    // Default 300: cubre el lookback de estrategias de momentum (12-1 ≈ 252+skip) para que
-    // operen desde el PRIMER ciclo (la historia se baja del provider, no se espera a acumular).
-    const bars = Number((this.kv ? await this.kv.get('cycle.bars') : null) || 0) || 300;
+    // Default 400 daily bars (~19 months): momentum-factor-12-1 requests
+    // lookback_months+2 (~14) MONTHLY bars via provider_tools.get_ohlcv(timeframe="1Month"),
+    // which the sandbox resamples from these injected DAILY bars (see runner.py
+    // _resample_bars). ~14 months of daily history needs ~294 daily bars; 400 gives
+    // margin for months with fewer trading days / holidays so the strategy can operate
+    // from the FIRST cycle (history comes from the provider, no need to accumulate).
+    // Bumped from 300 (~14 months, too tight) — Fix A.
+    const bars = Number((this.kv ? await this.kv.get('cycle.bars') : null) || 0) || 400;
     // DATA provider for OHLCV is decoupled from the EXECUTION broker: Alpaca's free
     // IEX feed returns no historical bars, so default market data comes from Yahoo
     // (free, full history). Override via KV `cycle.data_provider`.

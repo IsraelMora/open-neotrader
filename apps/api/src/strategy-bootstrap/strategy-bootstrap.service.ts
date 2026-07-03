@@ -20,7 +20,16 @@ import { LlmService } from '../llm/llm.service';
  *
  * Idempotency: gated by KV `bootstrap.momentum_v1_applied`. Once set to 'true', every
  * subsequent boot is a no-op — this guarantees the seeder mutates the operator's
- * config exactly once, ever, even across redeploys.
+ * config (universe / execution.real / plugin activation) exactly once, ever, even
+ * across redeploys. This is deliberate: an operator may have since enabled real-money
+ * mode (TOTP-gated) or customized the universe/plugin set, and a redeploy must never
+ * silently reset that.
+ *
+ * Pretest-portfolio seeding (see PRETEST_PORTFOLIOS_TO_SEED) is gated by its OWN,
+ * INDEPENDENT flag (`PRETEST_SEED_KEY`) — it does NOT re-run or depend on the momentum
+ * flag above. This lets already-bootstrapped instances (v1 already applied) receive
+ * the pretest portfolios on their next boot without re-running the momentum/execution/
+ * universe/plugin block. Fresh instances get both blocks on first boot.
  *
  * Fail-soft: mirrors the OnModuleInit pattern in MigrationRunnerService (registered
  * in its own module, runs on boot) but never throws — any error is logged and
@@ -63,6 +72,13 @@ export const PLUGINS_TO_DEACTIVATE = [
 ] as const;
 
 export const BOOTSTRAP_APPLIED_KEY = 'bootstrap.momentum_v1_applied';
+/**
+ * Independent idempotency key for pretest-portfolio seeding. Deliberately separate
+ * from BOOTSTRAP_APPLIED_KEY so this can be back-filled on already-bootstrapped
+ * instances (v1 already set) without re-running the momentum/execution/universe/
+ * plugin block — see the module docstring above.
+ */
+export const PRETEST_SEED_KEY = 'bootstrap.pretest_seed_v2';
 const UNIVERSE_KEY = 'cycle.universe';
 const EXECUTION_REAL_KEY = 'execution.real';
 const SCHEDULER_KEY = 'scheduler';
@@ -96,6 +112,25 @@ interface PretestPortfolioSeed {
  */
 export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
   {
+    name: 'Ultra-Conservador Momentum',
+    description:
+      'Máxima defensa: top 40% del universo (muy diversificado), lookback 12 meses, tamaño de posición ≤5%, con macro-guard.',
+    initial_capital: 100_000,
+    plugin_ids: [
+      'momentum-factor-12-1',
+      'trend-following',
+      'relative-strength',
+      'position-sizing',
+      'risk-manager',
+      'macro-calendar-guard',
+    ],
+    plugin_configs: {
+      'momentum-factor-12-1': { top_pct: 40, lookback_months: 12 },
+      'position-sizing': { mode: 'vol_target', max_position_pct: 5 },
+      __pretest_policy__: { sizing_pct: 0.03, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
     name: 'Conservador Momentum',
     description:
       'Momentum de baja rotación: top 30% del universo, lookback 12 meses, tamaño de posición acotado al 8%.',
@@ -115,6 +150,25 @@ export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
     },
   },
   {
+    name: 'Balanceado Momentum',
+    description:
+      'Punto medio: top 20% del universo, lookback 9 meses, tamaño de posición hasta 12%, con macro-guard.',
+    initial_capital: 100_000,
+    plugin_ids: [
+      'momentum-factor-12-1',
+      'trend-following',
+      'relative-strength',
+      'position-sizing',
+      'risk-manager',
+      'macro-calendar-guard',
+    ],
+    plugin_configs: {
+      'momentum-factor-12-1': { top_pct: 20, lookback_months: 9 },
+      'position-sizing': { mode: 'vol_target', max_position_pct: 12 },
+      __pretest_policy__: { sizing_pct: 0.1, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
     name: 'Agresivo Momentum',
     description:
       'Momentum concentrado: top 10% del universo, lookback 6 meses, tamaño de posición hasta 25%.',
@@ -127,12 +181,35 @@ export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
     },
   },
   {
+    name: 'Ultra-Agresivo Momentum',
+    description:
+      'Máxima concentración y reactividad: top 5% del universo, lookback 6 meses, tamaño de posición al máximo (25%), sin frenos macro.',
+    initial_capital: 100_000,
+    plugin_ids: ['momentum-factor-12-1', 'position-sizing', 'risk-manager'],
+    plugin_configs: {
+      'momentum-factor-12-1': { top_pct: 5, lookback_months: 6 },
+      'position-sizing': { mode: 'vol_target', max_position_pct: 25 },
+      __pretest_policy__: { sizing_pct: 0.3, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
     name: 'Trend Puro',
     description: 'Solo trend-following (sin factor de momentum), tamaño de posición hasta 15%.',
     initial_capital: 100_000,
     plugin_ids: ['trend-following', 'position-sizing', 'risk-manager'],
     plugin_configs: {
       'position-sizing': { mode: 'vol_target', max_position_pct: 15 },
+      __pretest_policy__: { sizing_pct: 0.1, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
+    name: 'Relative-Strength Puro',
+    description:
+      'Solo fuerza relativa cross-sectional (familia distinta al momentum absoluto), tamaño de posición hasta 12%.',
+    initial_capital: 100_000,
+    plugin_ids: ['relative-strength', 'position-sizing', 'risk-manager'],
+    plugin_configs: {
+      'position-sizing': { mode: 'vol_target', max_position_pct: 12 },
       __pretest_policy__: { sizing_pct: 0.1, slippage_pct: 0.0005, commission_pct: 0 },
     },
   },
@@ -182,6 +259,14 @@ export class StrategyBootstrapService implements OnModuleInit {
     }
 
     try {
+      await this.seedPretestPortfoliosIfNeeded();
+    } catch (err: unknown) {
+      this.log.warn(
+        `Bootstrap: fallo en seedPretestPortfoliosIfNeeded (no bloquea el resto): ${String(err)}`,
+      );
+    }
+
+    try {
       this.applyLlmConfigFromEnv();
     } catch (err: unknown) {
       this.log.warn(
@@ -190,7 +275,12 @@ export class StrategyBootstrapService implements OnModuleInit {
     }
   }
 
-  /** Idempotent PAPER-mode bootstrap of the momentum-rotation strategy. */
+  /**
+   * Idempotent PAPER-mode bootstrap of the momentum-rotation strategy: universe,
+   * plugin activation/deactivation, execution.real='false', and the scheduler.
+   * Gated ONLY by BOOTSTRAP_APPLIED_KEY — does NOT seed pretest portfolios (see
+   * seedPretestPortfoliosIfNeeded(), gated independently by PRETEST_SEED_KEY).
+   */
   private async applyMomentumBootstrap(): Promise<void> {
     const alreadyApplied = kvBool(await this.kv.get(BOOTSTRAP_APPLIED_KEY), false);
     if (alreadyApplied) {
@@ -212,7 +302,6 @@ export class StrategyBootstrapService implements OnModuleInit {
     await this.kv.set(EXECUTION_REAL_KEY, 'false');
 
     await this.enableScheduler();
-    await this.seedPretestPortfolios();
 
     // Marks the bootstrap as done — MUST be the last write, and only after every
     // preceding step has been attempted, so a partial failure is retried on next boot.
@@ -222,15 +311,39 @@ export class StrategyBootstrapService implements OnModuleInit {
       `Bootstrap momentum_v1 aplicado: universo=${MOMENTUM_UNIVERSE} | ` +
         `activados=[${PLUGINS_TO_ACTIVATE.join(', ')}] | ` +
         `desactivados=[${PLUGINS_TO_DEACTIVATE.join(', ')}] | ` +
-        `modo=PAPER (execution.real=false) | scheduler habilitado | ` +
-        `pretest portfolios sembrados=[${PRETEST_PORTFOLIOS_TO_SEED.map((p) => p.name).join(', ')}]`,
+        `modo=PAPER (execution.real=false) | scheduler habilitado`,
     );
   }
 
   /**
-   * Seeds the 3 risk-differentiated virtual pretest portfolios (see
-   * PRETEST_PORTFOLIOS_TO_SEED), gated by the SAME bootstrap.momentum_v1_applied
-   * flag as the rest of this bootstrap — no separate idempotency key needed.
+   * Runs seedPretestPortfolios() gated by PRETEST_SEED_KEY — INDEPENDENTLY of
+   * BOOTSTRAP_APPLIED_KEY (the momentum flag). Seeds whenever PRETEST_SEED_KEY is
+   * not yet set, regardless of whether the momentum bootstrap already ran on a
+   * previous deploy — see the module docstring for why this must stay decoupled.
+   */
+  private async seedPretestPortfoliosIfNeeded(): Promise<void> {
+    const alreadySeeded = kvBool(await this.kv.get(PRETEST_SEED_KEY), false);
+    if (alreadySeeded) {
+      this.log.log('Bootstrap: pretest portfolios ya sembrados (pretest_seed_v2) — no-op');
+      return;
+    }
+
+    await this.seedPretestPortfolios();
+
+    // MUST be the last write here too, for the same partial-failure-retry reason
+    // as BOOTSTRAP_APPLIED_KEY above.
+    await this.kv.set(PRETEST_SEED_KEY, 'true');
+
+    this.log.log(
+      `Bootstrap: pretest portfolios sembrados=[${PRETEST_PORTFOLIOS_TO_SEED.map((p) => p.name).join(', ')}]`,
+    );
+  }
+
+  /**
+   * Seeds the 7 risk-differentiated virtual pretest portfolios (see
+   * PRETEST_PORTFOLIOS_TO_SEED). Called only from seedPretestPortfoliosIfNeeded(),
+   * which owns the PRETEST_SEED_KEY idempotency gate — this method itself is not
+   * gated, so it must never be called directly outside that wrapper.
    *
    * Idempotent by name: PretestPortfolio.name is @unique, so each spec is created
    * only if a row with that name doesn't already exist yet (findUnique-then-create,

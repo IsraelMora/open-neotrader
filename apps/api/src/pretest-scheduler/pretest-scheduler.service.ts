@@ -6,9 +6,13 @@ import { PretestService } from '../pretest/pretest.service';
 /** KV key: interval between automatic pretest cycles, in ms. <=0 disables the scheduler. */
 const CONFIG_KEY = 'pretest.scheduler_interval_ms';
 
-/** Default cadence: 60 minutes. Pretests are virtual-only, so a slower default than the
- * real cycle (45min) is fine and keeps LLM/API usage modest for N parallel portfolios. */
-const DEFAULT_INTERVAL_MS = 60 * 60_000;
+/** Default cadence: 6 hours. Pretests are virtual-only, so a slower default than the
+ * real cycle (45min) is fine and keeps LLM/API usage modest for N parallel portfolios.
+ * Raised from 60min (Fix B): the main cycle + 3 pretests each run the LLM, and at a
+ * 60min pretest cadence the combined daily call volume blew through the Gemini
+ * free-tier quota (~60% of production cycles hit 429s over an 11h run). 6h cuts
+ * pretest LLM calls 6x. KV `pretest.scheduler_interval_ms` still overrides this. */
+const DEFAULT_INTERVAL_MS = 6 * 60 * 60_000;
 
 /** How often the internal timer wakes up to check whether a run is due. */
 const TICK_MS = 60_000;
@@ -23,7 +27,7 @@ const TICK_MS = 60_000;
  * broker-facing state to protect here — a failed pretest cycle for one portfolio is
  * just logged and retried on the next tick.
  *
- * - Config: KV `pretest.scheduler_interval_ms` (default 60min). A value <= 0 disables
+ * - Config: KV `pretest.scheduler_interval_ms` (default 6h). A value <= 0 disables
  *   the scheduler (tick becomes a no-op).
  * - Overlap guard: a `running` flag skips a tick while a previous run is still in flight.
  * - Fail-soft: tick() NEVER throws — KV read errors and PretestService.runAllActive()
