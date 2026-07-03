@@ -165,9 +165,11 @@ export class LlmService implements OnModuleInit {
     requiredEnv: string | null;
     detail: string;
   } {
+    // 'openai' es el backend genérico OpenAI-compatible: LLM_API_KEY es el nombre
+    // preferido, con fallback a OPENAI_API_KEY para no romper despliegues existentes.
     const envByBackend: Partial<Record<LlmBackend, string>> = {
       anthropic: 'ANTHROPIC_API_KEY',
-      openai: 'OPENAI_API_KEY',
+      openai: 'LLM_API_KEY',
       gemini: 'GEMINI_API_KEY',
     };
     const requiredEnv = envByBackend[this._backend] ?? null;
@@ -177,6 +179,10 @@ export class LlmService implements OnModuleInit {
       credentialPresent = true; // OAuth vía plugin claude-subscription, sin API key
     } else if (this._backend === 'custom') {
       credentialPresent = this._activeCustomId !== null; // la key vive en el provider custom
+    } else if (this._backend === 'openai') {
+      credentialPresent = !!(
+        this.cfg.get<string>('LLM_API_KEY') || this.cfg.get<string>('OPENAI_API_KEY')
+      );
     } else {
       credentialPresent = requiredEnv !== null && !!this.cfg.get<string>(requiredEnv);
     }
@@ -376,14 +382,22 @@ export class LlmService implements OnModuleInit {
   // Skills inyectados upfront (sin tool use). Compatible con GPT-4o, GPT-4o-mini, etc.
 
   private async completeViaOpenAi(req: LlmRequest): Promise<LlmResponse> {
-    const apiKey = this.cfg.get<string>('OPENAI_API_KEY');
+    // Generic OpenAI-compatible client: LLM_API_KEY / LLM_BASE_URL are the preferred
+    // names (any OpenAI-compatible provider — OpenAI, OpenRouter, Gemini's openai
+    // endpoint, Groq, Together, Ollama...). OPENAI_API_KEY / OPENAI_BASE_URL are kept
+    // as fallback so existing deployments (e.g. the deployed nemotron/OpenRouter
+    // config) keep working without changes.
+    const apiKey = this.cfg.get<string>('LLM_API_KEY') || this.cfg.get<string>('OPENAI_API_KEY');
     if (!apiKey) {
-      throw new ServiceUnavailableException('OPENAI_API_KEY no configurada');
+      throw new ServiceUnavailableException('LLM_API_KEY (u OPENAI_API_KEY) no configurada');
     }
     // Base URL configurable → permite gateways OpenAI-compatibles (OpenRouter, Groq,
     // etc.) sin cambiar de backend. Default = OpenAI. Sin barra final (strip sin regex
     // para evitar backtracking super-lineal / ReDoS).
-    let baseUrl = this.cfg.get<string>('OPENAI_BASE_URL') ?? 'https://api.openai.com/v1';
+    let baseUrl =
+      this.cfg.get<string>('LLM_BASE_URL') ||
+      this.cfg.get<string>('OPENAI_BASE_URL') ||
+      'https://api.openai.com/v1';
     while (baseUrl.endsWith('/')) baseUrl = baseUrl.slice(0, -1);
 
     const { systemContent, skillNames } = await this._loadSkillsSection(req.system_prompt);

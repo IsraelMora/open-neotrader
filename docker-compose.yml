@@ -33,11 +33,18 @@ services:
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET requerido en .env}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
       TOTP_ISSUER: ${TOTP_ISSUER:-OpenNeoTrader}
-      # LLM — config NO-secreta acá; defaults alineados con .env.example (OpenRouter vía
-      # backend OpenAI-compatible). OPENAI_BASE_URL es imprescindible con backend=openai:
-      # sin él, la key de OpenRouter apunta a api.openai.com y los modelos OpenRouter
-      # (p.ej. nemotron) fallan.
+      # LLM — cliente genérico OpenAI-compatible (OpenAI, OpenRouter, Gemini vía su
+      # endpoint openai, Groq, Together, Ollama...). Config vía 3 vars genéricas:
+      # LLM_BASE_URL + LLM_API_KEY + LLM_MODEL sirven para CUALQUIER provider
+      # OpenAI-compatible, p.ej. Gemini = https://generativelanguage.googleapis.com/v1beta/openai.
+      # OPENAI_BASE_URL/OPENAI_API_KEY se mantienen como fallback de compatibilidad
+      # hacia atrás (el deploy actual de nemotron/OpenRouter los usa) — sin ellos, la
+      # key de OpenRouter apuntaría a api.openai.com y los modelos OpenRouter (p.ej.
+      # nemotron) fallarían. LLM_BASE_URL/LLM_API_KEY, si están seteadas, tienen
+      # prioridad sobre las OPENAI_*.
       LLM_BACKEND: ${LLM_BACKEND:-openai}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
       LLM_MODEL: ${LLM_MODEL:-nvidia/nemotron-3-super-120b-a12b:free}
       # GEMINI_API_KEY se pasa desde el env de Dokploy (lo setea el operador en el
