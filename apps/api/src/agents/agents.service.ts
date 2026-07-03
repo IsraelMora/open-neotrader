@@ -1791,11 +1791,20 @@ export class AgentsService {
         );
         await prisma.vetoDecision.create({ data });
       } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const symbol = String(rawSignal['symbol']);
         this.log.warn(
-          `[veto-ledger] persist failed for cycle ${cycle_id}, symbol ${String(
-            rawSignal['symbol'],
-          )} — decision not recorded: ${e}`,
+          `[veto-ledger] persist failed for cycle ${cycle_id}, symbol ${symbol} — decision not recorded: ${e}`,
         );
+        // Fail-soft: a dropped veto-ledger row is invisible in the audit trail otherwise —
+        // mirrors the sibling catch in _executeToolCalls. Must never block the cycle.
+        await this.audit.log({
+          cycle_id,
+          event_type: 'cycle_fail',
+          symbol,
+          error: msg,
+          meta: { source: 'veto_ledger_persist' },
+        });
       }
     }
   }

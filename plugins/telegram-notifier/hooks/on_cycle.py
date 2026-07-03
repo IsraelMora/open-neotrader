@@ -11,7 +11,6 @@ import json
 import sys
 from typing import Any
 
-
 # Default thresholds (mirror manifest [config] defaults)
 _DEFAULT_MIN_CONFIDENCE = 0.7
 _DEFAULT_MAX_MESSAGES = 10

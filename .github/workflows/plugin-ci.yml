@@ -33,12 +33,12 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF:   ${{ github.base_ref }}
         run: |
-          # Validar que BASE_REF no contenga caracteres peligrosos antes de usarlo en git
-          if ! echo "$BASE_REF" | grep -qE '^[A-Za-z0-9_./\-]+$'; then
-            echo "❌ BASE_REF contiene caracteres no permitidos: $BASE_REF"
-            exit 1
-          fi
           if [ "$EVENT_NAME" = "pull_request" ]; then
+            # Validar que BASE_REF no contenga caracteres peligrosos antes de usarlo en git
+            if ! echo "$BASE_REF" | grep -qE '^[A-Za-z0-9_./\-]+$'; then
+              echo "❌ BASE_REF contiene caracteres no permitidos: $BASE_REF"
+              exit 1
+            fi
             CHANGED=$(git diff --name-only "origin/${BASE_REF}...HEAD" -- plugins/ | \
               sed 's|plugins/\([^/]*\)/.*|\1|' | sort -u | tr '\n' ' ')
           else

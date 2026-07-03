@@ -13,7 +13,6 @@ No network calls. Pure computation only.
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import sys
@@ -22,8 +21,8 @@ import sys
 _SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "scripts")
 sys.path.insert(0, _SCRIPTS)
 
+from pyramid import calculate_tranches, evaluate_add  # noqa: E402
 from sizing import compute_kelly, position_size, stats_from_trades  # noqa: E402
-from pyramid import calculate_tranches, evaluate_add                 # noqa: E402
 
 _VALID_MODES = ("kelly", "pyramid", "fixed")
 

@@ -8,13 +8,12 @@ a Telegram — este hook no realiza llamadas de red directamente.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
-import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-from reporter import generate_report, format_telegram_message  # type: ignore[import]
-
+from reporter import format_telegram_message, generate_report  # type: ignore[import]
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
@@ -39,7 +38,10 @@ def on_cycle(ctx: dict) -> dict:
 
     # Graceful degradation: missing context data → return without intent
     if equity_curve is None or closed_trades is None:
-        return {"ok": False, "reason": "missing context: equity_curve or closed_trades not available"}
+        return {
+            "ok": False,
+            "reason": "missing context: equity_curve or closed_trades not available",
+        }
 
     should_run = _is_weekly_report_day(config) or _is_monthly_report_day(config)
 

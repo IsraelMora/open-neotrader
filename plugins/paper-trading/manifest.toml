@@ -16,6 +16,9 @@ interval_ms = 86_400_000
 network     = false
 filesystem  = false
 
+[hooks]
+on_cycle    = "hooks/cycle.py"
+
 [config]
 initial_capital     = { type = "number",  default = 10000, description = "Capital inicial del portafolio paper" }
 commission_pct      = { type = "number",  default = 0.001, description = "Comisión simulada por operación (0.001 = 0.1%)" }

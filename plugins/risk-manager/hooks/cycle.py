@@ -151,7 +151,11 @@ def on_cycle(ctx: dict) -> dict:
         active_filtered = apply_drawdown_layer(
             signals=active,
             equity_history=equity_history,
-            equity_open_today=equity_open_today if equity_open_today > 0 else (equity_history[0] if equity_history else 0.0),
+            equity_open_today=(
+                equity_open_today
+                if equity_open_today > 0
+                else (equity_history[0] if equity_history else 0.0)
+            ),
             circuit_state=circuit_state,
             worst_drawdown_in_state=worst_drawdown_in_state,
             config=config,

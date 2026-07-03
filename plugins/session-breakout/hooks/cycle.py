@@ -40,7 +40,12 @@ def on_cycle(ctx: dict) -> dict:
         try:
             bars = get_ohlcv(symbol=symbol, timeframe=timeframe, limit=_MIN_BARS)
             if not bars or len(bars) < 3:
-                logs.append({"level": "warning", "msg": f"{symbol}: insufficient bars ({len(bars) if bars else 0})"})
+                logs.append(
+                    {
+                        "level": "warning",
+                        "msg": f"{symbol}: insufficient bars ({len(bars) if bars else 0})",
+                    }
+                )
                 continue
         except Exception as exc:
             logs.append({"level": "error", "msg": f"{symbol}: OHLCV fetch failed — {exc}"})
@@ -54,11 +59,21 @@ def on_cycle(ctx: dict) -> dict:
 
         if signal == "long":
             if in_position:
-                logs.append({"level": "debug", "msg": f"{symbol}: long signal skipped (already in position)"})
+                logs.append(
+                    {
+                        "level": "debug",
+                        "msg": f"{symbol}: long signal skipped (already in position)",
+                    }
+                )
                 continue
         elif signal in ("short", "exit"):
             if not in_position:
-                logs.append({"level": "debug", "msg": f"{symbol}: {signal} signal skipped (not in position)"})
+                logs.append(
+                    {
+                        "level": "debug",
+                        "msg": f"{symbol}: {signal} signal skipped (not in position)",
+                    }
+                )
                 continue
         elif signal == "none":
             continue

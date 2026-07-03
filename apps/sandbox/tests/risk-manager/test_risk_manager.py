@@ -60,6 +60,7 @@ from risk_manager_core import (  # noqa: E402
     apply_correlation_layer,
     apply_drawdown_layer,
     apply_exposure_layer,
+    pearson_correlation,
 )
 
 pass  # on_cycle: module-level
@@ -255,6 +256,40 @@ class TestExposureLayer:
         assert len(result) == 1
         assert result[0]["action"] == "exit"
 
+    def test_a5_tiny_residual_qty_position_is_treated_as_flat_for_max_open(self) -> None:
+        """
+        A position left with a tiny float residual (e.g. 1e-12 market value —
+        the kind of dust left over from a partial close) must be treated as
+        FLAT ("is_new" == True) for the max-open-positions gate, not as an
+        already-open position that lets the signal skip the cap check.
+
+        Portfolio: "OPEN" is genuinely open (counts toward the cap) and
+        "RESIDUAL" is a dust position from a partial close. max_open_positions=1
+        is already reached by "OPEN". A new "long" for RESIDUAL must still be
+        cancelled — the residual must not let it silently bypass the gate by
+        being misread as "already a held position" (exact float == 0 bug).
+        """
+        positions = [
+            {"symbol": "OPEN", "market_value": 10_000.0},
+            {"symbol": "RESIDUAL", "market_value": 1e-12},
+        ]
+        signal = {"symbol": "RESIDUAL", "action": "long", "qty": 1.0, "price": 100.0}
+        cfg = _all_enabled_config(max_open_positions=1, max_total_exposure=0.95)
+
+        result = apply_exposure_layer(
+            signals=[signal],
+            portfolio_value=100_000.0,
+            positions=positions,
+            config=cfg,
+        )
+
+        cancelled = [s for s in result if s.get("action") == "cancelled"]
+        assert len(cancelled) == 1, (
+            "RESIDUAL is effectively flat (dust); the gate must treat it as a "
+            "new symbol and enforce max_open_positions=1, already reached by "
+            f"OPEN; got {result}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # (b) Concentration layer: blocks an over-concentrated sector add
@@ -431,6 +466,42 @@ class TestCorrelationLayer:
 
         non_cancelled = [s for s in result if s.get("action") != "cancelled"]
         assert len(non_cancelled) == 2, "exit and short must not be cancelled by correlation"
+
+    def test_c5_near_flat_series_returns_zero_not_spurious_correlation(self) -> None:
+        """
+        Two near-flat series (std ~1e-10, e.g. a symbol barely moving) must NOT
+        produce a spurious large |correlation| that trips the correlation veto.
+        The current `std_a == 0 or std_b == 0` guard only catches EXACT zero,
+        so a near-zero-but-nonzero std still divides cov by a tiny denominator
+        and inflates the ratio. Must be treated as "no correlation" (0.0).
+        """
+        n = 20
+        near_flat_a = [100.0 + (1e-10 if i % 2 == 0 else -1e-10) for i in range(n)]
+        near_flat_b = [50.0 + (1e-10 if i % 2 == 1 else -1e-10) for i in range(n)]
+
+        corr = pearson_correlation(near_flat_a, near_flat_b)
+
+        assert corr == 0.0, (
+            f"Near-flat (near-zero std) series must yield 0.0 correlation, got {corr}"
+        )
+
+    def test_c6_genuinely_correlated_series_still_compute_correctly(self) -> None:
+        """The near-zero-std guard must not affect series with real variance."""
+        a = _price_series_high_corr(80)
+        b = _price_series_high_corr_b(80)
+
+        corr = pearson_correlation(_log_returns_for_test(a), _log_returns_for_test(b))
+
+        assert corr > 0.9, f"Genuinely correlated series must still compute a high corr, got {corr}"
+
+
+def _log_returns_for_test(prices: list[float]) -> list[float]:
+    import math as _math
+    return [
+        _math.log(prices[i] / prices[i - 1])
+        for i in range(1, len(prices))
+        if prices[i - 1] > 0
+    ]
 
 
 # ---------------------------------------------------------------------------

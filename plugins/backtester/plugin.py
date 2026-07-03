@@ -13,10 +13,10 @@ _SCRIPTS_DIR = str(Path(__file__).parent / "scripts")
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from engine import run_backtest
-from generate import generate_signals
-from walk_forward import run_walk_forward as _run_walk_forward
-from cross_sectional import run_cross_sectional as _run_cross_sectional
+from cross_sectional import run_cross_sectional as _run_cross_sectional  # noqa: E402
+from engine import run_backtest  # noqa: E402
+from generate import generate_signals  # noqa: E402
+from walk_forward import run_walk_forward as _run_walk_forward  # noqa: E402
 
 
 def run_cross_sectional(prices: dict, config: dict, _context=None) -> dict:

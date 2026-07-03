@@ -1,5 +1,5 @@
 """
-Hook on_cycle de Claude Subscription.
+Cycle hook de Claude Subscription (entrypoint: run()/main()).
 Anota en el contexto que el backend del LLM es la suscripción de Claude, para
 que el resto del pipeline (y el propio LLM) lo tenga presente. No accede a la
 red ni invoca el CLI: el cambio de backend real lo hace NestJS al detectar que

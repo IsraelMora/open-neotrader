@@ -404,6 +404,23 @@ export class TradeIntentService {
           positions: [],
         };
 
+    // "hold" → executed immediately as no-op, no quote fetch, no portfolio mutation. Mirrors
+    // autoProcess() — a data-feed outage must never fail an approved no-op (see _executeReal's
+    // defensive "should have been short-circuited before reaching here" comment: this is that
+    // short-circuit for the human-approval path).
+    if (action === 'hold') {
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'executed',
+          quantity: 0,
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({ quantity: 0, reason: 'hold — no position change' }),
+        },
+      });
+    }
+
     // Real mode: risk gates/sizing MUST read the REAL account (RealNavSnapshot/RealPosition),
     // never the paper portfolio — see getRealAccountState doc comment. Loaded unconditionally
     // once effectiveMode === 'real' (cheap: one findFirst + one count).
@@ -521,8 +538,12 @@ export class TradeIntentService {
     const autonomous = kvBool(rawAutonomous, DEFAULT_EXECUTION_POLICY.autonomous);
 
     let max_position_pct = kvNum(rawMaxPosPct, DEFAULT_EXECUTION_POLICY.max_position_pct);
-    if (max_position_pct <= 0 || max_position_pct > 1)
+    if (max_position_pct <= 0 || max_position_pct > 1) {
+      this.log.warn(
+        `execution.max_position_pct out of range (${max_position_pct}) — falling back to default ${DEFAULT_EXECUTION_POLICY.max_position_pct}`,
+      );
       max_position_pct = DEFAULT_EXECUTION_POLICY.max_position_pct;
+    }
 
     let max_open_positions = Math.round(
       kvNum(rawMaxOpenPos, DEFAULT_EXECUTION_POLICY.max_open_positions),
@@ -1221,35 +1242,45 @@ export class TradeIntentService {
     );
     if ('failedUpdate' in preconditions) return preconditions.failedUpdate;
 
-    // Fetch live quote for sizing.
-    let price: number;
+    // Fetch live quote — best-effort ONLY. "long"/"short" need it for sizing (qty is derived
+    // from price × equity), so a missing/invalid quote must still fail those. "exit"/"hold"
+    // must NEVER depend on it: a real exit's qty is sourced from the BROKER's live position
+    // via `_resolveRealSideAndQty` → `_resolveRealExitQty` (a market order — no price needed
+    // to size it), and the quote here is used only for the WARN log below and the notional
+    // ceiling, which already exempts exits (see the ceiling check further down). Failing an
+    // exit/hold on a market-data outage would strand a real position open — violating the
+    // "exit/hold always closeable" invariant (see class-level risk-kernel doc). A quote
+    // failure is therefore swallowed here for exit/hold; `price` stays NaN and is only ever
+    // used for logging in that path.
+    let price = NaN;
+    let quoteError: string | null = null;
     try {
       const quote = await this.gateway.getQuote(null, symbol);
       price = quote.last;
     } catch (err) {
-      this.log.warn(`REAL ORDER FAILED [${id}]: getQuote error for ${symbol} — ${String(err)}`);
+      quoteError = String(err);
+    }
+    const quoteInvalid = quoteError !== null || !isFinite(price) || price <= 0;
+
+    if (quoteInvalid && (action === 'long' || action === 'short')) {
+      const reason = quoteError ?? `Invalid quote price: ${price}`;
+      this.log.warn(`REAL ORDER FAILED [${id}]: ${reason} for ${symbol}`);
       return this.db.tradeIntent.update({
         where: { id },
         data: {
           status: 'failed',
           decided_at: new Date(),
           decided_by,
-          result_json: JSON.stringify({ error: String(err) }),
+          result_json: JSON.stringify({ error: reason }),
         },
       });
     }
-
-    if (!isFinite(price) || price <= 0) {
-      this.log.warn(`REAL ORDER FAILED [${id}]: invalid quote price ${price} for ${symbol}`);
-      return this.db.tradeIntent.update({
-        where: { id },
-        data: {
-          status: 'failed',
-          decided_at: new Date(),
-          decided_by,
-          result_json: JSON.stringify({ error: `Invalid quote price: ${price}` }),
-        },
-      });
+    if (quoteInvalid) {
+      const quoteIssue = quoteError ?? `invalid price ${price}`;
+      this.log.warn(
+        `REAL ORDER [${id}]: quote unavailable for ${symbol} (${quoteIssue}) ` +
+          `— proceeding anyway, ${action} does not depend on the quote`,
+      );
     }
 
     // 'hold' — should have been short-circuited before reaching here; defensive no-op.
@@ -1620,8 +1651,8 @@ export class TradeIntentService {
     symbol: string,
     fillPrice: number,
     state: PaperState,
-    sizingPct = SIZING_PCT,
-    maxPositionPct = DEFAULT_EXECUTION_POLICY.max_position_pct,
+    sizingPct: number,
+    maxPositionPct: number,
   ): { quantity: number; realized_pnl: number | null; newState: PaperState } {
     // Deep-copy positions so we don't mutate the original.
     const newState: PaperState = {

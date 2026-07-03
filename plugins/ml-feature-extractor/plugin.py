@@ -13,9 +13,9 @@ from pathlib import Path
 # Make scripts/ importable without requiring the runner's sys.path manipulation
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 
-from neurotrader_sdk import Context, skill  # noqa: E402
 from model import predict as _predict  # noqa: E402
 from model import train as _train  # noqa: E402
+from neurotrader_sdk import Context, skill  # noqa: E402
 
 
 def _cfg(ctx: Context | None) -> dict:

@@ -410,6 +410,192 @@
       ],
       "verified": true,
       "bundled": true
+    },
+    {
+      "id": "claude-subscription",
+      "name": "Claude Subscription (CLI)",
+      "version": "1.0.0",
+      "type": "extra",
+      "description": "Enruta el orquestador LLM a tu suscripción de Claude vía el CLI de Claude Code (claude -p) en lugar de una API key. Costo operativo cercano a cero para ciclos 24/7. Al activar este plugin, la plataforma usa el backend 'subscription' automáticamente.",
+      "author": "OpenNeoTrader",
+      "tags": [
+        "llm",
+        "claude",
+        "subscription",
+        "cost",
+        "cli"
+      ],
+      "verified": true,
+      "bundled": true
+    },
+    {
+      "id": "data-quality",
+      "name": "Data Quality — Validación de Datos de Mercado",
+      "version": "1.0.0",
+      "type": "discipline",
+      "description": "Valida la calidad de los datos de precio antes de permitir señales. Detecta: precios obsoletos (>24h), gaps en series históricas, outliers estadísticos (>4σ), precios negativos/cero, y discrepancias entre providers. Vetoes señales de símbolos con datos sospechosos y emite alertas.",
+      "author": "OpenNeoTrader",
+      "tags": [
+        "data-quality",
+        "validation",
+        "risk",
+        "outlier-detection",
+        "discipline"
+      ],
+      "verified": true,
+      "bundled": true
+    },
+    {
+      "id": "doctor",
+      "name": "Doctor — Diagnóstico del Sistema",
+      "version": "1.0.0",
+      "type": "extra",
+      "description": "Chequeo de integridad al inicio de cada ciclo: valida plugins activos, credenciales requeridas, conexiones a providers y estado de la base de datos. Reporta advertencias al LLM y al log de auditoría.",
+      "author": "OpenNeoTrader",
+      "tags": [
+        "diagnostics",
+        "health",
+        "monitoring",
+        "safety"
+      ],
+      "verified": true,
+      "bundled": true
+    },
+    {
+      "id": "ensemble-signal-voting",
+      "name": "Ensemble Signal Voting + Vol-Targeting",
+      "version": "1.0.0",
+      "type": "skill",
+      "description": "Ensemble de 12 variantes: EMA × 4 lookbacks + Donchian Channel × 4 + Time-Series Momentum × 4. Voto por mayoría. Vol-targeting: escala la posición inversamente a la volatilidad realizada para mantener un riesgo constante del 10% anual.",
+      "author": "OpenNeoTrader",
+      "tags": [
+        "ensemble",
+        "momentum",
+        "trend",
+        "vol-targeting",
+        "diversification"
+      ],
+      "verified": true,
+      "bundled": true
+    },
+    {
+      "id": "funding-rate-arb",
+      "name": "Funding Rate Arbitrage (Crypto)",
+      "version": "1.0.0",
+      "type": "skill",
+      "description": "Estrategia de ingresos pasivos en crypto: detecta oportunidades de arbitraje entre tasas de financiamiento (funding rates) de futuros perpetuos y spot. Long spot + Short perp = capturar funding rate sin riesgo de precio. Rendimiento objetivo: 15-40% APR en tasas altas. Basado en la mecánica de funding de Bitmex/Binance Futures.",
+      "author": "OpenNeoTrader",
+      "tags": [
+        "crypto",
+        "arbitrage",
+        "funding-rate",
+        "neutral",
+        "passive-income",
+        "perp-futures"
+      ],
+      "verified": true,
+      "bundled": true
+    },
+    {
+      "id": "kalman-filter",
+      "name": "Kalman Filter Trend Following",
+      "version": "1.0.0",
+      "type": "skill",
+      "description": "Trend following usando el Filtro de Kalman discreto para estimar el estado oculto (tendencia) del precio. Supera al EMA porque adapta su ganancia dinámicamente según la relación ruido/señal. Las señales se generan cuando el precio cruza el estado estimado por el filtro. Welch & Bishop (1995), Zacks (2009) 'Optimal Control'.",
+      "author": "OpenNeoTrader",
+      "tags": [
+        "trend",
+        "kalman",
+        "adaptive",
+        "signal-processing",
+        "state-space"
+      ],
+      "verified": true,
+      "bundled": true
+    },
+    {
+      "id": "ml-feature-extractor",
+      "name": "ML Feature Extractor",
+      "version": "0.1.0",
+      "type": "discipline",
+      "description": "On-device sklearn model: learns which of the agent's own skill signals made money and adjusts per-signal confidence multiplicatively in [0.5x, 1.5x]. INFORMS, never a barrier. Cold-start/error → identity.",
+      "author": "OpenNeoTrader",
+      "tags": [
+        "ml",
+        "sklearn",
+        "confidence",
+        "adaptive"
+      ],
+      "verified": true,
+      "bundled": true
+    },
+    {
+      "id": "param-discipline",
+      "name": "Param Discipline — Journal y Lock de Parámetros",
+      "version": "1.0.0",
+      "type": "discipline",
+      "description": "Evita el overfitting accidental: cualquier cambio de parámetros de un plugin requiere entrada en el journal (razón + hipótesis), luego se registra el cambio, y el sistema queda bloqueado para nuevos cambios hasta que el ciclo siguiente confirme la hipótesis. Patrón: journal → cambio → relock → validación.",
+      "author": "OpenNeoTrader",
+      "tags": [
+        "risk",
+        "governance",
+        "params",
+        "overfitting",
+        "discipline"
+      ],
+      "verified": true,
+      "bundled": true
+    },
+    {
+      "id": "trader-knowledge",
+      "name": "Professional Trader Knowledge Base",
+      "version": "1.0.0",
+      "type": "skill",
+      "description": "Base de conocimiento de un trader profesional con 20+ años de experiencia. Cubre psicología, gestión de riesgo, lectura de mercado, patrones de precio, macro, y lecciones aprendidas de crisis reales. Usar como contexto base para todos los ciclos de análisis.",
+      "author": "OpenNeoTrader",
+      "tags": [
+        "knowledge-base",
+        "psychology",
+        "risk-management",
+        "market-reading"
+      ],
+      "verified": true,
+      "bundled": true
+    },
+    {
+      "id": "weekly-reporter",
+      "name": "Weekly/Monthly Reporter",
+      "version": "1.0.0",
+      "type": "extra",
+      "description": "Genera resúmenes periódicos de rendimiento: P&L, Sharpe ratio, max drawdown, win rate y top señales. Envía el reporte vía Telegram. Configurable para reportes semanales y/o mensuales.",
+      "author": "OpenNeoTrader",
+      "tags": [
+        "reporting",
+        "telegram",
+        "pnl",
+        "performance",
+        "monitoring"
+      ],
+      "verified": true,
+      "bundled": true
+    },
+    {
+      "id": "wyckoff-volume",
+      "name": "Wyckoff — Análisis de Precio/Volumen Institucional",
+      "version": "1.0.0",
+      "type": "skill",
+      "description": "Método Wyckoff (1910-1934): detecta fases de acumulación y distribución institucional mediante análisis precio/volumen. Identifica: Springs (false breakdowns con bajo volumen), Upthrusts (false breakouts con alto volumen), Climax de venta/compra (capitulación), y Tests secundarios. Win rate ~65-70% en activos con suficiente volumen institucional.",
+      "author": "OpenNeoTrader",
+      "tags": [
+        "wyckoff",
+        "volume-analysis",
+        "institutional",
+        "accumulation",
+        "distribution",
+        "price-volume"
+      ],
+      "verified": true,
+      "bundled": true
     }
   ]
 }

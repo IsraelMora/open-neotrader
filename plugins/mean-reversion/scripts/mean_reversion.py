@@ -17,7 +17,6 @@ from __future__ import annotations
 import math
 from typing import Any
 
-
 # ── OU half-life estimation ───────────────────────────────────────────────────
 
 
@@ -147,7 +146,9 @@ def analyze(bars: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any
     # 1. Rolling mean/std over last `lookback` bars
     window = closes[-lookback:]
     mean_price = sum(window) / len(window)
-    variance = sum((p - mean_price) ** 2 for p in window) / (len(window) - 1) if len(window) > 1 else 0.0
+    variance = (
+        sum((p - mean_price) ** 2 for p in window) / (len(window) - 1) if len(window) > 1 else 0.0
+    )
     std_price = math.sqrt(variance) if variance > 0 else 0.0
 
     if std_price < 1e-10:
@@ -235,7 +236,11 @@ def analyze(bars: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any
 
     # Neutral / vetoed
     if not ou_valid and abs_z > entry_z:
-        hl_desc = f"half_life={half_life:.1f}d (> max {max_half_life}d)" if half_life is not None else "half_life=None (not mean-reverting)"
+        hl_desc = (
+            f"half_life={half_life:.1f}d (> max {max_half_life}d)"
+            if half_life is not None
+            else "half_life=None (not mean-reverting)"
+        )
         reason = f"OU veto: {hl_desc}, z={zscore:.3f}"
     elif use_rsi_confirm and abs_z > entry_z:
         reason = f"RSI confirmation failed (RSI={rsi_value}), z={zscore:.3f}"

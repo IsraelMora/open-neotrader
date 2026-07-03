@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { KvService } from '../common/kv.service';
+import { isPrismaUniqueViolation } from '../common/prisma-error.util';
 import { StoreService } from '../store/store.service';
 
 /** Escapa un string para un valor TOML básico ("..."). */
@@ -114,7 +115,6 @@ export const STRATEGY_CONFIG_KEYS = [
 
 /** test = usa data real pero NO coloca órdenes (mide resultados); live = opera de verdad. */
 export type StrategyMode = 'test' | 'live';
-export const STRATEGY_MODES: readonly StrategyMode[] = ['test', 'live'];
 
 export interface StrategyDto {
   id: string;
@@ -136,10 +136,6 @@ interface StrategyRow {
   mode: string;
   created_at: Date;
   updated_at: Date;
-}
-
-function isUniqueViolation(e: unknown): boolean {
-  return typeof e === 'object' && e !== null && (e as { code?: string }).code === 'P2002';
 }
 
 @Injectable()
@@ -205,7 +201,7 @@ export class StrategyService {
       });
       return this.toDto(r);
     } catch (e) {
-      if (isUniqueViolation(e)) {
+      if (isPrismaUniqueViolation(e)) {
         throw new ConflictException(`Ya existe una estrategia llamada "${input.name}"`);
       }
       throw e;
@@ -231,7 +227,7 @@ export class StrategyService {
       const r = await this.db.strategy.update({ where: { id }, data });
       return this.toDto(r);
     } catch (e) {
-      if (isUniqueViolation(e)) {
+      if (isPrismaUniqueViolation(e)) {
         throw new ConflictException(`Ya existe una estrategia llamada "${patch.name ?? ''}"`);
       }
       throw e;

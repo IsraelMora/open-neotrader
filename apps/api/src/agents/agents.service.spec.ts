@@ -10895,6 +10895,37 @@ describe('veto-decisions-ledger — _runVetoLayer persists one VetoDecision row 
     const approved = vetoCtx['pending_signals'] as unknown[];
     expect(approved).toHaveLength(1);
   });
+
+  it('e. a ledger-write failure emits a cycle_fail audit event (mirrors _executeToolCalls sibling) without throwing', async () => {
+    const prisma = makePrismaVetoMock();
+    prisma.vetoDecision.create.mockRejectedValue(new Error('DB write failed'));
+    const audit = makeAudit();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+      call: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { signals: [{ symbol: 'AAPL', action: 'buy', qty: 10 }], logs: [] },
+      }),
+      getPluginStage: jest.fn().mockReturnValue('post'),
+    };
+    const service = makeS3AgentsService({ sandbox, prisma, audit });
+
+    const disciplinePlugins = [{ id: 'risk-manager', type: 'discipline', name: 'Risk Manager' }];
+    const pendingSignals = [{ symbol: 'AAPL', action: 'buy', qty: 10, plugin_id: 'momentum' }];
+
+    await callRunVetoLayerS3(service, 'cycle-ledger-e', disciplinePlugins, {}, pendingSignals, {});
+
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cycle_id: 'cycle-ledger-e',
+        event_type: 'cycle_fail',
+        symbol: 'AAPL',
+        error: 'DB write failed',
+        meta: { source: 'veto_ledger_persist' },
+      }),
+    );
+  });
 });
 
 // ── veto-ledger-verdict-fix: real plugin shapes drive verdict diffing ────────
