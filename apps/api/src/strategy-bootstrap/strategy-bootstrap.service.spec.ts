@@ -5,6 +5,7 @@ import {
   PLUGINS_TO_ACTIVATE,
   PLUGINS_TO_DEACTIVATE,
   BOOTSTRAP_APPLIED_KEY,
+  PRETEST_SEED_KEY,
   PRETEST_PORTFOLIOS_TO_SEED,
 } from './strategy-bootstrap.service';
 import type { PrismaService } from '../prisma/prisma.service';
@@ -217,7 +218,7 @@ describe('StrategyBootstrapService', () => {
     expect(haltCalls).toHaveLength(0);
   });
 
-  it('sets bootstrap.momentum_v1_applied LAST, only after config/plugin writes succeed', async () => {
+  it('sets bootstrap.momentum_v1_applied only after config/plugin writes succeed, before pretest seeding', async () => {
     const { kv, setMock } = makeKv();
     const { db } = makeDb();
     const { llm } = makeLlm();
@@ -226,7 +227,14 @@ describe('StrategyBootstrapService', () => {
     await svc.run();
 
     const keysInOrder = setMock.mock.calls.map((c: unknown[]) => c[0] as string);
-    expect(keysInOrder[keysInOrder.length - 1]).toBe(BOOTSTRAP_APPLIED_KEY);
+    const momentumIdx = keysInOrder.indexOf(BOOTSTRAP_APPLIED_KEY);
+    const universeIdx = keysInOrder.indexOf('cycle.universe');
+    const executionIdx = keysInOrder.indexOf('execution.real');
+    expect(momentumIdx).toBeGreaterThan(universeIdx);
+    expect(momentumIdx).toBeGreaterThan(executionIdx);
+    // Pretest seeding is a SEPARATE, independently-gated step that runs after the
+    // momentum block — see PRETEST_SEED_KEY decoupling below.
+    expect(keysInOrder[keysInOrder.length - 1]).toBe(PRETEST_SEED_KEY);
   });
 
   it('is fail-soft when a plugin row is missing: continues and still completes the bootstrap', async () => {
@@ -314,7 +322,13 @@ describe('StrategyBootstrapService', () => {
 // Bootstrap also seeds 7 virtual pretest portfolios spanning a full risk spectrum
 // (Ultra-Conservative → Ultra-Aggressive momentum, plus Trend-only and Relative-Strength
 // families) that all trade the same global ETF universe seeded above.
-// Idempotency reuses the SAME bootstrap.momentum_v2_applied flag — no separate KV key.
+//
+// Idempotency is gated by its OWN, INDEPENDENT key (PRETEST_SEED_KEY) — decoupled
+// from BOOTSTRAP_APPLIED_KEY (the momentum flag) on purpose: an already-bootstrapped
+// instance (operator may have since enabled real-money mode or customized the
+// universe/plugins) must be able to receive these 7 portfolios on its next boot
+// WITHOUT re-running the momentum/execution/universe/plugin block. See the
+// "independent idempotency" describe block below and the module docstring.
 
 describe('StrategyBootstrapService — pretest portfolio seeding', () => {
   it('seeds exactly 7 risk-differentiated pretest portfolios on first run', async () => {
@@ -407,7 +421,7 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
     expect(names).toEqual(expect.arrayContaining(['Agresivo Momentum', 'Trend Puro']));
   });
 
-  it('no-ops on a second run (gated by the same bootstrap.momentum_v1_applied flag)', async () => {
+  it('no-ops on a second run (gated by its own PRETEST_SEED_KEY flag)', async () => {
     const { kv } = makeKv();
     const { db, pretestCreate } = makeDb();
     const { llm } = makeLlm();
@@ -448,6 +462,78 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
       'Trend Puro',
       'Relative-Strength Puro',
     ]);
+  });
+});
+
+// ── Independent idempotency: pretest seeding vs. momentum bootstrap ───────────
+//
+// CRITICAL regression coverage: the momentum block (universe / execution.real /
+// plugin activation) must NEVER re-run on an instance where BOOTSTRAP_APPLIED_KEY
+// is already 'true' — even when PRETEST_SEED_KEY is unset. Conversely, pretest
+// seeding must run whenever PRETEST_SEED_KEY is unset, REGARDLESS of the momentum
+// flag's state. Each flag gates only its own block.
+
+describe('StrategyBootstrapService — pretest seeding is decoupled from the momentum flag', () => {
+  it('does NOT re-run the momentum block when BOOTSTRAP_APPLIED_KEY is already set, even if PRETEST_SEED_KEY is unset', async () => {
+    const { kv, store, setMock } = makeKv({ [BOOTSTRAP_APPLIED_KEY]: 'true' });
+    const { db, updateMany, pretestCreate } = makeDb();
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    // No plugin activation/deactivation writes — the momentum block was skipped.
+    expect(updateMany).not.toHaveBeenCalled();
+    // No execution.real or cycle.universe writes either.
+    const executionCalls = setMock.mock.calls.filter((c: unknown[]) => c[0] === 'execution.real');
+    const universeCalls = setMock.mock.calls.filter((c: unknown[]) => c[0] === 'cycle.universe');
+    expect(executionCalls).toHaveLength(0);
+    expect(universeCalls).toHaveLength(0);
+
+    // But pretest portfolios STILL get seeded, and PRETEST_SEED_KEY gets set.
+    expect(pretestCreate).toHaveBeenCalledTimes(7);
+    expect(store[PRETEST_SEED_KEY]).toBe('true');
+  });
+
+  it('still seeds pretest portfolios when the momentum flag is unset (fresh instance gets both)', async () => {
+    const { kv, store } = makeKv();
+    const { db, pretestCreate } = makeDb();
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(store[BOOTSTRAP_APPLIED_KEY]).toBe('true');
+    expect(store[PRETEST_SEED_KEY]).toBe('true');
+    expect(pretestCreate).toHaveBeenCalledTimes(7);
+  });
+
+  it('no-ops pretest seeding when PRETEST_SEED_KEY is already set, independently of the momentum flag', async () => {
+    const { kv } = makeKv({ [PRETEST_SEED_KEY]: 'true' });
+    const { db, pretestCreate, updateMany } = makeDb();
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(pretestCreate).not.toHaveBeenCalled();
+    // Momentum flag was unset, so that block still runs normally.
+    expect(updateMany).toHaveBeenCalled();
+  });
+
+  it('both blocks no-op when both flags are already set', async () => {
+    const { kv } = makeKv({
+      [BOOTSTRAP_APPLIED_KEY]: 'true',
+      [PRETEST_SEED_KEY]: 'true',
+    });
+    const { db, pretestCreate, updateMany } = makeDb();
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(pretestCreate).not.toHaveBeenCalled();
+    expect(updateMany).not.toHaveBeenCalled();
   });
 });
 

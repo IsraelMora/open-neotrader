@@ -27,21 +27,28 @@ class MomentumRank:
 def compute_momentum_ranks(
     universe_data: dict[str, list[float]],
     top_pct: float = 0.20,
+    lookback_months: int = 12,
     current_positions: set[str] | None = None,
 ) -> list[MomentumRank]:
     """
     Calcula rankings de momentum para un universo de activos.
 
     Args:
-        universe_data: { symbol: [precio_mes_0, ..., precio_mes_13] }
-                      ORDEN CRONOLÓGICO — índice 0 = MÁS ANTIGUO (hace 13 meses),
-                      índice -1 = MÁS RECIENTE (mes actual). Esta es la misma
-                      convención que usa el resto del repo (ver
+        universe_data: { symbol: [precio_mes_0, ..., precio_mes_N] }
+                      ORDEN CRONOLÓGICO — índice 0 = MÁS ANTIGUO, índice -1 =
+                      MÁS RECIENTE (mes actual). Esta es la misma convención que
+                      usa el resto del repo (ver
                       plugins/trend-following/scripts/trend_following.py y
                       provider_tools.get_ohlcv, que devuelve las últimas N barras
                       con la más reciente al final).
-                      Se necesitan al menos 14 precios mensuales (13 meses + inicial).
+                      Se necesitan al menos `lookback_months + 2` precios mensuales
+                      (el mes que se omite + el período de lookback + el precio
+                      inicial de la ventana).
         top_pct:      fracción superior del universo a seleccionar (0.20 = 20%)
+        lookback_months: longitud de la ventana de momentum en meses (configurable
+                      por portfolio, ver plugins/momentum-factor-12-1/manifest.toml
+                      [config.lookback_months]). Con lookback_months=12 este cálculo
+                      reproduce exactamente el 12-1 canónico (Jegadeesh & Titman).
         current_positions: set de símbolos actualmente en cartera
 
     Returns:
@@ -50,25 +57,27 @@ def compute_momentum_ranks(
     if current_positions is None:
         current_positions = set()
 
+    min_len = lookback_months + 2
+
     scores: list[tuple[str, float, float]] = []  # (symbol, return_12_1, vol_12m)
 
     for symbol, prices in universe_data.items():
-        if len(prices) < 14:
-            continue  # datos insuficientes
+        if len(prices) < min_len:
+            continue  # datos insuficientes para la ventana configurada
 
-        # índice 0 = hace 13 meses (más antiguo), índice -1 = mes actual (más reciente)
         price_now = prices[-1]
-        price_13m_ago = prices[0]
+        price_window_start = prices[-min_len]
 
-        if price_13m_ago <= 0 or price_now <= 0:
+        if price_window_start <= 0 or price_now <= 0:
             continue
 
-        # Retorno 12-1 (Jegadeesh & Titman): retorno de 12 meses terminando 1 mes
+        # Retorno N-1 (skip-1-month momentum, Jegadeesh & Titman generalizado a
+        # lookback_months): retorno de `lookback_months` meses terminando 1 mes
         # atrás, omitiendo el mes más reciente para evitar reversal de corto plazo.
         # price_skip_1m = precio hace 1 mes (índice -2, el mes que se omite)
-        # price_window_start = precio hace 13 meses (índice 0) — 12 meses antes del skip
+        # price_window_start = precio hace (lookback_months + 1) meses — inicio de
+        # la ventana de `lookback_months` meses que termina en el skip.
         price_skip_1m = prices[-2]
-        price_window_start = prices[0]
         return_12_1 = price_skip_1m / price_window_start - 1.0
 
         # Volatilidad anualizada (desviación estándar de retornos mensuales × √12)
@@ -152,10 +161,13 @@ if __name__ == "__main__":
 
     universe_data = data.get("universe_data", {})
     top_pct = data.get("top_pct", 0.20)
+    lookback_months = data.get("lookback_months", 12)
     current_positions = set(data.get("current_positions", []))
     market_trend_up = data.get("market_trend_up", True)
 
-    ranks = compute_momentum_ranks(universe_data, top_pct, current_positions)
+    ranks = compute_momentum_ranks(
+        universe_data, top_pct, lookback_months, current_positions=current_positions
+    )
     ranks = apply_trend_filter(ranks, market_trend_up)
 
     print(

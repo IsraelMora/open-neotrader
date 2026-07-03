@@ -60,7 +60,7 @@ def on_cycle(ctx: dict) -> dict:
         if callable(get_ohlcv):
             try:
                 bars = get_ohlcv(symbol=symbol, timeframe="1Month", limit=lookback_months + 2)
-                if bars and len(bars) >= lookback_months + 1:
+                if bars and len(bars) >= lookback_months + 2:
                     closes = [b["close"] for b in bars]
                     universe_data[symbol] = closes
                 else:
@@ -94,7 +94,9 @@ def on_cycle(ctx: dict) -> dict:
         return {"signals": signals, "logs": logs}
 
     current_positions = set(portfolio.keys())
-    ranks = compute_momentum_ranks(universe_data, top_pct, current_positions)
+    ranks = compute_momentum_ranks(
+        universe_data, top_pct, lookback_months, current_positions=current_positions
+    )
     ranks = apply_trend_filter(ranks, market_trend_up)
 
     for r in ranks:
