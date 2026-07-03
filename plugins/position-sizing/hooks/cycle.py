@@ -1,12 +1,17 @@
 """
 on_cycle hook — unified position-sizing discipline.
 
-Supports three modes via config["mode"]:
-  "kelly"   — Kelly Criterion: sizes from win-rate / payoff ratio derived from
-              trade_history. Falls back to safety_size_pct when history is thin.
-  "pyramid" — Van Tharp pyramiding: splits new signals into tranches; evaluates
-              open positions in portfolio for add opportunities.
-  "fixed"   — Fixed fractional: uses fixed_pct regardless of history.
+Supports four modes via config["mode"]:
+  "kelly"      — Kelly Criterion: sizes from win-rate / payoff ratio derived
+                 from trade_history. Falls back to safety_size_pct when
+                 history is thin.
+  "pyramid"    — Van Tharp pyramiding: splits new signals into tranches;
+                 evaluates open positions in portfolio for add opportunities.
+  "fixed"      — Fixed fractional: uses fixed_pct regardless of history.
+  "vol_target" — Inverse-vol / risk-parity weighting across the current
+                 batch of long signals (docs/design/trading-strategy.md
+                 step 4). Used by the momentum-rotation strategy: no single
+                 position dominates, lower-vol assets get more weight.
 
 No network calls. Pure computation only.
 """
@@ -22,9 +27,14 @@ _SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "scripts")
 sys.path.insert(0, _SCRIPTS)
 
 from pyramid import calculate_tranches, evaluate_add  # noqa: E402
-from sizing import compute_kelly, position_size, stats_from_trades  # noqa: E402
+from sizing import (  # noqa: E402
+    compute_inverse_vol_weights,
+    compute_kelly,
+    position_size,
+    stats_from_trades,
+)
 
-_VALID_MODES = ("kelly", "pyramid", "fixed")
+_VALID_MODES = ("kelly", "pyramid", "fixed", "vol_target")
 
 
 def on_cycle(ctx: dict) -> dict:
@@ -56,6 +66,8 @@ def on_cycle(ctx: dict) -> dict:
         return _run_kelly(pending_signals, portfolio_value, trade_history, config)
     elif mode == "pyramid":
         return _run_pyramid(pending_signals, portfolio, config)
+    elif mode == "vol_target":
+        return _run_vol_target(pending_signals, portfolio_value, config)
     else:  # fixed
         return _run_fixed(pending_signals, portfolio_value, config)
 
@@ -369,6 +381,107 @@ def _run_fixed(
             "msg": (
                 f"Fixed sizing ({fixed_pct}%): {sized_count} signals sized"
                 f" out of {len(pending_signals)} received."
+            ),
+        }
+    )
+    return {"signals": signals, "logs": logs}
+
+
+# ---------------------------------------------------------------------------
+# Mode: vol_target (inverse-vol / risk-parity)
+# ---------------------------------------------------------------------------
+
+def _run_vol_target(
+    pending_signals: list[dict],
+    portfolio_value: float,
+    config: dict,
+) -> dict:
+    """
+    Weight each long candidate inversely to its own volatility so lower-vol
+    assets get more capital and no single position dominates the sleeve.
+
+    Reads volatility from sig["volatility_12m"] (emitted by
+    momentum-factor-12-1) with a fallback of sig["volatility"], and finally
+    config["default_volatility_pct"] if neither is present.
+    """
+    max_position_pct = config.get("max_position_pct", 10.0)
+    default_volatility_pct = config.get("default_volatility_pct", 20.0)
+
+    signals: list[dict] = []
+    logs: list[dict] = []
+
+    long_signals = [s for s in pending_signals if s.get("action") == "long"]
+    other_signals = [s for s in pending_signals if s.get("action") != "long"]
+    signals.extend(other_signals)
+
+    if not long_signals:
+        return {"signals": signals, "logs": logs}
+
+    volatilities: dict[str, float] = {}
+    for sig in long_signals:
+        symbol = sig.get("symbol", "?")
+        vol = sig.get("volatility_12m")
+        if vol is None:
+            vol = sig.get("volatility")
+        if vol is None:
+            vol = default_volatility_pct / 100.0
+            logs.append(
+                {
+                    "level": "warning",
+                    "msg": (
+                        f"{symbol}: no volatility on signal, using default "
+                        f"volatility ({default_volatility_pct}%)"
+                    ),
+                }
+            )
+        volatilities[symbol] = float(vol)
+
+    weights = compute_inverse_vol_weights(volatilities)
+
+    for sig in long_signals:
+        symbol = sig.get("symbol", "?")
+        price = sig.get("price", 0.0)
+        weight = weights.get(symbol, 0.0)
+
+        if price <= 0:
+            logs.append(
+                {"level": "warning", "msg": f"{symbol}: invalid price ({price}), skipped"}
+            )
+            continue
+
+        target_pct = weight
+        capped_at_max = False
+        max_pct_frac = max_position_pct / 100.0
+        if target_pct > max_pct_frac:
+            target_pct = max_pct_frac
+            capped_at_max = True
+
+        position_usd = portfolio_value * target_pct
+        shares = math.floor(position_usd / price) if price > 0 else 0
+        actual_usd = shares * price
+        actual_pct = (actual_usd / portfolio_value * 100) if portfolio_value > 0 else 0.0
+
+        signals.append(
+            {
+                **sig,
+                "vol_target": {
+                    "weight": round(weight, 4),
+                    "volatility_used": round(volatilities[symbol], 4),
+                    "shares": shares,
+                    "position_usd": round(actual_usd, 2),
+                    "position_pct": round(actual_pct, 2),
+                    "capped_at_max": capped_at_max,
+                },
+            }
+        )
+
+    sized_count = sum(1 for s in signals if "vol_target" in s)
+    logs.append(
+        {
+            "level": "info",
+            "msg": (
+                f"Vol-target sizing done: {sized_count} signals sized"
+                f" out of {len(long_signals)} long candidates."
             ),
         }
     )

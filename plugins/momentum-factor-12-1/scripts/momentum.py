@@ -33,9 +33,14 @@ def compute_momentum_ranks(
     Calcula rankings de momentum para un universo de activos.
 
     Args:
-        universe_data: { symbol: [precio_mes_0, ..., precio_mes_-13] }
-                      índice 0 = más reciente, índice -1 = más antiguo
-                      se necesitan al menos 14 precios mensuales (13 meses + inicial)
+        universe_data: { symbol: [precio_mes_0, ..., precio_mes_13] }
+                      ORDEN CRONOLÓGICO — índice 0 = MÁS ANTIGUO (hace 13 meses),
+                      índice -1 = MÁS RECIENTE (mes actual). Esta es la misma
+                      convención que usa el resto del repo (ver
+                      plugins/trend-following/scripts/trend_following.py y
+                      provider_tools.get_ohlcv, que devuelve las últimas N barras
+                      con la más reciente al final).
+                      Se necesitan al menos 14 precios mensuales (13 meses + inicial).
         top_pct:      fracción superior del universo a seleccionar (0.20 = 20%)
         current_positions: set de símbolos actualmente en cartera
 
@@ -51,18 +56,20 @@ def compute_momentum_ranks(
         if len(prices) < 14:
             continue  # datos insuficientes
 
-        # Precios en orden cronológico (índice 0 = más antiguo)
-        # prices[0] = hace 13 meses, prices[-1] = mes actual, prices[-2] = hace 1 mes (skip)
+        # índice 0 = hace 13 meses (más antiguo), índice -1 = mes actual (más reciente)
         price_now = prices[-1]
         price_13m_ago = prices[0]
 
         if price_13m_ago <= 0 or price_now <= 0:
             continue
 
-        # Retorno 12-1: desde hace 13 meses hasta hace 1 mes
+        # Retorno 12-1 (Jegadeesh & Titman): retorno de 12 meses terminando 1 mes
+        # atrás, omitiendo el mes más reciente para evitar reversal de corto plazo.
+        # price_skip_1m = precio hace 1 mes (índice -2, el mes que se omite)
+        # price_window_start = precio hace 13 meses (índice 0) — 12 meses antes del skip
         price_skip_1m = prices[-2]
-        price_12m_ago = prices[0]  # equivalente a 13m - 1m = 12m de lookback desde skip
-        return_12_1 = price_skip_1m / price_12m_ago - 1.0
+        price_window_start = prices[0]
+        return_12_1 = price_skip_1m / price_window_start - 1.0
 
         # Volatilidad anualizada (desviación estándar de retornos mensuales × √12)
         monthly_returns = [prices[i + 1] / prices[i] - 1.0 for i in range(len(prices) - 1)]
@@ -93,11 +100,15 @@ def compute_momentum_ranks(
         # Vol-adjusted score: mejor measure para weighting dentro del portfolio
         vol_adj = ret / max(vol, 0.01)  # evitar div/0
 
-        # Señal
-        if in_top:
+        # Señal — filtro de momentum absoluto (Antonacci, dual momentum):
+        # solo se emite "long" si además de estar en el top relativo, el
+        # retorno 12-1 propio del activo es positivo. Sin este filtro un
+        # activo podría rankear #1 en un universo en caída generalizada y
+        # aun así recibir una señal de compra.
+        if in_top and ret > 0:
             signal = "long"
         elif symbol in current_positions:
-            signal = "exit"  # estaba en cartera pero salió del top
+            signal = "exit"  # estaba en cartera pero salió del top o del filtro absoluto
         else:
             signal = "neutral"
 

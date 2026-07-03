@@ -1,6 +1,6 @@
 ---
 name: Position Sizing (Unified)
-description: Unified position-sizing discipline with three selectable modes — Kelly Criterion, Van Tharp Pyramiding, and Fixed Fractional. Use BEFORE opening any position to determine how many shares/units to buy. Consolidates kelly-criterion and position-sizing-pyramid into one plugin.
+description: Unified position-sizing discipline with four selectable modes — Kelly Criterion, Van Tharp Pyramiding, Fixed Fractional, and Vol-Target (inverse-vol / risk-parity). Use BEFORE opening any position to determine how many shares/units to buy. Consolidates kelly-criterion and position-sizing-pyramid into one plugin.
 ---
 
 # Position Sizing — Unified Discipline
@@ -67,12 +67,39 @@ Best for: early-stage portfolios, strategies without enough history for Kelly, o
 
 ---
 
+### `mode = "vol_target"` — Inverse-Vol / Risk-Parity
+
+Weights each long candidate in the current batch inversely to its own volatility, so
+lower-vol assets get more capital and no single position dominates. This is the sizing
+half of the dual/time-series momentum strategy (`docs/design/trading-strategy.md` step 4).
+
+**Formula:**
+```
+w_i = (1 / vol_i) / sum_j(1 / vol_j)
+position_i = min(w_i, max_position_pct) × portfolio_value
+```
+
+**Volatility source (in priority order):** `signal["volatility_12m"]` (emitted by
+`momentum-factor-12-1`) → `signal["volatility"]` → `config.default_volatility_pct` (with a
+warning log when falling back).
+
+**Config params used:** `max_position_pct`, `default_volatility_pct`
+
+**Example (two candidates):**
+```
+vol_A = 0.10, vol_B = 0.30
+w_A = (1/0.10) / (1/0.10 + 1/0.30) = 10 / 13.33 ≈ 0.75
+w_B = (1/0.30) / (1/0.10 + 1/0.30) = 3.33 / 13.33 ≈ 0.25
+```
+
+---
+
 ## ctx contract (`on_cycle`)
 
 | Field | Type | Required by |
 |---|---|---|
 | `pending_signals` | `list[dict]` | all modes |
-| `portfolio_value` | `float` | kelly, fixed |
+| `portfolio_value` | `float` | kelly, fixed, vol_target |
 | `portfolio` | `dict[symbol → position]` | pyramid (for adds) |
 | `trade_history` | `list[dict]` with `pnl_pct` | kelly |
 | `config` | `dict` | all modes |
@@ -84,6 +111,7 @@ Best for: early-stage portfolios, strategies without enough history for Kelly, o
 | `kelly` | `"kelly"` | shares, position_usd, position_pct, risk_usd, reward_usd, rr_ratio, warning |
 | `pyramid` | `"pyramid_plan"` + sets `size_pct` | total_tranches, executed_tranches, remaining_tranches |
 | `fixed` | `"fixed"` | shares, position_usd, position_pct, risk_usd, reward_usd, rr_ratio |
+| `vol_target` | `"vol_target"` | weight, volatility_used, shares, position_usd, position_pct, capped_at_max |
 
 Non-long signals (exit, neutral) always pass through unchanged.
 

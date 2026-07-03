@@ -107,6 +107,7 @@ def on_cycle(ctx: dict) -> dict:
                     "rank": r.rank,
                     "return_12_1": r.return_12_1,
                     "percentile": r.percentile,
+                    "volatility_12m": r.volatility_12m,
                     "vol_adjusted_score": r.vol_adjusted_score,
                     "confidence": r.percentile,
                 }
