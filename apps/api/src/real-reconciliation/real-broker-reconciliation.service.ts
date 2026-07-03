@@ -52,6 +52,7 @@ import { normalizeBrokerStatus } from '../common/broker-status.util';
 import { AlertsService } from '../alerts/alerts.service';
 import { haltRealExecution } from '../common/real-execution-halt.util';
 import { RealOrderService } from '../real-order/real-order.service';
+import { randomUUID } from 'crypto';
 import type { RealOrder } from '@prisma/client';
 
 /** Persisted circuit-breaker state — mirrors CycleSchedulerService.CircuitBreakerState. */
@@ -926,6 +927,131 @@ export class RealBrokerReconciliationService implements OnModuleInit, OnModuleDe
     }
 
     return drifted;
+  }
+
+  // ── adoptBrokerPosition ───────────────────────────────────────────────────
+
+  /**
+   * Reconciles a REAL broker position that already exists at the broker but has
+   * no explaining fill history on this platform into the ledger — the resolution
+   * for a BROKER_DRIFT halt caused by legacy fire-and-forget orders (a position
+   * held at the broker with no filled RealOrder row). Without this, clearing the
+   * kill-switch is futile: the next syncPortfolio tick re-detects the unexplained
+   * position and re-trips the halt (a permanent dead end).
+   *
+   * NEVER fabricates a position: it re-fetches broker truth via getPortfolio and
+   * refuses (throws, with NO writes) if the symbol is not currently reported by
+   * the broker. This is pure LEDGER reconciliation to an already-existing broker
+   * position — it does NOT place or cancel any order.
+   *
+   * Writes, in ONE `$transaction`:
+   *   - a companion TradeIntent (status 'executed', mode 'real') — the RealOrder
+   *     schema requires a non-null trade_intent_id FK, and this row documents the
+   *     adoption as an executed real-mode intent.
+   *   - ONE RealOrder with status 'filled', filled_qty = |broker qty| (> 0 so it
+   *     satisfies detectDrift's `filled_qty>0` query with NO change to
+   *     detectDrift), filled_avg_price = broker avg_entry, a unique
+   *     `adopted-<uuid>` client_order_id, null broker_order_id, and the adoption
+   *     marked in broker_raw_json ({adopted, adopted_at, note}).
+   *
+   * The adopted RealOrder is TERMINAL ('filled'), so reconcileAllOpenOrders'
+   * OPEN_STATUSES query (submitted/accepted/partially_filled) never selects it
+   * and reconcileOrder() short-circuits on its already-terminal guard — a real
+   * broker call is never made for it again.
+   *
+   * Adopting does NOT itself clear the halt (that stays a human/TOTP action) — it
+   * removes the reason drift re-trips. As a convenience it re-runs
+   * syncPortfolio()+detectDrift() so the caller sees drift cleared in the same
+   * request; the returned driftedSymbols reflects the post-adoption state.
+   */
+  async adoptBrokerPosition(
+    symbol: string,
+    brokerPluginId: string,
+    note?: string,
+  ): Promise<{ adopted: RealOrder; driftedSymbols: string[] }> {
+    const portfolio = await this.gateway.getPortfolio(brokerPluginId);
+    const pos = portfolio.positions.find((p) => p.symbol === symbol);
+    if (!pos) {
+      // No-fabrication invariant: only adopt a position that currently exists at
+      // the broker. Refuse with NO writes when the symbol is not reported.
+      throw new Error(
+        `adoptBrokerPosition: broker=${brokerPluginId} does not currently report a position ` +
+          `for symbol=${symbol} — refusing to fabricate a position (nothing written)`,
+      );
+    }
+
+    const now = new Date();
+    // filled_qty must be strictly positive to satisfy detectDrift; the broker
+    // reports a negative qty for a short, so the size is |qty| and direction is
+    // carried by `side` instead.
+    const qty = Math.abs(pos.qty);
+    const side = pos.side === 'short' ? 'sell' : 'buy';
+    const action = pos.side === 'short' ? 'short' : 'long';
+    const clientOrderId = `adopted-${randomUUID()}`;
+    const noteSuffix = note ? `: ${note}` : '';
+    const brokerRawJson = JSON.stringify({
+      adopted: true,
+      adopted_at: now.toISOString(),
+      note: note ?? null,
+    });
+
+    const adopted = await this.db.$transaction(async (tx) => {
+      const intent = await tx.tradeIntent.create({
+        data: {
+          symbol,
+          action,
+          confidence: 1,
+          rationale: `Adopted pre-existing broker position (${symbol})${noteSuffix}`,
+          mode: 'real',
+          status: 'executed',
+          fill_price: pos.avg_entry,
+          quantity: qty,
+        },
+      });
+
+      return tx.realOrder.create({
+        data: {
+          trade_intent_id: intent.id,
+          broker_plugin_id: brokerPluginId,
+          client_order_id: clientOrderId,
+          broker_order_id: null,
+          symbol,
+          side,
+          order_type: 'market',
+          requested_qty: qty,
+          status: 'filled',
+          filled_qty: qty,
+          filled_avg_price: pos.avg_entry,
+          submitted_at: now,
+          filled_at: now,
+          last_reconciled_at: now,
+          broker_raw_json: brokerRawJson,
+        },
+      });
+    });
+
+    this.log.warn(
+      `adoptBrokerPosition: adopted broker position symbol=${symbol} qty=${qty} side=${side} ` +
+        `avg_entry=${pos.avg_entry} broker=${brokerPluginId} into RealOrder ${adopted.id} ` +
+        `(client_order_id=${clientOrderId}) — drift will no longer re-trip; the halt still ` +
+        `requires a human/TOTP clear`,
+    );
+
+    // Re-run the portfolio sync so the caller sees drift cleared in this same
+    // request (the adopted row now explains the position). Fail-soft: a sync
+    // failure here never undoes the adoption above.
+    const { driftedSymbols } = await this.syncPortfolio(brokerPluginId, 'poll');
+    return { adopted, driftedSymbols };
+  }
+
+  /**
+   * Public accessor for the active broker plugin id (KV) — used by the operator
+   * adoption endpoint, which receives only {symbol, note} and must resolve the
+   * broker the same way the reconciliation loop does. Empty string when no
+   * broker is configured (adoptBrokerPosition then refuses on getPortfolio).
+   */
+  async getActiveBrokerPluginId(): Promise<string> {
+    return this._resolveBrokerPluginId();
   }
 
   /** Reads the active broker plugin id the same way TradeIntentService._effectiveMode does. */

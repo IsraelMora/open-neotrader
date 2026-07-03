@@ -93,10 +93,15 @@ function makeTxClient(): TxClient {
  * method with an implicit `this`, and that lint rule flags any bare reference to it (even
  * behind an `as jest.Mock` cast) as unsafe to detach from its object.
  */
+/** Shared shape for the hand-built Prisma delegate mocks used across these suites. */
+type ReconPrismaMock = jest.Mocked<
+  Pick<PrismaService, 'realOrder' | 'tradeIntent' | '$transaction'>
+>;
+
 function makePrisma(opts?: {
   findUniqueResult?: RealOrderRow | null;
   txClient?: TxClient;
-}): jest.Mocked<Pick<PrismaService, 'realOrder' | 'tradeIntent' | '$transaction'>> & {
+}): ReconPrismaMock & {
   _realOrderFindMany: jest.Mock;
 } {
   const txClient = opts?.txClient ?? makeTxClient();
@@ -119,7 +124,7 @@ function makePrisma(opts?: {
     tradeIntent,
     $transaction,
     _realOrderFindMany: realOrderFindMany,
-  } as unknown as jest.Mocked<Pick<PrismaService, 'realOrder' | 'tradeIntent' | '$transaction'>> & {
+  } as unknown as ReconPrismaMock & {
     _realOrderFindMany: jest.Mock;
   };
 }
@@ -1941,5 +1946,134 @@ describe('RealBrokerReconciliationService — portfolio sync wiring into the rec
     expect(syncSpy).toHaveBeenLastCalledWith('alpaca', 'poll');
 
     svc.onModuleDestroy();
+  });
+});
+
+// ── adoptBrokerPosition ─────────────────────────────────────────────────────
+//
+// Broker-position adoption: writes ONE filled RealOrder (filled_qty>0) for a
+// position that already exists at the broker but has NO explaining fill history
+// (legacy fire-and-forget era). This satisfies detectDrift's `filled_qty>0`
+// query with no change to detectDrift, so drift stops re-tripping the halt on
+// the next syncPortfolio tick. NEVER fabricates: a symbol the broker does not
+// currently report is refused with no writes.
+
+type AdoptTxClient = {
+  tradeIntent: { create: jest.Mock };
+  realOrder: { create: jest.Mock };
+  realPosition: { deleteMany: jest.Mock; upsert: jest.Mock };
+  realNavSnapshot: { findFirst: jest.Mock; create: jest.Mock };
+};
+
+function makeAdoptTxClient(): AdoptTxClient {
+  return {
+    tradeIntent: { create: jest.fn().mockResolvedValue({ id: 'ti_adopted' }) },
+    realOrder: {
+      create: jest
+        .fn()
+        .mockImplementation((args: { data: Record<string, unknown> }) =>
+          Promise.resolve({ id: 'ro_adopted', ...args.data }),
+        ),
+    },
+    realPosition: {
+      deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      upsert: jest.fn().mockResolvedValue(undefined),
+    },
+    realNavSnapshot: {
+      findFirst: jest.fn().mockResolvedValue(null),
+      create: jest.fn().mockResolvedValue(undefined),
+    },
+  };
+}
+
+function makeAdoptPrisma(opts?: {
+  txClient?: AdoptTxClient;
+  realOrderFindFirstResult?: unknown;
+}): ReconPrismaMock & {
+  _tx: AdoptTxClient;
+} {
+  const txClient = opts?.txClient ?? makeAdoptTxClient();
+  // detectDrift (run by the follow-up syncPortfolio) looks up an explaining
+  // RealOrder — a truthy result models "the adopted row now explains it".
+  const realOrderFindFirstResult =
+    opts && 'realOrderFindFirstResult' in opts
+      ? opts.realOrderFindFirstResult
+      : { id: 'ro_adopted' };
+  const realOrder = {
+    findFirst: jest.fn().mockResolvedValue(realOrderFindFirstResult),
+    create: txClient.realOrder.create,
+  };
+  const tradeIntent = { create: txClient.tradeIntent.create };
+  const $transaction = jest
+    .fn()
+    .mockImplementation(async (fn: (tx: AdoptTxClient) => Promise<unknown>) => fn(txClient));
+
+  return {
+    realOrder,
+    tradeIntent,
+    $transaction,
+    _tx: txClient,
+  } as unknown as ReconPrismaMock & {
+    _tx: AdoptTxClient;
+  };
+}
+
+describe('RealBrokerReconciliationService.adoptBrokerPosition', () => {
+  it('writes ONE filled RealOrder (filled_qty=broker qty) that explains the position, clearing drift', async () => {
+    const txClient = makeAdoptTxClient();
+    const prisma = makeAdoptPrisma({ txClient, realOrderFindFirstResult: { id: 'ro_adopted' } });
+    const portfolio = makePortfolio({
+      positions: [makeBrokerPosition({ symbol: 'SPY', qty: 4, avg_entry: 500, side: 'long' })],
+    });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const alerts = makePortfolioAlerts();
+    const svc = makePortfolioService(prisma, gateway, makeKv(), alerts);
+
+    const result = await svc.adoptBrokerPosition('SPY', 'alpaca', 'legacy fire-and-forget');
+
+    expect(txClient.realOrder.create).toHaveBeenCalledTimes(1);
+    const roArgs = callArg<{ data: Record<string, unknown> }>(txClient.realOrder.create);
+    expect(roArgs.data['status']).toBe('filled');
+    expect(roArgs.data['filled_qty']).toBe(4);
+    expect(roArgs.data['filled_avg_price']).toBeCloseTo(500, 5);
+    expect(roArgs.data['symbol']).toBe('SPY');
+    expect(roArgs.data['broker_plugin_id']).toBe('alpaca');
+    expect(roArgs.data['side']).toBe('buy');
+    expect(roArgs.data['broker_order_id']).toBeNull();
+    expect(String(roArgs.data['client_order_id'])).toMatch(/^adopted-/);
+    expect(String(roArgs.data['broker_raw_json'])).toContain('"adopted":true');
+    expect(String(roArgs.data['broker_raw_json'])).toContain('legacy fire-and-forget');
+
+    // Follow-up sync re-runs detectDrift; the adopted row now explains the position.
+    expect(result.driftedSymbols).toEqual([]);
+  });
+
+  it('adopts a short position: filled_qty is the absolute size and side is sell', async () => {
+    const txClient = makeAdoptTxClient();
+    const prisma = makeAdoptPrisma({ txClient });
+    const portfolio = makePortfolio({
+      positions: [makeBrokerPosition({ symbol: 'UUP', qty: -3, avg_entry: 28, side: 'short' })],
+    });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const svc = makePortfolioService(prisma, gateway);
+
+    await svc.adoptBrokerPosition('UUP', 'alpaca');
+
+    const roArgs = callArg<{ data: Record<string, unknown> }>(txClient.realOrder.create);
+    expect(roArgs.data['filled_qty']).toBe(3);
+    expect(roArgs.data['side']).toBe('sell');
+  });
+
+  it('throws and writes nothing when the symbol is not currently a broker position (never fabricates)', async () => {
+    const txClient = makeAdoptTxClient();
+    const prisma = makeAdoptPrisma({ txClient });
+    const portfolio = makePortfolio({ positions: [makeBrokerPosition({ symbol: 'SPY' })] });
+    const gateway = makePortfolioGateway({ getPortfolioResult: portfolio });
+    const svc = makePortfolioService(prisma, gateway);
+
+    await expect(svc.adoptBrokerPosition('QQQ', 'alpaca')).rejects.toThrow(/QQQ/);
+
+    expect(txClient.tradeIntent.create).not.toHaveBeenCalled();
+    expect(txClient.realOrder.create).not.toHaveBeenCalled();
   });
 });
