@@ -364,13 +364,27 @@ export class PretestService {
 
     const pluginIds = pluginsWithOverrides.map((p: HydratedPlugin) => p.id);
 
+    // Per-plugin effective config (manifest/persisted defaults overlaid with
+    // portfolio.plugin_configs[pluginId]), keyed by plugin id. runner.py's
+    // cmd_run_cycle layers this on top of each plugin's manifest [config] defaults
+    // for that plugin ONLY — this is what makes different pretest portfolios that
+    // share a plugin (e.g. momentum-factor-12-1 with different top_pct/lookback_months)
+    // actually diverge instead of all running with identical manifest defaults.
+    const pluginConfigs: Record<string, Record<string, unknown>> = {};
+    for (const p of pluginsWithOverrides) {
+      pluginConfigs[p.id] = p.config;
+    }
+
     // ── Ciclo de señales ──────────────────────────────────────────────────────
     const cycleCtx: Record<string, unknown> = {
       pretest_mode: true,
       pretest_id: id,
       universe: market.universe,
       ohlcv: market.ohlcv,
+      // Legacy global config left empty: this pretest engine always differentiates
+      // per plugin via plugin_configs below, never via a single shared config.
       config: {},
+      plugin_configs: pluginConfigs,
       portfolio: this._positionsToPortfolioDict(portfolio.state),
       portfolio_state: portfolio.state,
       portfolio_value: portfolio.state.equity,
