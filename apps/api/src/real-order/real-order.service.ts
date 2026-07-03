@@ -159,6 +159,7 @@ export class RealOrderService implements OnModuleInit {
     const existingActiveForSymbol = await this.findActiveOrderForSymbol(
       args.symbol,
       args.brokerPluginId,
+      args.side,
     );
     if (existingActiveForSymbol) {
       this.log.warn(
@@ -294,19 +295,30 @@ export class RealOrderService implements OnModuleInit {
   }
 
   /**
-   * Finds the NON-TERMINAL RealOrder row for a symbol+broker, if any, regardless of
-   * trade_intent_id. See submit()'s symbol-scoped guard doc for why this exists
-   * alongside findActiveOrderForIntent — the per-intent guard alone misses a
-   * resubmit for the SAME symbol from a freshly-created TradeIntent.
+   * Finds the NON-TERMINAL RealOrder row for a symbol+broker+side, if any, regardless
+   * of trade_intent_id. See submit()'s symbol-scoped guard doc for why this exists
+   * alongside findActiveOrderForIntent — the per-intent guard alone misses a resubmit
+   * for the SAME symbol from a freshly-created TradeIntent.
+   *
+   * MONEY-SAFETY: side is part of the match on purpose. This guard's only job is to
+   * stop a SAME-side duplicate re-submit spam (e.g. the LLM re-emitting "exit SPY"
+   * every cycle). Matching on symbol+broker alone — without side — let an unrelated
+   * open BUY silently skip a genuine EXIT (SELL) submit for the same symbol, leaving a
+   * real position un-closeable. That violates the non-negotiable invariant "exit/hold:
+   * a position must always be closeable." Keeping side in the where clause ensures an
+   * open BUY never blocks a SELL (and vice-versa) while still deduping a second SELL
+   * against an in-flight SELL.
    */
   private async findActiveOrderForSymbol(
     symbol: string,
     brokerPluginId: string,
+    side: string,
   ): Promise<RealOrder | null> {
     return this.db.realOrder.findFirst({
       where: {
         symbol,
         broker_plugin_id: brokerPluginId,
+        side,
         status: { notIn: TERMINAL_STATUSES },
       },
       orderBy: { created_at: 'desc' },

@@ -653,22 +653,25 @@ describe('RealOrderService.submit — per-intent idempotency', () => {
 // findActiveOrderForIntent never finds a match even though an order for the SAME
 // symbol+broker is still open. This caused a real SPY sell to be resubmitted every
 // cycle, hitting Alpaca 403 "insufficient qty" repeatedly. The fix: after the
-// per-intent check, also check for any non-terminal order on the same symbol+broker,
-// regardless of trade_intent_id.
+// per-intent check, also check for any non-terminal order on the same symbol+broker
+// AND SAME SIDE, regardless of trade_intent_id — side-scoping was added after a review
+// found the side-agnostic version could block a genuine EXIT (see the money-safety
+// fix test group below): an open BUY must never block a SELL, and vice-versa.
 
 describe('RealOrderService.submit — symbol-scoped guard (Fix 4)', () => {
-  it('an active order for the SAME symbol+broker but a DIFFERENT trade_intent_id blocks resubmit: placeOrder is never called and the existing row is returned', async () => {
+  it('an active order for the SAME symbol+broker+side but a DIFFERENT trade_intent_id blocks resubmit: placeOrder is never called and the existing row is returned', async () => {
     const openSymbolOrder = makeRow({
       id: 'ro_open_spy',
       trade_intent_id: 'ti_previous_cycle',
       symbol: 'SPY',
       broker_plugin_id: 'alpaca',
+      side: 'sell',
       status: 'submitted',
     });
     const prisma = makePrisma();
     // First findFirst call: per-intent guard for the NEW trade_intent_id — no active row.
-    // Second findFirst call: symbol-scoped guard — finds the still-open SPY order from
-    // a previous cycle's (different) trade_intent_id.
+    // Second findFirst call: symbol-scoped guard — finds the still-open SPY SELL order
+    // from a previous cycle's (different) trade_intent_id.
     (prisma.realOrder.findFirst as jest.Mock)
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(openSymbolOrder);
@@ -708,7 +711,7 @@ describe('RealOrderService.submit — symbol-scoped guard (Fix 4)', () => {
     expect(gateway.placeOrder).toHaveBeenCalledTimes(1);
   });
 
-  it('the symbol-scoped guard query is scoped to symbol + broker_plugin_id and excludes terminal statuses', async () => {
+  it('the symbol-scoped guard query is scoped to symbol + broker_plugin_id + side and excludes terminal statuses', async () => {
     const prisma = makePrisma();
     (prisma.realOrder.findFirst as jest.Mock)
       .mockResolvedValueOnce(null)
@@ -727,15 +730,109 @@ describe('RealOrderService.submit — symbol-scoped guard (Fix 4)', () => {
     const findFirstCalls = (prisma.realOrder.findFirst as jest.Mock).mock.calls as unknown[][];
     expect(findFirstCalls.length).toBeGreaterThanOrEqual(2);
     const symbolGuardArgs = findFirstCalls[1][0] as {
-      where: { symbol: string; broker_plugin_id: string; status: { notIn: string[] } };
+      where: {
+        symbol: string;
+        broker_plugin_id: string;
+        side: string;
+        status: { notIn: string[] };
+      };
     };
     expect(symbolGuardArgs.where.symbol).toBe('SPY');
     expect(symbolGuardArgs.where.broker_plugin_id).toBe('alpaca');
+    expect(symbolGuardArgs.where.side).toBe('sell');
     const actualSorted = [...symbolGuardArgs.where.status.notIn].sort((a, b) => a.localeCompare(b));
     const expectedSorted = ['canceled', 'expired', 'filled', 'rejected', 'submit_failed'].sort(
       (a, b) => a.localeCompare(b),
     );
     expect(actualSorted).toEqual(expectedSorted);
+  });
+});
+
+// ── submit — side-aware symbol guard money-safety fix ─────────────────────────────
+//
+// CRITICAL money-safety regression found in review: the Fix 4 symbol-scoped guard
+// matched on symbol + broker_plugin_id + non-terminal status only, WITHOUT side. That
+// meant an unrelated open BUY for a symbol could silently skip a genuine EXIT (SELL)
+// submit for that same symbol — leaving a real position un-closeable, violating the
+// non-negotiable invariant "exit/hold: a position must always be closeable." The fix
+// adds side to the guard so it only dedupes SAME-side resubmits (preserving the
+// original anti-spam behavior) while a cross-side submit (e.g. BUY open, SELL
+// incoming) always reaches the broker.
+
+describe('RealOrderService.submit — side-aware symbol guard (money-safety fix)', () => {
+  it('an existing non-terminal BUY for the symbol does NOT block a SELL (exit) submit: placeOrder IS called and a new row is created', async () => {
+    const openBuyOrder = makeRow({
+      id: 'ro_open_buy',
+      trade_intent_id: 'ti_entry_cycle',
+      symbol: 'SPY',
+      broker_plugin_id: 'alpaca',
+      side: 'buy',
+      status: 'submitted',
+    });
+    const freshSellRow = makeRow({
+      id: 'ro_exit_sell',
+      trade_intent_id: 'ti_exit_cycle',
+      symbol: 'SPY',
+      broker_plugin_id: 'alpaca',
+      side: 'sell',
+      status: 'pending_submit',
+    });
+    const prisma = makePrisma({ createResult: freshSellRow });
+    // First findFirst call: per-intent guard for the NEW trade_intent_id — no active row.
+    // Second findFirst call: side-aware symbol-scoped guard — must NOT match the open
+    // BUY because it's a different side, so it should resolve null here.
+    (prisma.realOrder.findFirst as jest.Mock)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    const gateway = makeGateway({ placeOrderResult: { id: 'broker_order_exit' } });
+    const svc = makeService(prisma, gateway);
+
+    const result = await svc.submit({
+      tradeIntentId: 'ti_exit_cycle',
+      brokerPluginId: 'alpaca',
+      symbol: 'SPY',
+      side: 'sell',
+      requestedQty: 10,
+    });
+
+    expect(gateway.placeOrder).toHaveBeenCalledTimes(1);
+    expect((prisma.realOrder.create as jest.Mock).mock.calls).toHaveLength(1);
+    expect(result).not.toEqual(openBuyOrder);
+
+    // Assert the guard query actually scoped by side=sell (the incoming order's side),
+    // so it structurally cannot match the open buy order above.
+    const findFirstCalls = (prisma.realOrder.findFirst as jest.Mock).mock.calls as unknown[][];
+    const symbolGuardArgs = findFirstCalls[1][0] as { where: { side: string } };
+    expect(symbolGuardArgs.where.side).toBe('sell');
+  });
+
+  it('an existing non-terminal SELL for the symbol still blocks a second SELL submit (same-side dedupe preserved): placeOrder is never called and the existing row is returned', async () => {
+    const openSellOrder = makeRow({
+      id: 'ro_open_sell',
+      trade_intent_id: 'ti_previous_exit_cycle',
+      symbol: 'SPY',
+      broker_plugin_id: 'alpaca',
+      side: 'sell',
+      status: 'submitted',
+    });
+    const prisma = makePrisma();
+    (prisma.realOrder.findFirst as jest.Mock)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(openSellOrder);
+    const gateway = makeGateway();
+    const svc = makeService(prisma, gateway);
+
+    const result = await svc.submit({
+      tradeIntentId: 'ti_new_exit_cycle',
+      brokerPluginId: 'alpaca',
+      symbol: 'SPY',
+      side: 'sell',
+      requestedQty: 10,
+    });
+
+    expect(result).toEqual(openSellOrder);
+    expect(gateway.placeOrder).not.toHaveBeenCalled();
+    expect((prisma.realOrder.create as jest.Mock).mock.calls).toHaveLength(0);
   });
 });
 
