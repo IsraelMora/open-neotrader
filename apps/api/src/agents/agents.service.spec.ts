@@ -490,9 +490,12 @@ describe('AgentsService._executeCycle — decision prompt injection (Phase 6.3)'
     expect(sentPrompt).toContain(decisionPrompt);
     // Compact tool schema must be present (no pretty-printing).
     expect(sentPrompt).toContain('my-provider__do_thing');
-    // Compact JSON: no newlines inside the schema portion.
-    const schemaJson = JSON.stringify(tools);
+    // Compact JSON: no newlines inside the schema portion. The provider tool is
+    // serialized first, followed by the always-present kernel__web_search tool
+    // (see runGovernedTurn — web_search is available in every non-chat turn).
+    const schemaJson = JSON.stringify(tools[0]);
     expect(sentPrompt).toContain(schemaJson);
+    expect(sentPrompt).toContain('kernel__web_search');
   });
 
   it('does NOT inject decision prompt or tool schema when no decision plugin is active', async () => {
@@ -5815,6 +5818,599 @@ describe('F6-S2 PR3 — kernel__record_lesson dispatch', () => {
   });
 });
 
+// ── kernel__web_search — KERNEL-level, provider-agnostic web search ───────────
+//
+// Unlike the other kernel__* tools, web_search is READ-ONLY and available in ANY
+// non-chat governed turn (cycle/pretest/reflection), not just reflection. It must
+// never create a trade signal, never touch the veto/real-order path, and must never
+// starve the real trade tool call by consuming the anti-amplification budget.
+
+import type { WebSearchService, WebSearchResult } from '../web-search/web-search.service';
+
+/** Minimal WebSearchService stub. */
+function makeWebSearchStub(
+  result: WebSearchResult = { ok: true, text: 'search text', sources: ['https://example.com'] },
+): jest.Mocked<Pick<WebSearchService, 'search'>> {
+  return { search: jest.fn().mockResolvedValue(result) };
+}
+
+/** Build an AgentsService with webSearch wired in as the last (18th) constructor arg. */
+function makeWebSearchAgentsService(
+  audit: ReturnType<typeof makeAudit>,
+  plugins: ReturnType<typeof makeFullPlugins>,
+  webSearch?: ReturnType<typeof makeWebSearchStub> | null,
+  llm?: Partial<LlmService>,
+  kv?: ReturnType<typeof makeKvSingleTurn>,
+): AgentsService {
+  return new (AgentsService as unknown as new (
+    llm: unknown,
+    sandbox: unknown,
+    plugins: unknown,
+    memory: unknown,
+    audit: unknown,
+    alerts: unknown,
+    snapshot: unknown,
+    cfg: unknown,
+    notifier: unknown,
+    pretest: unknown,
+    kv: unknown,
+    longTermMemory: unknown,
+    debate: unknown,
+    providerGateway: unknown,
+    mlSignalRecord: unknown,
+    tradeIntent: unknown,
+    prisma: unknown,
+    webSearch: unknown,
+  ) => AgentsService)(
+    llm ?? {},
+    makeSandbox(),
+    plugins,
+    makeMemory(),
+    audit,
+    { createBulk: jest.fn().mockResolvedValue([]) },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    kv ?? makeKvSingleTurn(),
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    webSearch ?? undefined,
+  );
+}
+
+/** Full-return-typed _executeToolCalls caller — includes signalsEmitted/executedCount. */
+async function callExecuteToolCallsFull(
+  service: AgentsService,
+  cycleId: string,
+  calls: import('../llm/llm.service').ToolCallRequest[],
+  budget = Number.MAX_SAFE_INTEGER,
+  webSearchBudget?: number,
+): Promise<{
+  decisions: import('./agents.service').Decision[];
+  sandbox_results: import('./agents.service').SandboxResult[];
+  signalsEmitted: { symbol: string; action: string }[];
+  executedCount: number;
+  webSearchExecutedCount: number;
+}> {
+  return (
+    service as unknown as {
+      _executeToolCalls: (
+        c: string,
+        t: import('../llm/llm.service').ToolCallRequest[],
+        b: number,
+        wsb?: number,
+      ) => Promise<{
+        decisions: import('./agents.service').Decision[];
+        sandbox_results: import('./agents.service').SandboxResult[];
+        signalsEmitted: { symbol: string; action: string }[];
+        executedCount: number;
+        webSearchExecutedCount: number;
+      }>;
+    }
+  )._executeToolCalls(cycleId, calls, budget, webSearchBudget);
+}
+
+describe('kernel__web_search — _validateToolCalls source gate', () => {
+  const CYCLE_ID = 'web-search-validate-001';
+
+  it.each(['cycle', 'pretest', 'reflection'])(
+    'is NOT dropped for source=%s (read-only tool bypasses the reflection-only gate)',
+    async (source) => {
+      const audit = makeAudit();
+      const plugins = makeFullPlugins();
+      const service = makeWebSearchAgentsService(audit, plugins, makeWebSearchStub());
+
+      const calls: import('../llm/llm.service').ToolCallRequest[] = [
+        { plugin_id: 'kernel', function: 'web_search', args: { query: 'fed rate decision' } },
+      ];
+
+      const valid = await callValidateWithSource(service, CYCLE_ID, calls, source);
+
+      expect(valid).toHaveLength(1);
+      expect(valid[0]?.function).toBe('web_search');
+    },
+  );
+
+  it('is dropped as unknown_kernel_tool when NOT in KERNEL_TOOL_REGISTRY is violated — sanity check web_search IS registered', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const service = makeWebSearchAgentsService(audit, plugins, makeWebSearchStub());
+
+    const calls: import('../llm/llm.service').ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'web_search', args: { query: 'x' } },
+    ];
+
+    await callValidateWithSource(service, CYCLE_ID, calls, 'cycle');
+
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'tool_call_dropped',
+        meta: expect.objectContaining({ reason: 'unknown_kernel_tool' }) as unknown,
+      }),
+    );
+  });
+});
+
+describe('kernel__web_search — tool schema injection', () => {
+  function buildCapturingService(
+    source: NonReflectionSource,
+    capturedSchema: { tools: string }[],
+  ): AgentsService {
+    const llm: Partial<LlmService> = {
+      complete: jest.fn().mockImplementation((opts: { system_prompt?: string }) => {
+        const sp = opts.system_prompt ?? '';
+        const match = /\[TOOL SCHEMA\]\n([\s\S]*?)(?:\n\n|$)/.exec(sp);
+        capturedSchema.push({ tools: match ? match[1] : '' });
+        return Promise.resolve({
+          text: '',
+          tool_calls: [],
+          backend: 'api' as const,
+          skills_read: [],
+          skills_written: [],
+        } as LlmResponse);
+      }),
+    };
+    const plugins = makeFullPlugins('Use tools via JSON.', []);
+    return makeWebSearchAgentsService(
+      { log: jest.fn().mockResolvedValue(undefined) },
+      plugins,
+      makeWebSearchStub(),
+      llm,
+    );
+  }
+
+  it('source:cycle → kernel__web_search IS in the injected [TOOL SCHEMA] (not reflection-gated)', async () => {
+    const captured: { tools: string }[] = [];
+    const service = buildCapturingService('cycle', captured);
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'run cycle' });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).toContain('kernel__web_search');
+  });
+
+  it('source:chat → kernel__web_search NOT in the injected schema (chat has no tools at all)', async () => {
+    const captured: { tools: string }[] = [];
+    const service = buildCapturingService('chat', captured);
+
+    await service.runGovernedTurn({ source: 'chat', context: 'ask something' });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].tools).not.toContain('kernel__web_search');
+  });
+});
+
+describe('kernel__web_search — dispatch (_dispatchKernelTool / _executeToolCalls)', () => {
+  const CYCLE_ID = 'web-search-dispatch-001';
+
+  it('dispatches to WebSearchService.search and feeds the result back as a sandbox_result (not a signal)', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const webSearch = makeWebSearchStub({
+      ok: true,
+      text: 'The Fed held rates steady.',
+      sources: ['https://example.com/fed'],
+    });
+    const service = makeWebSearchAgentsService(audit, plugins, webSearch);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'web_search',
+      args: { query: 'fed rate decision' },
+    };
+
+    const { decisions, sandbox_results, signalsEmitted } = await callExecuteToolCallsFull(
+      service,
+      CYCLE_ID,
+      [tc],
+    );
+
+    expect(webSearch.search).toHaveBeenCalledWith('fed rate decision');
+    expect(decisions[0]?.allowed).toBe(true);
+    expect(sandbox_results[0]?.ok).toBe(true);
+    expect((sandbox_results[0]?.result as { text: string }).text).toBe(
+      'The Fed held rates steady.',
+    );
+    // NEVER a trade signal — web_search is read-only.
+    expect(signalsEmitted).toHaveLength(0);
+
+    // Audited as a benign info event.
+    const infoEvent = findAuditEvent(audit, 'kernel_web_search');
+    expect(infoEvent).toBeDefined();
+  });
+
+  it('fails soft when WebSearchService is absent (webSearch not injected)', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const service = makeWebSearchAgentsService(audit, plugins, null);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'web_search',
+      args: { query: 'fed rate decision' },
+    };
+
+    const { decisions, sandbox_results } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
+
+    expect(decisions[0]?.allowed).toBe(false);
+    expect(decisions[0]?.reason).toBe('web_search_unavailable');
+    expect(sandbox_results[0]?.ok).toBe(false);
+  });
+
+  it('never places an order / never hits the sandbox — sandbox.callPlugin is NEVER called', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const webSearch = makeWebSearchStub();
+    const sandbox = makeSandbox();
+    const service = new AgentsService(
+      {} as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      {} as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      webSearch as unknown as WebSearchService,
+    );
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'web_search',
+      args: { query: 'anything' },
+    };
+
+    await callExecuteToolCalls(service, CYCLE_ID, [tc]);
+
+    expect(sandbox.callPlugin).not.toHaveBeenCalled();
+  });
+
+  it('a failed/degraded search (ok:false) never blocks the cycle — decision is still allowed:true, sandbox_result.ok reflects the search failure', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const webSearch = makeWebSearchStub({
+      ok: false,
+      text: 'Búsqueda web no configurada (falta WEB_SEARCH_API_KEY).',
+    });
+    const service = makeWebSearchAgentsService(audit, plugins, webSearch);
+
+    const tc: import('../llm/llm.service').ToolCallRequest = {
+      plugin_id: 'kernel',
+      function: 'web_search',
+      args: { query: 'anything' },
+    };
+
+    const { decisions, sandbox_results } = await callExecuteToolCalls(service, CYCLE_ID, [tc]);
+
+    expect(decisions[0]?.allowed).toBe(true);
+    expect(sandbox_results[0]?.ok).toBe(false);
+  });
+
+  it('does NOT consume the anti-amplification tool-call budget — a real trade call in the same iteration still executes when budget=1', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const webSearch = makeWebSearchStub();
+    const service = makeWebSearchAgentsService(audit, plugins, webSearch);
+
+    const calls: import('../llm/llm.service').ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'web_search', args: { query: 'macro news' } },
+      {
+        plugin_id: 'decision',
+        function: 'emit_trade_intent',
+        args: { symbol: 'AAPL', action: 'long' },
+      },
+    ];
+
+    // budget=1 — if web_search consumed a budget slot, the trade call would be dropped.
+    const { decisions, sandbox_results, executedCount } = await callExecuteToolCallsFull(
+      service,
+      CYCLE_ID,
+      calls,
+      1,
+    );
+
+    expect(webSearch.search).toHaveBeenCalledTimes(1);
+    // Both calls executed: web_search (exempt) + the trade call (within budget=1).
+    const tradeDecision = decisions.find((d) => d.function === 'emit_trade_intent');
+    expect(tradeDecision?.allowed).toBe(true);
+    const tradeResult = sandbox_results.find((r) => r.function === 'emit_trade_intent');
+    expect(tradeResult).toBeDefined();
+    // executedCount only reflects the BUDGETED call, not the exempt web_search one.
+    expect(executedCount).toBe(1);
+  });
+
+  it('caps web_search calls per iteration at MAX_WEB_SEARCH_CALLS_PER_ITERATION (defense in depth)', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const webSearch = makeWebSearchStub();
+    const service = makeWebSearchAgentsService(audit, plugins, webSearch);
+
+    const calls: import('../llm/llm.service').ToolCallRequest[] = Array.from(
+      { length: 10 },
+      (_, i) => ({
+        plugin_id: 'kernel',
+        function: 'web_search',
+        args: { query: `query ${String(i)}` },
+      }),
+    );
+
+    await callExecuteToolCalls(service, CYCLE_ID, calls);
+
+    expect(webSearch.search.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it('caps web_search calls at the given per-cycle budget within a single iteration, dropping the rest gracefully', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const webSearch = makeWebSearchStub();
+    const service = makeWebSearchAgentsService(audit, plugins, webSearch);
+
+    const calls: import('../llm/llm.service').ToolCallRequest[] = Array.from(
+      { length: 10 },
+      (_, i) => ({
+        plugin_id: 'kernel',
+        function: 'web_search',
+        args: { query: `query ${String(i)}` },
+      }),
+    );
+
+    // webSearchBudget=2 is tighter than MAX_WEB_SEARCH_CALLS_PER_ITERATION (3) — the
+    // cycle-level cap must win when it's the smaller of the two.
+    const { webSearchExecutedCount } = await callExecuteToolCallsFull(
+      service,
+      CYCLE_ID,
+      calls,
+      Number.MAX_SAFE_INTEGER,
+      2,
+    );
+
+    expect(webSearch.search).toHaveBeenCalledTimes(2);
+    expect(webSearchExecutedCount).toBe(2);
+    expect(findAuditEvent(audit, 'web_search_cycle_cap_reached')).toBeDefined();
+  });
+
+  it('does not throw and never blocks the cycle when webSearchBudget is 0', async () => {
+    const audit = makeAudit();
+    const plugins = makeFullPlugins();
+    const webSearch = makeWebSearchStub();
+    const service = makeWebSearchAgentsService(audit, plugins, webSearch);
+
+    const calls: import('../llm/llm.service').ToolCallRequest[] = [
+      { plugin_id: 'kernel', function: 'web_search', args: { query: 'anything' } },
+    ];
+
+    const { webSearchExecutedCount, decisions } = await callExecuteToolCallsFull(
+      service,
+      CYCLE_ID,
+      calls,
+      Number.MAX_SAFE_INTEGER,
+      0,
+    );
+
+    expect(webSearch.search).not.toHaveBeenCalled();
+    expect(webSearchExecutedCount).toBe(0);
+    expect(decisions).toHaveLength(0);
+  });
+});
+
+describe('kernel__web_search — per-CYCLE cap across the whole ReAct loop (MAX_WEB_SEARCH_CALLS_PER_CYCLE)', () => {
+  /**
+   * Builds an LlmResponse that requests a single kernel__web_search call.
+   */
+  function webSearchTurn(query: string): LlmResponse {
+    return {
+      text:
+        '<tool_calls>[' +
+        `{"tool":"kernel__web_search","args":{"query":"${query}"}}` +
+        ']</tool_calls>',
+      tool_calls: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+    };
+  }
+
+  it('never dispatches more than MAX_WEB_SEARCH_CALLS_PER_CYCLE (5) web_search calls across N ReAct turns, dropping the (N+1)-th gracefully', async () => {
+    const audit = makeAudit();
+    // 4 ReAct turns available (kv override), each turn requests exactly 1 web_search
+    // — well under MAX_WEB_SEARCH_CALLS_PER_ITERATION (3) per turn, so only the
+    // per-CYCLE cap (5) can be the thing that bites here. Use enough turns that the
+    // cumulative total across turns (up to maxTurns * 1) would exceed 5 if uncapped.
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'react.max_turns') return Promise.resolve('7');
+        return Promise.resolve(null);
+      }),
+    };
+    const plugins = makeFullPlugins('Use tools.', []);
+    const webSearch = makeWebSearchStub();
+
+    const llmComplete = jest
+      .fn()
+      .mockResolvedValueOnce(webSearchTurn('q1'))
+      .mockResolvedValueOnce(webSearchTurn('q2'))
+      .mockResolvedValueOnce(webSearchTurn('q3'))
+      .mockResolvedValueOnce(webSearchTurn('q4'))
+      .mockResolvedValueOnce(webSearchTurn('q5'))
+      .mockResolvedValueOnce(webSearchTurn('q6'))
+      .mockResolvedValueOnce(makeLlmText('done'));
+
+    const service = makeWebSearchAgentsService(
+      audit,
+      plugins,
+      webSearch,
+      { complete: llmComplete },
+      kv,
+    );
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'context' });
+
+    // Exactly MAX_WEB_SEARCH_CALLS_PER_CYCLE (5) dispatched, never 6 — the 6th turn's
+    // web_search call is dropped gracefully (no throw, cycle completes normally).
+    expect(webSearch.search).toHaveBeenCalledTimes(5);
+    expect(findAuditEvent(audit, 'web_search_cycle_cap_reached')).toBeDefined();
+  });
+
+  it('a real trade tool call still executes in the same cycle after the web_search cap is reached', async () => {
+    const audit = makeAudit();
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'react.max_turns') return Promise.resolve('7');
+        return Promise.resolve(null);
+      }),
+    };
+    const plugins = makeFullPlugins('Use tools.', [ALPACA_PROVIDER_TOOL]);
+    plugins.findActive.mockResolvedValue([
+      { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+    ] as never);
+    const webSearch = makeWebSearchStub();
+    const sandbox = {
+      callPlugin: jest.fn().mockResolvedValue({ ok: true, result: null }),
+    } as jest.Mocked<Pick<SandboxGateway, 'callPlugin'>>;
+
+    const tradeTurn: LlmResponse = {
+      text:
+        '<tool_calls>[' +
+        '{"tool":"alpaca-provider__place_order","args":{"symbol":"AAPL","action":"buy"}}' +
+        ']</tool_calls>',
+      tool_calls: [],
+      backend: 'api',
+      skills_read: [],
+      skills_written: [],
+    };
+
+    const llmComplete = jest
+      .fn()
+      .mockResolvedValueOnce(webSearchTurn('q1'))
+      .mockResolvedValueOnce(webSearchTurn('q2'))
+      .mockResolvedValueOnce(webSearchTurn('q3'))
+      .mockResolvedValueOnce(webSearchTurn('q4'))
+      .mockResolvedValueOnce(webSearchTurn('q5'))
+      .mockResolvedValueOnce(webSearchTurn('q6')) // cap already reached — dropped
+      .mockResolvedValueOnce(tradeTurn); // real trade call — must still execute
+
+    const service = new (AgentsService as unknown as new (
+      llm: unknown,
+      sandbox: unknown,
+      plugins: unknown,
+      memory: unknown,
+      audit: unknown,
+      alerts: unknown,
+      snapshot: unknown,
+      cfg: unknown,
+      notifier: unknown,
+      pretest: unknown,
+      kv: unknown,
+      longTermMemory: unknown,
+      debate: unknown,
+      providerGateway: unknown,
+      mlSignalRecord: unknown,
+      tradeIntent: unknown,
+      prisma: unknown,
+      webSearch: unknown,
+    ) => AgentsService)(
+      { complete: llmComplete },
+      sandbox,
+      plugins,
+      makeMemory(),
+      audit,
+      { createBulk: jest.fn().mockResolvedValue([]) },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      kv,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      webSearch,
+    );
+
+    await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'context',
+      _activePlugins: [
+        { id: 'alpaca-provider', type: 'provider', name: 'Alpaca' },
+      ] as import('../plugins/plugins.service').HydratedPlugin[],
+    });
+
+    expect(webSearch.search).toHaveBeenCalledTimes(5);
+    expect(sandbox.callPlugin).toHaveBeenCalledTimes(1);
+  });
+
+  it('a cycle made ENTIRELY of web_search calls (no trade tool) still completes normally once the cap is hit', async () => {
+    const audit = makeAudit();
+    const kv: jest.Mocked<Pick<KvService, 'get'>> = {
+      get: jest.fn().mockImplementation((key: string) => {
+        if (key === 'react.max_turns') return Promise.resolve('7');
+        return Promise.resolve(null);
+      }),
+    };
+    const plugins = makeFullPlugins('Use tools.', []);
+    const webSearch = makeWebSearchStub();
+
+    const llmComplete = jest
+      .fn()
+      .mockResolvedValueOnce(webSearchTurn('q1'))
+      .mockResolvedValueOnce(webSearchTurn('q2'))
+      .mockResolvedValueOnce(webSearchTurn('q3'))
+      .mockResolvedValueOnce(webSearchTurn('q4'))
+      .mockResolvedValueOnce(webSearchTurn('q5'))
+      .mockResolvedValueOnce(webSearchTurn('q6'))
+      .mockResolvedValue(makeLlmText('done'));
+
+    const service = makeWebSearchAgentsService(
+      audit,
+      plugins,
+      webSearch,
+      { complete: llmComplete },
+      kv,
+    );
+
+    await expect(
+      service.runGovernedTurn({ source: 'cycle', context: 'context' }),
+    ).resolves.toBeDefined();
+    expect(webSearch.search).toHaveBeenCalledTimes(5);
+  });
+});
+
 // ── F6-S3 PR-B — Debate intercept (B1-B5) ─────────────────────────────────────
 
 import type { DebateService } from './debate.service';
@@ -7021,6 +7617,20 @@ describe('AgentsService.runGovernedTurn — tool gating (F6-S4)', () => {
     description: 'writes a skill',
     input_schema: { type: 'object', properties: {} },
   };
+  // Mirrors the real KERNEL_WEB_SEARCH_TOOL constant in agents.service.ts — it's always
+  // appended for non-chat sources (see runGovernedTurn), so the byte-identical schema
+  // assertion below must account for it.
+  const WEB_SEARCH_KERNEL_TOOL: ProviderTool = {
+    plugin_id: 'kernel',
+    name: 'kernel__web_search',
+    description:
+      'Busca información actual en internet (noticias, eventos macro, contexto de mercado) para fundamentar decisiones. Usalo cuando necesites contexto del mundo real, no solo señales técnicas.',
+    input_schema: {
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+    },
+  };
 
   /**
    * Build an AgentsService that:
@@ -7112,8 +7722,9 @@ describe('AgentsService.runGovernedTurn — tool gating (F6-S4)', () => {
     // Schema must contain provider tool (nothing hidden)
     expect(capturedSchema).toHaveLength(1);
     expect(capturedSchema[0].tools).toContain('place_order');
-    // Byte-identical: JSON of visibleTools equals JSON of all tools (both provider+kernel)
-    const expectedSchema = JSON.stringify([PROVIDER_TOOL, KERNEL_TOOL]);
+    // Byte-identical: JSON of visibleTools equals JSON of all tools (provider + fixture
+    // kernel tool + the always-present kernel__web_search tool).
+    const expectedSchema = JSON.stringify([PROVIDER_TOOL, KERNEL_TOOL, WEB_SEARCH_KERNEL_TOOL]);
     expect(capturedSchema[0].tools).toBe(expectedSchema);
   });
 

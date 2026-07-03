@@ -28,6 +28,7 @@ import {
 } from '../ml-signal-record/ml-signal-record.service';
 import { TradeIntentService } from '../trade-intent/trade-intent.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { WebSearchService } from '../web-search/web-search.service';
 
 import type { LlmResponse } from '../llm/llm.service';
 import type { Prisma } from '@prisma/client';
@@ -298,6 +299,26 @@ const KERNEL_TUNE_PLUGIN_PARAM_TOOL: import('../plugins/plugins.service').Provid
 };
 
 /**
+ * Schema definition for the kernel__web_search tool.
+ * Unlike the other kernel__* tools, this one is injected into EVERY non-chat governed
+ * turn (cycle/pretest/reflection) — not gated to source==='reflection' — because it's
+ * a READ-ONLY research aid the LLM should be able to reach for during a normal trading
+ * decision, not just during a reflection turn. See KERNEL_ALWAYS_ALLOWED_KERNEL_TOOLS
+ * in _resolveDropReason for the matching source-gate bypass.
+ */
+const KERNEL_WEB_SEARCH_TOOL: import('../plugins/plugins.service').ProviderTool = {
+  plugin_id: 'kernel',
+  name: 'kernel__web_search',
+  description:
+    'Busca información actual en internet (noticias, eventos macro, contexto de mercado) para fundamentar decisiones. Usalo cuando necesites contexto del mundo real, no solo señales técnicas.',
+  input_schema: {
+    type: 'object',
+    properties: { query: { type: 'string' } },
+    required: ['query'],
+  },
+};
+
+/**
  * Cold-start threshold: minimum number of labeled rows required to attempt training.
  * Mirrors manifest [config].min_samples = 50 in plugins/ml-feature-extractor/manifest.toml.
  * Below this, the handler audits cold_start and returns without writing KV.
@@ -324,7 +345,37 @@ const KERNEL_TOOL_REGISTRY: Set<string> = new Set([
   'record_lesson',
   'train_ml_model',
   'tune_plugin_param',
+  'web_search',
 ]);
+
+/**
+ * Kernel functions exempt from the reflection-only source gate in _resolveDropReason.
+ * web_search is READ-ONLY (never creates a trade intent/signal, never touches the veto
+ * or real-order path — see _kernelWebSearch/_dispatchKernelTool) so it's safe to allow
+ * in any turn that has kernel tools available (cycle/pretest/reflection; chat never
+ * sees any tools at all, see runGovernedTurn's isChat branch).
+ */
+const KERNEL_ALWAYS_ALLOWED_TOOLS: Set<string> = new Set(['web_search']);
+
+/**
+ * Defense-in-depth cap on web_search calls dispatched per _executeToolCalls invocation
+ * (i.e. per ReAct iteration). web_search calls are intentionally excluded from the
+ * anti-amplification tool-call budget (see _executeToolCalls) so they never starve the
+ * real trade tool call — this separate, small, hardcoded cap exists purely to bound
+ * cost/fan-out if the LLM emits an unreasonable number of search calls in one turn.
+ */
+const MAX_WEB_SEARCH_CALLS_PER_ITERATION = 3;
+
+/**
+ * Defense-in-depth cap on web_search calls dispatched across the WHOLE ReAct cycle
+ * (all iterations of a single runGovernedTurn call), mirroring how `toolCallsExecuted`
+ * bounds the trade-tool budget across turns. MAX_WEB_SEARCH_CALLS_PER_ITERATION alone
+ * only bounds a single iteration — react.max_turns (up to 10) could still let a
+ * misbehaving LLM rack up maxTurns × 3 sequential searches in one cycle. Once this
+ * ceiling is reached, later web_search calls are dropped gracefully (never dispatched,
+ * never throw, never affect the trade path) — see _executeToolCalls.
+ */
+const MAX_WEB_SEARCH_CALLS_PER_CYCLE = 5;
 
 /** Plugin id of the ML discipline — used for opt-in injection and ML-first sort. */
 const ML_PLUGIN_ID = 'ml-feature-extractor';
@@ -391,6 +442,11 @@ export class AgentsService {
     // the veto gate itself never depends on this.
     @Optional()
     private readonly prisma?: PrismaService,
+    // WebSearchService injected @Optional() — backs the kernel__web_search tool.
+    // Absent → _kernelWebSearch fails soft with reason 'web_search_unavailable'
+    // (never throws, never blocks the cycle).
+    @Optional()
+    private readonly webSearch?: WebSearchService,
   ) {}
 
   /**
@@ -527,6 +583,12 @@ export class AgentsService {
      * total tool calls this iteration may EXECUTE. Threaded across turns by the caller.
      */
     toolCallBudget: number;
+    /**
+     * Remaining web_search allowance for the WHOLE cycle (not per-turn), mirroring
+     * toolCallBudget. Threaded across turns by runGovernedTurn — see
+     * MAX_WEB_SEARCH_CALLS_PER_CYCLE.
+     */
+    webSearchBudget: number;
   }): Promise<{
     text: string;
     tool_calls: import('../llm/llm.service').ToolCallRequest[];
@@ -538,6 +600,7 @@ export class AgentsService {
     skills_written: string[];
     hadToolCalls: boolean;
     executedCount: number;
+    webSearchExecutedCount: number;
   }> {
     const { cycle_id, source, effectiveTools, visibleTools, decisionPrompt } = args;
 
@@ -599,8 +662,13 @@ export class AgentsService {
       args.virtual_only,
       source,
     );
-    const { decisions, sandbox_results, signalsEmitted, executedCount } =
-      await this._executeToolCalls(cycle_id, validatedCalls, args.toolCallBudget);
+    const { decisions, sandbox_results, signalsEmitted, executedCount, webSearchExecutedCount } =
+      await this._executeToolCalls(
+        cycle_id,
+        validatedCalls,
+        args.toolCallBudget,
+        args.webSearchBudget,
+      );
 
     // hadToolCalls is measured on post-validation calls (not raw parsed calls).
     // An all-dropped iteration counts as no valid intent → natural exit (safe direction).
@@ -655,6 +723,7 @@ export class AgentsService {
       skills_written,
       hadToolCalls,
       executedCount,
+      webSearchExecutedCount,
     };
   }
 
@@ -686,9 +755,14 @@ export class AgentsService {
 
     // ── Hoist ONCE — tool schema, decision prompt, and active plugins fixed per governed turn ──
     const providerTools = await this.plugins.getProviderTools();
+    // kernel__web_search is available in EVERY non-chat turn (cycle/pretest/reflection):
+    // it's a read-only research aid, not a privileged reflection-only mutation like the
+    // other kernel__* tools below. isChat discards kernelTools entirely (effectiveTools=[])
+    // so chat never sees it either way.
     const kernelTools =
       (input.source as string) === 'reflection'
         ? [
+            KERNEL_WEB_SEARCH_TOOL,
             KERNEL_WRITE_SKILL_TOOL,
             KERNEL_CREATE_PRETEST_VARIANT_TOOL,
             KERNEL_RUN_PRETEST_COMPARE_TOOL,
@@ -697,7 +771,7 @@ export class AgentsService {
             KERNEL_TRAIN_ML_MODEL_TOOL,
             KERNEL_TUNE_PLUGIN_PARAM_TOOL,
           ]
-        : [];
+        : [KERNEL_WEB_SEARCH_TOOL];
 
     // Chat uses empty tools and a null decision prompt so _runSingleIteration never
     // injects [DECISION]/[TOOL SCHEMA]. Non-chat keeps the full trading-brain setup.
@@ -727,6 +801,8 @@ export class AgentsService {
     // counted across every turn (not per-turn). See REACT_MAX_TOOL_CALLS_DEFAULT.
     const maxToolCalls = await this._resolveMaxToolCalls();
     let toolCallsExecuted = 0;
+    // Per-cycle web_search cap (defense in depth) — see MAX_WEB_SEARCH_CALLS_PER_CYCLE.
+    let webSearchCallsExecuted = 0;
 
     // ── Accumulators ─────────────────────────────────────────────────────────
     const allDecisions: Decision[] = [];
@@ -742,6 +818,7 @@ export class AgentsService {
       turn++;
       const iterContext = this._composeIterationContext(input.context, observations);
       const toolCallBudget = Math.max(0, maxToolCalls - toolCallsExecuted);
+      const webSearchBudget = Math.max(0, MAX_WEB_SEARCH_CALLS_PER_CYCLE - webSearchCallsExecuted);
       last = await this._runSingleIteration({
         cycle_id,
         source: input.source,
@@ -753,8 +830,10 @@ export class AgentsService {
         virtual_only: input.virtual_only,
         decisionPrompt,
         toolCallBudget,
+        webSearchBudget,
       });
       toolCallsExecuted += last.executedCount;
+      webSearchCallsExecuted += last.webSearchExecutedCount;
 
       // Accumulate results
       allDecisions.push(...last.decisions);
@@ -1833,7 +1912,10 @@ export class AgentsService {
     // This check must come BEFORE virtual_only and plugin-active checks.
     if (call.plugin_id === 'kernel') {
       if (!KERNEL_TOOL_REGISTRY.has(call.function)) return 'unknown_kernel_tool';
-      // Source gate: kernel tools are only executable in reflection turns.
+      // web_search (and any other KERNEL_ALWAYS_ALLOWED_TOOLS entry) is read-only and
+      // safe in any turn that has kernel tools at all — bypasses the reflection-only gate.
+      if (KERNEL_ALWAYS_ALLOWED_TOOLS.has(call.function)) return null;
+      // Source gate: the remaining kernel tools are only executable in reflection turns.
       // In s1, 'reflection' is not in GovernedTurnInput.source union — so kernel tools
       // are NEVER reachable in production turns. allowKernelTools=false drops any
       // LLM-emitted kernel call with a distinct, auditable reason.
@@ -1967,6 +2049,7 @@ export class AgentsService {
       record_lesson: (c, t, d, s) => this._kernelRecordLesson(c, t, d, s),
       train_ml_model: (c, t, d, s) => this._kernelTrainMlModel(c, t, d, s),
       tune_plugin_param: (c, t, d, s) => this._kernelTunePluginParam(c, t, d, s),
+      web_search: (c, t, d, s) => this._kernelWebSearch(c, t, d, s),
     };
     const handler = kernelDispatch[tc.function];
     if (handler) {
@@ -2240,6 +2323,71 @@ export class AgentsService {
       function: tc.function,
       ok: true,
       result: { text, episode_id, rationale },
+    });
+  }
+
+  /**
+   * Handles kernel__web_search dispatch.
+   *
+   * READ-ONLY / INFORMATIONAL ONLY: this never creates a trade intent/signal, never
+   * touches the veto or real-order path — it bypasses the sandbox entirely (same as
+   * every other kernel__* tool, see the "Pre-step: kernel tools bypass the sandbox
+   * entirely" guard in _executeToolCalls) and simply forwards WebSearchService's
+   * fail-soft result back into the ReAct loop as an observation (_toObservation reads
+   * sandbox_results[].result). A failed/unconfigured search never blocks the cycle —
+   * the LLM just decides on what it already has.
+   *
+   * decisions.allowed reflects whether the call was PERMITTED and dispatched (true
+   * whenever webSearch is present and query is non-empty) — NOT whether the search
+   * itself found anything. That distinction lives in sandbox_results.ok, mirroring
+   * WebSearchService's own ok:false-on-failure contract.
+   */
+  private async _kernelWebSearch(
+    cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+  ): Promise<void> {
+    const rawQuery = tc.args['query'];
+    const query = typeof rawQuery === 'string' ? rawQuery.trim() : '';
+
+    if (!this.webSearch) {
+      decisions.push({ ...tc, allowed: false, reason: 'web_search_unavailable' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'web_search_unavailable',
+      });
+      return;
+    }
+    if (!query) {
+      decisions.push({ ...tc, allowed: false, reason: 'invalid_query' });
+      sandbox_results.push({
+        plugin_id: 'kernel',
+        function: tc.function,
+        ok: false,
+        error: 'invalid_query',
+      });
+      return;
+    }
+
+    const result = await this.webSearch.search(query);
+
+    // Benign info event — never a decision/signal, audited separately from tool_call_dropped
+    // and from real trade-related events so it can't be mistaken for one in the audit trail.
+    await this.audit.log({
+      cycle_id,
+      event_type: 'kernel_web_search',
+      meta: { query: query.slice(0, 300), ok: result.ok },
+    });
+
+    decisions.push({ ...tc, allowed: true });
+    sandbox_results.push({
+      plugin_id: 'kernel',
+      function: tc.function,
+      ok: result.ok,
+      result: { text: result.text, sources: result.sources ?? [] },
     });
   }
 
@@ -2793,6 +2941,54 @@ export class AgentsService {
   }
 
   /**
+   * Dispatches a single tool_call: debate gate → kernel bypass or sandbox call → signal
+   * recording, with the shared try/catch/audit failure handling. Extracted from
+   * _executeToolCalls so both the budgeted dispatch loop and the read-only-tool
+   * exemption loop (web_search — see _executeToolCalls) share identical behavior.
+   */
+  private async _dispatchOne(
+    cycle_id: string,
+    tc: import('../llm/llm.service').ToolCallRequest,
+    decisions: Decision[],
+    sandbox_results: SandboxResult[],
+    signalsEmitted: { symbol: string; action: string }[],
+  ): Promise<void> {
+    try {
+      // ── DEBATE GATE — additive; short-circuits to byte-identical legacy path when off.
+      // Fully nested under `if (this.debate)` — when @Optional resolves to undefined
+      // (every existing test + production with feature off) this is a single falsy check:
+      // zero awaits, zero audits, zero allocations. The existing dispatch runs unchanged.
+      if (this.debate && (await this._runDebateGate(cycle_id, tc, decisions))) {
+        return;
+      }
+      // ↓↓↓ EXISTING dispatch — UNCHANGED ↓↓↓
+
+      // Pre-step: kernel tools bypass the sandbox entirely.
+      if (tc.plugin_id === 'kernel') {
+        await this._dispatchKernelTool(cycle_id, tc, decisions, sandbox_results);
+        return;
+      }
+
+      decisions.push({ ...tc, allowed: true });
+      const res = await this.sandbox.callPlugin(tc.plugin_id, tc.function, tc.args);
+      sandbox_results.push({ plugin_id: tc.plugin_id, function: tc.function, ...res });
+
+      await this._recordSignalAndIntent(cycle_id, tc, res, signalsEmitted);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      decisions.push({ ...tc, allowed: false, reason: msg });
+      this.log.warn(`Tool call falló: ${tc.plugin_id}.${tc.function} — ${msg}`);
+      await this.audit.log({
+        cycle_id,
+        event_type: 'cycle_fail',
+        plugin_id: tc.plugin_id,
+        error: msg,
+        meta: { function: tc.function },
+      });
+    }
+  }
+
+  /**
    * Dispatches validated tool_calls, enforcing the anti-amplification cap: at most
    * `budget` calls are EXECUTED (dispatched to the sandbox/kernel) — this is the
    * remaining allowance for the WHOLE cycle, not just this iteration (the caller
@@ -2800,60 +2996,79 @@ export class AgentsService {
    * they are audited once as 'tool_call_cap_reached' (cycle id + how many were
    * skipped) and silently omitted from decisions/sandbox_results — never a crash,
    * never a silent drop with no trace.
+   *
+   * READ-ONLY KERNEL TOOLS (web_search — see KERNEL_ALWAYS_ALLOWED_TOOLS) are executed
+   * OUTSIDE this budget entirely: they never create a trade signal, so counting them
+   * against the anti-amplification cap would let a couple of searches starve the actual
+   * trade tool call within the same cycle. They get their own small, hardcoded, per-
+   * iteration cap (MAX_WEB_SEARCH_CALLS_PER_ITERATION) instead — bounding cost/fan-out
+   * without touching the documented "max 3 tool calls per cycle" trade-call invariant.
+   * `executedCount` (fed back into the caller's cross-turn budget accounting) reflects
+   * ONLY budgeted calls, never read-only ones.
+   *
+   * `webSearchBudget` is the remaining web_search allowance for the WHOLE cycle (not just
+   * this iteration) — the caller (runGovernedTurn) threads it across ReAct turns the same
+   * way it threads the trade-tool budget. Defaults to MAX_WEB_SEARCH_CALLS_PER_CYCLE so
+   * direct/legacy callers (e.g. existing tests calling _executeToolCalls in isolation)
+   * keep their prior behavior. Calls beyond the cycle cap are dropped gracefully — never
+   * dispatched, never throw, audited once as 'web_search_cycle_cap_reached'.
    */
   private async _executeToolCalls(
     cycle_id: string,
     toolCalls: import('../llm/llm.service').ToolCallRequest[],
     budget: number,
+    webSearchBudget: number = MAX_WEB_SEARCH_CALLS_PER_CYCLE,
   ): Promise<{
     decisions: Decision[];
     sandbox_results: SandboxResult[];
     signalsEmitted: { symbol: string; action: string }[];
     executedCount: number;
+    webSearchExecutedCount: number;
   }> {
     const decisions: Decision[] = [];
     const sandbox_results: SandboxResult[] = [];
     const signalsEmitted: { symbol: string; action: string }[] = [];
 
+    const isReadOnlyKernelTool = (tc: import('../llm/llm.service').ToolCallRequest): boolean =>
+      tc.plugin_id === 'kernel' && KERNEL_ALWAYS_ALLOWED_TOOLS.has(tc.function);
+
+    const allReadOnlyCalls = toolCalls.filter(isReadOnlyKernelTool);
+    const safeWebSearchBudget = Math.max(0, webSearchBudget);
+    const readOnlyCalls = allReadOnlyCalls.slice(
+      0,
+      Math.min(MAX_WEB_SEARCH_CALLS_PER_ITERATION, safeWebSearchBudget),
+    );
+    const droppedByWebSearchCycleCap = allReadOnlyCalls.length - readOnlyCalls.length;
+    const budgetedCalls = toolCalls.filter((tc) => !isReadOnlyKernelTool(tc));
+
     const safeBudget = Math.max(0, budget);
-    const prioritized = this._prioritizeExits(toolCalls);
+    const prioritized = this._prioritizeExits(budgetedCalls);
     const toExecute = prioritized.slice(0, safeBudget);
     const droppedByCap = prioritized.length - toExecute.length;
 
+    // Read-only info tools first — never counted against safeBudget/droppedByCap.
+    for (const tc of readOnlyCalls) {
+      await this._dispatchOne(cycle_id, tc, decisions, sandbox_results, signalsEmitted);
+    }
+
+    if (droppedByWebSearchCycleCap > 0) {
+      // Fail-soft: audit-only, never throws, never blocks the cycle or the trade path.
+      this.log.warn(
+        `web_search per-cycle cap reached [${cycle_id}]: ${String(droppedByWebSearchCycleCap)} search call(s) skipped this iteration (webSearchBudget=${String(safeWebSearchBudget)})`,
+      );
+      await this.audit.log({
+        cycle_id,
+        event_type: 'web_search_cycle_cap_reached',
+        meta: {
+          web_search_budget: safeWebSearchBudget,
+          executed: readOnlyCalls.length,
+          dropped: droppedByWebSearchCycleCap,
+        },
+      });
+    }
+
     for (const tc of toExecute) {
-      try {
-        // ── DEBATE GATE — additive; short-circuits to byte-identical legacy path when off.
-        // Fully nested under `if (this.debate)` — when @Optional resolves to undefined
-        // (every existing test + production with feature off) this is a single falsy check:
-        // zero awaits, zero audits, zero allocations. The existing dispatch runs unchanged.
-        if (this.debate && (await this._runDebateGate(cycle_id, tc, decisions))) {
-          continue;
-        }
-        // ↓↓↓ EXISTING dispatch — UNCHANGED ↓↓↓
-
-        // Pre-step: kernel tools bypass the sandbox entirely.
-        if (tc.plugin_id === 'kernel') {
-          await this._dispatchKernelTool(cycle_id, tc, decisions, sandbox_results);
-          continue;
-        }
-
-        decisions.push({ ...tc, allowed: true });
-        const res = await this.sandbox.callPlugin(tc.plugin_id, tc.function, tc.args);
-        sandbox_results.push({ plugin_id: tc.plugin_id, function: tc.function, ...res });
-
-        await this._recordSignalAndIntent(cycle_id, tc, res, signalsEmitted);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        decisions.push({ ...tc, allowed: false, reason: msg });
-        this.log.warn(`Tool call falló: ${tc.plugin_id}.${tc.function} — ${msg}`);
-        await this.audit.log({
-          cycle_id,
-          event_type: 'cycle_fail',
-          plugin_id: tc.plugin_id,
-          error: msg,
-          meta: { function: tc.function },
-        });
-      }
+      await this._dispatchOne(cycle_id, tc, decisions, sandbox_results, signalsEmitted);
     }
 
     if (droppedByCap > 0) {
@@ -2872,7 +3087,13 @@ export class AgentsService {
       });
     }
 
-    return { decisions, sandbox_results, signalsEmitted, executedCount: toExecute.length };
+    return {
+      decisions,
+      sandbox_results,
+      signalsEmitted,
+      executedCount: toExecute.length,
+      webSearchExecutedCount: readOnlyCalls.length,
+    };
   }
 
   /**
