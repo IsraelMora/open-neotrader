@@ -4,6 +4,7 @@ import {
   PLUGINS_TO_ACTIVATE,
   PLUGINS_TO_DEACTIVATE,
   BOOTSTRAP_APPLIED_KEY,
+  PRETEST_PORTFOLIOS_TO_SEED,
 } from './strategy-bootstrap.service';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { KvService } from '../common/kv.service';
@@ -29,9 +30,15 @@ function makeKv(initial: Record<string, string> = {}): {
 function makeDb(
   missingIds: string[] = [],
   throwingIds: string[] = [],
+  opts: {
+    existingPretestNames?: string[];
+    throwingPretestNames?: string[];
+  } = {},
 ): {
   db: PrismaService;
   updateMany: jest.Mock;
+  pretestFindUnique: jest.Mock;
+  pretestCreate: jest.Mock;
 } {
   const updateMany = jest.fn(({ where }: { where: { id: string } }) => {
     if (throwingIds.includes(where.id)) {
@@ -42,7 +49,32 @@ function makeDb(
     }
     return Promise.resolve({ count: 1 });
   });
-  return { db: { plugin: { updateMany } } as unknown as PrismaService, updateMany };
+
+  const existingPretestNames = opts.existingPretestNames ?? [];
+  const throwingPretestNames = opts.throwingPretestNames ?? [];
+
+  const pretestFindUnique = jest.fn(({ where }: { where: { name: string } }) => {
+    if (existingPretestNames.includes(where.name)) {
+      return Promise.resolve({ id: 'existing-id', name: where.name });
+    }
+    return Promise.resolve(null);
+  });
+  const pretestCreate = jest.fn(({ data }: { data: { name: string } }) => {
+    if (throwingPretestNames.includes(data.name)) {
+      return Promise.reject(new Error(`db error creating ${data.name}`));
+    }
+    return Promise.resolve({ id: 'new-id', ...data });
+  });
+
+  return {
+    db: {
+      plugin: { updateMany },
+      pretestPortfolio: { findUnique: pretestFindUnique, create: pretestCreate },
+    } as unknown as PrismaService,
+    updateMany,
+    pretestFindUnique,
+    pretestCreate,
+  };
 }
 
 describe('StrategyBootstrapService', () => {
@@ -181,5 +213,165 @@ describe('StrategyBootstrapService', () => {
     const svc = new StrategyBootstrapService(db, kv);
 
     await expect(svc.onModuleInit()).resolves.not.toThrow();
+  });
+
+  it('creates the scheduler KV with run_count:0 (cosmetic fix — avoids run_count+1 = NaN)', async () => {
+    const { kv, store } = makeKv();
+    const { db } = makeDb();
+    const svc = new StrategyBootstrapService(db, kv);
+
+    await svc.run();
+
+    const scheduler = JSON.parse(store['scheduler']) as { run_count: number };
+    expect(scheduler.run_count).toBe(0);
+  });
+
+  it('defaults run_count to 0 when an existing scheduler config is missing the field', async () => {
+    const { kv, store } = makeKv({
+      scheduler: JSON.stringify({ enabled: false, override_interval_ms: 90_000 }),
+    });
+    const { db } = makeDb();
+    const svc = new StrategyBootstrapService(db, kv);
+
+    await svc.run();
+
+    const scheduler = JSON.parse(store['scheduler']) as { run_count: number };
+    expect(scheduler.run_count).toBe(0);
+  });
+
+  it('preserves an existing run_count instead of clobbering it', async () => {
+    const { kv, store } = makeKv({
+      scheduler: JSON.stringify({ enabled: false, override_interval_ms: 90_000, run_count: 7 }),
+    });
+    const { db } = makeDb();
+    const svc = new StrategyBootstrapService(db, kv);
+
+    await svc.run();
+
+    const scheduler = JSON.parse(store['scheduler']) as { run_count: number };
+    expect(scheduler.run_count).toBe(7);
+  });
+});
+
+// ── Risk-differentiated pretest portfolios ────────────────────────────────────
+//
+// Bootstrap also seeds 3 virtual pretest portfolios (Conservative/Aggressive/Trend-only)
+// that all trade the same global ETF universe seeded above, at different risk profiles.
+// Idempotency reuses the SAME bootstrap.momentum_v1_applied flag — no separate KV key.
+
+describe('StrategyBootstrapService — pretest portfolio seeding', () => {
+  it('seeds exactly 3 risk-differentiated pretest portfolios on first run', async () => {
+    const { kv } = makeKv();
+    const { db, pretestCreate } = makeDb();
+    const svc = new StrategyBootstrapService(db, kv);
+
+    await svc.run();
+
+    expect(pretestCreate).toHaveBeenCalledTimes(3);
+    const names = (pretestCreate.mock.calls as Array<[{ data: { name: string } }]>).map(
+      (c) => c[0].data.name,
+    );
+    expect(names).toEqual(
+      expect.arrayContaining(['Conservador Momentum', 'Agresivo Momentum', 'Trend Puro']),
+    );
+  });
+
+  it('each seeded portfolio uses $100k initial capital and the DEFAULT_STATE shape', async () => {
+    const { kv } = makeKv();
+    const { db, pretestCreate } = makeDb();
+    const svc = new StrategyBootstrapService(db, kv);
+
+    await svc.run();
+
+    for (const call of pretestCreate.mock.calls as Array<
+      [{ data: { initial_capital: number; state: string } }]
+    >) {
+      expect(call[0].data.initial_capital).toBe(100000);
+      const state = JSON.parse(call[0].data.state) as { equity: number; cash: number };
+      expect(state.equity).toBe(100000);
+      expect(state.cash).toBe(100000);
+    }
+  });
+
+  it('plugin_configs use config keys the plugins actually read (no dead "vol_target" key)', async () => {
+    const { kv } = makeKv();
+    const { db, pretestCreate } = makeDb();
+    const svc = new StrategyBootstrapService(db, kv);
+
+    await svc.run();
+
+    for (const call of pretestCreate.mock.calls as Array<
+      [{ data: { name: string; plugin_configs: string } }]
+    >) {
+      const configs = JSON.parse(call[0].data.plugin_configs) as Record<
+        string,
+        Record<string, unknown>
+      >;
+      const sizing = configs['position-sizing'];
+      if (sizing) {
+        expect(sizing['mode']).toBe('vol_target');
+        expect(sizing).not.toHaveProperty('vol_target');
+        // max_position_pct must be a percentage-point number (manifest range 1-25),
+        // never a 0-1 fraction — that would silently clamp/misconfigure sizing.
+        expect(sizing['max_position_pct']).toBeGreaterThanOrEqual(1);
+        expect(sizing['max_position_pct']).toBeLessThanOrEqual(25);
+      }
+      const policy = configs['__pretest_policy__'];
+      expect(policy).toBeDefined();
+      expect(typeof policy['sizing_pct']).toBe('number');
+    }
+  });
+
+  it('is idempotent by name: does not recreate a portfolio that already exists', async () => {
+    const { kv } = makeKv();
+    const { db, pretestCreate } = makeDb([], [], {
+      existingPretestNames: ['Conservador Momentum'],
+    });
+    const svc = new StrategyBootstrapService(db, kv);
+
+    await svc.run();
+
+    const names = (pretestCreate.mock.calls as Array<[{ data: { name: string } }]>).map(
+      (c) => c[0].data.name,
+    );
+    expect(names).not.toContain('Conservador Momentum');
+    expect(names).toEqual(expect.arrayContaining(['Agresivo Momentum', 'Trend Puro']));
+  });
+
+  it('no-ops on a second run (gated by the same bootstrap.momentum_v1_applied flag)', async () => {
+    const { kv } = makeKv();
+    const { db, pretestCreate } = makeDb();
+    const svc = new StrategyBootstrapService(db, kv);
+
+    await svc.run();
+    const callsAfterFirst = pretestCreate.mock.calls.length;
+    await svc.run();
+
+    expect(pretestCreate.mock.calls).toHaveLength(callsAfterFirst);
+  });
+
+  it('is fail-soft: a create failure for one portfolio does not block the rest or the bootstrap', async () => {
+    const { kv, store } = makeKv();
+    const { db, pretestCreate } = makeDb([], [], {
+      throwingPretestNames: ['Agresivo Momentum'],
+    });
+    const svc = new StrategyBootstrapService(db, kv);
+
+    await expect(svc.run()).resolves.not.toThrow();
+    expect(store[BOOTSTRAP_APPLIED_KEY]).toBe('true');
+    const names = (pretestCreate.mock.calls as Array<[{ data: { name: string } }]>).map(
+      (c) => c[0].data.name,
+    );
+    expect(names).toEqual(
+      expect.arrayContaining(['Conservador Momentum', 'Agresivo Momentum', 'Trend Puro']),
+    );
+  });
+
+  it('PRETEST_PORTFOLIOS_TO_SEED exposes exactly the 3 expected specs', () => {
+    expect(PRETEST_PORTFOLIOS_TO_SEED.map((p) => p.name)).toEqual([
+      'Conservador Momentum',
+      'Agresivo Momentum',
+      'Trend Puro',
+    ]);
   });
 });

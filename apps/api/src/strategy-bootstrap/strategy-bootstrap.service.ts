@@ -2,6 +2,7 @@ import { Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { KvService } from '../common/kv.service';
 import { kvBool } from '../common/kv.util';
+import { DEFAULT_STATE as defaultPretestState } from '../pretest/pretest.service';
 
 /**
  * StrategyBootstrapService — deploy-time, idempotent PAPER-mode seeder.
@@ -62,10 +63,82 @@ const UNIVERSE_KEY = 'cycle.universe';
 const EXECUTION_REAL_KEY = 'execution.real';
 const SCHEDULER_KEY = 'scheduler';
 
+/** Spec for a single seeded pretest (virtual) portfolio. */
+interface PretestPortfolioSeed {
+  name: string;
+  description: string;
+  initial_capital: number;
+  plugin_ids: string[];
+  plugin_configs: Record<string, Record<string, unknown>>;
+}
+
+/**
+ * Three risk-differentiated VIRTUAL pretest portfolios, seeded once alongside the
+ * momentum-rotation bootstrap. All three trade the SAME global `cycle.universe`
+ * (see MOMENTUM_UNIVERSE / UNIVERSE_KEY above) — only their plugin set, factor
+ * parameters, and __pretest_policy__ fill assumptions differ.
+ *
+ * Config keys below were verified against each plugin's actual on_cycle hook
+ * (not assumed from the plugin name):
+ *   - momentum-factor-12-1 reads config["top_pct"] / config["lookback_months"]
+ *     (plugins/momentum-factor-12-1/hooks/cycle.py).
+ *   - position-sizing in "vol_target" mode reads config["max_position_pct"]
+ *     (percentage POINTS, e.g. 8 = 8%, per plugins/position-sizing/manifest.toml
+ *     [config.max_position_pct] range 1-25) and config["default_volatility_pct"].
+ *     It does NOT read a "vol_target" key — target volatility is not a config
+ *     input to this hook, so that key is intentionally omitted here.
+ *   - __pretest_policy__ is PretestService's reserved fill-policy config (never
+ *     passed to plugins), read by PretestService._readPolicy().
+ */
+export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
+  {
+    name: 'Conservador Momentum',
+    description:
+      'Momentum de baja rotación: top 30% del universo, lookback 12 meses, tamaño de posición acotado al 8%.',
+    initial_capital: 100_000,
+    plugin_ids: [
+      'momentum-factor-12-1',
+      'trend-following',
+      'relative-strength',
+      'position-sizing',
+      'risk-manager',
+      'macro-calendar-guard',
+    ],
+    plugin_configs: {
+      'momentum-factor-12-1': { top_pct: 30, lookback_months: 12 },
+      'position-sizing': { mode: 'vol_target', max_position_pct: 8 },
+      __pretest_policy__: { sizing_pct: 0.05, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
+    name: 'Agresivo Momentum',
+    description:
+      'Momentum concentrado: top 10% del universo, lookback 6 meses, tamaño de posición hasta 25%.',
+    initial_capital: 100_000,
+    plugin_ids: ['momentum-factor-12-1', 'trend-following', 'position-sizing', 'risk-manager'],
+    plugin_configs: {
+      'momentum-factor-12-1': { top_pct: 10, lookback_months: 6 },
+      'position-sizing': { mode: 'vol_target', max_position_pct: 25 },
+      __pretest_policy__: { sizing_pct: 0.2, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
+    name: 'Trend Puro',
+    description: 'Solo trend-following (sin factor de momentum), tamaño de posición hasta 15%.',
+    initial_capital: 100_000,
+    plugin_ids: ['trend-following', 'position-sizing', 'risk-manager'],
+    plugin_configs: {
+      'position-sizing': { mode: 'vol_target', max_position_pct: 15 },
+      __pretest_policy__: { sizing_pct: 0.1, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+];
+
 /** Minimal shape this service cares about; the real config carries more fields (see CycleSchedulerService). */
 interface SchedulerConfigPatch {
   enabled: boolean;
   override_interval_ms: number;
+  run_count: number;
   [key: string]: unknown;
 }
 
@@ -111,6 +184,7 @@ export class StrategyBootstrapService implements OnModuleInit {
     await this.kv.set(EXECUTION_REAL_KEY, 'false');
 
     await this.enableScheduler();
+    await this.seedPretestPortfolios();
 
     // Marks the bootstrap as done — MUST be the last write, and only after every
     // preceding step has been attempted, so a partial failure is retried on next boot.
@@ -120,8 +194,54 @@ export class StrategyBootstrapService implements OnModuleInit {
       `Bootstrap momentum_v1 aplicado: universo=${MOMENTUM_UNIVERSE} | ` +
         `activados=[${PLUGINS_TO_ACTIVATE.join(', ')}] | ` +
         `desactivados=[${PLUGINS_TO_DEACTIVATE.join(', ')}] | ` +
-        `modo=PAPER (execution.real=false) | scheduler habilitado`,
+        `modo=PAPER (execution.real=false) | scheduler habilitado | ` +
+        `pretest portfolios sembrados=[${PRETEST_PORTFOLIOS_TO_SEED.map((p) => p.name).join(', ')}]`,
     );
+  }
+
+  /**
+   * Seeds the 3 risk-differentiated virtual pretest portfolios (see
+   * PRETEST_PORTFOLIOS_TO_SEED), gated by the SAME bootstrap.momentum_v1_applied
+   * flag as the rest of this bootstrap — no separate idempotency key needed.
+   *
+   * Idempotent by name: PretestPortfolio.name is @unique, so each spec is created
+   * only if a row with that name doesn't already exist yet (findUnique-then-create,
+   * never upsert — an operator's manual edits to an existing portfolio are never
+   * overwritten). Per-portfolio fail-soft: one failure never blocks the rest or the
+   * overall bootstrap.
+   *
+   * Writes directly via PrismaService (not PretestService.create()) to avoid pulling
+   * PretestService's full dependency graph (sandbox/LLM/providers/agents/audit) into
+   * this boot-time seeder; the row shape mirrors PretestService.create() exactly,
+   * including the shared DEFAULT_STATE factory.
+   */
+  private async seedPretestPortfolios(): Promise<void> {
+    for (const spec of PRETEST_PORTFOLIOS_TO_SEED) {
+      try {
+        const existing = await this.db.pretestPortfolio.findUnique({
+          where: { name: spec.name },
+        });
+        if (existing) {
+          this.log.log(`Bootstrap: pretest portfolio '${spec.name}' ya existe — omitido`);
+          continue;
+        }
+        await this.db.pretestPortfolio.create({
+          data: {
+            name: spec.name,
+            description: spec.description,
+            initial_capital: spec.initial_capital,
+            plugin_ids: JSON.stringify(spec.plugin_ids),
+            plugin_configs: JSON.stringify(spec.plugin_configs),
+            state: JSON.stringify(defaultPretestState(spec.initial_capital)),
+          },
+        });
+        this.log.log(`Bootstrap: pretest portfolio '${spec.name}' creado`);
+      } catch (err: unknown) {
+        this.log.warn(
+          `Bootstrap: fallo al sembrar pretest portfolio '${spec.name}': ${String(err)}`,
+        );
+      }
+    }
   }
 
   /** Per-plugin, fail-soft active-flag write. A missing row or DB error never stops the rest. */
@@ -151,11 +271,16 @@ export class StrategyBootstrapService implements OnModuleInit {
         }
       }
       const existingInterval = current['override_interval_ms'];
+      const existingRunCount = current['run_count'];
       const updated: SchedulerConfigPatch = {
         ...current,
         enabled: true,
         override_interval_ms:
           typeof existingInterval === 'number' ? existingInterval : DEFAULT_SCHEDULER_INTERVAL_MS,
+        // Cosmetic fix: default run_count to 0 when the scheduler KV is being created
+        // (or an existing config is missing the field) — CycleSchedulerService reads
+        // cfg.run_count + 1 on the first tick; leaving it undefined would produce NaN.
+        run_count: typeof existingRunCount === 'number' ? existingRunCount : 0,
       };
       await this.kv.set(SCHEDULER_KEY, JSON.stringify(updated));
     } catch (err: unknown) {

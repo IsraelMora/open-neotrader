@@ -1199,6 +1199,192 @@ describe('PretestService.runCycle — uses agents.runGovernedTurn (PR3)', () => 
   });
 });
 
+// ── Risk-differentiated portfolios: cycleCtx must carry the global ETF universe ──
+//
+// Momentum/trend-following hooks read ctx["universe"] + ctx["provider_tools"]["get_ohlcv"]
+// (backed by ctx["ohlcv"], see apps/sandbox/runner.py). Without this, those hooks always
+// see an empty universe and never emit a signal — the pretest portfolio would never trade.
+// PretestService.runCycle must resolve the SAME `cycle.universe` KV key the real agent
+// cycle reads (AgentsService._buildMarketContext) and fetch OHLCV for it via ProviderGateway.
+
+describe('PretestService.runCycle — cycleCtx carries universe + ohlcv (risk portfolios)', () => {
+  it('resolves universe from KV cycle.universe and fetches OHLCV per symbol into the sandbox context', async () => {
+    const PORTFOLIO_ID = 'portfolio-universe';
+    const UNIVERSE = 'SPY,QQQ,IWM';
+
+    const bars = [{ ts: '2024-01-01', open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 }];
+
+    const mockAgents = {
+      runGovernedTurn: jest.fn().mockResolvedValue({
+        cycle_id: 'c',
+        text: '',
+        tool_calls: [],
+        decisions: [],
+        sandbox_results: [],
+        backend: 'api' as const,
+        skills_read: [],
+        skills_written: [],
+        llm_response: {
+          text: '',
+          tool_calls: [],
+          backend: 'api' as const,
+          skills_read: [],
+          skills_written: [],
+        },
+        signalsEmitted: [],
+      }),
+    } as unknown as AgentsService;
+
+    const getOhlcv = jest.fn().mockResolvedValue(bars);
+    const gateway = {
+      getQuote: jest.fn().mockResolvedValue(makeQuote('AAPL', 150)),
+      getOhlcv,
+    } as unknown as ProviderGatewayService;
+
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = { findActive: jest.fn().mockResolvedValue([]) } as unknown as PluginsService;
+    const sandboxRunCycle = jest
+      .fn()
+      .mockResolvedValue({ ok: true, result: { pending_signals: [] } });
+    const sandbox = { runCycle: sandboxRunCycle } as unknown as SandboxGateway;
+
+    const portfolioRow = {
+      id: PORTFOLIO_ID,
+      name: 'Universe Portfolio',
+      description: null,
+      initial_capital: 100000,
+      plugin_ids: JSON.stringify(['momentum-factor-12-1']),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(makeState({ equity: 100000, cash: 100000 })),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        update: jest.fn().mockResolvedValue(portfolioRow),
+      },
+    } as unknown as PrismaService;
+
+    const kv = makeStubKv({ 'cycle.universe': UNIVERSE });
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      mockAgents,
+      kv,
+      makeStubAudit(),
+    );
+
+    await svc.runCycle(PORTFOLIO_ID);
+
+    expect(sandboxRunCycle).toHaveBeenCalledTimes(1);
+    const [, ctx] = sandboxRunCycle.mock.calls[0] as [string[], Record<string, unknown>];
+    expect(ctx['universe']).toEqual(['SPY', 'QQQ', 'IWM']);
+    const ohlcv = ctx['ohlcv'] as Record<string, unknown[]>;
+    expect(Object.keys(ohlcv).sort((a, b) => a.localeCompare(b))).toEqual(['IWM', 'QQQ', 'SPY']);
+    expect(Array.isArray(ohlcv['SPY'])).toBe(true);
+    expect(Array.isArray(ohlcv['QQQ'])).toBe(true);
+    expect(Array.isArray(ohlcv['IWM'])).toBe(true);
+
+    expect(getOhlcv).toHaveBeenCalledWith(
+      expect.any(String),
+      'SPY',
+      expect.any(String),
+      expect.any(Number),
+    );
+  });
+
+  it('falls back to a default universe when KV cycle.universe is unset', async () => {
+    const PORTFOLIO_ID = 'portfolio-default-universe';
+
+    const mockAgents = {
+      runGovernedTurn: jest.fn().mockResolvedValue({
+        cycle_id: 'c',
+        text: '',
+        tool_calls: [],
+        decisions: [],
+        sandbox_results: [],
+        backend: 'api' as const,
+        skills_read: [],
+        skills_written: [],
+        llm_response: {
+          text: '',
+          tool_calls: [],
+          backend: 'api' as const,
+          skills_read: [],
+          skills_written: [],
+        },
+        signalsEmitted: [],
+      }),
+    } as unknown as AgentsService;
+
+    const gateway = {
+      getQuote: jest.fn().mockResolvedValue(makeQuote('AAPL', 150)),
+      getOhlcv: jest.fn().mockResolvedValue([]),
+    } as unknown as ProviderGatewayService;
+
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = { findActive: jest.fn().mockResolvedValue([]) } as unknown as PluginsService;
+    const sandboxRunCycle = jest
+      .fn()
+      .mockResolvedValue({ ok: true, result: { pending_signals: [] } });
+    const sandbox = { runCycle: sandboxRunCycle } as unknown as SandboxGateway;
+
+    const portfolioRow = {
+      id: PORTFOLIO_ID,
+      name: 'Default Universe Portfolio',
+      description: null,
+      initial_capital: 100000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(makeState({ equity: 100000, cash: 100000 })),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        update: jest.fn().mockResolvedValue(portfolioRow),
+      },
+    } as unknown as PrismaService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      mockAgents,
+      makeStubKv(),
+      makeStubAudit(),
+    );
+
+    await svc.runCycle(PORTFOLIO_ID);
+
+    const [, ctx] = sandboxRunCycle.mock.calls[0] as [string[], Record<string, unknown>];
+    expect(Array.isArray(ctx['universe'])).toBe(true);
+    expect((ctx['universe'] as string[]).length).toBeGreaterThan(0);
+  });
+});
+
 // ── Phase 4.1: RED tests — significance gate (PR4) ───────────────────────────
 
 /**

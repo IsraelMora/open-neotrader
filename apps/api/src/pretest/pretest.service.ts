@@ -48,6 +48,24 @@ const POLICY_DEFAULTS: PretestPolicy = {
 /** Buy & hold benchmark for the alpha gate. SPY = broad US-equity index proxy. */
 const BENCHMARK_SYMBOL = 'SPY';
 
+/**
+ * Fallback universe when KV `cycle.universe` is unset. Mirrors
+ * AgentsService.DEFAULT_UNIVERSE so a pretest cycle and the real agent cycle
+ * default to the same instrument set absent explicit operator config.
+ */
+const DEFAULT_UNIVERSE = [
+  'AAPL',
+  'MSFT',
+  'GOOGL',
+  'AMZN',
+  'NVDA',
+  'META',
+  'TSLA',
+  'SPY',
+  'QQQ',
+  'AMD',
+];
+
 export interface PretestTrade {
   ts: string;
   symbol: string;
@@ -189,7 +207,7 @@ export interface PretestCompare {
   winner_by_risk_adj: string; // mayor retorno / max_drawdown
 }
 
-const DEFAULT_STATE = (capital: number): PretestState => ({
+export const DEFAULT_STATE = (capital: number): PretestState => ({
   equity: capital,
   cash: capital,
   positions: [],
@@ -322,6 +340,13 @@ export class PretestService {
 
     this.log.log(`Pretest ciclo: ${portfolio.name} (plugins: ${portfolio.plugin_ids.join(', ')})`);
 
+    // Market data for the strategy hooks: resolve the SAME `cycle.universe` KV key the
+    // real agent cycle reads (AgentsService._buildMarketContext) and fetch OHLCV so
+    // universe-dependent hooks (momentum-factor-12-1, trend-following, ...) receive
+    // real data. Without this, ctx["universe"] stays empty and those hooks never emit
+    // a signal — the portfolio would never trade.
+    const market = await this._buildMarketContext();
+
     // Construir plugins del pretest (solo los declarados, no los globalmente activos)
     const allPlugins = await this.plugins.findActive();
     const pretestPlugins = allPlugins.filter((p: HydratedPlugin) =>
@@ -343,7 +368,12 @@ export class PretestService {
     const cycleCtx: Record<string, unknown> = {
       pretest_mode: true,
       pretest_id: id,
+      universe: market.universe,
+      ohlcv: market.ohlcv,
+      config: {},
+      portfolio: this._positionsToPortfolioDict(portfolio.state),
       portfolio_state: portfolio.state,
+      portfolio_value: portfolio.state.equity,
     };
 
     const hookResult = await this.sandbox.runCycle(pluginIds, cycleCtx);
@@ -886,6 +916,74 @@ export class PretestService {
     }
 
     return { applied, failed };
+  }
+
+  /**
+   * Resolves the trading universe (KV `cycle.universe`, the same key the real agent
+   * cycle reads) and fetches OHLCV bars per symbol via ProviderGateway. Mirrors
+   * AgentsService._buildMarketContext so pretest strategy hooks receive the same
+   * market-data shape they'd get in the real cycle, WITHOUT the sandbox ever touching
+   * the network (bars are injected; runner.py exposes them as provider_tools.get_ohlcv).
+   * Fail-soft: KV read errors fall back to DEFAULT_UNIVERSE; per-symbol OHLCV fetch
+   * errors are skipped (logged warn), never thrown.
+   */
+  private async _buildMarketContext(): Promise<{
+    universe: string[];
+    ohlcv: Record<string, unknown[]>;
+  }> {
+    let universe: string[] = DEFAULT_UNIVERSE;
+    try {
+      const raw = await this.kv.get('cycle.universe');
+      if (raw && raw.trim()) {
+        const parsed = raw
+          .split(',')
+          .map((s) => s.trim().toUpperCase())
+          .filter(Boolean);
+        if (parsed.length > 0) universe = parsed;
+      }
+    } catch {
+      /* use default */
+    }
+    universe = universe.slice(0, 30);
+
+    const timeframe = (await this.kv.get('cycle.timeframe')) || '1d';
+    const bars = Number((await this.kv.get('cycle.bars')) || 0) || 300;
+    const dataProvider = (await this.kv.get('cycle.data_provider')) || 'yahoo-finance-provider';
+
+    const ohlcv: Record<string, unknown[]> = {};
+    await Promise.all(
+      universe.map(async (symbol) => {
+        try {
+          const raw = await this.gateway.getOhlcv(dataProvider, symbol, timeframe, bars);
+          ohlcv[symbol] = (raw ?? []).map((b) => ({
+            date: typeof b.ts === 'string' ? b.ts.slice(0, 10) : b.ts,
+            open: b.open,
+            high: b.high,
+            low: b.low,
+            close: b.close,
+            volume: b.volume,
+          }));
+        } catch (e: unknown) {
+          this.log.warn(
+            `Pretest OHLCV fetch falló para ${symbol}: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }),
+    );
+    return { universe, ohlcv };
+  }
+
+  /** Maps open positions to the { symbol: {...} } shape strategy hooks read as ctx["portfolio"]. */
+  private _positionsToPortfolioDict(state: PretestState): Record<string, unknown> {
+    const dict: Record<string, unknown> = {};
+    for (const p of state.positions) {
+      dict[p.symbol] = {
+        quantity: p.quantity,
+        avg_price: p.avg_price,
+        current_price: p.current_price ?? p.avg_price,
+      };
+    }
+    return dict;
   }
 
   // ── Simulación de fills ───────────────────────────────────────────────────────
