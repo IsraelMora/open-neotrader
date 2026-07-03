@@ -40,6 +40,7 @@ from risk_manager_core import (  # noqa: E402
     apply_correlation_layer,
     apply_drawdown_layer,
     apply_exposure_layer,
+    compute_vol_target_exposure,
 )
 
 
@@ -58,8 +59,40 @@ def on_cycle(ctx: dict) -> dict:
     logs: list[dict] = []
     signals = list(pending_signals)
 
+    # ── Vol-target exposure scalar (opt-in, ADDITIVE) ───────────────────────
+    # Computed FIRST and independent of whether there are pending_signals this
+    # cycle: a vol-managed book must re-evaluate its target exposure every
+    # cycle (e.g. to rebalance an already-open position toward the new
+    # scalar), not only when a new entry signal happens to exist.
+    exposure_extra: dict = {}
+    if config.get("exposure_mode") == "vol_target":
+        benchmark_symbol = str(config.get("vol_target_benchmark", "SPY"))
+        ohlcv: dict = ctx.get("ohlcv", {}) or {}
+        bars = ohlcv.get(benchmark_symbol, [])
+        closes = [b["close"] for b in bars if isinstance(b, dict) and "close" in b]
+        target_vol_pct = float(config.get("target_vol_pct", 12.0))
+        vol_window_days = int(config.get("vol_window_days", 20))
+        exposure_cap = float(config.get("exposure_cap", 1.0))
+
+        scalar = compute_vol_target_exposure(
+            closes, target_vol_pct, vol_window_days, exposure_cap
+        )
+        # Fail-safe: no/insufficient benchmark data -> 0.0 (stay in cash),
+        # never guess an exposure from missing data.
+        exposure_scalar = scalar if scalar is not None else 0.0
+
+        logs.append({
+            "level": "info",
+            "msg": (
+                f"[vol_target] benchmark={benchmark_symbol} "
+                f"scalar={exposure_scalar:.4f} (target_vol={target_vol_pct}% "
+                f"window={vol_window_days}d cap={exposure_cap})"
+            ),
+        })
+        exposure_extra = {"exposure_scalar": exposure_scalar}
+
     if not signals:
-        return {"signals": [], "logs": logs}
+        return {"signals": [], "logs": logs, **exposure_extra}
 
     # ── Layer 1: Exposure ────────────────────────────────────────────────────
     if config.get("enable_exposure", True):
@@ -182,7 +215,7 @@ def on_cycle(ctx: dict) -> dict:
         ),
     })
 
-    return {"signals": signals, "logs": logs}
+    return {"signals": signals, "logs": logs, **exposure_extra}
 
 
 def _count_rescaled(original: list[dict], result: list[dict]) -> int:

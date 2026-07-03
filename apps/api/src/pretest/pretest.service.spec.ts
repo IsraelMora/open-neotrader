@@ -4026,3 +4026,282 @@ describe('PretestService — short-selling fill model', () => {
     });
   });
 });
+
+// ── Vol-target exposure scalar wiring (vol-managed-exposure change) ───────────
+//
+// A discipline plugin configured with exposure_mode:'vol_target' (risk-manager)
+// must be invoked directly via sandbox.call({cmd:'run_hook', ...}) so runCycle
+// can read its emitted `exposure_scalar` and use it to (a) scale new-entry
+// sizing_pct and (b) rebalance already-open long positions toward it. Portfolios
+// that never configure exposure_mode must see byte-identical behavior (no
+// sandbox.call at all, exposureScalar defaults to a no-op 1).
+
+describe('PretestService.runCycle — vol_target exposure scalar wiring', () => {
+  function makeVolTargetRow(overrides: {
+    plugin_configs: Record<string, unknown>;
+    state?: PretestState;
+  }) {
+    return {
+      id: 'vt-portfolio',
+      name: 'Vol Target Portfolio',
+      description: null,
+      initial_capital: 100_000,
+      plugin_ids: JSON.stringify(['broad-index-hold', 'risk-manager']),
+      plugin_configs: JSON.stringify(overrides.plugin_configs),
+      state: JSON.stringify(overrides.state ?? makeState({ equity: 100_000, cash: 100_000 })),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+  }
+
+  function makeAgentsWithBuy(symbol: string): AgentsService {
+    return {
+      runGovernedTurn: jest.fn().mockResolvedValue({
+        cycle_id: 'c',
+        text: '',
+        tool_calls: [
+          { plugin_id: 'broad-index-hold', function: 'trade', args: { symbol, action: 'buy' } },
+        ],
+        decisions: [],
+        sandbox_results: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+        llm_response: {
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        },
+        signalsEmitted: [],
+      }),
+    } as unknown as AgentsService;
+  }
+
+  it('does NOT call sandbox.call at all when no discipline uses exposure_mode:vol_target (no-op)', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+    } as unknown as PluginsService;
+    const sandboxCall = jest.fn();
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      call: sandboxCall,
+    } as unknown as SandboxGateway;
+    const row = makeVolTargetRow({ plugin_configs: {} });
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue(row),
+      },
+    } as unknown as PrismaService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeAgentsWithBuy('SPY'),
+      makeStubKv(),
+      makeStubAudit(),
+    );
+
+    await svc.runCycle('vt-portfolio');
+
+    expect(sandboxCall).not.toHaveBeenCalled();
+  });
+
+  it('calls sandbox.call({cmd:run_hook}) for the vol_target discipline and scales new-entry sizing_pct by the emitted exposure_scalar', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+    } as unknown as PluginsService;
+    const sandboxCall = jest.fn().mockResolvedValue({ ok: true, result: { exposure_scalar: 0.5 } });
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      call: sandboxCall,
+    } as unknown as SandboxGateway;
+    const row = makeVolTargetRow({
+      plugin_configs: {
+        'risk-manager': { exposure_mode: 'vol_target', target_vol_pct: 12 },
+        __pretest_policy__: { sizing_pct: 0.5, slippage_pct: 0, commission_pct: 0 },
+      },
+    });
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue(row),
+      },
+    } as unknown as PrismaService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeAgentsWithBuy('SPY'),
+      makeStubKv(),
+      makeStubAudit(),
+    );
+
+    const { trades_simulated } = await svc.runCycle('vt-portfolio');
+
+    expect(sandboxCall).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cmd: 'run_hook',
+        plugin_id: 'risk-manager',
+        hook: 'on_cycle',
+      }),
+    );
+    // Unscaled sizing_pct=0.5 * cash=100_000 / price=100 = 500 shares.
+    // Scaled by exposure_scalar=0.5 -> 250 shares.
+    expect(trades_simulated).toHaveLength(1);
+    expect(trades_simulated[0].quantity).toBe(250);
+  });
+
+  it('fail-safe: sandbox.call rejecting collapses exposure_scalar to 0 (no new entries) AND emits an audit event', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+    } as unknown as PluginsService;
+    const sandboxCall = jest.fn().mockRejectedValue(new Error('boom'));
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      call: sandboxCall,
+    } as unknown as SandboxGateway;
+    const row = makeVolTargetRow({
+      plugin_configs: {
+        'risk-manager': { exposure_mode: 'vol_target' },
+        __pretest_policy__: { sizing_pct: 0.5, slippage_pct: 0, commission_pct: 0 },
+      },
+    });
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue(row),
+      },
+    } as unknown as PrismaService;
+    const auditLogFn = jest.fn().mockResolvedValue(undefined);
+    const audit = { log: auditLogFn } as unknown as AuditService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeAgentsWithBuy('SPY'),
+      makeStubKv(),
+      audit,
+    );
+
+    const { trades_simulated } = await svc.runCycle('vt-portfolio');
+
+    // (a) existing fail-safe behavior preserved — no new entries when exposure collapses to 0.
+    expect(trades_simulated).toHaveLength(0);
+
+    // (b) NEW: a stuck-in-cash portfolio must be discoverable via the audit trail,
+    // not just a server-log warning.
+    expect(auditLogFn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'vol_target_exposure_failed',
+        meta: expect.objectContaining({
+          pretest_id: 'vt-portfolio',
+          plugin_id: 'risk-manager',
+          error: expect.stringContaining('boom') as unknown,
+        }) as unknown,
+      }),
+    );
+  });
+
+  describe('_buildVolTargetRebalanceTrades', () => {
+    it('sells part of an existing long position when exposureScalar shrinks below current invested fraction', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        equity: 100_000,
+        cash: 0,
+        positions: [{ symbol: 'SPY', quantity: 800, avg_price: 100, current_price: 100 }],
+      });
+      // current invested = 800*100 = 80_000 (80% of equity). Target = 0.5*100_000 = 50_000.
+      const trades = await (
+        asPrivate(svc) as unknown as {
+          _buildVolTargetRebalanceTrades: (
+            s: PretestState,
+            scalar: number,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._buildVolTargetRebalanceTrades(state, 0.5);
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('sell');
+      expect(trades[0].symbol).toBe('SPY');
+      expect(trades[0].quantity).toBe(300); // sell (80_000-50_000)/100 = 300 shares
+    });
+
+    it('buys more of an existing long position when exposureScalar grows above current invested fraction (within cash)', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        equity: 100_000,
+        cash: 50_000,
+        positions: [{ symbol: 'SPY', quantity: 500, avg_price: 100, current_price: 100 }],
+      });
+      // current invested = 50_000 (50%). Target = 1.0*100_000 = 100_000.
+      const trades = await (
+        asPrivate(svc) as unknown as {
+          _buildVolTargetRebalanceTrades: (
+            s: PretestState,
+            scalar: number,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._buildVolTargetRebalanceTrades(state, 1.0);
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('buy');
+      expect(trades[0].quantity).toBe(500); // buy (100_000-50_000)/100 = 500 shares
+    });
+
+    it('is a no-op when nothing is held yet', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({ equity: 100_000, cash: 100_000, positions: [] });
+      const trades = await (
+        asPrivate(svc) as unknown as {
+          _buildVolTargetRebalanceTrades: (
+            s: PretestState,
+            scalar: number,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._buildVolTargetRebalanceTrades(state, 0.5);
+      expect(trades).toEqual([]);
+    });
+  });
+});

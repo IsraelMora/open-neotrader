@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 
 # Load THIS plugin's cycle.py under a unique module name (every plugin's hook is
 # named cycle.py → a bare `from cycle import` collides via sys.modules across the
@@ -60,6 +62,7 @@ from risk_manager_core import (  # noqa: E402
     apply_correlation_layer,
     apply_drawdown_layer,
     apply_exposure_layer,
+    compute_vol_target_exposure,
     pearson_correlation,
 )
 
@@ -825,3 +828,133 @@ class TestOnCycleIntegration:
         result = on_cycle(ctx)
         cancelled = [s for s in result["signals"] if s.get("action") == "cancelled"]
         assert len(cancelled) == 0, "All layers disabled → nothing cancelled"
+
+
+# ---------------------------------------------------------------------------
+# Vol-target exposure scalar (Moreira & Muir 2017 style) — batch 6 research
+# reproduction. exposure_t = clip(target_vol / realized_vol_{t-1}, 0, cap).
+# ---------------------------------------------------------------------------
+
+
+def _constant_vol_closes(n: int, daily_ret: float, start: float = 100.0) -> list[float]:
+    """Deterministic close series with alternating +daily_ret/-daily_ret so the
+    sample stdev of returns is exactly daily_ret (mean ~0), for exact vol math."""
+    closes = [start]
+    for i in range(n):
+        r = daily_ret if i % 2 == 0 else -daily_ret
+        closes.append(closes[-1] * (1 + r))
+    return closes
+
+
+class TestComputeVolTargetExposure:
+    def test_g1_insufficient_history_returns_none(self) -> None:
+        """Fewer than vol_window_days prior returns -> None (caller treats as 0 exposure)."""
+        closes = [100.0, 101.0, 102.0]  # only 2 prior returns, window needs 20
+        assert compute_vol_target_exposure(closes, 12.0, 20, 1.0) is None
+
+    def test_g2_exact_target_vol_yields_scalar_near_one(self) -> None:
+        """When realized annualized vol ~= target_vol, scalar ~= 1.0."""
+        import math
+
+        daily_ret = 0.12 / math.sqrt(252)  # annualizes to ~12%
+        closes = _constant_vol_closes(40, daily_ret)
+        scalar = compute_vol_target_exposure(closes, 12.0, 20, 1.0)
+        assert scalar is not None
+        assert 0.9 <= scalar <= 1.1
+
+    def test_g3_high_vol_scales_exposure_down(self) -> None:
+        """Realized vol >> target -> scalar well below 1."""
+        closes = _constant_vol_closes(40, 0.05)  # ~79% annualized vol
+        scalar = compute_vol_target_exposure(closes, 12.0, 20, 1.0)
+        assert scalar is not None
+        assert scalar < 0.3
+
+    def test_g4_low_vol_clips_at_cap(self) -> None:
+        """Realized vol << target -> scalar clips at exposure_cap, never exceeds it."""
+        closes = _constant_vol_closes(40, 0.0001)
+        scalar = compute_vol_target_exposure(closes, 12.0, 20, 1.0)
+        assert scalar == 1.0
+
+    def test_g5_cap_above_one_allows_leverage(self) -> None:
+        closes = _constant_vol_closes(40, 0.0001)
+        scalar = compute_vol_target_exposure(closes, 15.0, 20, 1.5)
+        assert scalar == 1.5
+
+    def test_g6_scalar_never_negative(self) -> None:
+        closes = _constant_vol_closes(40, 0.05)
+        scalar = compute_vol_target_exposure(closes, 12.0, 20, 1.0)
+        assert scalar is not None
+        assert scalar >= 0.0
+
+    def test_g7_no_lookahead_last_close_excluded_from_vol(self) -> None:
+        """Appending an extreme final close (a lookahead leak if used) must NOT
+        change the computed scalar, because compute_vol_target_exposure always
+        excludes the most recent close from the return series."""
+        import math
+
+        daily_ret = 0.12 / math.sqrt(252)
+        closes = _constant_vol_closes(40, daily_ret)
+        scalar_before = compute_vol_target_exposure(closes, 12.0, 20, 1.0)
+        closes_with_shock = closes + [closes[-1] * 3.0]  # extreme "today" close
+        scalar_after = compute_vol_target_exposure(closes_with_shock, 12.0, 20, 1.0)
+        assert scalar_before == pytest.approx(scalar_after, abs=1e-9)
+
+    def test_g8_zero_vol_returns_cap_not_none(self) -> None:
+        """Flat closes (zero realized vol) -> scalar clips at cap (not a crash/None)."""
+        closes = [100.0] * 40
+        scalar = compute_vol_target_exposure(closes, 12.0, 20, 1.0)
+        assert scalar == 1.0
+
+
+class TestOnCycleVolTargetMode:
+    def test_h1_default_mode_no_exposure_scalar_key(self) -> None:
+        """exposure_mode absent/'layered' (default): no exposure_scalar key at all,
+        existing layered behavior fully preserved."""
+        ctx = _make_ctx(pending_signals=[], config=_all_enabled_config())
+        result = on_cycle(ctx)
+        assert "exposure_scalar" not in result
+
+    def test_h2_vol_target_mode_emits_exposure_scalar(self) -> None:
+        import math
+
+        daily_ret = 0.12 / math.sqrt(252)
+        closes = _constant_vol_closes(40, daily_ret)
+        bars = [{"date": f"2024-01-{i:02d}", "close": c} for i, c in enumerate(closes, start=1)]
+        ctx = _make_ctx(
+            pending_signals=[],
+            config={
+                **_all_enabled_config(),
+                "exposure_mode": "vol_target",
+                "target_vol_pct": 12.0,
+                "vol_window_days": 20,
+                "exposure_cap": 1.0,
+                "vol_target_benchmark": "SPY",
+            },
+        )
+        ctx["ohlcv"] = {"SPY": bars}
+        result = on_cycle(ctx)
+        assert "exposure_scalar" in result
+        assert 0.0 <= result["exposure_scalar"] <= 1.0
+
+    def test_h3_vol_target_mode_missing_benchmark_data_defaults_zero(self) -> None:
+        """No ohlcv for the configured benchmark -> exposure_scalar=0.0 (fail-safe:
+        stay in cash rather than guess an exposure)."""
+        ctx = _make_ctx(
+            pending_signals=[],
+            config={**_all_enabled_config(), "exposure_mode": "vol_target"},
+        )
+        ctx["ohlcv"] = {}
+        result = on_cycle(ctx)
+        assert result["exposure_scalar"] == 0.0
+
+    def test_h4_vol_target_mode_does_not_disable_other_layers(self) -> None:
+        """exposure_mode=vol_target is additive: the four layers still run and can
+        still cancel signals, exactly as in layered mode."""
+        signal = {"symbol": "SHORT1", "action": "short", "qty": 10, "price": 100.0}
+        ctx = _make_ctx(
+            pending_signals=[signal],
+            config={**_all_enabled_config(allow_shorts=False), "exposure_mode": "vol_target"},
+        )
+        ctx["ohlcv"] = {}
+        result = on_cycle(ctx)
+        assert result["signals"][0]["action"] == "cancelled"

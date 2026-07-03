@@ -78,7 +78,7 @@ export const BOOTSTRAP_APPLIED_KEY = 'bootstrap.momentum_v1_applied';
  * instances (v1 already set) without re-running the momentum/execution/universe/
  * plugin block — see the module docstring above.
  */
-export const PRETEST_SEED_KEY = 'bootstrap.pretest_seed_v2';
+export const PRETEST_SEED_KEY = 'bootstrap.pretest_seed_v3';
 const UNIVERSE_KEY = 'cycle.universe';
 const EXECUTION_REAL_KEY = 'execution.real';
 const SCHEDULER_KEY = 'scheduler';
@@ -109,6 +109,18 @@ interface PretestPortfolioSeed {
  *     input to this hook, so that key is intentionally omitted here.
  *   - __pretest_policy__ is PretestService's reserved fill-policy config (never
  *     passed to plugins), read by PretestService._readPolicy().
+ *
+ * 'Vol-Managed Index' (v3 addition) is DIFFERENT in kind from the other seven:
+ * it does not use momentum/trend/relative-strength ranking at all — it holds
+ * SPY unconditionally (broad-index-hold) and lets risk-manager's
+ * exposure_mode="vol_target" scale total exposure toward a 12% target
+ * annualized volatility (20-trading-day realized-vol window, cap=1.0x — no
+ * leverage). This reproduces the batch-6 research result (vol-managed SPY:
+ * Sharpe 0.96 vs SPY buy-hold's 0.78, roughly half the max drawdown) as REAL
+ * plugin code, wired through PretestService.runCycle's exposure_scalar path
+ * (see pretest.service.ts). __pretest_policy__.sizing_pct=1.0 so a fully
+ * unscaled entry would buy with 100% of cash — exposureScalar is what throttles
+ * it down to the target-vol level, not sizing_pct.
  */
 export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
   {
@@ -211,6 +223,28 @@ export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
     plugin_configs: {
       'position-sizing': { mode: 'vol_target', max_position_pct: 12 },
       __pretest_policy__: { sizing_pct: 0.1, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
+    name: 'Vol-Managed Index',
+    description:
+      'Volatility-managed SPY exposure (Moreira & Muir 2017 style): holds SPY unconditionally (no ranking, no monthly rebalance) and lets risk-manager scale total exposure toward a 12% target annualized volatility (20d realized-vol window, no leverage). Batch-6 research: Sharpe 0.96 vs SPY buy-hold 0.78.',
+    initial_capital: 100_000,
+    plugin_ids: ['broad-index-hold', 'risk-manager'],
+    plugin_configs: {
+      'broad-index-hold': { symbols: 'SPY' },
+      'risk-manager': {
+        exposure_mode: 'vol_target',
+        target_vol_pct: 12,
+        vol_window_days: 20,
+        exposure_cap: 1.0,
+        vol_target_benchmark: 'SPY',
+      },
+      // sizing_pct=1.0: an UNSCALED entry would use 100% of cash — the
+      // exposureScalar computed from risk-manager's exposure_scalar is what
+      // actually throttles this down toward the 12%-target-vol level (see
+      // PretestService.runCycle's effectivePolicy / volTargetPlugin wiring).
+      __pretest_policy__: { sizing_pct: 1.0, slippage_pct: 0.0005, commission_pct: 0 },
     },
   },
 ];
@@ -324,7 +358,7 @@ export class StrategyBootstrapService implements OnModuleInit {
   private async seedPretestPortfoliosIfNeeded(): Promise<void> {
     const alreadySeeded = kvBool(await this.kv.get(PRETEST_SEED_KEY), false);
     if (alreadySeeded) {
-      this.log.log('Bootstrap: pretest portfolios ya sembrados (pretest_seed_v2) — no-op');
+      this.log.log(`Bootstrap: pretest portfolios ya sembrados (${PRETEST_SEED_KEY}) — no-op`);
       return;
     }
 

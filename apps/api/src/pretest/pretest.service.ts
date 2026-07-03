@@ -388,6 +388,46 @@ export class PretestService {
       pluginConfigs[p.id] = p.config;
     }
 
+    // ── Vol-target exposure scalar (opt-in) ────────────────────────────────────
+    // If a discipline plugin in this portfolio is configured with
+    // exposure_mode:'vol_target' (risk-manager), invoke its on_cycle hook
+    // directly — mirrors AgentsService._runVetoLayer's run_hook pattern — to
+    // obtain a continuous exposure_scalar ∈ [0, cap] driven by REAL realized
+    // volatility (plugins/risk-manager/scripts/risk_manager_core.py
+    // compute_vol_target_exposure). Portfolios that never set exposure_mode
+    // get exposureScalar=1 — a pure no-op, existing behavior fully unchanged.
+    const volTargetPlugin = pluginsWithOverrides.find(
+      (p: HydratedPlugin) =>
+        p.type === 'discipline' && pluginConfigs[p.id]?.['exposure_mode'] === 'vol_target',
+    );
+    let exposureScalar = 1;
+    if (volTargetPlugin) {
+      try {
+        const hookResp = await this.sandbox.call({
+          cmd: 'run_hook',
+          plugin_id: volTargetPlugin.id,
+          hook: 'on_cycle',
+          context: {
+            pending_signals: [],
+            portfolio: this._positionsToPortfolioDict(portfolio.state),
+            positions: portfolio.state.positions,
+            portfolio_value: portfolio.state.equity,
+            ohlcv: market.ohlcv,
+            config: pluginConfigs[volTargetPlugin.id],
+          },
+        });
+        const raw = (hookResp.result as Record<string, unknown> | undefined)?.['exposure_scalar'];
+        // Fail-safe: hook error, missing key, or a non-finite/negative value
+        // all collapse to 0 exposure (stay in cash) — never silently fall
+        // back to "fully invested" when the real scalar couldn't be obtained.
+        exposureScalar = typeof raw === 'number' && isFinite(raw) && raw >= 0 ? raw : 0;
+      } catch (err) {
+        this.log.warn(`vol_target exposure hook failed for ${volTargetPlugin.id}: ${String(err)}`);
+        exposureScalar = 0;
+        await this._auditVolTargetExposureFailure(id, portfolio.name, volTargetPlugin.id, err);
+      }
+    }
+
     // ── Ciclo de señales ──────────────────────────────────────────────────────
     const cycleCtx: Record<string, unknown> = {
       pretest_mode: true,
@@ -432,14 +472,32 @@ export class PretestService {
 
     // ── Leer política de fills del portfolio ──────────────────────────────────
     const policy = this._readPolicy(portfolio);
+    // Vol-target scaling: new-entry sizing is throttled by exposureScalar (1 = no-op).
+    // This is the "gate new entries" half of the mechanism; the other half —
+    // rebalancing EXISTING positions toward the scalar — is _buildVolTargetRebalanceTrades below.
+    const effectivePolicy: PretestPolicy =
+      exposureScalar === 1 ? policy : { ...policy, sizing_pct: policy.sizing_pct * exposureScalar };
 
     // ── Simular fills (async: price from getQuote.last + slippage) ────────────
     // Use validated tool_calls from the governed turn (providers already dropped by virtual guard).
-    const trades = await this._simulateFills(turnResult.tool_calls, portfolio.state, policy);
+    const trades = await this._simulateFills(
+      turnResult.tool_calls,
+      portfolio.state,
+      effectivePolicy,
+    );
+
+    // ── Vol-target rebalance of EXISTING long positions toward exposureScalar ──
+    const rebalanceTrades = volTargetPlugin
+      ? await this._buildVolTargetRebalanceTrades(portfolio.state, exposureScalar)
+      : [];
 
     // Actualizar estado virtual (sync trade application + commission, async MTM equity)
-    const newState = this._applyTrades(portfolio.state, trades, policy);
-    await this._updateEquityMetrics(newState, policy);
+    const newState = this._applyTrades(
+      portfolio.state,
+      [...trades, ...rebalanceTrades],
+      effectivePolicy,
+    );
+    await this._updateEquityMetrics(newState, effectivePolicy);
 
     await this.db.pretestPortfolio.update({
       where: { id },
@@ -1144,6 +1202,116 @@ export class PretestService {
     // sell / close (long exits)
     const pos = state.positions.find((p) => p.symbol === symbol);
     return pos && pos.quantity > 0 ? pos.quantity : 0;
+  }
+
+  /**
+   * Rebalances EXISTING long positions toward exposureScalar × portfolio
+   * equity, pro-rata across all currently-held long positions (weighted by
+   * their current notional). This is the "minimal faithful mechanism"
+   * documented in the vol-managed-exposure change: the per-signal fill model
+   * has no native "target weight" concept, so instead of reimplementing a
+   * full target-weight rebalancer, this scales whatever the LLM/plugins have
+   * already chosen to hold, toward the risk-manager-emitted exposure_scalar
+   * (never hardcoded — see runCycle's volTargetPlugin hook call).
+   *
+   * New entries are separately throttled via sizing_pct scaling in runCycle
+   * (effectivePolicy) — this method only ever touches ALREADY-open long
+   * positions. Shorts are left untouched (vol-target is a long-exposure
+   * concept in the batch-6 research). No-op when nothing is held yet — the
+   * next cycle's entry, sized via the scaled sizing_pct, is what establishes
+   * the book in the first place.
+   */
+  /** Fresh marks for every held long position; falls back to last-known mark
+   * (or cost basis) on a getQuote failure — never throws. Extracted from
+   * _buildVolTargetRebalanceTrades to keep its cognitive complexity low. */
+  private async _freshMarks(positions: PretestPosition[]): Promise<Map<string, number>> {
+    const marks = new Map<string, number>();
+    for (const pos of positions) {
+      try {
+        const quote = await this.gateway.getQuote(null, pos.symbol);
+        if (isFinite(quote.last) && quote.last > 0) marks.set(pos.symbol, quote.last);
+      } catch {
+        /* fall through to last-known mark below */
+      }
+    }
+    return marks;
+  }
+
+  /** One symbol's rebalance trade toward its pro-rata share of `delta` USD, or
+   * null when there's nothing tradeable (price<=0 or resulting qty is 0). */
+  private _oneRebalanceTrade(
+    pos: PretestPosition,
+    price: number,
+    symbolDeltaUsd: number,
+    ts: string,
+  ): PretestTrade | null {
+    if (price <= 0) return null;
+    if (symbolDeltaUsd > 0) {
+      // Scale up: buy more of this symbol. _applyBuy silently skips if cash
+      // is insufficient — no separate cash check needed here.
+      const qty = Math.floor(symbolDeltaUsd / price);
+      return qty > 0 ? { ts, symbol: pos.symbol, action: 'buy', price, quantity: qty } : null;
+    }
+    // Scale down: sell part of this symbol, capped at the held quantity.
+    const qty = Math.min(pos.quantity, Math.floor(Math.abs(symbolDeltaUsd) / price));
+    return qty > 0 ? { ts, symbol: pos.symbol, action: 'sell', price, quantity: qty } : null;
+  }
+
+  /**
+   * Audit trail for a failed vol-target exposure hook. exposureScalar already fails
+   * safe to 0 (portfolio goes/stays 100% cash) by the time this is called — this only
+   * ADDS observability so a persistently-failing hook is discoverable via the audit
+   * API/UI instead of only a server-log warning. Fail-soft: never throws out of runCycle.
+   */
+  private async _auditVolTargetExposureFailure(
+    pretestId: string,
+    pretestName: string,
+    pluginId: string,
+    err: unknown,
+  ): Promise<void> {
+    try {
+      await this.audit.log({
+        event_type: 'vol_target_exposure_failed',
+        meta: {
+          pretest_id: pretestId,
+          pretest_name: pretestName,
+          plugin_id: pluginId,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+    } catch (auditErr: unknown) {
+      this.log.warn(`Failed to audit vol_target_exposure_failed: ${String(auditErr)}`);
+    }
+  }
+
+  private async _buildVolTargetRebalanceTrades(
+    state: PretestState,
+    exposureScalar: number,
+  ): Promise<PretestTrade[]> {
+    const longPositions = state.positions.filter((p) => p.quantity > 0);
+    if (longPositions.length === 0 || !isFinite(exposureScalar) || exposureScalar < 0) return [];
+
+    const marks = await this._freshMarks(longPositions);
+    const priceOf = (pos: PretestPosition): number =>
+      marks.get(pos.symbol) ?? pos.current_price ?? pos.avg_price;
+
+    const currentInvested = longPositions.reduce((sum, p) => sum + p.quantity * priceOf(p), 0);
+    if (currentInvested <= 0) return [];
+
+    const targetInvested = exposureScalar * state.equity;
+    const delta = targetInvested - currentInvested;
+    // Ignore sub-$1 deltas — not worth a trade, avoids churn from float noise.
+    if (Math.abs(delta) < 1) return [];
+
+    const ts = new Date().toISOString();
+    const trades: PretestTrade[] = [];
+    for (const pos of longPositions) {
+      const price = priceOf(pos);
+      const weight = (pos.quantity * price) / currentInvested;
+      const trade = this._oneRebalanceTrade(pos, price, delta * weight, ts);
+      if (trade) trades.push(trade);
+    }
+    return trades;
   }
 
   private _applyTrades(
