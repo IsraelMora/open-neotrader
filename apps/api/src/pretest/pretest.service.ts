@@ -431,16 +431,27 @@ export class PretestService {
     };
   }
 
-  /** Ejecuta UN ciclo para TODOS los portfolios activos (comparación en paralelo). */
+  /**
+   * Ejecuta UN ciclo para TODOS los portfolios activos, SECUENCIALMENTE.
+   *
+   * Deliberately sequential (not Promise.all): N portfolios share the same
+   * universe, so running them concurrently would burst N LLM calls + N×|universe|
+   * OHLCV fetches per tick and rate-limit a shared (often free-tier) provider/LLM.
+   * One portfolio at a time keeps load bounded; fail-soft per portfolio so one
+   * failure never aborts the rest.
+   */
   async runAllActive(): Promise<Array<{ id: string; name: string; ok: boolean; error?: string }>> {
     const active = await this.db.pretestPortfolio.findMany({ where: { is_active: true } });
-    const results = await Promise.allSettled(active.map((p) => this.runCycle(p.id)));
-    return results.map((r, i) => ({
-      id: active[i].id,
-      name: active[i].name,
-      ok: r.status === 'fulfilled',
-      error: r.status === 'rejected' ? String(r.reason) : undefined,
-    }));
+    const results: Array<{ id: string; name: string; ok: boolean; error?: string }> = [];
+    for (const p of active) {
+      try {
+        await this.runCycle(p.id);
+        results.push({ id: p.id, name: p.name, ok: true });
+      } catch (err) {
+        results.push({ id: p.id, name: p.name, ok: false, error: String(err) });
+      }
+    }
+    return results;
   }
 
   /** Comparativa de rendimiento entre todos los portfolios de pretest. */
