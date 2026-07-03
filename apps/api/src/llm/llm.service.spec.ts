@@ -333,6 +333,26 @@ describe('LlmService.completeViaOpenAi — generic LLM_BASE_URL / LLM_API_KEY co
     expect(headers['Authorization']).toBe('Bearer generic-key');
   });
 
+  it('sends the configured model AS-IS (never forces gpt-4o-mini) for a non-gpt model', async () => {
+    const svc = new LlmService(
+      makeConfig({
+        LLM_BACKEND: 'openai',
+        LLM_BASE_URL: 'https://generativelanguage.googleapis.com/v1beta/openai',
+        LLM_API_KEY: 'generic-key',
+        LLM_MODEL: 'gemini-3.5-flash',
+      }),
+      makePlugins(),
+      makeKvStub(),
+    );
+    const fetchMock = mockOpenAiFetch('ok');
+
+    await svc.complete({ context: 'test' });
+
+    const callArgs = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(callArgs[1].body as string) as { model: string };
+    expect(body.model).toBe('gemini-3.5-flash');
+  });
+
   it('falls back to OPENAI_BASE_URL / OPENAI_API_KEY when generic vars are unset (backward compat)', async () => {
     const svc = new LlmService(
       makeConfig({

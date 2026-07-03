@@ -404,7 +404,10 @@ export class LlmService implements OnModuleInit {
 
     const hasTools = req.tools && req.tools.length > 0;
     const requestBody: Record<string, unknown> = {
-      model: this._model.startsWith('gpt') ? this._model : 'gpt-4o-mini',
+      // Send the configured model AS-IS: this is a generic OpenAI-compatible client
+      // (OpenRouter/Gemini/Groq/Ollama/… all use their own model ids), so forcing a
+      // 'gpt-*' fallback would silently swap the operator's model for gpt-4o-mini.
+      model: this._model,
       messages: [
         { role: 'system', content: systemContent },
         { role: 'user', content: req.context },

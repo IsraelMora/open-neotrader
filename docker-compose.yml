@@ -47,12 +47,8 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
       LLM_MODEL: ${LLM_MODEL:-nvidia/nemotron-3-super-120b-a12b:free}
-      # GEMINI_API_KEY se pasa desde el env de Dokploy (lo setea el operador en el
-      # tab Environment) para que backend=gemini pueda autenticar. A diferencia de la
-      # nota de abajo, ESTA key sí se cablea acá porque se aprovisiona por el env de
-      # Dokploy, no por POST /api/credentials. Si está vacía, queda "" (sin efecto).
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      # NOTA: las demás API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, brokers)
+      # NOTA: las API keys de providers nativos (OPENAI_API_KEY, ANTHROPIC_API_KEY,
+      # GEMINI_API_KEY, brokers)
       # NO van acá. Declararlas con default vacío (${VAR:-}) las define como "" en el
       # contenedor, y @nestjs/config NO deja que /data/.env pise una env ya presente →
       # la credencial real del volumen queda TAPADA ("no configurada"). Se cargan por
