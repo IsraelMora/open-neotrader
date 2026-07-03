@@ -35,6 +35,7 @@ import { StrategyModule } from './strategy/strategy.module';
 import { VetoAnalyzerModule } from './veto-analyzer/veto-analyzer.module';
 import { RealOrderModule } from './real-order/real-order.module';
 import { RealReconciliationModule } from './real-reconciliation/real-broker-reconciliation.module';
+import { StrategyBootstrapModule } from './strategy-bootstrap/strategy-bootstrap.module';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard';
 import { CorrelationMiddleware } from './common/correlation.middleware';
 
@@ -97,6 +98,7 @@ import { CorrelationMiddleware } from './common/correlation.middleware';
     // boot) — it is NOT load-bearing for correctness anymore.
     RealOrderModule,
     RealReconciliationModule,
+    StrategyBootstrapModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: JwtAuthGuard },
