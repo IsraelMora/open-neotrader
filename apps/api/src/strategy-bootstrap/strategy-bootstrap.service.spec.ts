@@ -1,13 +1,16 @@
+import { Logger } from '@nestjs/common';
 import {
   StrategyBootstrapService,
   MOMENTUM_UNIVERSE,
   PLUGINS_TO_ACTIVATE,
   PLUGINS_TO_DEACTIVATE,
   BOOTSTRAP_APPLIED_KEY,
+  LLM_GEMINI_APPLIED_KEY,
   PRETEST_PORTFOLIOS_TO_SEED,
 } from './strategy-bootstrap.service';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { KvService } from '../common/kv.service';
+import type { LlmService } from '../llm/llm.service';
 
 function makeKv(initial: Record<string, string> = {}): {
   kv: KvService;
@@ -25,6 +28,21 @@ function makeKv(initial: Record<string, string> = {}): {
     delete: jest.fn(() => Promise.resolve()),
   } as unknown as KvService;
   return { kv, store, setMock };
+}
+
+/** Minimal LlmService mock — only patchConfig is exercised by the bootstrap step. */
+function makeLlm(opts: { throwOnPatch?: boolean } = {}): {
+  llm: LlmService;
+  patchConfig: jest.Mock;
+} {
+  const patchConfig = jest.fn((_patch: { model?: string; backend?: string }) => {
+    if (opts.throwOnPatch) {
+      throw new Error('patchConfig failed');
+    }
+    return {};
+  });
+  const llm = { patchConfig } as unknown as LlmService;
+  return { llm, patchConfig };
 }
 
 function makeDb(
@@ -81,7 +99,8 @@ describe('StrategyBootstrapService', () => {
   it('applies the bootstrap once, then no-ops on a second run (idempotency guard)', async () => {
     const { kv, store } = makeKv();
     const { db, updateMany } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
     expect(store[BOOTSTRAP_APPLIED_KEY]).toBe('true');
@@ -95,7 +114,8 @@ describe('StrategyBootstrapService', () => {
   it('writes cycle.universe with the momentum rotation symbol list', async () => {
     const { kv, store } = makeKv();
     const { db } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -105,7 +125,8 @@ describe('StrategyBootstrapService', () => {
   it('activates the momentum stack plugins and deactivates the noisy/buggy ones', async () => {
     const { kv } = makeKv();
     const { db, updateMany } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -120,7 +141,8 @@ describe('StrategyBootstrapService', () => {
   it('sets PAPER mode (execution.real=false) and enables the scheduler with a sane interval', async () => {
     const { kv, store } = makeKv();
     const { db } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -139,7 +161,8 @@ describe('StrategyBootstrapService', () => {
       scheduler: JSON.stringify({ enabled: false, override_interval_ms: 90_000 }),
     });
     const { db } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -154,7 +177,8 @@ describe('StrategyBootstrapService', () => {
   it('NEVER sets execution.real=true and NEVER touches the real-money kill-switch', async () => {
     const { kv, setMock } = makeKv();
     const { db } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -171,7 +195,8 @@ describe('StrategyBootstrapService', () => {
   it('sets bootstrap.momentum_v1_applied LAST, only after config/plugin writes succeed', async () => {
     const { kv, setMock } = makeKv();
     const { db } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -182,7 +207,8 @@ describe('StrategyBootstrapService', () => {
   it('is fail-soft when a plugin row is missing: continues and still completes the bootstrap', async () => {
     const { kv, store } = makeKv();
     const { db } = makeDb(['momentum-factor-12-1']);
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await expect(svc.run()).resolves.not.toThrow();
     expect(store[BOOTSTRAP_APPLIED_KEY]).toBe('true');
@@ -192,7 +218,8 @@ describe('StrategyBootstrapService', () => {
   it('is fail-soft when a plugin update throws (DB error): continues with the rest', async () => {
     const { kv, store } = makeKv();
     const { db, updateMany } = makeDb([], ['trend-following']);
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await expect(svc.run()).resolves.not.toThrow();
     // The rest of the plugins still get processed despite one throwing.
@@ -210,7 +237,8 @@ describe('StrategyBootstrapService', () => {
       delete: jest.fn(),
     } as unknown as KvService;
     const { db } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await expect(svc.onModuleInit()).resolves.not.toThrow();
   });
@@ -218,7 +246,8 @@ describe('StrategyBootstrapService', () => {
   it('creates the scheduler KV with run_count:0 (cosmetic fix — avoids run_count+1 = NaN)', async () => {
     const { kv, store } = makeKv();
     const { db } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -231,7 +260,8 @@ describe('StrategyBootstrapService', () => {
       scheduler: JSON.stringify({ enabled: false, override_interval_ms: 90_000 }),
     });
     const { db } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -244,7 +274,8 @@ describe('StrategyBootstrapService', () => {
       scheduler: JSON.stringify({ enabled: false, override_interval_ms: 90_000, run_count: 7 }),
     });
     const { db } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -263,7 +294,8 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
   it('seeds exactly 3 risk-differentiated pretest portfolios on first run', async () => {
     const { kv } = makeKv();
     const { db, pretestCreate } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -279,7 +311,8 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
   it('each seeded portfolio uses $100k initial capital and the DEFAULT_STATE shape', async () => {
     const { kv } = makeKv();
     const { db, pretestCreate } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -296,7 +329,8 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
   it('plugin_configs use config keys the plugins actually read (no dead "vol_target" key)', async () => {
     const { kv } = makeKv();
     const { db, pretestCreate } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -327,7 +361,8 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
     const { db, pretestCreate } = makeDb([], [], {
       existingPretestNames: ['Conservador Momentum'],
     });
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
 
@@ -341,7 +376,8 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
   it('no-ops on a second run (gated by the same bootstrap.momentum_v1_applied flag)', async () => {
     const { kv } = makeKv();
     const { db, pretestCreate } = makeDb();
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await svc.run();
     const callsAfterFirst = pretestCreate.mock.calls.length;
@@ -355,7 +391,8 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
     const { db, pretestCreate } = makeDb([], [], {
       throwingPretestNames: ['Agresivo Momentum'],
     });
-    const svc = new StrategyBootstrapService(db, kv);
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
 
     await expect(svc.run()).resolves.not.toThrow();
     expect(store[BOOTSTRAP_APPLIED_KEY]).toBe('true');
@@ -373,5 +410,102 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
       'Agresivo Momentum',
       'Trend Puro',
     ]);
+  });
+});
+
+// ── LLM Gemini backend switch ─────────────────────────────────────────────────
+//
+// Independent idempotent step, gated by its own KV flag (LLM_GEMINI_APPLIED_KEY),
+// so it keeps retrying on every boot until GEMINI_API_KEY is present — even after
+// the momentum bootstrap has already been marked applied.
+
+describe('StrategyBootstrapService — Gemini LLM backend switch', () => {
+  const ORIGINAL_GEMINI_KEY = process.env.GEMINI_API_KEY;
+
+  afterEach(() => {
+    if (ORIGINAL_GEMINI_KEY === undefined) {
+      delete process.env.GEMINI_API_KEY;
+    } else {
+      process.env.GEMINI_API_KEY = ORIGINAL_GEMINI_KEY;
+    }
+  });
+
+  it('switches the LLM backend to gemini and marks the flag when GEMINI_API_KEY is present', async () => {
+    process.env.GEMINI_API_KEY = 'test-key-value';
+    const { kv, store } = makeKv();
+    const { db } = makeDb();
+    const { llm, patchConfig } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(patchConfig).toHaveBeenCalledWith({ backend: 'gemini', model: 'gemini-3.5-flash' });
+    expect(store[LLM_GEMINI_APPLIED_KEY]).toBe('true');
+  });
+
+  it('skips the switch and does NOT set the flag when GEMINI_API_KEY is absent', async () => {
+    delete process.env.GEMINI_API_KEY;
+    const { kv, store } = makeKv();
+    const { db } = makeDb();
+    const { llm, patchConfig } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(patchConfig).not.toHaveBeenCalled();
+    expect(store[LLM_GEMINI_APPLIED_KEY]).toBeUndefined();
+  });
+
+  it('is idempotent: no-ops on a second run once the flag is already set', async () => {
+    process.env.GEMINI_API_KEY = 'test-key-value';
+    const { kv } = makeKv({ [LLM_GEMINI_APPLIED_KEY]: 'true' });
+    const { db } = makeDb();
+    const { llm, patchConfig } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(patchConfig).not.toHaveBeenCalled();
+  });
+
+  it('retries on a later boot once the key appears, even if the momentum bootstrap already applied', async () => {
+    process.env.GEMINI_API_KEY = 'test-key-value';
+    const { kv, store } = makeKv({ [BOOTSTRAP_APPLIED_KEY]: 'true' });
+    const { db } = makeDb();
+    const { llm, patchConfig } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(patchConfig).toHaveBeenCalledWith({ backend: 'gemini', model: 'gemini-3.5-flash' });
+    expect(store[LLM_GEMINI_APPLIED_KEY]).toBe('true');
+  });
+
+  it('is fail-soft: does not set the flag and does not throw if patchConfig throws', async () => {
+    process.env.GEMINI_API_KEY = 'test-key-value';
+    const { kv, store } = makeKv();
+    const { db } = makeDb();
+    const { llm } = makeLlm({ throwOnPatch: true });
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await expect(svc.run()).resolves.not.toThrow();
+    expect(store[LLM_GEMINI_APPLIED_KEY]).toBeUndefined();
+  });
+
+  it('never logs or embeds the API key value itself', async () => {
+    process.env.GEMINI_API_KEY = 'super-secret-value-should-not-leak';
+    const { kv } = makeKv();
+    const { db } = makeDb();
+    const { llm, patchConfig } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+
+    await svc.run();
+
+    for (const call of logSpy.mock.calls) {
+      expect(JSON.stringify(call)).not.toContain('super-secret-value-should-not-leak');
+    }
+    expect(patchConfig).toHaveBeenCalledWith({ backend: 'gemini', model: 'gemini-3.5-flash' });
+    logSpy.mockRestore();
   });
 });

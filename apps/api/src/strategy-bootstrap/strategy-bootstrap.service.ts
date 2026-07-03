@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { KvService } from '../common/kv.service';
 import { kvBool } from '../common/kv.util';
 import { DEFAULT_STATE as defaultPretestState } from '../pretest/pretest.service';
+import { LlmService } from '../llm/llm.service';
 
 /**
  * StrategyBootstrapService — deploy-time, idempotent PAPER-mode seeder.
@@ -62,6 +63,15 @@ export const BOOTSTRAP_APPLIED_KEY = 'bootstrap.momentum_v1_applied';
 const UNIVERSE_KEY = 'cycle.universe';
 const EXECUTION_REAL_KEY = 'execution.real';
 const SCHEDULER_KEY = 'scheduler';
+
+/**
+ * Idempotency flag for the Gemini LLM backend switch (see applyGeminiBackend()).
+ * Independent from BOOTSTRAP_APPLIED_KEY on purpose: this step must keep retrying
+ * on every boot until GEMINI_API_KEY is present, even after the momentum bootstrap
+ * has already been applied once.
+ */
+export const LLM_GEMINI_APPLIED_KEY = 'bootstrap.llm_gemini_v1_applied';
+const GEMINI_MODEL = 'gemini-3.5-flash';
 
 /** Spec for a single seeded pretest (virtual) portfolio. */
 interface PretestPortfolioSeed {
@@ -149,6 +159,7 @@ export class StrategyBootstrapService implements OnModuleInit {
   constructor(
     private readonly db: PrismaService,
     private readonly kv: KvService,
+    private readonly llm: LlmService,
   ) {}
 
   /** Runs on boot. Never throws — a bootstrap failure must never block application startup. */
@@ -162,8 +173,29 @@ export class StrategyBootstrapService implements OnModuleInit {
     }
   }
 
-  /** Idempotent PAPER-mode bootstrap of the momentum-rotation strategy. */
+  /**
+   * Runs every independently-guarded bootstrap step. Each step (momentum seeding,
+   * Gemini backend switch, ...) has its own idempotency flag and its own try/catch,
+   * so a failure in one step can never abort or skip the others.
+   */
   async run(): Promise<void> {
+    try {
+      await this.applyMomentumBootstrap();
+    } catch (err: unknown) {
+      this.log.warn(
+        `Bootstrap: fallo en applyMomentumBootstrap (no bloquea el resto): ${String(err)}`,
+      );
+    }
+
+    try {
+      await this.applyGeminiBackend();
+    } catch (err: unknown) {
+      this.log.warn(`Bootstrap: fallo en applyGeminiBackend (no bloquea el resto): ${String(err)}`);
+    }
+  }
+
+  /** Idempotent PAPER-mode bootstrap of the momentum-rotation strategy. */
+  private async applyMomentumBootstrap(): Promise<void> {
     const alreadyApplied = kvBool(await this.kv.get(BOOTSTRAP_APPLIED_KEY), false);
     if (alreadyApplied) {
       this.log.log('Bootstrap momentum_v1 ya aplicado — no-op');
@@ -286,5 +318,39 @@ export class StrategyBootstrapService implements OnModuleInit {
     } catch (err: unknown) {
       this.log.warn(`Bootstrap: fallo al habilitar el scheduler: ${String(err)}`);
     }
+  }
+
+  /**
+   * Idempotent, deploy-time switch of the LLM backend to Google Gemini once a
+   * GEMINI_API_KEY is present in the environment.
+   *
+   * Guarded by LLM_GEMINI_APPLIED_KEY, separate from BOOTSTRAP_APPLIED_KEY: this
+   * step must be able to run (and eventually succeed) on a deploy AFTER the
+   * momentum bootstrap has already been marked applied. Only reads whether the
+   * env var is present — never its value — and never logs the key itself.
+   *
+   * Ordering: the KV flag is set ONLY after LlmService.patchConfig() succeeds, so
+   * a failure here leaves the flag unset and the step retries on the next boot.
+   * Fail-soft: never throws out of onModuleInit (see run()).
+   */
+  private async applyGeminiBackend(): Promise<void> {
+    const alreadyApplied = kvBool(await this.kv.get(LLM_GEMINI_APPLIED_KEY), false);
+    if (alreadyApplied) {
+      this.log.log('Bootstrap llm_gemini_v1 ya aplicado — no-op');
+      return;
+    }
+
+    const geminiKeyPresent = !!process.env.GEMINI_API_KEY;
+    if (!geminiKeyPresent) {
+      this.log.log(
+        'GEMINI_API_KEY no presente — LLM sin cambios (se reintentará en el próximo deploy)',
+      );
+      return;
+    }
+
+    this.llm.patchConfig({ backend: 'gemini', model: GEMINI_MODEL });
+    this.log.log(`LLM cambiado a ${GEMINI_MODEL}`);
+
+    await this.kv.set(LLM_GEMINI_APPLIED_KEY, 'true');
   }
 }
