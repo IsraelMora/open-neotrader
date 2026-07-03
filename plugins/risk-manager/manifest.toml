@@ -172,6 +172,50 @@ max         = 10.0
 label       = "Daily loss limit (%)"
 description = "If the portfolio loses this % intraday, all new entries are halted until next session."
 
+# ── Vol-target exposure scalar (opt-in, ADDITIVE — Moreira & Muir 2017) ───────
+# When exposure_mode="vol_target", the hook ALSO computes a continuous
+# exposure_scalar from a benchmark's realized volatility and emits it in the
+# on_cycle result. The four layers above still run unchanged either way —
+# this does not replace or gate them. Default mode "layered" never computes
+# or emits exposure_scalar, so existing portfolios are fully unaffected.
+
+[config.exposure_mode]
+type        = "string"
+default     = "layered"
+options     = ["layered", "vol_target"]
+label       = "Exposure mode"
+description = "layered (default) = only the four risk layers above. vol_target = ALSO compute a volatility-managed total-exposure scalar, emitted as exposure_scalar; the four layers above keep running unchanged."
+
+[config.target_vol_pct]
+type        = "number"
+default     = 12.0
+min         = 1.0
+max         = 40.0
+label       = "Target annualized volatility (%)"
+description = "Target annualized volatility for the vol_target exposure scalar. Only used when exposure_mode=vol_target."
+
+[config.vol_window_days]
+type        = "number"
+default     = 20
+min         = 5
+max         = 120
+label       = "Realized-vol window (trading days)"
+description = "Trailing window (as-of t-1, no lookahead) of daily returns used to estimate realized volatility for the vol_target scalar."
+
+[config.exposure_cap]
+type        = "number"
+default     = 1.0
+min         = 0.0
+max         = 2.0
+label       = "Exposure cap"
+description = "Upper clip on the vol_target exposure scalar. 1.0 = no leverage (default); values above 1.0 allow leverage."
+
+[config.vol_target_benchmark]
+type        = "string"
+default     = "SPY"
+label       = "Vol-target benchmark symbol"
+description = "Symbol whose realized volatility drives the vol_target exposure scalar. Must be present in ctx.ohlcv (the same universe/OHLCV data fed to skill plugins)."
+
 # ── LLM-callable skills (tools exposed to the AI orchestrator) ────────────────
 
 [skills]

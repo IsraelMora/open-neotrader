@@ -50,7 +50,11 @@ export type AuditEventType =
   | 'kernel_web_search'
   // kernel web search: per-cycle defense-in-depth cap reached (MAX_WEB_SEARCH_CALLS_PER_CYCLE)
   // — one or more web_search calls dropped gracefully in this iteration, cycle unaffected.
-  | 'web_search_cycle_cap_reached';
+  | 'web_search_cycle_cap_reached'
+  // vol-managed exposure: the vol-target discipline's on_cycle hook failed (or returned
+  // an unusable value) during a pretest cycle — exposureScalar fails safe to 0 (100% cash)
+  // but a persistently-failing hook would otherwise be invisible outside server logs.
+  | 'vol_target_exposure_failed';
 
 export interface AuditPayload {
   cycle_id?: string;

@@ -196,6 +196,76 @@ def apply_exposure_layer(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Vol-target exposure scalar (Moreira & Muir 2017 style, batch-6 research
+# reproduction). This is ADDITIVE to the four layers above — it never mutates
+# signals, it only computes a continuous exposure_scalar that the caller
+# (hooks/cycle.py, and ultimately the pipeline that applies it) uses to scale
+# total gross exposure toward a target annualized volatility.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def compute_vol_target_exposure(
+    closes: list[float],
+    target_vol_pct: float,
+    vol_window_days: int,
+    exposure_cap: float,
+) -> float | None:
+    """
+    exposure = clip(target_vol / realized_vol_{t-1}, 0, exposure_cap)
+
+    `closes` is a chronological list of daily closes for the benchmark/book
+    being exposure-managed. NO-LOOKAHEAD is enforced twice:
+      1. The most recent close in `closes` (closes[-1], "today's" close) is
+         ALWAYS excluded before building the return series — the exposure
+         decided for today can never see today's own close.
+      2. `realized_vol_series`-style windowing (mirrors the batch-6 research
+         script `vol_managed_overlay.py`): the trailing window of
+         `vol_window_days` returns used for the vol estimate is itself built
+         from closes strictly before the excluded most-recent close, so the
+         vol driving today's exposure is realized as of the close of t-1.
+
+    Returns None when there is not a full `vol_window_days` window of prior
+    returns available (caller should treat this as "no signal yet" — e.g.
+    stay in cash / exposure 0 — not as an error).
+    """
+    if vol_window_days <= 0 or target_vol_pct < 0 or exposure_cap < 0:
+        return None
+
+    # No-lookahead margin #1: drop the most recent close entirely.
+    prior_closes = closes[:-1] if len(closes) > 1 else closes
+    if len(prior_closes) < 2:
+        return None
+
+    rets = [
+        prior_closes[i] / prior_closes[i - 1] - 1.0
+        for i in range(1, len(prior_closes))
+        if prior_closes[i - 1] > 0
+    ]
+    if len(rets) < vol_window_days:
+        return None
+
+    window_rets = rets[-vol_window_days:]
+    mean = sum(window_rets) / vol_window_days
+    var = (
+        sum((r - mean) ** 2 for r in window_rets) / (vol_window_days - 1)
+        if vol_window_days > 1
+        else 0.0
+    )
+    std = math.sqrt(var)
+    realized_vol = std * math.sqrt(252)
+
+    if realized_vol <= 0:
+        # Zero realized vol (e.g. flat prices): no risk observed, so the
+        # target-vol ratio is undefined — clip at the cap (fully invested up
+        # to the configured ceiling) rather than raising or returning None.
+        return min(1.0, exposure_cap) if exposure_cap >= 0 else 0.0
+
+    target_vol = target_vol_pct / 100.0
+    scalar = target_vol / realized_vol
+    return max(0.0, min(exposure_cap, scalar))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Layer 2: Concentration (ported from portfolio-risk-manager)
 # ─────────────────────────────────────────────────────────────────────────────
 

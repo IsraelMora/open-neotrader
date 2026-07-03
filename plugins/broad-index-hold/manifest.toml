@@ -1,0 +1,27 @@
+[plugin]
+id          = "broad-index-hold"
+type        = "skill"
+version     = "1.0.0"
+name        = "Broad Index Hold"
+description = "Minimal, no-ranking buy-and-hold skill: emits a long signal for each configured symbol (default SPY) the first cycle it is not already held. No periodic rebalance, no exits, no filtering. Intended as the base book for volatility-managed total-exposure strategies (see risk-manager's exposure_mode=vol_target) — the exposure discipline lives entirely in that plugin's exposure_scalar output, not here."
+author      = "OpenNeoTrader"
+tags        = ["passive", "buy-and-hold", "broad-index", "vol-managed"]
+
+[config]
+[config.symbols]
+type        = "string"
+default     = "SPY"
+label       = "Symbols (comma-separated)"
+description = "Comma-separated symbol list to hold, e.g. 'SPY' (default, matches the batch-6 vol-managed-SPY research result) or 'SPY,QQQ,IWM' for an equal-weight broad-index basket."
+
+[hooks]
+on_cycle = "hooks/cycle.py"
+
+[permissions]
+network     = false
+emit_events = false
+
+[scheduler]
+mode        = "polling"
+timeframe   = "1d"
+interval_ms = 86400000
