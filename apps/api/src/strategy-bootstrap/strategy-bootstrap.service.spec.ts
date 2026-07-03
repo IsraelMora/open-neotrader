@@ -439,7 +439,10 @@ describe('StrategyBootstrapService — Gemini LLM backend switch', () => {
 
     await svc.run();
 
-    expect(patchConfig).toHaveBeenCalledWith({ backend: 'gemini', model: 'gemini-3-flash-preview' });
+    expect(patchConfig).toHaveBeenCalledWith({
+      backend: 'gemini',
+      model: 'gemini-3-flash-preview',
+    });
     expect(store[LLM_GEMINI_APPLIED_KEY]).toBe('true');
   });
 
@@ -477,7 +480,10 @@ describe('StrategyBootstrapService — Gemini LLM backend switch', () => {
 
     await svc.run();
 
-    expect(patchConfig).toHaveBeenCalledWith({ backend: 'gemini', model: 'gemini-3-flash-preview' });
+    expect(patchConfig).toHaveBeenCalledWith({
+      backend: 'gemini',
+      model: 'gemini-3-flash-preview',
+    });
     expect(store[LLM_GEMINI_APPLIED_KEY]).toBe('true');
   });
 
@@ -505,7 +511,10 @@ describe('StrategyBootstrapService — Gemini LLM backend switch', () => {
     for (const call of logSpy.mock.calls) {
       expect(JSON.stringify(call)).not.toContain('super-secret-value-should-not-leak');
     }
-    expect(patchConfig).toHaveBeenCalledWith({ backend: 'gemini', model: 'gemini-3-flash-preview' });
+    expect(patchConfig).toHaveBeenCalledWith({
+      backend: 'gemini',
+      model: 'gemini-3-flash-preview',
+    });
     logSpy.mockRestore();
   });
 });
