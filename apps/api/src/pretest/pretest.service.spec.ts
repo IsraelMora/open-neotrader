@@ -4259,6 +4259,28 @@ describe('PretestService — short-selling fill model', () => {
   });
 });
 
+// Shared by both the vol_target and passive-holder describe blocks below —
+// both exercise the SAME 'broad-index-hold' + 'risk-manager' portfolio shape.
+function makeVolTargetRow(overrides: {
+  plugin_configs: Record<string, unknown>;
+  state?: PretestState;
+}) {
+  return {
+    id: 'vt-portfolio',
+    name: 'Vol Target Portfolio',
+    description: null,
+    initial_capital: 100_000,
+    plugin_ids: JSON.stringify(['broad-index-hold', 'risk-manager']),
+    plugin_configs: JSON.stringify(overrides.plugin_configs),
+    state: JSON.stringify(overrides.state ?? makeState({ equity: 100_000, cash: 100_000 })),
+    run_count: 0,
+    last_run_at: null,
+    is_active: true,
+    created_at: new Date(),
+    updated_at: new Date(),
+  };
+}
+
 // ── Vol-target exposure scalar wiring (vol-managed-exposure change) ───────────
 //
 // A discipline plugin configured with exposure_mode:'vol_target' (risk-manager)
@@ -4269,26 +4291,6 @@ describe('PretestService — short-selling fill model', () => {
 // sandbox.call at all, exposureScalar defaults to a no-op 1).
 
 describe('PretestService.runCycle — vol_target exposure scalar wiring', () => {
-  function makeVolTargetRow(overrides: {
-    plugin_configs: Record<string, unknown>;
-    state?: PretestState;
-  }) {
-    return {
-      id: 'vt-portfolio',
-      name: 'Vol Target Portfolio',
-      description: null,
-      initial_capital: 100_000,
-      plugin_ids: JSON.stringify(['broad-index-hold', 'risk-manager']),
-      plugin_configs: JSON.stringify(overrides.plugin_configs),
-      state: JSON.stringify(overrides.state ?? makeState({ equity: 100_000, cash: 100_000 })),
-      run_count: 0,
-      last_run_at: null,
-      is_active: true,
-      created_at: new Date(),
-      updated_at: new Date(),
-    };
-  }
-
   function makeAgentsWithBuy(symbol: string): AgentsService {
     return {
       runGovernedTurn: jest.fn().mockResolvedValue({
@@ -4635,6 +4637,314 @@ describe('PretestService.runCycle — vol_target exposure scalar wiring', () => 
       )._buildVolTargetRebalanceTrades(state, 0.5);
       expect(trades).toEqual([]);
     });
+  });
+});
+
+// ── passive-holder deterministic execution (broad-index-hold + vol_target) ────
+//
+// Root cause: broad-index-hold emits a SINGLE passive `long` signal (see
+// plugins/broad-index-hold/hooks/cycle.py) which is not compelling enough to
+// make the light pretest LLM actually call emit_trade_intent (it just
+// describes the decision in text instead). Momentum portfolios have many
+// strong signals and DO get tool calls; a lone passive-hold signal doesn't.
+// A passive-hold strategy is a deterministic rule, not an LLM judgment call —
+// so runCycle now synthesizes emit_trade_intent-shaped tool calls directly
+// from any pending_signals entry whose `type` follows the `*_hold_signal`
+// naming convention (generic across any future passive-holder plugin, not
+// hardcoded to broad-index-hold), merges them with whatever the LLM emitted
+// (de-duped by symbol so the same symbol is never bought twice), and feeds
+// the merged list through the SAME kernel risk floor + exposure-scaled
+// _simulateFills as everything else.
+describe('PretestService.runCycle — passive-holder deterministic execution', () => {
+  function makeAgents(
+    toolCalls: Array<{ plugin_id: string; function: string; args: Record<string, unknown> }>,
+  ): AgentsService {
+    return {
+      runGovernedTurn: jest.fn().mockResolvedValue({
+        cycle_id: 'c',
+        text: '',
+        tool_calls: toolCalls,
+        decisions: [],
+        sandbox_results: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+        llm_response: {
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        },
+        signalsEmitted: [],
+      }),
+    } as unknown as AgentsService;
+  }
+
+  function makePassiveHoldSignal(symbol: string) {
+    return {
+      type: 'broad_index_hold_signal',
+      symbol,
+      action: 'long',
+      reason: 'broad-index-hold: unconditional buy-and-hold, no ranking',
+    };
+  }
+
+  it('produces a BUY fill for the held symbol even when the LLM returns ZERO tool_calls', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+    } as unknown as PluginsService;
+    const sandboxCall = jest.fn().mockResolvedValue({ ok: true, result: { exposure_scalar: 0.5 } });
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { pending_signals: [makePassiveHoldSignal('SPY')] },
+      }),
+      call: sandboxCall,
+    } as unknown as SandboxGateway;
+    const row = makeVolTargetRow({
+      plugin_configs: {
+        'risk-manager': { exposure_mode: 'vol_target', target_vol_pct: 12 },
+        __pretest_policy__: { sizing_pct: 0.5, slippage_pct: 0, commission_pct: 0 },
+      },
+    });
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue(row),
+      },
+    } as unknown as PrismaService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeAgents([]), // LLM emitted NO tool calls at all
+      makeStubKv(),
+      makeStubAudit(),
+    );
+
+    const { trades_simulated } = await svc.runCycle('vt-portfolio');
+
+    // Unscaled sizing_pct=0.5 * cash=100_000 / price=100 = 500 shares.
+    // Scaled by exposure_scalar=0.5 -> 250 shares.
+    expect(trades_simulated).toHaveLength(1);
+    expect(trades_simulated[0].symbol).toBe('SPY');
+    expect(trades_simulated[0].action).toBe('buy');
+    expect(trades_simulated[0].quantity).toBe(250);
+  });
+
+  it('de-dupes: LLM emitting long SPY AND the passive holder emitting long SPY results in only ONE buy', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+    } as unknown as PluginsService;
+    const sandboxCall = jest.fn().mockResolvedValue({ ok: true, result: { exposure_scalar: 0.5 } });
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { pending_signals: [makePassiveHoldSignal('SPY')] },
+      }),
+      call: sandboxCall,
+    } as unknown as SandboxGateway;
+    const row = makeVolTargetRow({
+      plugin_configs: {
+        'risk-manager': { exposure_mode: 'vol_target', target_vol_pct: 12 },
+        __pretest_policy__: { sizing_pct: 0.5, slippage_pct: 0, commission_pct: 0 },
+      },
+    });
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue(row),
+      },
+    } as unknown as PrismaService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      // LLM ALSO independently decided to go long SPY this cycle.
+      makeAgents([
+        {
+          plugin_id: 'decision',
+          function: 'emit_trade_intent',
+          args: { symbol: 'SPY', action: 'long' },
+        },
+      ]),
+      makeStubKv(),
+      makeStubAudit(),
+    );
+
+    const { trades_simulated } = await svc.runCycle('vt-portfolio');
+
+    // Only ONE buy fill — not one from the LLM plus a separate one from the passive holder.
+    expect(trades_simulated).toHaveLength(1);
+    expect(trades_simulated[0].symbol).toBe('SPY');
+    expect(trades_simulated[0].quantity).toBe(250);
+  });
+
+  it('momentum portfolio (no broad-index-hold plugin) is unchanged — fills come only from LLM tool_calls', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = {
+      findActive: jest
+        .fn()
+        .mockResolvedValue([{ id: 'momentum-factor-12-1', type: 'skill', config: {} }]),
+    } as unknown as PluginsService;
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({
+        result: {
+          // A momentum-style signal, NOT a *_hold_signal — must never be
+          // deterministically executed.
+          pending_signals: [{ type: 'momentum_signal', symbol: 'AAPL', action: 'long' }],
+        },
+      }),
+      call: jest.fn(),
+    } as unknown as SandboxGateway;
+    const row = {
+      id: 'mom-portfolio',
+      name: 'Momentum Portfolio',
+      description: null,
+      initial_capital: 100_000,
+      plugin_ids: JSON.stringify(['momentum-factor-12-1']),
+      plugin_configs: JSON.stringify({
+        __pretest_policy__: { sizing_pct: 0.5, slippage_pct: 0, commission_pct: 0 },
+      }),
+      state: JSON.stringify(makeState({ equity: 100_000, cash: 100_000 })),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue(row),
+      },
+    } as unknown as PrismaService;
+
+    // LLM emits ZERO tool_calls despite the momentum signal — no passive holder
+    // is present, so runCycle must NOT synthesize anything: 0 trades, exactly as before.
+    const svcNoTools = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeAgents([]),
+      makeStubKv(),
+      makeStubAudit(),
+    );
+    const { trades_simulated: noToolTrades } = await svcNoTools.runCycle('mom-portfolio');
+    expect(noToolTrades).toHaveLength(0);
+
+    // When the LLM DOES emit a tool call, behavior is exactly as before (unaffected).
+    const db2 = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue(row),
+      },
+    } as unknown as PrismaService;
+    const svcWithTool = new PretestService(
+      db2,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeAgents([
+        {
+          plugin_id: 'decision',
+          function: 'emit_trade_intent',
+          args: { symbol: 'AAPL', action: 'long' },
+        },
+      ]),
+      makeStubKv(),
+      makeStubAudit(),
+    );
+    const { trades_simulated } = await svcWithTool.runCycle('mom-portfolio');
+    expect(trades_simulated).toHaveLength(1);
+    expect(trades_simulated[0].symbol).toBe('AAPL');
+  });
+
+  it('a drawdown-halted passive portfolio does NOT buy — the passive fill still goes through the risk floor', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+    } as unknown as PluginsService;
+    const sandboxCall = jest.fn().mockResolvedValue({ ok: true, result: { exposure_scalar: 0.5 } });
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { pending_signals: [makePassiveHoldSignal('SPY')] },
+      }),
+      call: sandboxCall,
+    } as unknown as SandboxGateway;
+    // equity=7_000 vs hwm=10_000 -> 30% drawdown, past the 25% default halt.
+    const row = makeVolTargetRow({
+      plugin_configs: {
+        'risk-manager': { exposure_mode: 'vol_target', target_vol_pct: 12 },
+        __pretest_policy__: { sizing_pct: 0.5, slippage_pct: 0, commission_pct: 0 },
+      },
+      state: makeState({ equity: 7_000, cash: 7_000, hwm: 10_000 }),
+    });
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue(row),
+      },
+    } as unknown as PrismaService;
+    const auditLogFn = jest.fn().mockResolvedValue(undefined);
+    const audit = { log: auditLogFn } as unknown as AuditService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeAgents([]),
+      makeStubKv(),
+      audit,
+    );
+
+    const { trades_simulated } = await svc.runCycle('vt-portfolio');
+
+    expect(trades_simulated).toHaveLength(0);
+    expect(auditLogFn).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_entry_rejected' }),
+    );
   });
 });
 

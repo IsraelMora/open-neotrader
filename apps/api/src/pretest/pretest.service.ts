@@ -494,12 +494,6 @@ export class PretestService {
         // all collapse to 0 exposure (stay in cash) — never silently fall
         // back to "fully invested" when the real scalar couldn't be obtained.
         exposureScalar = typeof raw === 'number' && isFinite(raw) && raw >= 0 ? raw : 0;
-        // TEMP DIAGNOSTIC (vol-managed 0-trades): observe runtime bars + scalar
-        const _bm = String(volTargetBenchmark);
-        const _bars = market.ohlcv[_bm] ?? [];
-        this.log.warn(
-          `[VOLDEBUG] ${portfolio.name} bm=${_bm} bars=${_bars.length} firstBar=${JSON.stringify(_bars[0])} lastBar=${JSON.stringify(_bars[_bars.length - 1])} rawScalar=${JSON.stringify(raw)} scalar=${exposureScalar} cfg=${JSON.stringify(pluginConfigs[volTargetPlugin.id])} hookKeys=${JSON.stringify(Object.keys((hookResp.result as object) ?? {}))}`,
-        );
       } catch (err) {
         this.log.warn(`vol_target exposure hook failed for ${volTargetPlugin.id}: ${String(err)}`);
         exposureScalar = 0;
@@ -536,7 +530,7 @@ export class PretestService {
       `[Capital virtual: $${portfolio.state.equity.toFixed(2)}]`,
       `[SEÑALES PRETEST]\n${JSON.stringify(signals, null, 2)}`,
       systemPrompt ?? '',
-      '\nEres un agente en modo PRETEST. Evalúa las señales pero NO ejecutes órdenes reales. Indica qué acciones tomarías y por qué.',
+      '\nEres un agente en modo PRETEST/paper. Las órdenes son virtuales (no reales), pero DEBÉS emitir emit_trade_intent para registrar cada decisión que tomarías — no te limites a describirla en texto.',
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -548,6 +542,18 @@ export class PretestService {
       context,
       virtual_only: true,
     });
+
+    // ── Deterministic passive-holder execution (broad-index-hold and friends) ──
+    // A passive-hold strategy (e.g. broad-index-hold: "hold the configured index
+    // at the vol-target exposure") is a deterministic rule, not an LLM judgment
+    // call. Its emitted signal is often the ONLY signal in the cycle, which is
+    // not compelling enough to make the (light) pretest LLM actually call
+    // emit_trade_intent — it just describes the decision in text instead,
+    // leaving `turnResult.tool_calls` empty and the portfolio stuck at 0 trades.
+    // See `_synthesizePassiveHoldToolCalls` for the merge+de-dup logic; the
+    // result is fed through the SAME kernel risk floor + exposure-scaled fill
+    // path as everything else below.
+    const mergedToolCalls = this._synthesizePassiveHoldToolCalls(signals, turnResult.tool_calls);
 
     // ── Leer política de fills del portfolio ──────────────────────────────────
     const policy = this._readPolicy(portfolio);
@@ -563,11 +569,12 @@ export class PretestService {
     // exit/hold are never gated (closeability invariant). A rejected entry is stripped here
     // (never fills) and recorded via a 'pretest_entry_rejected' audit event. `gated.state`
     // carries forward any hwm/day-week baseline changes and MUST be used for every
-    // downstream step.
+    // downstream step. `mergedToolCalls` includes the synthesized passive-holder calls
+    // above, so a drawdown-halted (or otherwise gated) passive portfolio never buys.
     const gated = await this._applyKernelRiskFloor(
       id,
       portfolio.name,
-      turnResult.tool_calls,
+      mergedToolCalls,
       portfolio.state,
     );
 
@@ -575,14 +582,6 @@ export class PretestService {
     // Use validated tool_calls from the governed turn (providers already dropped by virtual
     // guard, and now also filtered by the kernel risk floor above).
     const trades = await this._simulateFills(gated.toolCalls, gated.state, effectivePolicy);
-
-    if (volTargetPlugin) {
-      const _tc = gated.toolCalls.map((t) => ({ s: t.args?.['symbol'], a: t.args?.['action'] }));
-      const _tr = trades.map((t) => ({ s: t.symbol, a: t.action, q: t.quantity }));
-      this.log.warn(
-        `[VOLDEBUG2] ${portfolio.name} cash=${gated.state.cash} effSizing=${effectivePolicy.sizing_pct} toolCalls=${JSON.stringify(_tc)} trades=${JSON.stringify(_tr)}`,
-      );
-    }
 
     // ── Vol-target rebalance of EXISTING long positions toward exposureScalar ──
     const rebalanceTrades = volTargetPlugin
@@ -1336,6 +1335,55 @@ export class PretestService {
       max_daily_loss_pct,
       max_weekly_loss_pct,
     };
+  }
+
+  /**
+   * Synthesizes deterministic `emit_trade_intent`-shaped tool calls from any
+   * `pending_signals` entry that follows the generic `*_hold_signal` naming
+   * convention (e.g. broad-index-hold's `broad_index_hold_signal` — not
+   * hardcoded to that specific plugin; any future passive-holder plugin can
+   * opt in by following the same convention) with `action:'long'`.
+   *
+   * A passive-hold strategy is a deterministic rule ("hold the configured
+   * index"), not an LLM judgment call — its single signal is often not
+   * compelling enough to make the (light) pretest LLM actually call
+   * emit_trade_intent, leaving the portfolio stuck at 0 trades. This merges
+   * the synthesized calls with whatever the LLM emitted, de-duped by symbol
+   * so the LLM and the passive holder never double-buy the same symbol.
+   */
+  private _synthesizePassiveHoldToolCalls(
+    signals: unknown[],
+    llmToolCalls: Array<{ plugin_id: string; function: string; args: Record<string, unknown> }>,
+  ): Array<{ plugin_id: string; function: string; args: Record<string, unknown> }> {
+    const llmLongSymbols = new Set(
+      llmToolCalls
+        .filter((tc) => (tc.args['action'] as string | undefined)?.toLowerCase() === 'long')
+        .map((tc) =>
+          typeof tc.args['symbol'] === 'string' ? tc.args['symbol'].toUpperCase() : '',
+        ),
+    );
+    const passiveToolCalls: Array<{
+      plugin_id: string;
+      function: string;
+      args: Record<string, unknown>;
+    }> = [];
+    const seenPassiveSymbols = new Set<string>();
+    for (const sig of signals) {
+      if (!sig || typeof sig !== 'object') continue;
+      const s = sig as Record<string, unknown>;
+      const sigType = typeof s['type'] === 'string' ? s['type'] : '';
+      const sigAction = typeof s['action'] === 'string' ? s['action'].toLowerCase() : '';
+      const sigSymbol = typeof s['symbol'] === 'string' ? s['symbol'].toUpperCase() : '';
+      if (!sigType.endsWith('_hold_signal') || sigAction !== 'long' || !sigSymbol) continue;
+      if (llmLongSymbols.has(sigSymbol) || seenPassiveSymbols.has(sigSymbol)) continue;
+      seenPassiveSymbols.add(sigSymbol);
+      passiveToolCalls.push({
+        plugin_id: 'decision',
+        function: 'emit_trade_intent',
+        args: { symbol: sigSymbol, action: 'long' },
+      });
+    }
+    return [...llmToolCalls, ...passiveToolCalls];
   }
 
   /** Best-effort audit of a pretest entry rejected by the shared kernel risk floor. */
