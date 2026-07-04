@@ -10,6 +10,7 @@ import { ProvidersModule } from '../providers/providers.module';
 import { AgentsModule } from '../agents/agents.module';
 import { KvService } from '../common/kv.service';
 import { AuditModule } from '../audit/audit.module';
+import { GovernedPaperExecutionService } from '../execution/governed-paper-execution.service';
 
 @Module({
   imports: [
@@ -27,7 +28,10 @@ import { AuditModule } from '../audit/audit.module';
     forwardRef(() => AgentsModule),
     AuditModule,
   ],
-  providers: [PretestService, KvService],
+  // GovernedPaperExecutionService — the shared kernel-gated execution core, also used by
+  // TradeIntentModule. Declared here too (not exported from a shared module) since it only
+  // depends on ProviderGatewayService + optional AuditService, both already imported above.
+  providers: [PretestService, KvService, GovernedPaperExecutionService],
   controllers: [PretestController],
   exports: [PretestService],
 })

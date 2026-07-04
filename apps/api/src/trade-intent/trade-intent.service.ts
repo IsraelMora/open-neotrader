@@ -40,6 +40,8 @@ import {
 import { AuditService } from '../audit/audit.service';
 import { RealOrderService } from '../real-order/real-order.service';
 import { RealBrokerReconciliationService } from '../real-reconciliation/real-broker-reconciliation.service';
+import { GovernedPaperExecutionService } from '../execution/governed-paper-execution.service';
+import type { RiskPolicy } from '../execution/governed-account-state';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -193,6 +195,11 @@ export class TradeIntentService {
     private readonly db: PrismaService,
     private readonly gateway: ProviderGatewayService,
     private readonly kv: KvService,
+    // GovernedPaperExecutionService — the shared kernel-gated fill core, ALSO used by
+    // PretestService, so both the live paper account and every pretest portfolio run
+    // through the IDENTICAL entry gate + fill math. Real-money execution (below) never
+    // touches this service — it stays entirely on RealAccountState/RealOrderService.
+    private readonly governedPaperExec: GovernedPaperExecutionService,
     // RealOrderService owns idempotent, crash-safe real-order submission (client_order_id
     // generation, DB row created BEFORE the broker call). _executeReal delegates all real
     // order placement to it instead of calling gateway.placeOrder directly.
@@ -1676,8 +1683,36 @@ export class TradeIntentService {
       const { pass, reason } = this._passesAutoRisk(realState as RealAccountState, policy, 'real');
       return { pass, reason, paperState };
     }
-    const gateResult = await this._passesPaperEntryGate(paperState, policy);
-    return { pass: gateResult.pass, reason: gateResult.reason, paperState: gateResult.state };
+
+    // Paper mode delegates the ENTIRE entry gate (MTM + loss circuit-breaker + drawdown/
+    // max-open-positions) to the shared GovernedPaperExecutionService — the same kernel
+    // floor pretest now goes through. See that service's evaluateEntryGate doc comment.
+    const riskPolicy: RiskPolicy = {
+      max_position_pct: policy.max_position_pct,
+      max_open_positions: policy.max_open_positions,
+      max_drawdown_halt_pct: policy.max_drawdown_halt_pct,
+      max_short_notional_pct: policy.max_short_notional_pct,
+      loss_circuit_breaker_enabled: policy.loss_circuit_breaker_enabled,
+      max_daily_loss_pct: policy.max_daily_loss_pct,
+      max_weekly_loss_pct: policy.max_weekly_loss_pct,
+    };
+    const gate = await this.governedPaperExec.evaluateEntryGate(paperState, riskPolicy);
+
+    // Persistence: when the entry ultimately PASSES, this never writes to the DB — the reset
+    // baseline rides along in gate.state, which the caller substitutes into the normal
+    // trade-execution path (_runPaperExecution's own upsert persists it alongside the trade).
+    // When the entry is ultimately REJECTED and a period rollover was detected, the reset is
+    // persisted immediately here — a rejected intent never reaches _runPaperExecution, so
+    // without this write a loss that happened before the very first evaluation of a new
+    // day/week would be invisible forever.
+    if (!gate.pass && gate.baselineChanged) {
+      await this.db.portfolio.upsert({
+        where: { name: PAPER_PORTFOLIO_NAME },
+        create: { name: PAPER_PORTFOLIO_NAME, data: JSON.stringify(gate.state) },
+        update: { data: JSON.stringify(gate.state) },
+      });
+    }
+    return { pass: gate.pass, reason: gate.reason, paperState: gate.state };
   }
 
   // ── _passesAutoRisk ───────────────────────────────────────────────────────────
@@ -1717,258 +1752,6 @@ export class TradeIntentService {
     }
 
     return { pass: true };
-  }
-
-  // ── _markToMarketPaper ────────────────────────────────────────────────────────
-
-  /**
-   * Mark-to-market of ALL open paper positions against CURRENT prices — CRITICAL
-   * safety fix (adversarial-review finding): the drawdown circuit-breaker used to gate
-   * against `paperState.equity`, but that field was only ever recomputed as a side effect
-   * of executing a trade on the SPECIFIC symbol just traded (see _positionsValue/
-   * _executePaper). An OPEN position moving against the book (a rallying SHORT —
-   * unbounded loss — or a falling LONG) while no new trade touches that symbol was
-   * therefore INVISIBLE to the halt. This recomputes equity fresh over every open
-   * position, one batched round of quote fetches per gate evaluation, mirroring the
-   * pattern in PretestService._updateEquityMetrics.
-   *
-   * `equity = cash + Σ(current_price * signed_quantity)` — quantity is already SIGNED
-   * (negative for shorts), so a rising price on a short correctly REDUCES equity without
-   * any special-casing. hwm is updated to max(previous hwm, fresh equity) so a new
-   * all-time high is still recognized, exactly like the existing per-trade path.
-   *
-   * Fail-CLOSED, never fail-soft: unlike PretestService's MTM (which falls back to a
-   * stale price so a long-running simulation keeps ticking), a FAILURE to price any
-   * single open position here means `ok: false` — the caller MUST refuse the entry
-   * rather than gate against a partially-stale or fabricated equity number. This
-   * function is only ever called before an ENTRY (long/short) decision — "exit"/"hold"
-   * never call it, preserving the closeability invariant (a position must always be
-   * closeable even when the book can't be fully valued).
-   */
-  private async _markToMarketPaper(
-    state: PaperState,
-  ): Promise<{ equity: number; hwm: number; ok: boolean }> {
-    const baseHwm = state.hwm ?? state.equity;
-
-    if (state.positions.length === 0) {
-      return { equity: state.equity, hwm: Math.max(baseHwm, state.equity), ok: true };
-    }
-
-    let ok = true;
-    let positionsValue = 0;
-    // One batched round of quote fetches — never a new outbound-HTTP path, reuses the
-    // same ProviderGatewayService.getQuote already used everywhere else in this service.
-    await Promise.all(
-      state.positions.map(async (pos) => {
-        try {
-          const quote = await this.gateway.getQuote(null, pos.symbol);
-          if (!quote || !isFinite(quote.last) || quote.last <= 0) {
-            ok = false;
-            return;
-          }
-          positionsValue += quote.last * pos.quantity;
-        } catch {
-          ok = false;
-        }
-      }),
-    );
-
-    if (!ok) {
-      // Fail closed: do not return a partially-priced/fabricated equity — caller must
-      // refuse the entry outright.
-      return { equity: state.equity, hwm: baseHwm, ok: false };
-    }
-
-    const equity = state.cash + positionsValue;
-    return { equity, hwm: Math.max(baseHwm, equity), ok: true };
-  }
-
-  /** UTC calendar-day key ("YYYY-MM-DD") for the daily loss circuit-breaker. */
-  private _dayKey(now: Date): string {
-    return now.toISOString().slice(0, 10);
-  }
-
-  /**
-   * UTC Monday-anchored week-start key ("YYYY-MM-DD" of that week's Monday) for the
-   * weekly loss circuit-breaker. Monday-anchoring (rather than ISO week numbers) sidesteps
-   * ISO 8601's year-boundary edge cases while still giving a stable, comparable key.
-   */
-  private _weekKey(now: Date): string {
-    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-    const day = d.getUTCDay(); // 0=Sun..6=Sat
-    const diffToMonday = (day + 6) % 7; // Mon=0, Tue=1, ..., Sun=6
-    d.setUTCDate(d.getUTCDate() - diffToMonday);
-    return d.toISOString().slice(0, 10);
-  }
-
-  /**
-   * Rolls the day/week loss-circuit-breaker baselines forward when the calendar period has
-   * changed since they were last recorded — pure function, no side effects. A period
-   * "changes" whenever `state.day_key`/`week_key` is unset (never initialized) or doesn't
-   * match the CURRENT key: the new baseline becomes `mtmEquity` (the freshly mark-to-market'd
-   * equity from `_markToMarketPaper`), i.e. "loss since the first evaluation of this period" —
-   * there is no way to know the account's true equity at the exact midnight/Monday boundary,
-   * so the first evaluation of a new period is definitionally its 0%-loss starting point.
-   * Returns `changed: false` (and the SAME state reference) when nothing needs updating, so
-   * the caller can skip a redundant persist.
-   */
-  private _syncPaperPeriodBaselines(
-    state: PaperState,
-    mtmEquity: number,
-    now: Date,
-  ): { state: PaperState; changed: boolean } {
-    const dayKey = this._dayKey(now);
-    const weekKey = this._weekKey(now);
-
-    const dayChanged = state.day_key !== dayKey;
-    const weekChanged = state.week_key !== weekKey;
-    if (!dayChanged && !weekChanged) {
-      return { state, changed: false };
-    }
-
-    return {
-      state: {
-        ...state,
-        day_key: dayKey,
-        day_start_equity: dayChanged ? mtmEquity : state.day_start_equity,
-        week_key: weekKey,
-        week_start_equity: weekChanged ? mtmEquity : state.week_start_equity,
-      },
-      changed: true,
-    };
-  }
-
-  /**
-   * Evaluates ONE period (day or week) of the loss circuit-breaker: has equity fallen by
-   * `maxLossPct` or more since `startEquity` (the period's baseline)? `startEquity`
-   * undefined/non-positive means the baseline hasn't been established yet (fresh portfolio,
-   * first-ever evaluation before `_syncPaperPeriodBaselines` even runs) — always passes, since
-   * there is nothing to measure the loss against.
-   */
-  private _checkPeriodLossLimit(
-    startEquity: number | undefined,
-    currentEquity: number,
-    maxLossPct: number,
-    label: 'daily' | 'weekly',
-  ): { pass: boolean; reason?: string } {
-    if (startEquity === undefined || startEquity <= 0) return { pass: true };
-    const lossPct = (startEquity - currentEquity) / startEquity;
-    if (lossPct >= maxLossPct) {
-      return {
-        pass: false,
-        reason:
-          `circuit breaker: ${label} loss ${(lossPct * 100).toFixed(2)}% >= ` +
-          `${(maxLossPct * 100).toFixed(2)}% — new entries blocked until the next ${
-            label === 'daily' ? 'day' : 'week'
-          } (UTC)`,
-      };
-    }
-    return { pass: true };
-  }
-
-  /** Best-effort audit of a loss-circuit-breaker trip. Never breaks execution. */
-  private async _auditLossBreakerTrip(period: 'daily' | 'weekly', reason: string): Promise<void> {
-    if (!this.audit) return;
-    try {
-      await this.audit.log({
-        event_type: 'loss_circuit_breaker_tripped',
-        meta: { period, reason },
-      });
-    } catch {
-      // audit is best-effort — a logging failure must never affect execution.
-    }
-  }
-
-  /**
-   * Combines `_markToMarketPaper` with the existing `_passesAutoRisk` gate for a PAPER
-   * entry (long/short), PLUS the daily/weekly loss circuit-breaker (prop-firm-style,
-   * calendar-period based — see class-level doc). Ordering: MTM failure → circuit breaker
-   * (daily, then weekly) → the existing peak-to-trough drawdown/max-open-positions gate.
-   * The circuit breaker is a SEPARATE, ADDITIONAL restriction — it never loosens or
-   * replaces the drawdown halt.
-   *
-   * A mark-to-market failure blocks the entry (fail-closed) with a dedicated reason
-   * distinct from the other reasons, so an operator can tell "book valued fine, but risk
-   * limit hit" apart from "couldn't value the book at all".
-   *
-   * Returns the (possibly period-baseline-reset) `state` alongside pass/reason — the CALLER
-   * must use this returned `state` for any subsequent paper execution, so a baseline reset
-   * detected here is carried into the persisted portfolio row instead of being silently lost.
-   *
-   * Persistence: when the entry ultimately PASSES, this function itself never writes to the
-   * DB — the reset baseline rides along in the returned `state`, which the caller substitutes
-   * into the normal trade-execution path (`_runPaperExecution`'s own upsert persists it
-   * alongside the trade, avoiding a redundant write). When the entry is ultimately REJECTED
-   * (by this gate or the existing risk gate below) AND a period rollover was detected, the
-   * reset is persisted immediately here — a rejected intent never reaches
-   * `_runPaperExecution`, so without this write a loss that happened before the very first
-   * evaluation of a new day/week would be invisible forever (each subsequent call would keep
-   * "discovering" a new day and resetting the baseline to the CURRENT, already-depressed
-   * equity, permanently masking the loss).
-   */
-  private async _passesPaperEntryGate(
-    state: PaperState,
-    policy: ExecutionPolicy,
-  ): Promise<{ pass: boolean; reason?: string; state: PaperState }> {
-    const mtm = await this._markToMarketPaper(state);
-    if (!mtm.ok) {
-      this.log.warn(
-        'PAPER ENTRY BLOCKED: mark-to-market failed for one or more open positions — refusing new entry (fail-closed)',
-      );
-      return {
-        pass: false,
-        reason: 'mark-to-market unavailable for one or more open positions — refusing new entry',
-        state,
-      };
-    }
-
-    const { state: syncedState, changed } = this._syncPaperPeriodBaselines(
-      state,
-      mtm.equity,
-      new Date(),
-    );
-
-    const persistBaselineIfRejected = async (result: {
-      pass: boolean;
-      reason?: string;
-    }): Promise<{ pass: boolean; reason?: string; state: PaperState }> => {
-      if (!result.pass && changed) {
-        await this.db.portfolio.upsert({
-          where: { name: PAPER_PORTFOLIO_NAME },
-          create: { name: PAPER_PORTFOLIO_NAME, data: JSON.stringify(syncedState) },
-          update: { data: JSON.stringify(syncedState) },
-        });
-      }
-      return { ...result, state: syncedState };
-    };
-
-    if (policy.loss_circuit_breaker_enabled) {
-      const daily = this._checkPeriodLossLimit(
-        syncedState.day_start_equity,
-        mtm.equity,
-        policy.max_daily_loss_pct,
-        'daily',
-      );
-      if (!daily.pass) {
-        await this._auditLossBreakerTrip('daily', daily.reason ?? '');
-        return persistBaselineIfRejected(daily);
-      }
-
-      const weekly = this._checkPeriodLossLimit(
-        syncedState.week_start_equity,
-        mtm.equity,
-        policy.max_weekly_loss_pct,
-        'weekly',
-      );
-      if (!weekly.pass) {
-        await this._auditLossBreakerTrip('weekly', weekly.reason ?? '');
-        return persistBaselineIfRejected(weekly);
-      }
-    }
-
-    const freshState: PaperState = { ...syncedState, equity: mtm.equity, hwm: mtm.hwm };
-    const risk = this._passesAutoRisk(freshState, policy, 'paper');
-    return persistBaselineIfRejected(risk);
   }
 
   // ── _clampToPositionCeiling ───────────────────────────────────────────────────
@@ -2046,9 +1829,10 @@ export class TradeIntentService {
       });
     }
 
-    // Execute the trade in-memory.
-    const { quantity, realized_pnl, newState } = this._executePaper(
-      id,
+    // Execute the trade in-memory — shared fill math (GovernedPaperExecutionService),
+    // identical to the historical _executePaper/_executePaperLong/_executePaperShort
+    // (commissionPct omitted → defaults to 0, byte-identical to the pre-refactor behavior).
+    const { quantity, realized_pnl, newState } = this.governedPaperExec.executeFill(
       action,
       symbol,
       fillPrice,
@@ -2091,230 +1875,6 @@ export class TradeIntentService {
     });
   }
 
-  // ── Paper execution logic ─────────────────────────────────────────────────────
-
-  /**
-   * Applies a paper trade to the virtual portfolio state (pure function except for state mutation).
-   * Returns the executed quantity, any realized_pnl (for exit), and the updated state.
-   *
-   * "long"  → buy floor(cash * sizingPct / fill_price) shares, hard-clamped to the
-   *           policy.max_position_pct ceiling; avg_price cost-basis. Refuses to open a
-   *           long on top of an existing SHORT in the same symbol (mixed long/short
-   *           per symbol is not modeled — use "exit" to cover first).
-   * "short" → sell-to-open floor(cash * sizingPct / fill_price) shares, gated by the
-   *           SAME max_position_pct ceiling as "long" (never looser) PLUS an
-   *           additional max_short_notional_pct ceiling. Position quantity goes
-   *           NEGATIVE. Refuses to open a short on top of an existing LONG.
-   * "exit"  → close the ENTIRE existing position, long or short. Quantity is SIGNED
-   *           (negative for a short), so realized_pnl = (fill - avg) * quantity and
-   *           cash += fill * quantity generalize correctly to both: covering a short
-   *           (a negative quantity) naturally debits cash and credits profit when
-   *           fill < avg. This is the ONLY path that closes a short — "exit" always
-   *           bypasses the risk gate (see autoProcess/approve), so a short is ALWAYS
-   *           closeable, mirroring the long-exit invariant.
-   * "hold"  → no trade; qty=0.
-   *
-   * hwm (high-water-mark) is recomputed on every return path as max(previous hwm,
-   * new equity) — this is the source the drawdown risk gate reads (_computeDrawdownPct).
-   */
-  private _executePaper(
-    id: string,
-    action: TradeAction,
-    symbol: string,
-    fillPrice: number,
-    state: PaperState,
-    sizingPct: number,
-    maxPositionPct: number,
-    maxShortNotionalPct: number = DEFAULT_EXECUTION_POLICY.max_short_notional_pct,
-  ): { quantity: number; realized_pnl: number | null; newState: PaperState } {
-    // Deep-copy positions so we don't mutate the original. Carries forward the loss
-    // circuit-breaker's day/week baselines untouched — trade execution never resets them
-    // (only _syncPaperPeriodBaselines does, on a period rollover during the entry gate).
-    const newState: PaperState = {
-      equity: state.equity,
-      cash: state.cash,
-      positions: state.positions.map((p) => ({ ...p })),
-      hwm: state.hwm,
-      day_key: state.day_key,
-      day_start_equity: state.day_start_equity,
-      week_key: state.week_key,
-      week_start_equity: state.week_start_equity,
-    };
-    const baseHwm = state.hwm ?? state.equity;
-
-    if (action === 'long') {
-      return this._executePaperLong(
-        id,
-        symbol,
-        fillPrice,
-        newState,
-        baseHwm,
-        sizingPct,
-        maxPositionPct,
-        state.equity,
-      );
-    }
-
-    if (action === 'short') {
-      return this._executePaperShort(
-        id,
-        symbol,
-        fillPrice,
-        newState,
-        baseHwm,
-        sizingPct,
-        maxPositionPct,
-        maxShortNotionalPct,
-        state.equity,
-      );
-    }
-
-    if (action === 'exit') {
-      const posIdx = newState.positions.findIndex((p) => p.symbol === symbol);
-      if (posIdx < 0) {
-        // No open position to exit — still executed, just qty=0
-        newState.hwm = Math.max(baseHwm, newState.equity);
-        return { quantity: 0, realized_pnl: null, newState };
-      }
-      const pos = newState.positions[posIdx];
-      // quantity is SIGNED (negative for a short). This single formula generalizes to
-      // both a long exit AND a short cover: proceeds = fill * quantity is negative for
-      // a short (cash correctly debited to buy back), and realized_pnl = (fill - avg) *
-      // quantity is positive when a short is covered BELOW its entry price. See doc
-      // comment above.
-      const quantity = pos.quantity;
-      const proceeds = fillPrice * quantity;
-      const realized_pnl = (fillPrice - pos.avg_price) * quantity;
-      newState.cash += proceeds;
-      newState.positions.splice(posIdx, 1);
-      newState.equity = newState.cash + this._positionsValue(newState.positions, fillPrice, symbol);
-      newState.hwm = Math.max(baseHwm, newState.equity);
-      return { quantity, realized_pnl, newState };
-    }
-
-    // "hold": no portfolio mutation.
-    newState.hwm = Math.max(baseHwm, newState.equity);
-    return { quantity: 0, realized_pnl: null, newState };
-  }
-
-  /**
-   * "long" branch of _executePaper — extracted to keep that function's cognitive
-   * complexity within the sonarjs limit. See _executePaper's doc comment for the
-   * full contract (including the mixed long/short refusal).
-   */
-  private _executePaperLong(
-    id: string,
-    symbol: string,
-    fillPrice: number,
-    newState: PaperState,
-    baseHwm: number,
-    sizingPct: number,
-    maxPositionPct: number,
-    baseEquity: number,
-  ): { quantity: number; realized_pnl: number | null; newState: PaperState } {
-    const existing = newState.positions.find((p) => p.symbol === symbol);
-    if (existing && existing.quantity < 0) {
-      // Refuse to open a long on top of an existing short — cover it first via "exit".
-      newState.hwm = Math.max(baseHwm, newState.equity);
-      return { quantity: 0, realized_pnl: null, newState };
-    }
-
-    const budget = newState.cash * sizingPct;
-    const quantity = this._clampToPositionCeiling(
-      Math.floor(budget / fillPrice),
-      baseEquity,
-      fillPrice,
-      maxPositionPct,
-      id,
-      'paper long',
-    );
-    if (quantity <= 0) {
-      newState.hwm = Math.max(baseHwm, newState.equity);
-      return { quantity: 0, realized_pnl: null, newState };
-    }
-    const cost = fillPrice * quantity;
-    newState.cash -= cost;
-
-    if (existing) {
-      const totalQty = existing.quantity + quantity;
-      existing.avg_price =
-        (existing.avg_price * existing.quantity + fillPrice * quantity) / totalQty;
-      existing.quantity = totalQty;
-    } else {
-      newState.positions.push({ symbol, quantity, avg_price: fillPrice });
-    }
-
-    newState.equity = newState.cash + this._positionsValue(newState.positions, fillPrice, symbol);
-    newState.hwm = Math.max(baseHwm, newState.equity);
-    return { quantity, realized_pnl: null, newState };
-  }
-
-  /**
-   * "short" branch of _executePaper — extracted to keep that function's cognitive
-   * complexity within the sonarjs limit. See _executePaper's doc comment for the
-   * full contract (including the max_short_notional_pct ceiling and the mixed
-   * long/short refusal).
-   */
-  private _executePaperShort(
-    id: string,
-    symbol: string,
-    fillPrice: number,
-    newState: PaperState,
-    baseHwm: number,
-    sizingPct: number,
-    maxPositionPct: number,
-    maxShortNotionalPct: number,
-    baseEquity: number,
-  ): { quantity: number; realized_pnl: number | null; newState: PaperState } {
-    const existing = newState.positions.find((p) => p.symbol === symbol);
-    if (existing && existing.quantity > 0) {
-      // Refuse to open a short on top of an existing long — exit it first.
-      newState.hwm = Math.max(baseHwm, newState.equity);
-      return { quantity: 0, realized_pnl: null, newState };
-    }
-
-    const budget = newState.cash * sizingPct;
-    // Same base ceiling as "long" (never looser), PLUS an additional short-specific
-    // notional ceiling — see class-level risk-kernel doc.
-    let quantity = this._clampToPositionCeiling(
-      Math.floor(budget / fillPrice),
-      baseEquity,
-      fillPrice,
-      maxPositionPct,
-      id,
-      'paper short',
-    );
-    quantity = this._clampToShortNotionalCeiling(
-      quantity,
-      baseEquity,
-      fillPrice,
-      maxShortNotionalPct,
-      id,
-    );
-    if (quantity <= 0) {
-      newState.hwm = Math.max(baseHwm, newState.equity);
-      return { quantity: 0, realized_pnl: null, newState };
-    }
-
-    // Sell-to-open: cash is credited with proceeds; the negative position quantity
-    // represents the liability, so equity (cash + Σ price*quantity) is correct for free.
-    const proceeds = fillPrice * quantity;
-    newState.cash += proceeds;
-
-    if (existing) {
-      const existingAbs = Math.abs(existing.quantity);
-      const totalQty = existingAbs + quantity;
-      existing.avg_price = (existing.avg_price * existingAbs + fillPrice * quantity) / totalQty;
-      existing.quantity = -totalQty;
-    } else {
-      newState.positions.push({ symbol, quantity: -quantity, avg_price: fillPrice });
-    }
-
-    newState.equity = newState.cash + this._positionsValue(newState.positions, fillPrice, symbol);
-    newState.hwm = Math.max(baseHwm, newState.equity);
-    return { quantity, realized_pnl: null, newState };
-  }
-
   /**
    * Additional, short-specific ceiling ON TOP OF _clampToPositionCeiling: a short's
    * notional can never exceed max_short_notional_pct of equity. Only ever REDUCES qty
@@ -2337,17 +1897,5 @@ export class TradeIntentService {
       return maxQty;
     }
     return qty;
-  }
-
-  /** Computes total position value using fillPrice for the traded symbol, avg_price for others. */
-  private _positionsValue(
-    positions: PaperPosition[],
-    fillPrice: number,
-    tradedSymbol: string,
-  ): number {
-    return positions.reduce((sum, p) => {
-      const price = p.symbol === tradedSymbol ? fillPrice : p.avg_price;
-      return sum + price * p.quantity;
-    }, 0);
   }
 }

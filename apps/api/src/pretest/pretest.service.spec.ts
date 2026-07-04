@@ -4537,3 +4537,325 @@ describe('PretestService.runCycle — vol_target exposure scalar wiring', () => 
     });
   });
 });
+
+// ── unify-pretest-execution: kernel risk floor now applies to pretest ─────────
+//
+// Previously PretestService had NO risk floor at all (no drawdown halt, no max-open-
+// positions, no daily/weekly circuit breaker) — a pretest portfolio could keep "trading"
+// through an arbitrarily large drawdown. runCycle now routes every long/short tool call
+// through GovernedPaperExecutionService.evaluateEntryGate (the SAME kernel floor the live
+// paper/real account uses) BEFORE _simulateFills ever sees it. exit/hold always bypass the
+// gate (closeability invariant).
+
+describe('PretestService.runCycle — kernel risk floor (unify-pretest-execution)', () => {
+  function makeRunCycleHarness(opts: {
+    state: PretestState;
+    action: string;
+    symbol?: string;
+    kvOverrides?: Record<string, string | null>;
+    toolCalls?: Array<{ plugin_id: string; function: string; args: Record<string, unknown> }>;
+  }) {
+    const symbol = opts.symbol ?? 'AAPL';
+    const gateway = makeGateway((_pluginId, quotedSymbol) =>
+      Promise.resolve(makeQuote(quotedSymbol, 100)),
+    );
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = { findActive: jest.fn().mockResolvedValue([]) } as unknown as PluginsService;
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+    } as unknown as SandboxGateway;
+    const llm = { complete: jest.fn() } as unknown as LlmService;
+    const agents = {
+      runGovernedTurn: jest.fn().mockResolvedValue({
+        cycle_id: 'c',
+        text: '',
+        tool_calls: opts.toolCalls ?? [makeToolCall(symbol, opts.action)],
+        decisions: [],
+        sandbox_results: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+        llm_response: {
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        },
+        signalsEmitted: [],
+      }),
+    } as unknown as AgentsService;
+
+    const portfolioRow = {
+      id: 'risk-floor-portfolio',
+      name: 'Risk Floor Portfolio',
+      description: null,
+      initial_capital: 10_000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(opts.state),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const dbUpdate = jest.fn().mockResolvedValue(portfolioRow);
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        update: dbUpdate,
+      },
+    } as unknown as PrismaService;
+
+    const audit = makeStubAudit();
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      llm,
+      memory,
+      gateway,
+      agents,
+      makeStubKv(opts.kvOverrides ?? {}),
+      audit,
+    );
+    return { svc, db, dbUpdate, audit };
+  }
+
+  it('rejects a NEW long entry once the portfolio is past max_drawdown_halt_pct (25% default)', async () => {
+    // equity=7000 vs hwm=10000 -> 30% drawdown, past the 25% default halt.
+    const state = makeState({ equity: 7_000, cash: 7_000, hwm: 10_000 });
+    const { svc, dbUpdate, audit } = makeRunCycleHarness({ state, action: 'long' });
+
+    const result = await svc.runCycle('risk-floor-portfolio');
+
+    // No fill was recorded for the rejected entry.
+    expect(result.trades_simulated).toEqual([]);
+    expect(result.portfolio.state.positions).toEqual([]);
+    // Cash is untouched — the entry never reached _simulateFills.
+    expect(result.portfolio.state.cash).toBe(7_000);
+
+    // Observability: the rejection is audited.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'pretest_entry_rejected',
+        meta: expect.objectContaining({ symbol: 'AAPL', action: 'long' }) as unknown,
+      }),
+    );
+    expect(dbUpdate).toHaveBeenCalled();
+  });
+
+  it('rejects a NEW short entry once the portfolio is past max_drawdown_halt_pct', async () => {
+    const state = makeState({ equity: 7_000, cash: 7_000, hwm: 10_000 });
+    const { svc, audit } = makeRunCycleHarness({ state, action: 'short' });
+
+    const result = await svc.runCycle('risk-floor-portfolio');
+
+    expect(result.trades_simulated).toEqual([]);
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'pretest_entry_rejected',
+        meta: expect.objectContaining({ symbol: 'AAPL', action: 'short' }) as unknown,
+      }),
+    );
+  });
+
+  it('exit ALWAYS bypasses the drawdown halt — closing a losing position stays possible', async () => {
+    const state = makeState({
+      equity: 7_000,
+      cash: 6_000,
+      hwm: 10_000,
+      positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 100 }],
+    });
+    const { svc } = makeRunCycleHarness({ state, action: 'exit' });
+
+    const result = await svc.runCycle('risk-floor-portfolio');
+
+    expect(result.trades_simulated).toHaveLength(1);
+    expect(result.trades_simulated[0].action).toBe('close');
+    expect(result.portfolio.state.positions).toEqual([]);
+  });
+
+  it('hold is always allowed during an active drawdown halt (pure no-op, never gated)', async () => {
+    const state = makeState({ equity: 7_000, cash: 7_000, hwm: 10_000 });
+    const { svc, audit } = makeRunCycleHarness({ state, action: 'hold' });
+
+    const result = await svc.runCycle('risk-floor-portfolio');
+
+    expect(result.trades_simulated).toEqual([]);
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_entry_rejected' }),
+    );
+  });
+
+  it('a healthy portfolio (no drawdown) still lets a new long entry through the gate', async () => {
+    const state = makeState({ equity: 10_000, cash: 10_000 });
+    const { svc, audit } = makeRunCycleHarness({ state, action: 'long' });
+
+    const result = await svc.runCycle('risk-floor-portfolio');
+
+    expect(result.trades_simulated).toHaveLength(1);
+    expect(result.trades_simulated[0].action).toBe('buy');
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_entry_rejected' }),
+    );
+  });
+
+  it('max_open_positions gate blocks a new entry once the ceiling is reached', async () => {
+    const state = makeState({
+      equity: 10_000,
+      cash: 10_000,
+      positions: [
+        { symbol: 'S0', quantity: 1, avg_price: 100 },
+        { symbol: 'S1', quantity: 1, avg_price: 100 },
+      ],
+    });
+    const { svc, audit } = makeRunCycleHarness({
+      state,
+      action: 'long',
+      symbol: 'AAPL',
+      kvOverrides: { 'execution.max_open_positions': '2' },
+    });
+
+    const result = await svc.runCycle('risk-floor-portfolio');
+
+    expect(result.trades_simulated).toEqual([]);
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_entry_rejected' }),
+    );
+  });
+
+  it('within-cycle reservation: two NEW-symbol longs in the same cycle only let ONE through once the ceiling is reached', async () => {
+    // 1 open position + max_open_positions=2: BOTH new-symbol longs pass evaluateEntryGate
+    // individually (1 < 2 each, since fills only happen after this whole loop), but only ONE
+    // may actually be admitted this cycle — the second must be rejected + audited.
+    const state = makeState({
+      equity: 10_000,
+      cash: 10_000,
+      positions: [{ symbol: 'S0', quantity: 1, avg_price: 100 }],
+    });
+    const { svc, audit } = makeRunCycleHarness({
+      state,
+      action: 'long',
+      kvOverrides: { 'execution.max_open_positions': '2' },
+      toolCalls: [makeToolCall('NEW1', 'long'), makeToolCall('NEW2', 'long')],
+    });
+
+    const result = await svc.runCycle('risk-floor-portfolio');
+
+    expect(result.trades_simulated).toHaveLength(1);
+    expect(result.portfolio.state.positions).toHaveLength(2);
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'pretest_entry_rejected',
+        meta: expect.objectContaining({ symbol: 'NEW2', action: 'long' }) as unknown,
+      }),
+    );
+  });
+
+  it('within-cycle reservation: two tool calls adding to the SAME new symbol are NOT falsely blocked', async () => {
+    // Both target the same brand-new symbol — the second is "adding to" the first, not a
+    // second new slot, so it must NOT be rejected by the reservation logic.
+    const state = makeState({
+      equity: 10_000,
+      cash: 10_000,
+      positions: [{ symbol: 'S0', quantity: 1, avg_price: 100 }],
+    });
+    const { svc, audit } = makeRunCycleHarness({
+      state,
+      action: 'long',
+      kvOverrides: { 'execution.max_open_positions': '2' },
+      toolCalls: [makeToolCall('NEW1', 'long'), makeToolCall('NEW1', 'long')],
+    });
+
+    const result = await svc.runCycle('risk-floor-portfolio');
+
+    expect(result.trades_simulated).toHaveLength(2);
+    expect(result.portfolio.state.positions).toHaveLength(2);
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_entry_rejected' }),
+    );
+  });
+
+  it('within-cycle reservation: adding to an already EXISTING position never consumes a reservation slot', async () => {
+    // S0 is already open. A new-symbol long (NEW1) plus another add to S0 must both pass —
+    // S0 is not a new slot, so only NEW1 consumes the single free slot below the ceiling of 2.
+    const state = makeState({
+      equity: 10_000,
+      cash: 10_000,
+      positions: [{ symbol: 'S0', quantity: 1, avg_price: 100 }],
+    });
+    const { svc, audit } = makeRunCycleHarness({
+      state,
+      action: 'long',
+      kvOverrides: { 'execution.max_open_positions': '2' },
+      toolCalls: [makeToolCall('S0', 'long'), makeToolCall('NEW1', 'long')],
+    });
+
+    const result = await svc.runCycle('risk-floor-portfolio');
+
+    expect(result.trades_simulated).toHaveLength(2);
+    expect(result.portfolio.state.positions).toHaveLength(2);
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(audit.log).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'pretest_entry_rejected' }),
+    );
+  });
+
+  it('exit/hold in the same batch as gated new entries still bypass the reservation logic', async () => {
+    const state = makeState({
+      equity: 10_000,
+      cash: 10_000,
+      positions: [{ symbol: 'S0', quantity: 1, avg_price: 100 }],
+    });
+    const { svc, audit } = makeRunCycleHarness({
+      state,
+      action: 'long',
+      kvOverrides: { 'execution.max_open_positions': '2' },
+      toolCalls: [
+        makeToolCall('NEW1', 'long'),
+        makeToolCall('NEW2', 'long'),
+        makeToolCall('S0', 'exit'),
+        makeToolCall('S0', 'hold'),
+      ],
+    });
+
+    const result = await svc.runCycle('risk-floor-portfolio');
+
+    // NEW1 allowed, NEW2 rejected (ceiling), S0 exit always bypasses, hold is a no-op.
+    expect(result.trades_simulated.map((t) => t.action).sort((a, b) => a.localeCompare(b))).toEqual(
+      ['buy', 'close'],
+    );
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'pretest_entry_rejected',
+        meta: expect.objectContaining({ symbol: 'NEW2', action: 'long' }) as unknown,
+      }),
+    );
+  });
+
+  it('cross-portfolio isolation: two portfolios do not share hwm/day_key/week_key baselines', async () => {
+    // Portfolio A is past the drawdown halt; portfolio B (fresh) must NOT be affected —
+    // each _applyKernelRiskFloor call only ever reads/writes the state passed to IT.
+    const stateA = makeState({ equity: 7_000, cash: 7_000, hwm: 10_000 });
+    const { svc: svcA } = makeRunCycleHarness({ state: stateA, action: 'long' });
+    const resultA = await svcA.runCycle('risk-floor-portfolio');
+    expect(resultA.trades_simulated).toEqual([]);
+
+    const stateB = makeState({ equity: 10_000, cash: 10_000 });
+    const { svc: svcB } = makeRunCycleHarness({ state: stateB, action: 'long' });
+    const resultB = await svcB.runCycle('risk-floor-portfolio');
+    expect(resultB.trades_simulated).toHaveLength(1);
+  });
+});

@@ -8,6 +8,7 @@
  */
 
 import { TradeIntentService } from './trade-intent.service';
+import { GovernedPaperExecutionService } from '../execution/governed-paper-execution.service';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -116,10 +117,18 @@ function makeService(
   audit?: MockAudit,
   reconciliation?: MockReconciliation,
 ): TradeIntentService {
+  // GovernedPaperExecutionService is a real instance wired to the SAME mocked gateway
+  // (+ optional audit) — the paper-execution math it now owns is exercised exactly as
+  // before, just via the shared service instead of TradeIntentService private methods.
+  const governedPaperExec = new GovernedPaperExecutionService(
+    gateway as unknown as ConstructorParameters<typeof GovernedPaperExecutionService>[0],
+    audit as unknown as ConstructorParameters<typeof GovernedPaperExecutionService>[1],
+  );
   return new (TradeIntentService as unknown as new (
     db: unknown,
     gw: unknown,
     kv: unknown,
+    governedPaperExec: unknown,
     realOrderService: unknown,
     reconciliation: unknown,
     audit?: unknown,
@@ -127,6 +136,7 @@ function makeService(
     prisma,
     gateway,
     kv,
+    governedPaperExec,
     realOrderService ?? makeRealOrderService(),
     reconciliation ?? makeReconciliation(),
     audit,
