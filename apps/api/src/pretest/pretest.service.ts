@@ -147,6 +147,20 @@ export interface SignificanceMetrics {
   /** Portfolio return − buy&hold benchmark return (%). null when no benchmark is
    * tracked or initial_capital is unknown → the alpha gate check is then skipped. */
   alpha_pct: number | null;
+  /** Average pnl ($) of winning closing trades. 0 when no winners. */
+  avg_win: number;
+  /** Average |pnl| ($) of losing closing trades. 0 when no losers. */
+  avg_loss: number;
+  /** avg_win / avg_loss. null when no losing trades (undefined denominator). */
+  payoff_ratio: number | null;
+  /**
+   * Expectancy per trade ($) — the statistical edge: (win_rate * avg_win) − (loss_rate * avg_loss).
+   * Positive expectancy means the strategy has a real edge over its own trade history;
+   * negative/zero means it is (on average) not profitable per trade regardless of any
+   * single winning streak. loss_rate = loss_trades / n_trades (mirrors win_rate's denominator —
+   * both exclude break-even trades with pnl === 0).
+   */
+  expectancy: number;
 }
 
 /** Result of the significance gate evaluation. */
@@ -215,6 +229,11 @@ export interface PretestCompare {
     realized_pnl: number;
     plugin_count: number;
     gate_status: 'READY' | 'NOT_READY';
+    /** Expectancy per trade ($) — see SignificanceMetrics.expectancy. */
+    expectancy: number;
+    avg_win: number;
+    avg_loss: number;
+    payoff_ratio: number | null;
   }>;
   winner_by_return: string;
   winner_by_risk_adj: string; // mayor retorno / max_drawdown
@@ -567,6 +586,10 @@ export class PretestService {
         realized_pnl: p.state.realized_pnl,
         plugin_count: p.plugin_ids.length,
         gate_status,
+        expectancy: metrics.expectancy,
+        avg_win: metrics.avg_win,
+        avg_loss: metrics.avg_loss,
+        payoff_ratio: metrics.payoff_ratio,
         _risk_adj: risk_adj,
       };
     });
@@ -626,6 +649,10 @@ export class PretestService {
         n_trades: 0,
         loss_trades: 0,
         alpha_pct,
+        avg_win: 0,
+        avg_loss: 0,
+        payoff_ratio: null,
+        expectancy: 0,
       };
     }
 
@@ -652,7 +679,42 @@ export class PretestService {
       sharpe = effectively_zero ? 0 : mean / std;
     }
 
-    // profit_factor = Σ(+pnl) / |Σ(-pnl)|; null if no losses
+    // profit_factor / win_rate / expectancy tracking — extracted to keep this function's
+    // cognitive complexity within the sonarjs limit (see _computeWinLossStats doc comment).
+    const winLoss = this._computeWinLossStats(closingTrades, n);
+
+    return {
+      sharpe,
+      profit_factor: winLoss.profit_factor,
+      win_rate: winLoss.win_rate,
+      max_dd: state.max_drawdown_pct,
+      n_trades: n,
+      loss_trades: winLoss.losses,
+      alpha_pct,
+      avg_win: winLoss.avg_win,
+      avg_loss: winLoss.avg_loss,
+      payoff_ratio: winLoss.payoff_ratio,
+      expectancy: winLoss.expectancy,
+    };
+  }
+
+  /**
+   * profit_factor / win_rate / expectancy-tracking stats from a set of closing trades —
+   * extracted from computeSignificance to keep its cognitive complexity within the sonarjs
+   * limit. See SignificanceMetrics doc comment for the field definitions.
+   */
+  private _computeWinLossStats(
+    closingTrades: PretestTrade[],
+    n: number,
+  ): {
+    profit_factor: number | null;
+    win_rate: number;
+    losses: number;
+    avg_win: number;
+    avg_loss: number;
+    payoff_ratio: number | null;
+    expectancy: number;
+  } {
     let sumPos = 0;
     let sumNeg = 0;
     let wins = 0;
@@ -669,15 +731,21 @@ export class PretestService {
     }
     const profit_factor: number | null = sumNeg > 0 ? sumPos / sumNeg : null;
     const win_rate = wins / n;
+    const loss_rate = losses / n;
+
+    const avg_win = wins > 0 ? sumPos / wins : 0;
+    const avg_loss = losses > 0 ? sumNeg / losses : 0;
+    const payoff_ratio = avg_loss > 0 ? avg_win / avg_loss : null;
+    const expectancy = win_rate * avg_win - loss_rate * avg_loss;
 
     return {
-      sharpe,
       profit_factor,
       win_rate,
-      max_dd: state.max_drawdown_pct,
-      n_trades: n,
-      loss_trades: losses,
-      alpha_pct,
+      losses,
+      avg_win: Math.round(avg_win * 100) / 100,
+      avg_loss: Math.round(avg_loss * 100) / 100,
+      payoff_ratio: payoff_ratio !== null ? Math.round(payoff_ratio * 10000) / 10000 : null,
+      expectancy: Math.round(expectancy * 100) / 100,
     };
   }
 

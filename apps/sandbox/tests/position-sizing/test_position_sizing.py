@@ -38,6 +38,8 @@ from sizing import (  # noqa: E402
     compute_inverse_vol_weights,
     compute_kelly,
     position_size,
+    position_size_fixed_fractional_risk,
+    resolve_stop_price,
     stats_from_trades,
 )
 
@@ -301,6 +303,125 @@ class TestFixedMode:
         assert abs(pct1 - pct2) < 0.01, (
             f"Fixed mode must not depend on trade history: {pct1} vs {pct2}"
         )
+
+
+# ---------------------------------------------------------------------------
+# (c2) mode="fixed_fractional_risk" — risk-based sizing (risk-discipline pillar 2)
+# ---------------------------------------------------------------------------
+
+class TestFixedFractionalRiskMode:
+    """
+    fixed_fractional_risk sizes a position so that a stop-out loses exactly
+    risk_per_trade_pct of equity: shares = floor((equity * risk_per_trade_pct/100)
+    / |entry_price - stop_price|). Stop is read from the signal's 'stop_price' (or
+    the atr-stop-loss convention 'stop_loss'), falling back to an ATR-derived stop
+    (stop_atr_mult * ATR) when neither is present.
+    """
+
+    def _ctx(self, signals: list[dict], config_override: dict | None = None) -> dict:
+        config = {
+            "mode": "fixed_fractional_risk",
+            "risk_per_trade_pct": 1.0,
+            "stop_atr_mult": 2.0,
+            # Wide open by default so these tests isolate the risk-based sizing math —
+            # see test_capped_by_max_position_pct for the ceiling-specific test.
+            "max_position_pct": 50.0,
+        }
+        config.update(config_override or {})
+        return {
+            "pending_signals": signals,
+            "portfolio_value": 10_000.0,
+            "portfolio": {},
+            "trade_history": [],
+            "config": config,
+        }
+
+    def test_sizes_from_explicit_stop_price(self) -> None:
+        """entry=100, stop=98 (risk=2/share), equity=10000, risk_pct=1% → budget=100 → 50 shares."""
+        sig = {**_long_signal(price=100.0), "stop_price": 98.0}
+        ctx = self._ctx([sig])
+        result = cycle.on_cycle(ctx)
+        out = result["signals"][0]
+        assert "fixed_fractional_risk" in out
+        ffr = out["fixed_fractional_risk"]
+        assert ffr["shares"] == 50
+        assert ffr["stop_price"] == pytest.approx(98.0)
+
+    def test_falls_back_to_stop_loss_key_atr_stop_loss_convention(self) -> None:
+        """No 'stop_price' but a 'stop_loss' key (atr-stop-loss plugin convention) is used."""
+        sig = {**_long_signal(price=100.0), "stop_loss": 95.0}
+        sig.pop("stop_loss_pct", None)
+        ctx = self._ctx([sig])
+        result = cycle.on_cycle(ctx)
+        out = result["signals"][0]
+        ffr = out["fixed_fractional_risk"]
+        # risk/share=5, budget=100 → 20 shares
+        assert ffr["shares"] == 20
+        assert ffr["stop_price"] == pytest.approx(95.0)
+
+    def test_wider_stop_yields_smaller_position_inverse_relationship(self) -> None:
+        """A wider stop (more risk/share) must produce a SMALLER position for the same budget."""
+        tight = self._ctx([{**_long_signal(price=100.0), "stop_price": 99.0}])  # risk=1/share
+        wide = self._ctx([{**_long_signal(price=100.0), "stop_price": 90.0}])  # risk=10/share
+
+        tight_shares = cycle.on_cycle(tight)["signals"][0]["fixed_fractional_risk"]["shares"]
+        wide_shares = cycle.on_cycle(wide)["signals"][0]["fixed_fractional_risk"]["shares"]
+
+        assert wide_shares < tight_shares, (
+            f"wider stop should size smaller: wide={wide_shares} tight={tight_shares}"
+        )
+
+    def test_derives_stop_from_atr_when_no_explicit_stop_present(self) -> None:
+        """No stop_price/stop_loss, but atr14 is present (atr-stop-loss output) → ATR*mult."""
+        sig = {**_long_signal(price=100.0), "atr14": 2.5}
+        sig.pop("stop_loss", None)
+        ctx = self._ctx([sig], {"stop_atr_mult": 2.0})
+        result = cycle.on_cycle(ctx)
+        out = result["signals"][0]
+        ffr = out["fixed_fractional_risk"]
+        # stop = 100 - 2.5*2 = 95 → risk/share=5 → budget=100 → 20 shares
+        assert ffr["stop_price"] == pytest.approx(95.0)
+        assert ffr["shares"] == 20
+
+    def test_short_direction_derives_stop_above_entry(self) -> None:
+        sig = {
+            "action": "short",
+            "symbol": "AAPL",
+            "price": 100.0,
+            "entry_price": 100.0,
+            "atr14": 2.0,
+        }
+        ctx = self._ctx([sig], {"stop_atr_mult": 2.0})
+        result = cycle.on_cycle(ctx)
+        out = result["signals"][0]
+        ffr = out["fixed_fractional_risk"]
+        assert ffr["stop_price"] == pytest.approx(104.0)
+
+    def test_no_stop_available_skips_signal_with_warning(self) -> None:
+        """No stop_price/stop_loss/atr14/closes → cannot size; signal passes through unsized."""
+        sig = _long_signal(price=100.0)
+        sig.pop("stop_loss", None)
+        ctx = self._ctx([sig])
+        result = cycle.on_cycle(ctx)
+        out = result["signals"][0]
+        assert "fixed_fractional_risk" not in out
+        assert any(log["level"] == "warning" for log in result["logs"])
+
+    def test_capped_by_max_position_pct(self) -> None:
+        """A very tight stop would otherwise risk-size a huge position — capped by the ceiling."""
+        sig = {**_long_signal(price=100.0), "stop_price": 99.9}  # risk/share=0.1 → huge raw size
+        ctx = self._ctx([sig], {"risk_per_trade_pct": 1.0, "max_position_pct": 10.0})
+        result = cycle.on_cycle(ctx)
+        out = result["signals"][0]["fixed_fractional_risk"]
+        # capped at 10% of 10000 = 1000 usd / 100 price = 10 shares
+        assert out["shares"] == 10
+        assert out["capped_by_max_position"] is True
+
+    def test_non_long_short_signals_pass_through_unmodified(self) -> None:
+        sig = {"action": "hold", "symbol": "AAPL"}
+        ctx = self._ctx([sig])
+        result = cycle.on_cycle(ctx)
+        assert result["signals"] == [sig]
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +766,50 @@ class TestPureMath:
         # 2% of 10000 = 200, shares = floor(200/100) = 2
         assert result.shares == 2
         assert result.warning is not None
+
+    def test_position_size_fixed_fractional_risk_exact_risk_budget(self) -> None:
+        """shares * risk_per_share must equal exactly the risk budget (equity * risk_pct)."""
+        result = position_size_fixed_fractional_risk(
+            equity=10_000.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            risk_per_trade_pct=1.0,
+            max_position_pct=50.0,  # wide open — not the ceiling under test here
+        )
+        assert result.shares == 50
+        assert result.risk_usd == pytest.approx(100.0, abs=0.01)
+
+    def test_position_size_fixed_fractional_risk_wider_stop_smaller_size(self) -> None:
+        tight = position_size_fixed_fractional_risk(10_000.0, 100.0, 99.0, 1.0, 50.0)
+        wide = position_size_fixed_fractional_risk(10_000.0, 100.0, 90.0, 1.0, 50.0)
+        assert wide.shares < tight.shares
+
+    def test_position_size_fixed_fractional_risk_invalid_inputs_safe(self) -> None:
+        result = position_size_fixed_fractional_risk(0.0, 100.0, 98.0, 1.0, 10.0)
+        assert result.shares == 0
+        assert result.warning is not None
+
+        same_price_stop = position_size_fixed_fractional_risk(10_000.0, 100.0, 100.0, 1.0, 10.0)
+        assert same_price_stop.shares == 0
+
+    def test_resolve_stop_price_prefers_explicit_stop_price(self) -> None:
+        sig = {"stop_price": 95.0, "stop_loss": 90.0, "atr14": 5.0}
+        stop, source = resolve_stop_price(sig, entry_price=100.0, direction="long")
+        assert stop == pytest.approx(95.0)
+        assert source == "signal"
+
+    def test_resolve_stop_price_falls_back_to_atr(self) -> None:
+        sig = {"atr14": 3.0}
+        stop, source = resolve_stop_price(
+            sig, entry_price=100.0, direction="long", stop_atr_mult=2.0
+        )
+        assert stop == pytest.approx(94.0)
+        assert source == "atr"
+
+    def test_resolve_stop_price_none_when_nothing_available(self) -> None:
+        stop, source = resolve_stop_price({}, entry_price=100.0, direction="long")
+        assert stop is None
+        assert source is None
 
     def test_calculate_tranches_plan_structure(self) -> None:
         plan = calculate_tranches(

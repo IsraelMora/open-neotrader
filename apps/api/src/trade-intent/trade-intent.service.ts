@@ -59,6 +59,19 @@ export interface PaperState {
   max_drawdown_pct?: number;
   /** High-water-mark equity — the highest equity ever recorded for this paper portfolio. */
   hwm?: number;
+  /**
+   * Daily/weekly loss circuit-breaker baselines (prop-firm-style, calendar-period based —
+   * see class-level doc and _passesPaperEntryGate). Undefined until the first entry-gate
+   * evaluation initializes them. `day_key`/`week_key` are UTC-anchored ("YYYY-MM-DD" for the
+   * day, the Monday of the current UTC week for the week) so a period rollover is detected
+   * by simple string inequality — no timezone-dependent date math at comparison time.
+   */
+  day_key?: string;
+  /** MTM equity recorded at the first entry-gate evaluation of the current `day_key`. */
+  day_start_equity?: number;
+  week_key?: string;
+  /** MTM equity recorded at the first entry-gate evaluation of the current `week_key`. */
+  week_start_equity?: number;
 }
 
 /**
@@ -101,6 +114,19 @@ export interface ExecutionPolicy {
    * for) the existing real gates.
    */
   allow_real_short: boolean;
+  /**
+   * Prop-firm-style loss circuit-breaker (paper account MTM): blocks all NEW ENTRIES
+   * (long/short) once the current calendar day's or week's loss reaches
+   * max_daily_loss_pct / max_weekly_loss_pct. "exit"/"hold" are NEVER affected
+   * (closeability invariant). ON by default in paper — see class-level doc for the
+   * rationale (safe, conservative defaults; distinct from and stacks with the
+   * peak-to-trough max-drawdown halt). Opt-out via execution.loss_circuit_breaker_enabled.
+   */
+  loss_circuit_breaker_enabled: boolean;
+  /** Fraction of day-start equity that, if lost intraday, blocks new entries until the next UTC day. Default 0.03 (3%). */
+  max_daily_loss_pct: number;
+  /** Fraction of week-start equity that, if lost this week, blocks new entries until the next UTC week (Monday). Default 0.06 (6%). */
+  max_weekly_loss_pct: number;
 }
 
 /**
@@ -118,6 +144,13 @@ const DEFAULT_EXECUTION_POLICY: ExecutionPolicy = {
   max_order_notional: 1_000,
   max_short_notional_pct: 0.1,
   allow_real_short: false,
+  // Prop-firm-style calendar-loss circuit-breaker — ON by default in paper (see
+  // ExecutionPolicy doc). 3%/6% are conservative-but-tradeable defaults: tight enough to
+  // stop a genuinely bad day/week early, loose enough that normal volatility doesn't
+  // constantly trip it.
+  loss_circuit_breaker_enabled: true,
+  max_daily_loss_pct: 0.03,
+  max_weekly_loss_pct: 0.06,
 };
 
 /** Default capital for the shared paper portfolio if it doesn't exist yet. */
@@ -279,7 +312,7 @@ export class TradeIntentService {
     const portfolioRow = await this.db.portfolio.findUnique({
       where: { name: PAPER_PORTFOLIO_NAME },
     });
-    const paperState: PaperState = portfolioRow
+    let paperState: PaperState = portfolioRow
       ? (JSON.parse(portfolioRow.data) as PaperState)
       : {
           equity: PAPER_PORTFOLIO_INITIAL_CAPITAL,
@@ -334,18 +367,19 @@ export class TradeIntentService {
       // (not just the just-traded symbol) — see _passesPaperEntryGate doc comment for
       // the safety-gap this closes. Real mode is unaffected (realState already reflects
       // the broker's live account).
-      const { pass, reason } =
-        effectiveMode === 'real'
-          ? this._passesAutoRisk(realState as RealAccountState, policy, 'real')
-          : await this._passesPaperEntryGate(paperState, policy);
-      if (!pass) {
+      // Carries forward any daily/weekly baseline reset into the execution path below —
+      // see _passesPaperEntryGate doc comment. Extracted to _evaluateEntryRiskGate (shared
+      // with approve()) to keep this function's cognitive complexity within the sonarjs limit.
+      const gate = await this._evaluateEntryRiskGate(effectiveMode, realState, paperState, policy);
+      paperState = gate.paperState;
+      if (!gate.pass) {
         return this.db.tradeIntent.update({
           where: { id },
           data: {
             status: 'rejected',
             decided_at: new Date(),
             decided_by: 'autonomous',
-            reject_reason: reason,
+            reject_reason: gate.reason,
           },
         });
       }
@@ -419,7 +453,7 @@ export class TradeIntentService {
     const portfolioRow = await this.db.portfolio.findUnique({
       where: { name: PAPER_PORTFOLIO_NAME },
     });
-    const state: PaperState = portfolioRow
+    let state: PaperState = portfolioRow
       ? (JSON.parse(portfolioRow.data) as PaperState)
       : {
           equity: PAPER_PORTFOLIO_INITIAL_CAPITAL,
@@ -480,18 +514,20 @@ export class TradeIntentService {
       // (not just the just-traded symbol) — see _passesPaperEntryGate doc comment for
       // the safety-gap this closes. Real mode is unaffected (realState already reflects
       // the broker's live account).
-      const { pass, reason } =
-        effectiveMode === 'real'
-          ? this._passesAutoRisk(realState as RealAccountState, policy, 'real')
-          : await this._passesPaperEntryGate(state, policy);
-      if (!pass) {
+      // Carries forward any daily/weekly baseline reset into the execution path below —
+      // see _passesPaperEntryGate doc comment. Extracted to _evaluateEntryRiskGate (shared
+      // with autoProcess()) to keep this function's cognitive complexity within the sonarjs
+      // limit.
+      const gate = await this._evaluateEntryRiskGate(effectiveMode, realState, state, policy);
+      state = gate.paperState;
+      if (!gate.pass) {
         return this.db.tradeIntent.update({
           where: { id },
           data: {
             status: 'rejected',
             decided_at: new Date(),
             decided_by,
-            reject_reason: reason,
+            reject_reason: gate.reason,
           },
         });
       }
@@ -553,6 +589,9 @@ export class TradeIntentService {
       rawMaxNotional,
       rawMaxShortNotionalPct,
       rawAllowRealShort,
+      rawLossBreakerEnabled,
+      rawMaxDailyLossPct,
+      rawMaxWeeklyLossPct,
     ] = await Promise.all([
       this.kv.get('execution.autonomous'),
       this.kv.get('execution.max_position_pct'),
@@ -563,6 +602,9 @@ export class TradeIntentService {
       this.kv.get('execution.max_order_notional'),
       this.kv.get('execution.max_short_notional_pct'),
       this.kv.get('execution.allow_real_short'),
+      this.kv.get('execution.loss_circuit_breaker_enabled'),
+      this.kv.get('execution.max_daily_loss_pct'),
+      this.kv.get('execution.max_weekly_loss_pct'),
     ]);
 
     // autonomous: only an explicit false disables it (default on). kvBool tolera el
@@ -615,6 +657,31 @@ export class TradeIntentService {
     // allow_real_short: only literal 'true' enables real short-selling (default false).
     const allow_real_short = kvBool(rawAllowRealShort, DEFAULT_EXECUTION_POLICY.allow_real_short);
 
+    // loss_circuit_breaker_enabled: ON by default (opt-out, not opt-in — see class doc).
+    const loss_circuit_breaker_enabled = kvBool(
+      rawLossBreakerEnabled,
+      DEFAULT_EXECUTION_POLICY.loss_circuit_breaker_enabled,
+    );
+
+    let max_daily_loss_pct = kvNum(rawMaxDailyLossPct, DEFAULT_EXECUTION_POLICY.max_daily_loss_pct);
+    if (max_daily_loss_pct <= 0 || max_daily_loss_pct > 1) {
+      this.log.warn(
+        `execution.max_daily_loss_pct out of range (${max_daily_loss_pct}) — falling back to default ${DEFAULT_EXECUTION_POLICY.max_daily_loss_pct}`,
+      );
+      max_daily_loss_pct = DEFAULT_EXECUTION_POLICY.max_daily_loss_pct;
+    }
+
+    let max_weekly_loss_pct = kvNum(
+      rawMaxWeeklyLossPct,
+      DEFAULT_EXECUTION_POLICY.max_weekly_loss_pct,
+    );
+    if (max_weekly_loss_pct <= 0 || max_weekly_loss_pct > 1) {
+      this.log.warn(
+        `execution.max_weekly_loss_pct out of range (${max_weekly_loss_pct}) — falling back to default ${DEFAULT_EXECUTION_POLICY.max_weekly_loss_pct}`,
+      );
+      max_weekly_loss_pct = DEFAULT_EXECUTION_POLICY.max_weekly_loss_pct;
+    }
+
     return {
       autonomous,
       max_position_pct,
@@ -625,6 +692,9 @@ export class TradeIntentService {
       max_order_notional,
       max_short_notional_pct,
       allow_real_short,
+      loss_circuit_breaker_enabled,
+      max_daily_loss_pct,
+      max_weekly_loss_pct,
     };
   }
 
@@ -657,6 +727,15 @@ export class TradeIntentService {
       await this.kv.set('execution.max_short_notional_pct', String(patch.max_short_notional_pct));
     if (patch.allow_real_short !== undefined)
       await this.kv.set('execution.allow_real_short', String(patch.allow_real_short));
+    if (patch.loss_circuit_breaker_enabled !== undefined)
+      await this.kv.set(
+        'execution.loss_circuit_breaker_enabled',
+        String(patch.loss_circuit_breaker_enabled),
+      );
+    if (patch.max_daily_loss_pct !== undefined)
+      await this.kv.set('execution.max_daily_loss_pct', String(patch.max_daily_loss_pct));
+    if (patch.max_weekly_loss_pct !== undefined)
+      await this.kv.set('execution.max_weekly_loss_pct', String(patch.max_weekly_loss_pct));
     return this._readExecutionPolicy();
   }
 
@@ -1577,6 +1656,30 @@ export class TradeIntentService {
     return hwm > 0 ? Math.max(0, ((hwm - paper.equity) / hwm) * 100) : 0;
   }
 
+  // ── _evaluateEntryRiskGate ─────────────────────────────────────────────────────
+
+  /**
+   * Shared entry-risk-gate dispatch used by BOTH autoProcess() and approve() — extracted so
+   * neither caller has to inline the real-vs-paper branch (keeps their cognitive complexity
+   * within the sonarjs limit). Real mode delegates to `_passesAutoRisk` against `realState`
+   * unchanged; paper mode delegates to `_passesPaperEntryGate` (MTM + loss circuit-breaker +
+   * drawdown/max-open-positions), returning its (possibly baseline-reset) `state` so the
+   * caller can carry it into the subsequent execution path.
+   */
+  private async _evaluateEntryRiskGate(
+    effectiveMode: 'paper' | 'real',
+    realState: RealAccountState | null,
+    paperState: PaperState,
+    policy: ExecutionPolicy,
+  ): Promise<{ pass: boolean; reason?: string; paperState: PaperState }> {
+    if (effectiveMode === 'real') {
+      const { pass, reason } = this._passesAutoRisk(realState as RealAccountState, policy, 'real');
+      return { pass, reason, paperState };
+    }
+    const gateResult = await this._passesPaperEntryGate(paperState, policy);
+    return { pass: gateResult.pass, reason: gateResult.reason, paperState: gateResult.state };
+  }
+
   // ── _passesAutoRisk ───────────────────────────────────────────────────────────
 
   /**
@@ -1680,19 +1783,133 @@ export class TradeIntentService {
     return { equity, hwm: Math.max(baseHwm, equity), ok: true };
   }
 
+  /** UTC calendar-day key ("YYYY-MM-DD") for the daily loss circuit-breaker. */
+  private _dayKey(now: Date): string {
+    return now.toISOString().slice(0, 10);
+  }
+
+  /**
+   * UTC Monday-anchored week-start key ("YYYY-MM-DD" of that week's Monday) for the
+   * weekly loss circuit-breaker. Monday-anchoring (rather than ISO week numbers) sidesteps
+   * ISO 8601's year-boundary edge cases while still giving a stable, comparable key.
+   */
+  private _weekKey(now: Date): string {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const day = d.getUTCDay(); // 0=Sun..6=Sat
+    const diffToMonday = (day + 6) % 7; // Mon=0, Tue=1, ..., Sun=6
+    d.setUTCDate(d.getUTCDate() - diffToMonday);
+    return d.toISOString().slice(0, 10);
+  }
+
+  /**
+   * Rolls the day/week loss-circuit-breaker baselines forward when the calendar period has
+   * changed since they were last recorded — pure function, no side effects. A period
+   * "changes" whenever `state.day_key`/`week_key` is unset (never initialized) or doesn't
+   * match the CURRENT key: the new baseline becomes `mtmEquity` (the freshly mark-to-market'd
+   * equity from `_markToMarketPaper`), i.e. "loss since the first evaluation of this period" —
+   * there is no way to know the account's true equity at the exact midnight/Monday boundary,
+   * so the first evaluation of a new period is definitionally its 0%-loss starting point.
+   * Returns `changed: false` (and the SAME state reference) when nothing needs updating, so
+   * the caller can skip a redundant persist.
+   */
+  private _syncPaperPeriodBaselines(
+    state: PaperState,
+    mtmEquity: number,
+    now: Date,
+  ): { state: PaperState; changed: boolean } {
+    const dayKey = this._dayKey(now);
+    const weekKey = this._weekKey(now);
+
+    const dayChanged = state.day_key !== dayKey;
+    const weekChanged = state.week_key !== weekKey;
+    if (!dayChanged && !weekChanged) {
+      return { state, changed: false };
+    }
+
+    return {
+      state: {
+        ...state,
+        day_key: dayKey,
+        day_start_equity: dayChanged ? mtmEquity : state.day_start_equity,
+        week_key: weekKey,
+        week_start_equity: weekChanged ? mtmEquity : state.week_start_equity,
+      },
+      changed: true,
+    };
+  }
+
+  /**
+   * Evaluates ONE period (day or week) of the loss circuit-breaker: has equity fallen by
+   * `maxLossPct` or more since `startEquity` (the period's baseline)? `startEquity`
+   * undefined/non-positive means the baseline hasn't been established yet (fresh portfolio,
+   * first-ever evaluation before `_syncPaperPeriodBaselines` even runs) — always passes, since
+   * there is nothing to measure the loss against.
+   */
+  private _checkPeriodLossLimit(
+    startEquity: number | undefined,
+    currentEquity: number,
+    maxLossPct: number,
+    label: 'daily' | 'weekly',
+  ): { pass: boolean; reason?: string } {
+    if (startEquity === undefined || startEquity <= 0) return { pass: true };
+    const lossPct = (startEquity - currentEquity) / startEquity;
+    if (lossPct >= maxLossPct) {
+      return {
+        pass: false,
+        reason:
+          `circuit breaker: ${label} loss ${(lossPct * 100).toFixed(2)}% >= ` +
+          `${(maxLossPct * 100).toFixed(2)}% — new entries blocked until the next ${
+            label === 'daily' ? 'day' : 'week'
+          } (UTC)`,
+      };
+    }
+    return { pass: true };
+  }
+
+  /** Best-effort audit of a loss-circuit-breaker trip. Never breaks execution. */
+  private async _auditLossBreakerTrip(period: 'daily' | 'weekly', reason: string): Promise<void> {
+    if (!this.audit) return;
+    try {
+      await this.audit.log({
+        event_type: 'loss_circuit_breaker_tripped',
+        meta: { period, reason },
+      });
+    } catch {
+      // audit is best-effort — a logging failure must never affect execution.
+    }
+  }
+
   /**
    * Combines `_markToMarketPaper` with the existing `_passesAutoRisk` gate for a PAPER
-   * entry (long/short). A mark-to-market failure blocks the entry (fail-closed) with a
-   * dedicated reason distinct from the drawdown/max-positions reasons, so an operator can
-   * tell "book valued fine, but risk limit hit" apart from "couldn't value the book at
-   * all". Never mutates the caller's `state` — the fresh equity/hwm are only used for this
-   * gate decision; the persisted paper portfolio still updates the normal way on trade
-   * execution.
+   * entry (long/short), PLUS the daily/weekly loss circuit-breaker (prop-firm-style,
+   * calendar-period based — see class-level doc). Ordering: MTM failure → circuit breaker
+   * (daily, then weekly) → the existing peak-to-trough drawdown/max-open-positions gate.
+   * The circuit breaker is a SEPARATE, ADDITIONAL restriction — it never loosens or
+   * replaces the drawdown halt.
+   *
+   * A mark-to-market failure blocks the entry (fail-closed) with a dedicated reason
+   * distinct from the other reasons, so an operator can tell "book valued fine, but risk
+   * limit hit" apart from "couldn't value the book at all".
+   *
+   * Returns the (possibly period-baseline-reset) `state` alongside pass/reason — the CALLER
+   * must use this returned `state` for any subsequent paper execution, so a baseline reset
+   * detected here is carried into the persisted portfolio row instead of being silently lost.
+   *
+   * Persistence: when the entry ultimately PASSES, this function itself never writes to the
+   * DB — the reset baseline rides along in the returned `state`, which the caller substitutes
+   * into the normal trade-execution path (`_runPaperExecution`'s own upsert persists it
+   * alongside the trade, avoiding a redundant write). When the entry is ultimately REJECTED
+   * (by this gate or the existing risk gate below) AND a period rollover was detected, the
+   * reset is persisted immediately here — a rejected intent never reaches
+   * `_runPaperExecution`, so without this write a loss that happened before the very first
+   * evaluation of a new day/week would be invisible forever (each subsequent call would keep
+   * "discovering" a new day and resetting the baseline to the CURRENT, already-depressed
+   * equity, permanently masking the loss).
    */
   private async _passesPaperEntryGate(
     state: PaperState,
     policy: ExecutionPolicy,
-  ): Promise<{ pass: boolean; reason?: string }> {
+  ): Promise<{ pass: boolean; reason?: string; state: PaperState }> {
     const mtm = await this._markToMarketPaper(state);
     if (!mtm.ok) {
       this.log.warn(
@@ -1701,10 +1918,57 @@ export class TradeIntentService {
       return {
         pass: false,
         reason: 'mark-to-market unavailable for one or more open positions — refusing new entry',
+        state,
       };
     }
-    const freshState: PaperState = { ...state, equity: mtm.equity, hwm: mtm.hwm };
-    return this._passesAutoRisk(freshState, policy, 'paper');
+
+    const { state: syncedState, changed } = this._syncPaperPeriodBaselines(
+      state,
+      mtm.equity,
+      new Date(),
+    );
+
+    const persistBaselineIfRejected = async (result: {
+      pass: boolean;
+      reason?: string;
+    }): Promise<{ pass: boolean; reason?: string; state: PaperState }> => {
+      if (!result.pass && changed) {
+        await this.db.portfolio.upsert({
+          where: { name: PAPER_PORTFOLIO_NAME },
+          create: { name: PAPER_PORTFOLIO_NAME, data: JSON.stringify(syncedState) },
+          update: { data: JSON.stringify(syncedState) },
+        });
+      }
+      return { ...result, state: syncedState };
+    };
+
+    if (policy.loss_circuit_breaker_enabled) {
+      const daily = this._checkPeriodLossLimit(
+        syncedState.day_start_equity,
+        mtm.equity,
+        policy.max_daily_loss_pct,
+        'daily',
+      );
+      if (!daily.pass) {
+        await this._auditLossBreakerTrip('daily', daily.reason ?? '');
+        return persistBaselineIfRejected(daily);
+      }
+
+      const weekly = this._checkPeriodLossLimit(
+        syncedState.week_start_equity,
+        mtm.equity,
+        policy.max_weekly_loss_pct,
+        'weekly',
+      );
+      if (!weekly.pass) {
+        await this._auditLossBreakerTrip('weekly', weekly.reason ?? '');
+        return persistBaselineIfRejected(weekly);
+      }
+    }
+
+    const freshState: PaperState = { ...syncedState, equity: mtm.equity, hwm: mtm.hwm };
+    const risk = this._passesAutoRisk(freshState, policy, 'paper');
+    return persistBaselineIfRejected(risk);
   }
 
   // ── _clampToPositionCeiling ───────────────────────────────────────────────────
@@ -1863,12 +2127,18 @@ export class TradeIntentService {
     maxPositionPct: number,
     maxShortNotionalPct: number = DEFAULT_EXECUTION_POLICY.max_short_notional_pct,
   ): { quantity: number; realized_pnl: number | null; newState: PaperState } {
-    // Deep-copy positions so we don't mutate the original.
+    // Deep-copy positions so we don't mutate the original. Carries forward the loss
+    // circuit-breaker's day/week baselines untouched — trade execution never resets them
+    // (only _syncPaperPeriodBaselines does, on a period rollover during the entry gate).
     const newState: PaperState = {
       equity: state.equity,
       cash: state.cash,
       positions: state.positions.map((p) => ({ ...p })),
       hwm: state.hwm,
+      day_key: state.day_key,
+      day_start_equity: state.day_start_equity,
+      week_key: state.week_key,
+      week_start_equity: state.week_start_equity,
     };
     const baseHwm = state.hwm ?? state.equity;
 
