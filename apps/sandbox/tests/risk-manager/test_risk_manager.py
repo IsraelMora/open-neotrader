@@ -936,6 +936,35 @@ class TestOnCycleVolTargetMode:
         assert "exposure_scalar" in result
         assert 0.0 <= result["exposure_scalar"] <= 1.0
 
+    def test_h2b_vol_target_mode_with_enough_bars_yields_positive_scalar(self) -> None:
+        """Bug reproduction guard (vol-managed-exposure-data): given >=21 daily bars
+        for the benchmark in ctx["ohlcv"] (vol_window_days=20 + 1 excluded-last bar),
+        on_cycle must emit a POSITIVE, finite exposure_scalar — never None/0.0. This is
+        the exact condition a Vol-Managed pretest portfolio needs to actually trade:
+        real benchmark data in -> a real (non-fail-safe) scalar out."""
+        import math
+
+        daily_ret = 0.12 / math.sqrt(252)
+        closes = _constant_vol_closes(40, daily_ret)  # far more than the 21-bar minimum
+        bars = [{"date": f"2024-01-{i:02d}", "close": c} for i, c in enumerate(closes, start=1)]
+        ctx = _make_ctx(
+            pending_signals=[],
+            config={
+                **_all_enabled_config(),
+                "exposure_mode": "vol_target",
+                "target_vol_pct": 12.0,
+                "vol_window_days": 20,
+                "exposure_cap": 1.0,
+                "vol_target_benchmark": "TECL",
+            },
+        )
+        ctx["ohlcv"] = {"TECL": bars}
+        result = on_cycle(ctx)
+        scalar = result["exposure_scalar"]
+        assert scalar is not None
+        assert math.isfinite(scalar)
+        assert scalar > 0.0
+
     def test_h3_vol_target_mode_missing_benchmark_data_defaults_zero(self) -> None:
         """No ohlcv for the configured benchmark -> exposure_scalar=0.0 (fail-safe:
         stay in cash rather than guess an exposure)."""
