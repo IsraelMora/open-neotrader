@@ -78,7 +78,7 @@ export const BOOTSTRAP_APPLIED_KEY = 'bootstrap.momentum_v1_applied';
  * instances (v1 already set) without re-running the momentum/execution/universe/
  * plugin block — see the module docstring above.
  */
-export const PRETEST_SEED_KEY = 'bootstrap.pretest_seed_v3';
+export const PRETEST_SEED_KEY = 'bootstrap.pretest_seed_v4';
 const UNIVERSE_KEY = 'cycle.universe';
 const EXECUTION_REAL_KEY = 'execution.real';
 const SCHEDULER_KEY = 'scheduler';
@@ -121,6 +121,17 @@ interface PretestPortfolioSeed {
  * (see pretest.service.ts). __pretest_policy__.sizing_pct=1.0 so a fully
  * unscaled entry would buy with 100% of cash — exposureScalar is what throttles
  * it down to the target-vol level, not sizing_pct.
+ *
+ * 'Vol-Managed QQQ' (v4 addition) is the same mechanism applied to QQQ
+ * (Nasdaq-100) instead of SPY, with a higher target vol (15%) and a 1.5x
+ * exposure cap (light leverage) instead of 1.0x — batch-9 research found this
+ * the higher-return sibling of 'Vol-Managed Index' (Sharpe 1.12 vs 0.955,
+ * +215% cumulative return, maxDD -22%). Same plugin wiring, same
+ * __pretest_policy__ shape (sizing_pct=1.0, exposureScalar does the
+ * throttling) — only the held symbol, vol_target_benchmark, target_vol_pct,
+ * and exposure_cap differ. Honest caveat kept in its description: the
+ * vol-managed edge over buy-and-hold is crash-concentrated (it comes from
+ * de-risking ahead of/during high-vol drawdowns, not from steady alpha).
  */
 export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
   {
@@ -243,6 +254,28 @@ export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
       // sizing_pct=1.0: an UNSCALED entry would use 100% of cash — the
       // exposureScalar computed from risk-manager's exposure_scalar is what
       // actually throttles this down toward the 12%-target-vol level (see
+      // PretestService.runCycle's effectivePolicy / volTargetPlugin wiring).
+      __pretest_policy__: { sizing_pct: 1.0, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
+    name: 'Vol-Managed QQQ',
+    description:
+      'Volatility-managed QQQ exposure (Nasdaq-100): holds QQQ unconditionalmente (sin ranking, sin rebalanceo mensual) y deja que risk-manager escale la exposición total hacia un 15% de volatilidad anualizada objetivo (ventana de 20 días de vol realizada, cap de exposición 1.5x — apalancamiento leve). Hermano de mayor retorno de "Vol-Managed Index": investigación batch-9, Sharpe 1.12 vs 0.955 (SPY), +215% retorno acumulado, maxDD -22%. Nota honesta: la ventaja del vol-managed sobre buy-and-hold está concentrada en crashes (de-risking antes/durante caídas de alta volatilidad), no es alfa estable.',
+    initial_capital: 100_000,
+    plugin_ids: ['broad-index-hold', 'risk-manager'],
+    plugin_configs: {
+      'broad-index-hold': { symbols: 'QQQ' },
+      'risk-manager': {
+        exposure_mode: 'vol_target',
+        target_vol_pct: 15,
+        vol_window_days: 20,
+        exposure_cap: 1.5,
+        vol_target_benchmark: 'QQQ',
+      },
+      // sizing_pct=1.0: an UNSCALED entry would use 100% of cash — the
+      // exposureScalar computed from risk-manager's exposure_scalar is what
+      // actually throttles this down toward the 15%-target-vol level (see
       // PretestService.runCycle's effectivePolicy / volTargetPlugin wiring).
       __pretest_policy__: { sizing_pct: 1.0, slippage_pct: 0.0005, commission_pct: 0 },
     },
