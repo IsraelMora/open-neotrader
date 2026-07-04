@@ -390,7 +390,9 @@ export class PretestService {
 
   /**
    * Ejecuta un ciclo de pretest para un portfolio virtual.
-   * - Corre los skill plugins del pretest (no los globalmente activos)
+   * - Corre los skill plugins DECLARADOS por el portfolio (portfolio.plugin_ids),
+   *   sin importar si están globalmente activos — el pretest es una simulación
+   *   aislada de su propia configuración declarada
    * - Pasa las señales al LLM en modo pretest (sin ejecución real)
    * - Simula el fill de órdenes a precio de mercado real (ProviderGateway.getQuote)
    * - Actualiza equity mark-to-market (MTM) usando quotes reales por posición
@@ -409,8 +411,15 @@ export class PretestService {
 
     this.log.log(`Pretest ciclo: ${portfolio.name} (plugins: ${portfolio.plugin_ids.join(', ')})`);
 
-    // Construir plugins del pretest (solo los declarados, no los globalmente activos)
-    const allPlugins = await this.plugins.findActive();
+    // Construir plugins del pretest: TODOS los declarados en portfolio.plugin_ids,
+    // sin importar su estado global de activación. Un portfolio de pretest declara
+    // su propia configuración de plugins (portfolio.plugin_ids) y debe correrlos
+    // siempre — findAll() (no findActive()) es la fuente correcta aquí, porque
+    // filtrar sobre "solo los activos globalmente" descarta silenciosamente
+    // plugins declarados pero no activados globalmente (p.ej. broad-index-hold),
+    // dejando el ciclo sin señales (signalsLen=0) sin ningún error visible.
+    // Un id declarado que ya no existe (desinstalado) se descarta fail-soft.
+    const allPlugins = await this.plugins.findAll();
     const pretestPlugins = allPlugins.filter((p: HydratedPlugin) =>
       portfolio.plugin_ids.includes(p.id),
     );
@@ -582,12 +591,6 @@ export class PretestService {
     // Use validated tool_calls from the governed turn (providers already dropped by virtual
     // guard, and now also filtered by the kernel risk floor above).
     const trades = await this._simulateFills(gated.toolCalls, gated.state, effectivePolicy);
-
-    if (volTargetPlugin) {
-      this.log.warn(
-        `[VOLD] ${portfolio.name} signalsLen=${signals.length} sig0=${JSON.stringify(signals[0])} llmTC=${turnResult.tool_calls.length} merged=${mergedToolCalls.length} gatedTC=${JSON.stringify(gated.toolCalls.map((t) => ({ s: t.args?.['symbol'], a: t.args?.['action'] })))} trades=${JSON.stringify(trades.map((t) => ({ s: t.symbol, a: t.action, q: t.quantity })))}`,
-      );
-    }
 
     // ── Vol-target rebalance of EXISTING long positions toward exposureScalar ──
     const rebalanceTrades = volTargetPlugin
