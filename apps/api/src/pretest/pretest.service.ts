@@ -494,6 +494,12 @@ export class PretestService {
         // all collapse to 0 exposure (stay in cash) — never silently fall
         // back to "fully invested" when the real scalar couldn't be obtained.
         exposureScalar = typeof raw === 'number' && isFinite(raw) && raw >= 0 ? raw : 0;
+        // TEMP DIAGNOSTIC (vol-managed 0-trades): observe runtime bars + scalar
+        const _bm = String(volTargetBenchmark);
+        const _bars = market.ohlcv[_bm] ?? [];
+        this.log.warn(
+          `[VOLDEBUG] ${portfolio.name} bm=${_bm} bars=${_bars.length} firstBar=${JSON.stringify(_bars[0])} lastBar=${JSON.stringify(_bars[_bars.length - 1])} rawScalar=${JSON.stringify(raw)} scalar=${exposureScalar} cfg=${JSON.stringify(pluginConfigs[volTargetPlugin.id])} hookKeys=${JSON.stringify(Object.keys((hookResp.result as object) ?? {}))}`,
+        );
       } catch (err) {
         this.log.warn(`vol_target exposure hook failed for ${volTargetPlugin.id}: ${String(err)}`);
         exposureScalar = 0;
