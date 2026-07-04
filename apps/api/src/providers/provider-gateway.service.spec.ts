@@ -119,6 +119,21 @@ function makeAgentManifest(): ProviderManifestShape {
   };
 }
 
+function makeYahooManifest(): ProviderManifestShape {
+  return {
+    plugin: { id: 'yahoo-finance-provider', name: 'Yahoo Finance Provider', type: 'provider' },
+    api: {
+      format: 'generic',
+      base_url: 'https://query1.finance.yahoo.com',
+      auth_type: 'header',
+      endpoints: {
+        quote: '{base_url}/v8/finance/chart/{symbol}?interval=1d&range=1d',
+        ohlcv: '{base_url}/v8/finance/chart/{symbol}?interval={tf}&range={range}',
+      },
+    },
+  };
+}
+
 function makeUnknownFormatManifest(): ProviderManifestShape {
   return {
     plugin: { id: 'unknown-fmt', name: 'Unknown Format Provider', type: 'provider' },
@@ -181,6 +196,40 @@ function makeAlpacaService(cacheOverride?: Partial<OhlcvCacheService>): Provider
   const { svc } = makeService(['alpaca'], { alpaca: makeAlpacaManifest() }, cacheOverride);
   svc.onModuleInit();
   return svc;
+}
+
+/** Builds a Yahoo (format "generic") service — no credentials required. */
+function makeYahooService(cacheOverride?: Partial<OhlcvCacheService>): ProviderGatewayService {
+  const { svc } = makeService(
+    ['yahoo-finance-provider'],
+    { 'yahoo-finance-provider': makeYahooManifest() },
+    cacheOverride,
+  );
+  svc.onModuleInit();
+  return svc;
+}
+
+/** A minimal fetch Response mock. `headers.get` defaults to returning null (no set-cookie). */
+function fakeResponse(opts: {
+  ok: boolean;
+  status?: number;
+  json?: unknown;
+  text?: string;
+  setCookie?: string | null;
+}): {
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+  text: () => Promise<string>;
+  headers: { get: (name: string) => string | null };
+} {
+  return {
+    ok: opts.ok,
+    status: opts.status ?? (opts.ok ? 200 : 500),
+    json: jest.fn().mockResolvedValue(opts.json ?? {}),
+    text: jest.fn().mockResolvedValue(opts.text ?? ''),
+    headers: { get: () => opts.setCookie ?? null },
+  };
 }
 
 // ── Global fetch mock ─────────────────────────────────────────────────────────
@@ -774,5 +823,146 @@ describe('ProviderGatewayService — placeOrder client_order_id', () => {
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string) as Record<string, unknown>;
     expect(body['client_order_id']).toBe('nt-test-id-1');
+  });
+});
+
+// ── Yahoo (format "generic") 429 hardening ─────────────────────────────────────
+//
+// Prod logs confirmed Yahoo's unofficial chart endpoint 429s the container IP.
+// These tests cover: browser User-Agent header, cookie warm-up (GET fc.yahoo.com
+// before the chart request), bounded retry-with-backoff on 429, and fail-soft
+// (empty result, not a throw) once retries are exhausted.
+
+const YAHOO_CHART_OK = {
+  chart: {
+    result: [
+      {
+        timestamp: [1704067200],
+        indicators: {
+          quote: [{ open: [1], high: [2], low: [0.5], close: [1.5], volume: [1000] }],
+        },
+      },
+    ],
+  },
+};
+
+describe('ProviderGatewayService — Yahoo 429 hardening', () => {
+  it('sends a realistic browser User-Agent on the chart request', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('fc.yahoo.com')) return Promise.resolve(fakeResponse({ ok: true }));
+      return Promise.resolve(fakeResponse({ ok: true, json: YAHOO_CHART_OK }));
+    });
+
+    const svc = makeYahooService();
+    await svc.getOhlcv('yahoo-finance-provider', 'SPY', '1d', 200);
+
+    const calls = fetchMock.mock.calls as [string, RequestInit][];
+    const chartCall = calls.find((c) => !c[0].includes('fc.yahoo.com'));
+    const headers = chartCall![1].headers as Record<string, string>;
+    expect(headers['User-Agent']).toMatch(/Mozilla/);
+  });
+
+  it('warms up a cookie via fc.yahoo.com before the chart request, and reuses it', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('fc.yahoo.com')) {
+        return Promise.resolve(fakeResponse({ ok: true, setCookie: 'B=abc123; path=/' }));
+      }
+      return Promise.resolve(fakeResponse({ ok: true, json: YAHOO_CHART_OK }));
+    });
+
+    const svc = makeYahooService();
+    await svc.getOhlcv('yahoo-finance-provider', 'SPY', '1d', 200);
+
+    const calls = fetchMock.mock.calls as [string, RequestInit][];
+    const warmupCall = calls.find((c) => c[0].includes('fc.yahoo.com'));
+    expect(warmupCall).toBeDefined();
+
+    const chartCall = calls.find((c) => !c[0].includes('fc.yahoo.com'));
+    const headers = chartCall![1].headers as Record<string, string>;
+    expect(headers['Cookie']).toBe('B=abc123; path=/');
+  });
+
+  it('retries on HTTP 429 with backoff and succeeds once Yahoo returns 200', async () => {
+    jest.useFakeTimers();
+    try {
+      let chartAttempts = 0;
+      fetchMock.mockImplementation((url: string) => {
+        if (url.includes('fc.yahoo.com')) return Promise.resolve(fakeResponse({ ok: true }));
+        chartAttempts++;
+        if (chartAttempts < 3) {
+          return Promise.resolve(
+            fakeResponse({ ok: false, status: 429, text: 'Too Many Requests' }),
+          );
+        }
+        return Promise.resolve(fakeResponse({ ok: true, json: YAHOO_CHART_OK }));
+      });
+
+      const svc = makeYahooService();
+      const resultPromise = svc.getOhlcv('yahoo-finance-provider', 'SPY', '1d', 200);
+      await jest.advanceTimersByTimeAsync(10_000);
+      const result = await resultPromise;
+
+      expect(chartAttempts).toBe(3);
+      expect(result).toHaveLength(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('fails soft (returns empty, does not throw) once 429 retries are exhausted', async () => {
+    jest.useFakeTimers();
+    try {
+      fetchMock.mockImplementation((url: string) => {
+        if (url.includes('fc.yahoo.com')) return Promise.resolve(fakeResponse({ ok: true }));
+        return Promise.resolve(fakeResponse({ ok: false, status: 429, text: 'Too Many Requests' }));
+      });
+
+      const svc = makeYahooService();
+      const resultPromise = svc.getOhlcv('yahoo-finance-provider', 'TECL', '1d', 400);
+      await jest.advanceTimersByTimeAsync(10_000);
+      const result = await resultPromise;
+
+      expect(result).toEqual([]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('a non-429 HTTP error still throws immediately (no fail-soft, no retry)', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('fc.yahoo.com')) return Promise.resolve(fakeResponse({ ok: true }));
+      return Promise.resolve(fakeResponse({ ok: false, status: 500, text: 'Internal Error' }));
+    });
+
+    const svc = makeYahooService();
+    await expect(svc.getOhlcv('yahoo-finance-provider', 'SPY', '1d', 200)).rejects.toThrow(/500/);
+
+    const calls = fetchMock.mock.calls as [string, RequestInit][];
+    const chartCalls = calls.filter((c) => !c[0].includes('fc.yahoo.com'));
+    expect(chartCalls).toHaveLength(1); // no retry on non-429
+  });
+
+  it('an exhausted-429 empty result is cached with the short TTL (does not poison the cache)', async () => {
+    jest.useFakeTimers();
+    try {
+      fetchMock.mockImplementation((url: string) => {
+        if (url.includes('fc.yahoo.com')) return Promise.resolve(fakeResponse({ ok: true }));
+        return Promise.resolve(fakeResponse({ ok: false, status: 429, text: 'Too Many Requests' }));
+      });
+
+      const setOhlcvMock = jest.fn();
+      const svc = makeYahooService({
+        getOhlcv: jest.fn().mockReturnValue(null),
+        setOhlcv: setOhlcvMock,
+      });
+
+      const resultPromise = svc.getOhlcv('yahoo-finance-provider', 'TECL', '1d', 400);
+      await jest.advanceTimersByTimeAsync(10_000);
+      await resultPromise;
+
+      expect(setOhlcvMock).toHaveBeenCalledWith('yahoo-finance-provider', 'TECL', '1d', 400, []);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

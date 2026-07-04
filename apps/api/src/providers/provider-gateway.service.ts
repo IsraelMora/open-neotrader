@@ -12,6 +12,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomInt } from 'node:crypto';
 import { OhlcvCacheService } from './ohlcv-cache.service';
 
 // ── Tipos públicos ────────────────────────────────────────────────────────────
@@ -665,6 +666,16 @@ export class ProviderGatewayService implements OnModuleInit {
     const headers = this.buildAuthHeaders(manifest);
     const timeoutMs = 10_000;
 
+    // Yahoo Finance (format "generic") is an unofficial, unauthenticated API that
+    // rate-limits by IP with HTTP 429. Prod logs confirmed a bare curl from the
+    // container gets 429'd. Harden only this path: a browser User-Agent + a
+    // cookie warm-up (both of which the default node/undici client lacks) plus
+    // a bounded retry-with-backoff on 429 so a transient rate-limit self-heals
+    // within the same cycle instead of falling through to an empty result.
+    if (manifest.api.format === 'generic') {
+      return this.requestYahooHardened(manifest, url, headers, timeoutMs);
+    }
+
     const res = await globalThis.fetch(url, {
       headers,
       signal: AbortSignal.timeout(timeoutMs),
@@ -675,6 +686,110 @@ export class ProviderGatewayService implements OnModuleInit {
       throw new Error(`${manifest.plugin.id} HTTP ${res.status}: ${body.slice(0, 200)}`);
     }
     return res.json();
+  }
+
+  // ── Yahoo Finance (format "generic") 429 hardening ─────────────────────────
+
+  // A realistic desktop-Chrome UA — the default node/undici UA gets 429'd by
+  // Yahoo's unofficial endpoint.
+  private static readonly YAHOO_USER_AGENT =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+  // Cookie warm-up endpoint used by Yahoo's chart API to hand out a session
+  // cookie; sending it back on the chart request reduces 429 rate-limiting.
+  private static readonly YAHOO_COOKIE_URL = 'https://fc.yahoo.com';
+
+  private static readonly YAHOO_MAX_RETRIES = 2; // → up to 3 attempts total
+  private static readonly YAHOO_BASE_DELAY_MS = 300;
+
+  // Cached across calls for the life of the process — the warm-up is a
+  // best-effort optimization, not required per-request.
+  private yahooCookie: string | null = null;
+
+  /**
+   * Yahoo chart request: UA + cookie warm-up + bounded 429 retry w/ backoff.
+   *
+   * Fail-soft ONLY on 429 exhaustion: after the last retry still gets a 429,
+   * this returns `{}` instead of throwing — normalizeBars() renders that as an
+   * empty bar array, which the caller then caches with the short empty-result
+   * TTL (see OhlcvCacheService) instead of poisoning the symbol for hours.
+   * Any OTHER HTTP error (4xx/5xx not 429) still throws immediately, same as
+   * every other provider format.
+   */
+  private async requestYahooHardened(
+    manifest: ProviderManifest,
+    url: string,
+    baseHeaders: Record<string, string>,
+    timeoutMs: number,
+  ): Promise<unknown> {
+    await this.ensureYahooCookie(timeoutMs);
+
+    const headers: Record<string, string> = {
+      ...baseHeaders,
+      'User-Agent': ProviderGatewayService.YAHOO_USER_AGENT,
+    };
+    if (this.yahooCookie) headers['Cookie'] = this.yahooCookie;
+
+    for (let attempt = 0; attempt <= ProviderGatewayService.YAHOO_MAX_RETRIES; attempt++) {
+      const res = await globalThis.fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+
+      if (res.ok) return res.json();
+
+      if (res.status !== 429) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`${manifest.plugin.id} HTTP ${res.status}: ${body.slice(0, 200)}`);
+      }
+
+      const isLastAttempt = attempt === ProviderGatewayService.YAHOO_MAX_RETRIES;
+      if (isLastAttempt) {
+        this.log.warn(
+          `${manifest.plugin.id}: exhausted 429 retries (${ProviderGatewayService.YAHOO_MAX_RETRIES + 1} attempts) — returning empty result (fail-soft)`,
+        );
+        return {};
+      }
+
+      const delay = this.yahooBackoffDelay(attempt);
+      this.log.warn(
+        `${manifest.plugin.id}: HTTP 429 (attempt ${attempt + 1}/${ProviderGatewayService.YAHOO_MAX_RETRIES + 1}), retrying in ${Math.round(delay)}ms`,
+      );
+      await this.sleep(delay);
+    }
+
+    // Unreachable: the loop above always either returns or throws.
+    return {};
+  }
+
+  /** GETs the Yahoo cookie endpoint once and caches the resulting cookie. Best-effort — never throws. */
+  private async ensureYahooCookie(timeoutMs: number): Promise<void> {
+    if (this.yahooCookie) return;
+    try {
+      const res = await globalThis.fetch(ProviderGatewayService.YAHOO_COOKIE_URL, {
+        headers: { 'User-Agent': ProviderGatewayService.YAHOO_USER_AGENT },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const setCookie = res.headers?.get?.('set-cookie');
+      if (setCookie) this.yahooCookie = setCookie;
+    } catch (err) {
+      this.log.warn(`Yahoo cookie warm-up failed, continuing without cookie: ${err}`);
+    }
+  }
+
+  /**
+   * Exponential backoff with jitter (0-30% of base) so retries don't fire in
+   * lockstep. Uses `randomInt` (not `Math.random`) purely to satisfy the
+   * pseudo-random-number lint rule — this jitter has no security relevance.
+   */
+  private yahooBackoffDelay(attempt: number): number {
+    const base = ProviderGatewayService.YAHOO_BASE_DELAY_MS * 2 ** attempt;
+    const maxJitter = Math.max(1, Math.floor(base * 0.3));
+    return base + randomInt(0, maxJitter);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   // ── Order lifecycle (Alpaca-specific: status / cancel / list) ──────────────

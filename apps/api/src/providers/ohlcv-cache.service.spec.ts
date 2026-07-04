@@ -104,6 +104,51 @@ describe('OhlcvCacheService — TTL per timeframe', () => {
   });
 });
 
+// ── Empty results must not poison the cache with the normal TTL ───────────────
+
+describe('OhlcvCacheService — empty result TTL (no cache poisoning)', () => {
+  it('caches an empty OHLCV result with a short TTL (1 min), not the timeframe TTL (±100 ms tolerance)', () => {
+    const svc = makeService();
+    const before = Date.now();
+    svc.setOhlcv('yahoo-finance-provider', 'TECL', '1d', 400, []);
+
+    const entry = internals(svc).ohlcvCache.get('yahoo-finance-provider:TECL:1d:400');
+    expect(entry).toBeDefined();
+
+    // Must be the short empty-result TTL (60s), NOT the 4h '1d' TTL.
+    const expectedExpiry = before + 60_000;
+    expect(entry!.expiresAt).toBeGreaterThanOrEqual(expectedExpiry - 100);
+    expect(entry!.expiresAt).toBeLessThanOrEqual(expectedExpiry + 100);
+  });
+
+  it('a transient empty result self-heals: after the short TTL elapses, cache misses again instead of serving [] for 4h', () => {
+    const svc = makeService();
+    svc.setOhlcv('yahoo-finance-provider', 'TECL', '1d', 400, []);
+
+    // Simulate the short TTL having elapsed (well before the 4h '1d' TTL would).
+    const key = 'yahoo-finance-provider:TECL:1d:400';
+    internals(svc).ohlcvCache.set(key, { data: [], expiresAt: Date.now() - 1 });
+
+    const result = svc.getOhlcv('yahoo-finance-provider', 'TECL', '1d', 400);
+    expect(result).toBeNull();
+    expect(internals(svc).ohlcvCache.has(key)).toBe(false);
+  });
+
+  it('a valid (non-empty) result still gets the full timeframe TTL', () => {
+    const svc = makeService();
+    const bars = [makeBar()];
+    const before = Date.now();
+    svc.setOhlcv('yahoo-finance-provider', 'SPY', '1d', 400, bars);
+
+    const entry = internals(svc).ohlcvCache.get('yahoo-finance-provider:SPY:1d:400');
+    expect(entry).toBeDefined();
+
+    const expectedExpiry = before + 4 * 3_600_000;
+    expect(entry!.expiresAt).toBeGreaterThanOrEqual(expectedExpiry - 100);
+    expect(entry!.expiresAt).toBeLessThanOrEqual(expectedExpiry + 100);
+  });
+});
+
 // ── Key scoping ───────────────────────────────────────────────────────────────
 
 describe('OhlcvCacheService — key scoping', () => {

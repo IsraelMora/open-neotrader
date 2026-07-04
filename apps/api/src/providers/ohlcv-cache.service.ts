@@ -33,6 +33,14 @@ const DEFAULT_TTL = 5 * 60_000;
 const MAX_OHLCV_ENTRIES = 500;
 const MAX_QUOTE_ENTRIES = 200;
 
+// Empty/failed OHLCV results (e.g. a transient provider 429) get a short TTL
+// instead of the normal per-timeframe TTL. Caching an empty result with the
+// full TTL (up to 4h for '1d') poisons the symbol for the whole window — a
+// single rate-limited fetch would starve every downstream consumer (e.g. the
+// vol-managed benchmark) until the cache naturally expired. A short TTL lets
+// the next cycle retry the provider and self-heal instead.
+const EMPTY_OHLCV_TTL = 60_000; // 1 minuto
+
 @Injectable()
 export class OhlcvCacheService {
   private readonly log = new Logger(OhlcvCacheService.name);
@@ -58,7 +66,15 @@ export class OhlcvCacheService {
     return entry.data;
   }
 
-  /** Almacena barras OHLCV en caché con TTL basado en el timeframe. */
+  /**
+   * Almacena barras OHLCV en caché.
+   *
+   * Un resultado vacío (provider caído / rate-limited / sin datos) usa un TTL
+   * corto (`EMPTY_OHLCV_TTL`) en vez del TTL normal del timeframe, para que un
+   * 429 transitorio del provider no envenene la caché del símbolo durante
+   * horas — el próximo ciclo reintenta contra el provider en vez de servir el
+   * vacío repetidamente.
+   */
   setOhlcv(
     provider: string,
     symbol: string,
@@ -70,7 +86,7 @@ export class OhlcvCacheService {
       this.evictExpired(this.ohlcvCache);
     }
     const key = `${provider}:${symbol}:${timeframe}:${limit}`;
-    const ttl = TTL_BY_TIMEFRAME[timeframe] ?? DEFAULT_TTL;
+    const ttl = bars.length === 0 ? EMPTY_OHLCV_TTL : (TTL_BY_TIMEFRAME[timeframe] ?? DEFAULT_TTL);
     this.ohlcvCache.set(key, { data: bars, expiresAt: Date.now() + ttl });
   }
 
