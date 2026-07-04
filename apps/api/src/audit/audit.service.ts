@@ -54,7 +54,10 @@ export type AuditEventType =
   // vol-managed exposure: the vol-target discipline's on_cycle hook failed (or returned
   // an unusable value) during a pretest cycle — exposureScalar fails safe to 0 (100% cash)
   // but a persistently-failing hook would otherwise be invisible outside server logs.
-  | 'vol_target_exposure_failed';
+  | 'vol_target_exposure_failed'
+  // risk-discipline: prop-firm-style daily/weekly loss circuit-breaker tripped — new paper
+  // entries (long/short) are blocked until the next UTC day/week. Exit/hold unaffected.
+  | 'loss_circuit_breaker_tripped';
 
 export interface AuditPayload {
   cycle_id?: string;

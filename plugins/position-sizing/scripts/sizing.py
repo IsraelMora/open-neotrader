@@ -155,6 +155,168 @@ def compute_inverse_vol_weights(
     return {symbol: raw / total for symbol, raw in inv_vol.items()}
 
 
+@dataclass
+class FixedFractionalRiskResult:
+    shares: int
+    position_usd: float
+    position_pct_capital: float
+    risk_usd: float
+    risk_per_share: float
+    stop_price: float
+    capped_by_max_position: bool
+    warning: str | None
+
+
+def position_size_fixed_fractional_risk(
+    equity: float,
+    entry_price: float,
+    stop_price: float,
+    risk_per_trade_pct: float = 1.0,
+    max_position_pct: float = 10.0,
+) -> FixedFractionalRiskResult:
+    """
+    Fixed-fractional RISK sizing: size a position so that a stop-out loses exactly
+    `risk_per_trade_pct` of equity — NOT a fixed % of capital (that's mode="fixed").
+
+    risk_per_share = |entry_price - stop_price|
+    shares = floor((equity * risk_per_trade_pct / 100) / risk_per_share)
+
+    A WIDER stop means MORE $ at risk per share for the same equity-at-risk budget,
+    so shares must shrink accordingly (inverse relationship) — this is the whole
+    point of risk-based sizing over naive fixed-fraction-of-capital sizing.
+
+    Hard-capped by max_position_pct of equity (position_usd), same ceiling
+    convention as the other sizing modes in this plugin (never a substitute for the
+    kernel's own max_position_pct ceiling in trade-intent.service.ts — this is an
+    additional, tighter constraint the plugin applies on top).
+
+    Args:
+        equity:            total account equity (paper or real)
+        entry_price:        intended entry fill price
+        stop_price:         where the position would be stopped out (any direction —
+                             caller passes the correct side; only the absolute
+                             distance from entry_price is used)
+        risk_per_trade_pct: % of equity to risk on this ONE trade if the stop is hit
+        max_position_pct:   upper limit of position notional as % of equity
+
+    Returns:
+        FixedFractionalRiskResult
+    """
+    risk_per_share = abs(entry_price - stop_price)
+
+    if equity <= 0 or entry_price <= 0 or risk_per_share <= 0:
+        return FixedFractionalRiskResult(
+            shares=0,
+            position_usd=0.0,
+            position_pct_capital=0.0,
+            risk_usd=0.0,
+            risk_per_share=round(risk_per_share, 4),
+            stop_price=round(stop_price, 4),
+            capped_by_max_position=False,
+            warning="Invalid inputs: equity/entry_price/risk_per_share must be positive",
+        )
+
+    risk_budget_usd = equity * (risk_per_trade_pct / 100.0)
+    shares = math.floor(risk_budget_usd / risk_per_share)
+
+    position_usd = shares * entry_price
+    max_position_usd = equity * (max_position_pct / 100.0)
+    capped = False
+    warning = None
+    if position_usd > max_position_usd:
+        capped = True
+        shares = math.floor(max_position_usd / entry_price)
+        position_usd = shares * entry_price
+        warning = (
+            f"Risk-based size would exceed {max_position_pct}% of equity "
+            f"— capped to {max_position_pct}%"
+        )
+
+    actual_risk_usd = shares * risk_per_share
+
+    return FixedFractionalRiskResult(
+        shares=shares,
+        position_usd=round(position_usd, 2),
+        position_pct_capital=round(position_usd / equity * 100, 2) if equity > 0 else 0.0,
+        risk_usd=round(actual_risk_usd, 2),
+        risk_per_share=round(risk_per_share, 4),
+        stop_price=round(stop_price, 4),
+        capped_by_max_position=capped,
+        warning=warning,
+    )
+
+
+def _wilder_atr_local(
+    highs: list[float], lows: list[float], closes: list[float], period: int = 14
+) -> float:
+    """
+    Minimal Wilder ATR, kept local to this plugin (deliberately NOT imported from
+    atr-stop-loss — plugins stay independent). Only used as a last-resort fallback
+    when a signal carries raw OHLCV arrays but no pre-computed atr14/stop.
+    """
+    if len(highs) < period + 1:
+        return 0.0
+
+    true_ranges: list[float] = []
+    for i in range(1, len(highs)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        true_ranges.append(tr)
+
+    if len(true_ranges) < period:
+        return 0.0
+
+    atr = sum(true_ranges[:period]) / period
+    for tr in true_ranges[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+def resolve_stop_price(
+    signal: dict,
+    entry_price: float,
+    direction: str = "long",
+    stop_atr_mult: float = 2.0,
+) -> tuple[float | None, str | None]:
+    """
+    Resolves the stop price for fixed_fractional_risk sizing, in priority order:
+
+      1. signal['stop_price']  — explicit stop set upstream (any producer)
+      2. signal['stop_loss']   — the atr-stop-loss plugin's convention (absolute price)
+      3. ATR-derived: entry_price -+ stop_atr_mult * ATR, where ATR comes from
+         signal['atr14'] if present (atr-stop-loss plugin output), else computed
+         locally from signal['closes']/['highs']/['lows'] if those arrays are present.
+      4. None — caller must skip sizing (no reliable risk denominator).
+
+    Returns (stop_price, source) where source is 'signal' | 'atr' | None.
+    """
+    stop_price = signal.get("stop_price")
+    if stop_price is not None and stop_price > 0:
+        return float(stop_price), "signal"
+
+    stop_loss = signal.get("stop_loss")
+    if stop_loss is not None and stop_loss > 0:
+        return float(stop_loss), "signal"
+
+    atr = signal.get("atr14")
+    if atr is None:
+        closes = signal.get("closes")
+        highs = signal.get("highs", closes)
+        lows = signal.get("lows", closes)
+        if closes and highs and lows:
+            atr = _wilder_atr_local(highs, lows, closes)
+
+    if atr and atr > 0 and entry_price > 0:
+        if direction == "short":
+            return entry_price + atr * stop_atr_mult, "atr"
+        return entry_price - atr * stop_atr_mult, "atr"
+
+    return None, None
+
+
 def position_size(
     capital: float,
     price: float,

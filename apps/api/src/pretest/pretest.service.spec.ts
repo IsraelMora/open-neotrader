@@ -1696,6 +1696,54 @@ describe('PretestService.computeSignificance (Phase 4.1.3)', () => {
   });
 });
 
+describe('PretestService.computeSignificance — expectancy tracking (risk-discipline)', () => {
+  it('computes expectancy, avg_win, avg_loss, payoff_ratio from a known set of closed trades', () => {
+    // 3 winners of pnl=100 each, 2 losers of pnl=-50 each.
+    // avg_win = 100, avg_loss = 50, win_rate = 3/5=0.6, loss_rate=2/5=0.4
+    // payoff_ratio = 100/50 = 2
+    // expectancy = 0.6*100 - 0.4*50 = 60 - 20 = 40
+    const state = makeStateWithTrades([
+      { action: 'sell', pnl: 100, price: 100, qty: 10 },
+      { action: 'sell', pnl: 100, price: 100, qty: 10 },
+      { action: 'sell', pnl: 100, price: 100, qty: 10 },
+      { action: 'sell', pnl: -50, price: 100, qty: 10 },
+      { action: 'sell', pnl: -50, price: 100, qty: 10 },
+    ]);
+    const svc = makeService(DEFAULT_GATEWAY);
+    const metrics = svc.computeSignificance(state);
+
+    expect(metrics.avg_win).toBeCloseTo(100, 5);
+    expect(metrics.avg_loss).toBeCloseTo(50, 5);
+    expect(metrics.payoff_ratio).toBeCloseTo(2, 5);
+    expect(metrics.expectancy).toBeCloseTo(40, 5);
+  });
+
+  it('expectancy/avg_win/avg_loss/payoff_ratio default to 0/0/0/null with no closing trades', () => {
+    const state = makeStateWithTrades([]);
+    const svc = makeService(DEFAULT_GATEWAY);
+    const metrics = svc.computeSignificance(state);
+
+    expect(metrics.avg_win).toBe(0);
+    expect(metrics.avg_loss).toBe(0);
+    expect(metrics.payoff_ratio).toBeNull();
+    expect(metrics.expectancy).toBe(0);
+  });
+
+  it('payoff_ratio is null (no losses) but expectancy still reflects avg_win * win_rate', () => {
+    const state = makeStateWithTrades([
+      { action: 'sell', pnl: 100, price: 100, qty: 10 },
+      { action: 'sell', pnl: 200, price: 100, qty: 10 },
+    ]);
+    const svc = makeService(DEFAULT_GATEWAY);
+    const metrics = svc.computeSignificance(state);
+
+    expect(metrics.payoff_ratio).toBeNull();
+    expect(metrics.avg_win).toBeCloseTo(150, 5);
+    expect(metrics.avg_loss).toBe(0);
+    expect(metrics.expectancy).toBeCloseTo(150, 5); // win_rate=1, loss_rate=0
+  });
+});
+
 describe('PretestService.gate (Phase 4.1.4-4.1.8)', () => {
   function makePortfolioRow(tradeCount: number, max_drawdown_pct: number, sharpe: number) {
     // Build trades with pnl that yields the desired sharpe
@@ -2703,6 +2751,10 @@ function makePromoteService(opts: {
       n_trades: 30,
       loss_trades: 12,
       alpha_pct: null,
+      avg_win: 100,
+      avg_loss: 50,
+      payoff_ratio: 2,
+      expectancy: 40,
     },
   });
 
@@ -3284,6 +3336,10 @@ describe('PretestService.computePluginReputation (F3-s3 Phase 2)', () => {
       n_trades: 20,
       loss_trades: 6,
       alpha_pct: null,
+      avg_win: 100,
+      avg_loss: 50,
+      payoff_ratio: 2,
+      expectancy: 40,
     });
 
     const result = await svc.computePluginReputation('plugin-formula');
@@ -3318,6 +3374,10 @@ describe('PretestService.computePluginReputation (F3-s3 Phase 2)', () => {
       n_trades: 20,
       loss_trades: 6,
       alpha_pct: null,
+      avg_win: 0,
+      avg_loss: 0,
+      payoff_ratio: null,
+      expectancy: 0,
     });
 
     const result = await svc.computePluginReputation('plugin-clamp');

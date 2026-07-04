@@ -814,7 +814,15 @@ describe('TradeIntentService', () => {
       await service.autoProcess('ti_001');
 
       expect(gateway.getQuote).not.toHaveBeenCalled();
-      expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
+      // NEW (risk-discipline): the entry gate now also initializes the daily/weekly
+      // loss-circuit-breaker baseline on a rejection, so a loss occurring before the very
+      // first evaluation of a new day/week isn't masked (see _passesPaperEntryGate doc
+      // comment). It writes ONLY the baseline fields — cash/positions/equity are unchanged.
+      expect(prisma.portfolio.upsert).toHaveBeenCalledTimes(1);
+      const [[upsertCall]] = prisma.portfolio.upsert.mock.calls as [[{ update: { data: string } }]];
+      const persisted = JSON.parse(upsertCall.update.data) as { cash: number; equity: number };
+      expect(persisted.cash).toBe(7_000);
+      expect(persisted.equity).toBe(7_000);
       expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
         oc({
           data: oc({
@@ -4174,6 +4182,239 @@ describe('TradeIntentService', () => {
 
       expect(realOrderService.submit).toHaveBeenCalledWith(oc({ side: 'sell' }));
       expect(result.status).toBe('real_pending');
+    });
+  });
+
+  // ── Daily/weekly loss circuit-breaker (kernel, prop-firm-style) ─────────────
+  //
+  // Stacks with (never replaces) the existing peak-to-trough drawdown halt: this
+  // gate is CALENDAR-PERIOD based (loss since start of the current UTC day/week),
+  // enabled ON by default in paper with conservative thresholds (3%/6%). Only
+  // ENTRIES (long/short) are blocked — exit/hold always remain reachable.
+
+  describe('daily/weekly loss circuit-breaker (kernel risk floor)', () => {
+    /** Mirrors the service's Monday-anchored UTC week-start key. */
+    function weekKeyUTC(date: Date): string {
+      const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+      const day = d.getUTCDay();
+      const diffToMonday = (day + 6) % 7;
+      d.setUTCDate(d.getUTCDate() - diffToMonday);
+      return d.toISOString().slice(0, 10);
+    }
+    const todayKey = new Date().toISOString().slice(0, 10);
+    const thisWeekKey = weekKeyUTC(new Date());
+
+    it('blocks a new LONG entry once daily loss >= default max_daily_loss_pct (3%), but exit still executes', async () => {
+      kv.get.mockResolvedValue(null); // defaults: max_daily_loss_pct=0.03, enabled=true
+      const portfolioAtDailyLoss = JSON.stringify({
+        equity: 9_600,
+        cash: 9_600,
+        positions: [],
+        hwm: 10_000, // drawdown=4% < 25% default — the DRAWDOWN halt must NOT be what fires here
+        day_key: todayKey,
+        day_start_equity: 10_000, // 4% loss today >= 3% default
+        week_key: thisWeekKey,
+        week_start_equity: 10_000,
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioAtDailyLoss,
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'rejected', ...args.data })) as unknown,
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(gateway.getQuote).not.toHaveBeenCalled(); // no positions to MTM, no quote needed to reject
+      expect(result.status).toBe('rejected');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'rejected',
+            reject_reason: expect.stringMatching(/daily.*circuit|circuit.*daily/i) as string,
+          }),
+        }),
+      );
+
+      // exit must still be reachable during the same halt.
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', id: 'ti_002' }),
+      );
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'executed', ...args.data })) as unknown,
+      );
+      const exitResult = await service.autoProcess('ti_002');
+      expect(exitResult.status).toBe('executed');
+    });
+
+    it('blocks a new entry once WEEKLY loss >= default max_weekly_loss_pct (6%), independent of the daily check', async () => {
+      kv.get.mockResolvedValue(null);
+      const portfolioAtWeeklyLoss = JSON.stringify({
+        equity: 9_200,
+        cash: 9_200,
+        positions: [],
+        hwm: 10_000, // drawdown=8% < 25% — drawdown halt not the trigger
+        day_key: todayKey,
+        day_start_equity: 9_200, // 0% daily loss (reset today) — daily check passes
+        week_key: thisWeekKey,
+        week_start_equity: 10_000, // 8% weekly loss >= 6% default
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'short' }));
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioAtWeeklyLoss,
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'rejected', ...args.data })) as unknown,
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(result.status).toBe('rejected');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'rejected',
+            reject_reason: expect.stringMatching(/weekly/i) as string,
+          }),
+        }),
+      );
+    });
+
+    it('resets the daily baseline on a new day — a stale/breached baseline from a prior day does not carry over', async () => {
+      kv.get.mockResolvedValue(null);
+      const staleYesterdayPortfolio = JSON.stringify({
+        equity: 9_000,
+        cash: 9_000,
+        positions: [],
+        hwm: 9_000, // no drawdown
+        day_key: '2000-01-01', // definitely stale — forces a baseline reset
+        day_start_equity: 100_000, // would be a huge "loss" if not reset
+        week_key: '2000-01-03',
+        week_start_equity: 100_000,
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: staleYesterdayPortfolio,
+        updatedAt: new Date(),
+      });
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockImplementation(
+        (args: { update: { data: string } }) =>
+          Promise.resolve({
+            name: 'paper',
+            data: args.update.data,
+            updatedAt: new Date(),
+          }) as unknown,
+      );
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'executed', ...args.data })) as unknown,
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      // Reset happened → 0% "loss" vs the fresh baseline → entry proceeds normally.
+      expect(result.status).toBe('executed');
+      // The reset baseline must have been persisted with today's key.
+      const upsertCalls = prisma.portfolio.upsert.mock.calls as Array<
+        [{ update: { data: string } }]
+      >;
+      const persistedWithFreshKey = upsertCalls.some(
+        ([call]) => (JSON.parse(call.update.data) as { day_key?: string }).day_key === todayKey,
+      );
+      expect(persistedWithFreshKey).toBe(true);
+    });
+
+    it('opt-out: execution.loss_circuit_breaker_enabled=false lets a would-be-tripped day through', async () => {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.loss_circuit_breaker_enabled') return Promise.resolve('false');
+        return Promise.resolve(null);
+      });
+      const portfolioAtDailyLoss = JSON.stringify({
+        equity: 9_000, // 10% loss today — would trip the default 3% breaker
+        cash: 9_000,
+        positions: [],
+        hwm: 10_000,
+        day_key: todayKey,
+        day_start_equity: 10_000,
+        week_key: thisWeekKey,
+        week_start_equity: 10_000,
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'long', symbol: 'AAPL' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioAtDailyLoss,
+        updatedAt: new Date(),
+      });
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'executed', ...args.data })) as unknown,
+      );
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(result.status).toBe('executed'); // breaker disabled — only the (non-tripped) drawdown/other gates apply
+    });
+
+    it('trips at the human-approval path too (approve() honors the same breaker as autoProcess())', async () => {
+      kv.get.mockResolvedValue(null);
+      const portfolioAtDailyLoss = JSON.stringify({
+        equity: 9_500,
+        cash: 9_500,
+        positions: [],
+        hwm: 10_000,
+        day_key: todayKey,
+        day_start_equity: 10_000, // 5% loss >= 3% default
+        week_key: thisWeekKey,
+        week_start_equity: 10_000,
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(pendingIntent({ action: 'long' }));
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioAtDailyLoss,
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockImplementation(
+        (args: { data: Record<string, unknown> }) =>
+          Promise.resolve(pendingIntent({ status: 'rejected', ...args.data })) as unknown,
+      );
+
+      const result = await service.approve('ti_001', 'alice');
+
+      expect(result.status).toBe('rejected');
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'rejected',
+            reject_reason: expect.stringMatching(/daily/i) as string,
+          }),
+        }),
+      );
     });
   });
 });

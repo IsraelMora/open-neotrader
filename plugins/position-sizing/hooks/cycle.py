@@ -31,10 +31,12 @@ from sizing import (  # noqa: E402
     compute_inverse_vol_weights,
     compute_kelly,
     position_size,
+    position_size_fixed_fractional_risk,
+    resolve_stop_price,
     stats_from_trades,
 )
 
-_VALID_MODES = ("kelly", "pyramid", "fixed", "vol_target")
+_VALID_MODES = ("kelly", "pyramid", "fixed", "vol_target", "fixed_fractional_risk")
 
 
 def on_cycle(ctx: dict) -> dict:
@@ -68,6 +70,8 @@ def on_cycle(ctx: dict) -> dict:
         return _run_pyramid(pending_signals, portfolio, config)
     elif mode == "vol_target":
         return _run_vol_target(pending_signals, portfolio_value, config)
+    elif mode == "fixed_fractional_risk":
+        return _run_fixed_fractional_risk(pending_signals, portfolio_value, config)
     else:  # fixed
         return _run_fixed(pending_signals, portfolio_value, config)
 
@@ -381,6 +385,100 @@ def _run_fixed(
             "msg": (
                 f"Fixed sizing ({fixed_pct}%): {sized_count} signals sized"
                 f" out of {len(pending_signals)} received."
+            ),
+        }
+    )
+    return {"signals": signals, "logs": logs}
+
+
+# ---------------------------------------------------------------------------
+# Mode: fixed_fractional_risk (risk-discipline pillar 2 — size from stop distance)
+# ---------------------------------------------------------------------------
+
+def _run_fixed_fractional_risk(
+    pending_signals: list[dict],
+    portfolio_value: float,
+    config: dict,
+) -> dict:
+    """
+    Sizes each long/short signal so that a stop-out loses exactly
+    `risk_per_trade_pct` of equity — see position_size_fixed_fractional_risk's doc
+    comment. The stop is resolved via resolve_stop_price (signal['stop_price'] >
+    signal['stop_loss'] > ATR-derived > none). Signals action not in (long, short)
+    pass through unmodified; signals with no resolvable stop pass through unsized
+    (with a warning log) rather than guessing a stop.
+    """
+    risk_per_trade_pct = config.get("risk_per_trade_pct", 1.0)
+    stop_atr_mult = config.get("stop_atr_mult", 2.0)
+    max_position_pct = config.get("max_position_pct", 10.0)
+
+    signals: list[dict] = []
+    logs: list[dict] = []
+
+    for sig in pending_signals:
+        action = sig.get("action")
+        if action not in ("long", "short"):
+            signals.append(sig)
+            continue
+
+        symbol = sig.get("symbol", "?")
+        entry_price = sig.get("price") or sig.get("entry_price", 0.0)
+
+        if entry_price <= 0:
+            logs.append(
+                {"level": "warning", "msg": f"{symbol}: invalid price ({entry_price}), skipped"}
+            )
+            signals.append(sig)
+            continue
+
+        stop_price, stop_source = resolve_stop_price(
+            sig, entry_price=entry_price, direction=action, stop_atr_mult=stop_atr_mult
+        )
+        if stop_price is None:
+            logs.append(
+                {
+                    "level": "warning",
+                    "msg": (
+                        f"{symbol}: no stop_price/stop_loss/atr14 available — "
+                        "cannot risk-size, signal left unsized"
+                    ),
+                }
+            )
+            signals.append(sig)
+            continue
+
+        sizing = position_size_fixed_fractional_risk(
+            equity=portfolio_value,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            risk_per_trade_pct=risk_per_trade_pct,
+            max_position_pct=max_position_pct,
+        )
+
+        signals.append(
+            {
+                **sig,
+                "fixed_fractional_risk": {
+                    "shares": sizing.shares,
+                    "position_usd": sizing.position_usd,
+                    "position_pct": sizing.position_pct_capital,
+                    "risk_usd": sizing.risk_usd,
+                    "risk_per_share": sizing.risk_per_share,
+                    "stop_price": sizing.stop_price,
+                    "stop_source": stop_source,
+                    "capped_by_max_position": sizing.capped_by_max_position,
+                    "warning": sizing.warning,
+                },
+            }
+        )
+
+    sized_count = sum(1 for s in signals if "fixed_fractional_risk" in s)
+    logs.append(
+        {
+            "level": "info",
+            "msg": (
+                f"Fixed-fractional-risk sizing ({risk_per_trade_pct}% risk/trade): "
+                f"{sized_count} signals sized out of {len(pending_signals)} received."
             ),
         }
     )
