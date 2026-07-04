@@ -987,3 +987,121 @@ class TestOnCycleVolTargetMode:
         ctx["ohlcv"] = {}
         result = on_cycle(ctx)
         assert result["signals"][0]["action"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# Real-sandbox reproduction (vol-managed-exposure-data, runtime debug)
+#
+# Every test above imports hooks/cycle.py DIRECTLY (see _load_on_cycle) and
+# calls on_cycle(ctx) in-process. That bypasses apps/sandbox/runner.py entirely:
+# no manifest [config] default-merge, no dynamic module loading via
+# importlib.util.spec_from_file_location, no JSON stdin/stdout round trip. Any
+# break specific to how PretestService actually talks to the sandbox — the
+# `{"cmd": "run_hook", ...}` protocol over a real subprocess with
+# NEUROTRADER_PLUGINS_DIR set — would never be caught by the in-process tests.
+#
+# This class spawns the REAL runner.py subprocess (matching production exactly)
+# and feeds it bars in the EXACT shape apps/api's PretestService._buildMarketContext
+# produces: {date, open, high, low, close, volume} dicts, uppercase symbol keys.
+# ---------------------------------------------------------------------------
+
+
+def _run_sandbox(req: dict) -> dict:
+    """Spawns the real runner.py subprocess with NEUROTRADER_PLUGINS_DIR set to
+    this repo's plugins/ dir (mirrors buildSandboxEnv in apps/api/src/sandbox/
+    sandbox.gateway.ts) and returns the parsed JSON response."""
+    import json
+    import subprocess
+
+    repo_root = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+    plugins_dir = os.path.join(repo_root, "plugins")
+    runner_path = os.path.join(repo_root, "apps", "sandbox", "runner.py")
+
+    env = {**os.environ, "NEUROTRADER_PLUGINS_DIR": plugins_dir}
+    proc = subprocess.run(
+        [sys.executable, runner_path],
+        input=json.dumps(req),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == 0, f"runner.py exited {proc.returncode}: {proc.stderr}"
+    return json.loads(proc.stdout.strip())
+
+
+def _production_shaped_bars(n: int, start: float = 400.0) -> list[dict]:
+    """Bars in the exact {date, open, high, low, close, volume} shape
+    PretestService._buildMarketContext maps ProviderGatewayService.getOhlcv output to."""
+    bars = []
+    price = start
+    for i in range(n):
+        # Small deterministic oscillation — non-zero realized vol, no NaN/negative.
+        price *= 1 + (0.004 if i % 2 == 0 else -0.004)
+        bars.append({
+            "date": f"2024-{(i // 27) + 1:02d}-{(i % 27) + 1:02d}",
+            "open": price,
+            "high": price * 1.01,
+            "low": price * 0.99,
+            "close": price,
+            "volume": 1_000_000,
+        })
+    return bars
+
+
+class TestRealSandboxVolTargetReproduction:
+    """Bug reproduction (vol-managed-exposure-data): proves the FULL production
+    path — JSON over stdin, runner.py's cmd_run_hook, dynamic hook loading — carries
+    real benchmark OHLCV to risk-manager's vol_target hook and yields a positive
+    exposure_scalar, for all four Vol-Managed pretest benchmarks."""
+
+    @pytest.mark.parametrize("benchmark", ["SPY", "QQQ", "TECL", "SOXL"])
+    def test_run_hook_subprocess_yields_positive_scalar(self, benchmark: str) -> None:
+        bars = _production_shaped_bars(60)
+        req = {
+            "cmd": "run_hook",
+            "plugin_id": "risk-manager",
+            "hook": "on_cycle",
+            "context": {
+                "pending_signals": [],
+                "portfolio": {},
+                "positions": [],
+                "portfolio_value": 100_000,
+                "ohlcv": {benchmark: bars},
+                "config": {
+                    "exposure_mode": "vol_target",
+                    "target_vol_pct": 12.0,
+                    "vol_window_days": 20,
+                    "exposure_cap": 1.0,
+                    "vol_target_benchmark": benchmark,
+                },
+            },
+        }
+        resp = _run_sandbox(req)
+        assert resp["ok"] is True
+        scalar = resp["result"]["exposure_scalar"]
+        assert isinstance(scalar, (int, float))
+        assert scalar > 0.0
+
+    def test_run_hook_subprocess_empty_ohlcv_yields_zero_scalar(self) -> None:
+        """Control case: confirms the fail-safe still trips when ohlcv is genuinely
+        empty — the counterpart to the positive-scalar case above."""
+        req = {
+            "cmd": "run_hook",
+            "plugin_id": "risk-manager",
+            "hook": "on_cycle",
+            "context": {
+                "pending_signals": [],
+                "portfolio": {},
+                "positions": [],
+                "portfolio_value": 100_000,
+                "ohlcv": {},
+                "config": {
+                    "exposure_mode": "vol_target",
+                    "vol_target_benchmark": "SPY",
+                },
+            },
+        }
+        resp = _run_sandbox(req)
+        assert resp["ok"] is True
+        assert resp["result"]["exposure_scalar"] == 0.0
