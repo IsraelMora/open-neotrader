@@ -1023,8 +1023,10 @@ describe('PretestService.runCycle — __pretest_policy__ exclusion (fix 3)', () 
     const pluginsFindActive = jest
       .fn()
       .mockResolvedValue([{ id: fakePretestPluginId, config: {} }]);
+    const pluginsFindAll = jest.fn().mockResolvedValue([{ id: fakePretestPluginId, config: {} }]);
     const pluginsService = {
       findActive: pluginsFindActive,
+      findAll: pluginsFindAll,
     } as unknown as import('../plugins/plugins.service').PluginsService;
 
     const portfolioRow = {
@@ -1311,7 +1313,10 @@ describe('PretestService.runCycle — uses agents.runGovernedTurn (PR3)', () => 
     const memory = {
       toContextString: jest.fn().mockResolvedValue(''),
     } as unknown as ContextMemoryService;
-    const plugins = { findActive: jest.fn().mockResolvedValue([]) } as unknown as PluginsService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([]),
+      findAll: jest.fn().mockResolvedValue([]),
+    } as unknown as PluginsService;
     const sandbox = {
       runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
     } as unknown as SandboxGateway;
@@ -1423,7 +1428,10 @@ describe('PretestService.runCycle — cycleCtx carries universe + ohlcv (risk po
     const memory = {
       toContextString: jest.fn().mockResolvedValue(''),
     } as unknown as ContextMemoryService;
-    const plugins = { findActive: jest.fn().mockResolvedValue([]) } as unknown as PluginsService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([]),
+      findAll: jest.fn().mockResolvedValue([]),
+    } as unknown as PluginsService;
     const sandboxRunCycle = jest
       .fn()
       .mockResolvedValue({ ok: true, result: { pending_signals: [] } });
@@ -1518,7 +1526,10 @@ describe('PretestService.runCycle — cycleCtx carries universe + ohlcv (risk po
     const memory = {
       toContextString: jest.fn().mockResolvedValue(''),
     } as unknown as ContextMemoryService;
-    const plugins = { findActive: jest.fn().mockResolvedValue([]) } as unknown as PluginsService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([]),
+      findAll: jest.fn().mockResolvedValue([]),
+    } as unknown as PluginsService;
     const sandboxRunCycle = jest
       .fn()
       .mockResolvedValue({ ok: true, result: { pending_signals: [] } });
@@ -1600,7 +1611,10 @@ describe('PretestService.runCycle — cycleCtx carries universe + ohlcv (risk po
     const memory = {
       toContextString: jest.fn().mockResolvedValue(''),
     } as unknown as ContextMemoryService;
-    const plugins = { findActive: jest.fn().mockResolvedValue([]) } as unknown as PluginsService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([]),
+      findAll: jest.fn().mockResolvedValue([]),
+    } as unknown as PluginsService;
     const sandboxRunCycle = jest
       .fn()
       .mockResolvedValue({ ok: true, result: { pending_signals: [] } });
@@ -1693,6 +1707,7 @@ describe('PretestService.runCycle — per-portfolio plugin config reaches the sa
     } as unknown as ContextMemoryService;
     const plugins = {
       findActive: jest.fn().mockResolvedValue([{ id: 'momentum-factor-12-1', config: {} }]),
+      findAll: jest.fn().mockResolvedValue([{ id: 'momentum-factor-12-1', config: {} }]),
     } as unknown as PluginsService;
     const kv = makeStubKv();
     const audit = makeStubAudit();
@@ -4326,6 +4341,10 @@ describe('PretestService.runCycle — vol_target exposure scalar wiring', () => 
         { id: 'broad-index-hold', type: 'skill', config: {} },
         { id: 'risk-manager', type: 'discipline', config: {} },
       ]),
+      findAll: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
     } as unknown as PluginsService;
     const sandboxCall = jest.fn();
     const sandbox = {
@@ -4364,6 +4383,10 @@ describe('PretestService.runCycle — vol_target exposure scalar wiring', () => 
     } as unknown as ContextMemoryService;
     const plugins = {
       findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+      findAll: jest.fn().mockResolvedValue([
         { id: 'broad-index-hold', type: 'skill', config: {} },
         { id: 'risk-manager', type: 'discipline', config: {} },
       ]),
@@ -4439,6 +4462,10 @@ describe('PretestService.runCycle — vol_target exposure scalar wiring', () => 
     } as unknown as ContextMemoryService;
     const plugins = {
       findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+      findAll: jest.fn().mockResolvedValue([
         { id: 'broad-index-hold', type: 'skill', config: {} },
         { id: 'risk-manager', type: 'discipline', config: {} },
       ]),
@@ -4520,6 +4547,10 @@ describe('PretestService.runCycle — vol_target exposure scalar wiring', () => 
     } as unknown as ContextMemoryService;
     const plugins = {
       findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+      findAll: jest.fn().mockResolvedValue([
         { id: 'broad-index-hold', type: 'skill', config: {} },
         { id: 'risk-manager', type: 'discipline', config: {} },
       ]),
@@ -4700,6 +4731,10 @@ describe('PretestService.runCycle — passive-holder deterministic execution', (
         { id: 'broad-index-hold', type: 'skill', config: {} },
         { id: 'risk-manager', type: 'discipline', config: {} },
       ]),
+      findAll: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
     } as unknown as PluginsService;
     const sandboxCall = jest.fn().mockResolvedValue({ ok: true, result: { exposure_scalar: 0.5 } });
     const sandbox = {
@@ -4751,6 +4786,10 @@ describe('PretestService.runCycle — passive-holder deterministic execution', (
     } as unknown as ContextMemoryService;
     const plugins = {
       findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+      findAll: jest.fn().mockResolvedValue([
         { id: 'broad-index-hold', type: 'skill', config: {} },
         { id: 'risk-manager', type: 'discipline', config: {} },
       ]),
@@ -4810,6 +4849,9 @@ describe('PretestService.runCycle — passive-holder deterministic execution', (
     } as unknown as ContextMemoryService;
     const plugins = {
       findActive: jest
+        .fn()
+        .mockResolvedValue([{ id: 'momentum-factor-12-1', type: 'skill', config: {} }]),
+      findAll: jest
         .fn()
         .mockResolvedValue([{ id: 'momentum-factor-12-1', type: 'skill', config: {} }]),
     } as unknown as PluginsService;
@@ -4901,6 +4943,10 @@ describe('PretestService.runCycle — passive-holder deterministic execution', (
         { id: 'broad-index-hold', type: 'skill', config: {} },
         { id: 'risk-manager', type: 'discipline', config: {} },
       ]),
+      findAll: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
     } as unknown as PluginsService;
     const sandboxCall = jest.fn().mockResolvedValue({ ok: true, result: { exposure_scalar: 0.5 } });
     const sandbox = {
@@ -4972,7 +5018,10 @@ describe('PretestService.runCycle — kernel risk floor (unify-pretest-execution
     const memory = {
       toContextString: jest.fn().mockResolvedValue(''),
     } as unknown as ContextMemoryService;
-    const plugins = { findActive: jest.fn().mockResolvedValue([]) } as unknown as PluginsService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([]),
+      findAll: jest.fn().mockResolvedValue([]),
+    } as unknown as PluginsService;
     const sandbox = {
       runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
     } as unknown as SandboxGateway;
@@ -5267,5 +5316,270 @@ describe('PretestService.runCycle — kernel risk floor (unify-pretest-execution
     const { svc: svcB } = makeRunCycleHarness({ state: stateB, action: 'long' });
     const resultB = await svcB.runCycle('risk-floor-portfolio');
     expect(resultB.trades_simulated).toHaveLength(1);
+  });
+});
+
+// ── fix/pretest-run-declared-plugins ──────────────────────────────────────────
+//
+// Root cause (confirmed via prod runtime logging: signalsLen=0): runCycle built
+// the pretest plugin set from `plugins.findActive()` (globally-active plugins)
+// filtered down to `portfolio.plugin_ids`. The stale comment said "only the
+// declared ones, not the globally active" but the code did the OPPOSITE — a
+// plugin declared by the portfolio but not globally activated (e.g.
+// broad-index-hold, which every Vol-Managed portfolio depends on for its
+// passive `long` signal) was silently dropped from `pluginIds`, so
+// sandbox.runCycle never ran it and the portfolio never traded. The fix
+// resolves the portfolio's OWN declared plugin_ids from ALL installed plugins
+// (`plugins.findAll()`), independent of global active status.
+describe('PretestService.runCycle — runs declared plugins regardless of global active status (fix/pretest-run-declared-plugins)', () => {
+  it('a declared-but-globally-inactive plugin (broad-index-hold) IS included in the plugin ids passed to sandbox.runCycle', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+
+    // findActive() intentionally omits 'broad-index-hold' — it is INSTALLED but never
+    // globally activated (mirrors the bootstrap only activating the momentum stack).
+    // findAll() returns the full installed set, including it.
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([]),
+      findAll: jest.fn().mockResolvedValue([{ id: 'broad-index-hold', type: 'skill', config: {} }]),
+    } as unknown as PluginsService;
+
+    const sandboxRunCycle = jest
+      .fn()
+      .mockResolvedValue({ ok: true, result: { pending_signals: [] } });
+    const sandbox = { runCycle: sandboxRunCycle } as unknown as SandboxGateway;
+
+    const portfolioRow = {
+      id: 'vol-managed-portfolio',
+      name: 'Vol Managed Portfolio',
+      description: null,
+      initial_capital: 100_000,
+      plugin_ids: JSON.stringify(['broad-index-hold']),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(makeState({ equity: 100_000, cash: 100_000 })),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        update: jest.fn().mockResolvedValue(portfolioRow),
+      },
+    } as unknown as PrismaService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeStubAgents(),
+      makeStubKv(),
+      makeStubAudit(),
+    );
+
+    await svc.runCycle('vol-managed-portfolio');
+
+    // Before the fix: pluginIds would be [] (findActive() didn't include it), so
+    // sandbox.runCycle would never see 'broad-index-hold' -> pending_signals always [].
+    const [calledPluginIds] = sandboxRunCycle.mock.calls[0] as [string[], unknown];
+    expect(calledPluginIds).toContain('broad-index-hold');
+  });
+
+  it('end-to-end: a Vol-Managed-style portfolio (broad-index-hold declared but globally inactive) now produces a BUY fill from the passive-holder signal (previously 0 trades)', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([]), // globally: nothing active
+      findAll: jest.fn().mockResolvedValue([{ id: 'broad-index-hold', type: 'skill', config: {} }]),
+    } as unknown as PluginsService;
+
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({
+        ok: true,
+        result: {
+          pending_signals: [
+            {
+              type: 'broad_index_hold_signal',
+              symbol: 'SPY',
+              action: 'long',
+              reason: 'broad-index-hold: unconditional buy-and-hold, no ranking',
+            },
+          ],
+        },
+      }),
+    } as unknown as SandboxGateway;
+
+    const portfolioRow = {
+      id: 'vol-managed-portfolio',
+      name: 'Vol Managed Portfolio',
+      description: null,
+      initial_capital: 100_000,
+      plugin_ids: JSON.stringify(['broad-index-hold']),
+      plugin_configs: JSON.stringify({
+        __pretest_policy__: { sizing_pct: 0.5, slippage_pct: 0, commission_pct: 0 },
+      }),
+      state: JSON.stringify(makeState({ equity: 100_000, cash: 100_000 })),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        update: jest.fn().mockResolvedValue(portfolioRow),
+      },
+    } as unknown as PrismaService;
+
+    // LLM emits ZERO tool_calls — only the synthesized passive-holder signal drives the fill.
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeStubAgents(),
+      makeStubKv(),
+      makeStubAudit(),
+    );
+
+    const { trades_simulated, signals } = await svc.runCycle('vol-managed-portfolio');
+
+    // Before the fix, pending_signals would never have reached this point compellingly
+    // (in production the plugin itself never ran: sandbox.runCycle got pluginIds=[]).
+    // This test asserts the DOWNSTREAM effect once the plugin's signal is present:
+    // it now results in a real BUY fill instead of staying stuck at 0 trades.
+    expect(signals).toHaveLength(1);
+    expect(trades_simulated).toHaveLength(1);
+    expect(trades_simulated[0].symbol).toBe('SPY');
+    expect(trades_simulated[0].action).toBe('buy');
+  });
+
+  it('a momentum portfolio whose declared plugin IS globally active is unchanged — same plugin still runs', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+
+    // Declared plugin is BOTH active and installed — findActive() and findAll() agree.
+    const plugins = {
+      findActive: jest
+        .fn()
+        .mockResolvedValue([{ id: 'momentum-factor-12-1', type: 'skill', config: {} }]),
+      findAll: jest
+        .fn()
+        .mockResolvedValue([{ id: 'momentum-factor-12-1', type: 'skill', config: {} }]),
+    } as unknown as PluginsService;
+
+    const sandboxRunCycle = jest
+      .fn()
+      .mockResolvedValue({ ok: true, result: { pending_signals: [] } });
+    const sandbox = { runCycle: sandboxRunCycle } as unknown as SandboxGateway;
+
+    const portfolioRow = {
+      id: 'momentum-portfolio',
+      name: 'Momentum Portfolio',
+      description: null,
+      initial_capital: 100_000,
+      plugin_ids: JSON.stringify(['momentum-factor-12-1']),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(makeState({ equity: 100_000, cash: 100_000 })),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        update: jest.fn().mockResolvedValue(portfolioRow),
+      },
+    } as unknown as PrismaService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeStubAgents(),
+      makeStubKv(),
+      makeStubAudit(),
+    );
+
+    await svc.runCycle('momentum-portfolio');
+
+    const [calledPluginIds] = sandboxRunCycle.mock.calls[0] as [string[], unknown];
+    expect(calledPluginIds).toEqual(['momentum-factor-12-1']);
+  });
+
+  it('a declared plugin id that no longer exists (uninstalled) is skipped fail-soft, not thrown', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+
+    // 'ghost-plugin' is declared by the portfolio but does not exist in findAll() at all
+    // (uninstalled after the portfolio was configured).
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([]),
+      findAll: jest.fn().mockResolvedValue([]),
+    } as unknown as PluginsService;
+
+    const sandboxRunCycle = jest
+      .fn()
+      .mockResolvedValue({ ok: true, result: { pending_signals: [] } });
+    const sandbox = { runCycle: sandboxRunCycle } as unknown as SandboxGateway;
+
+    const portfolioRow = {
+      id: 'ghost-portfolio',
+      name: 'Ghost Portfolio',
+      description: null,
+      initial_capital: 100_000,
+      plugin_ids: JSON.stringify(['ghost-plugin']),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(makeState({ equity: 100_000, cash: 100_000 })),
+      run_count: 0,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        update: jest.fn().mockResolvedValue(portfolioRow),
+      },
+    } as unknown as PrismaService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeStubAgents(),
+      makeStubKv(),
+      makeStubAudit(),
+    );
+
+    await expect(svc.runCycle('ghost-portfolio')).resolves.toBeDefined();
+    const [calledPluginIds] = sandboxRunCycle.mock.calls[0] as [string[], unknown];
+    expect(calledPluginIds).toEqual([]);
   });
 });
