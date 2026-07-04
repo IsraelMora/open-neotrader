@@ -78,7 +78,7 @@ export const BOOTSTRAP_APPLIED_KEY = 'bootstrap.momentum_v1_applied';
  * instances (v1 already set) without re-running the momentum/execution/universe/
  * plugin block — see the module docstring above.
  */
-export const PRETEST_SEED_KEY = 'bootstrap.pretest_seed_v4';
+export const PRETEST_SEED_KEY = 'bootstrap.pretest_seed_v5';
 const UNIVERSE_KEY = 'cycle.universe';
 const EXECUTION_REAL_KEY = 'execution.real';
 const SCHEDULER_KEY = 'scheduler';
@@ -132,6 +132,23 @@ interface PretestPortfolioSeed {
  * and exposure_cap differ. Honest caveat kept in its description: the
  * vol-managed edge over buy-and-hold is crash-concentrated (it comes from
  * de-risking ahead of/during high-vol drawdowns, not from steady alpha).
+ *
+ * 'Vol-Managed TECL (Agresivo)' and 'Vol-Managed SOXL (Agresivo)' (v5 addition)
+ * apply the SAME vol_target mechanism to 3x daily-leveraged sector ETFs (TECL =
+ * tech, SOXL = semiconductors) instead of an unleveraged broad index. Batch-11
+ * research: vol-targeting tames a 3x ETF's raw ~-80% drawdown down to
+ * SPY-like risk while preserving most of the leveraged upside — TECL: +286%
+ * cumulative return, Sharpe 1.03, maxDD -24.6% (better than SPY's own -34%
+ * buy-and-hold drawdown); SOXL: +293% cumulative return, Sharpe 1.04, maxDD
+ * -29.6%. Both use target_vol_pct=20 (batch-11 winner setting) and
+ * exposure_cap=1.0 — the underlying ETF is already 3x-leveraged, so no
+ * ADDITIONAL leverage is applied on top by risk-manager; exposureScalar only
+ * throttles exposure DOWN from the 3x baseline toward the target-vol level.
+ * Same __pretest_policy__ shape as the other Vol-Managed seeds (sizing_pct=1.0,
+ * exposureScalar does the throttling). Honest caveat kept in both descriptions:
+ * these are single-sector concentration bets on top of 3x leverage — the
+ * batch-11 backtest window covers one bear year, so the result is not proof
+ * against a multi-year bear market in that sector.
  */
 export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
   {
@@ -276,6 +293,50 @@ export const PRETEST_PORTFOLIOS_TO_SEED: PretestPortfolioSeed[] = [
       // sizing_pct=1.0: an UNSCALED entry would use 100% of cash — the
       // exposureScalar computed from risk-manager's exposure_scalar is what
       // actually throttles this down toward the 15%-target-vol level (see
+      // PretestService.runCycle's effectivePolicy / volTargetPlugin wiring).
+      __pretest_policy__: { sizing_pct: 1.0, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
+    name: 'Vol-Managed TECL (Agresivo)',
+    description:
+      'Volatility-managed TECL exposure (tech 3x leveraged): holds TECL unconditionalmente (sin ranking, sin rebalanceo mensual) y deja que risk-manager escale la exposición total hacia un 20% de volatilidad anualizada objetivo (ventana de 20 días de vol realizada, cap de exposición 1.0x — sin apalancamiento adicional sobre el ETF, que ya es 3x). Hermano agresivo de mayor retorno validado en investigación batch-11: el vol-targeting doma el drawdown crudo de ~-80% de un ETF 3x hasta un nivel similar al de SPY, con +286% de retorno acumulado, Sharpe 1.03 y maxDD -24.6% (mejor que el -34% del propio SPY buy-and-hold). Nota honesta: es una apuesta de concentración sectorial (tech) sobre apalancamiento 3x — la ventana de backtest de batch-11 cubre un solo año bajista, no es garantía frente a un mercado bajista prolongado en el sector.',
+    initial_capital: 100_000,
+    plugin_ids: ['broad-index-hold', 'risk-manager'],
+    plugin_configs: {
+      'broad-index-hold': { symbols: 'TECL' },
+      'risk-manager': {
+        exposure_mode: 'vol_target',
+        target_vol_pct: 20,
+        vol_window_days: 20,
+        exposure_cap: 1.0,
+        vol_target_benchmark: 'TECL',
+      },
+      // sizing_pct=1.0: an UNSCALED entry would use 100% of cash — the
+      // exposureScalar computed from risk-manager's exposure_scalar is what
+      // actually throttles this down toward the 20%-target-vol level (see
+      // PretestService.runCycle's effectivePolicy / volTargetPlugin wiring).
+      __pretest_policy__: { sizing_pct: 1.0, slippage_pct: 0.0005, commission_pct: 0 },
+    },
+  },
+  {
+    name: 'Vol-Managed SOXL (Agresivo)',
+    description:
+      'Volatility-managed SOXL exposure (semiconductores 3x leveraged): holds SOXL unconditionalmente (sin ranking, sin rebalanceo mensual) y deja que risk-manager escale la exposición total hacia un 20% de volatilidad anualizada objetivo (ventana de 20 días de vol realizada, cap de exposición 1.0x — sin apalancamiento adicional sobre el ETF, que ya es 3x). Hermano agresivo validado en investigación batch-11: el vol-targeting doma el drawdown crudo de ~-80% de un ETF 3x, con +293% de retorno acumulado, Sharpe 1.04 y maxDD -29.6%. Nota honesta: es una apuesta de concentración sectorial (semiconductores) sobre apalancamiento 3x — la ventana de backtest de batch-11 cubre un solo año bajista, no es garantía frente a un mercado bajista prolongado en el sector.',
+    initial_capital: 100_000,
+    plugin_ids: ['broad-index-hold', 'risk-manager'],
+    plugin_configs: {
+      'broad-index-hold': { symbols: 'SOXL' },
+      'risk-manager': {
+        exposure_mode: 'vol_target',
+        target_vol_pct: 20,
+        vol_window_days: 20,
+        exposure_cap: 1.0,
+        vol_target_benchmark: 'SOXL',
+      },
+      // sizing_pct=1.0: an UNSCALED entry would use 100% of cash — the
+      // exposureScalar computed from risk-manager's exposure_scalar is what
+      // actually throttles this down toward the 20%-target-vol level (see
       // PretestService.runCycle's effectivePolicy / volTargetPlugin wiring).
       __pretest_policy__: { sizing_pct: 1.0, slippage_pct: 0.0005, commission_pct: 0 },
     },

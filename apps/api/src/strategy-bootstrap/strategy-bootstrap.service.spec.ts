@@ -331,7 +331,7 @@ describe('StrategyBootstrapService', () => {
 // "independent idempotency" describe block below and the module docstring.
 
 describe('StrategyBootstrapService — pretest portfolio seeding', () => {
-  it('seeds exactly 8 risk-differentiated pretest portfolios on first run', async () => {
+  it('seeds exactly 11 risk-differentiated pretest portfolios on first run', async () => {
     const { kv } = makeKv();
     const { db, pretestCreate } = makeDb();
     const { llm } = makeLlm();
@@ -339,7 +339,7 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
 
     await svc.run();
 
-    expect(pretestCreate).toHaveBeenCalledTimes(9);
+    expect(pretestCreate).toHaveBeenCalledTimes(11);
     const names = (pretestCreate.mock.calls as Array<[{ data: { name: string } }]>).map(
       (c) => c[0].data.name,
     );
@@ -452,7 +452,7 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
     );
   });
 
-  it('PRETEST_PORTFOLIOS_TO_SEED exposes exactly the 9 expected specs', () => {
+  it('PRETEST_PORTFOLIOS_TO_SEED exposes exactly the 11 expected specs', () => {
     expect(PRETEST_PORTFOLIOS_TO_SEED.map((p) => p.name)).toEqual([
       'Ultra-Conservador Momentum',
       'Conservador Momentum',
@@ -463,6 +463,8 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
       'Relative-Strength Puro',
       'Vol-Managed Index',
       'Vol-Managed QQQ',
+      'Vol-Managed TECL (Agresivo)',
+      'Vol-Managed SOXL (Agresivo)',
     ]);
   });
 
@@ -490,6 +492,44 @@ describe('StrategyBootstrapService — pretest portfolio seeding', () => {
       vol_window_days: 20,
       exposure_cap: 1.5,
       vol_target_benchmark: 'QQQ',
+    });
+    expect(spec?.plugin_configs['__pretest_policy__']).toEqual({
+      sizing_pct: 1.0,
+      slippage_pct: 0.0005,
+      commission_pct: 0,
+    });
+  });
+
+  it('Vol-Managed TECL (Agresivo) is wired to risk-manager exposure_mode:vol_target with the batch-11 winner config (tv=20%, w=20d, cap=1.0)', () => {
+    const spec = PRETEST_PORTFOLIOS_TO_SEED.find((p) => p.name === 'Vol-Managed TECL (Agresivo)');
+    expect(spec).toBeDefined();
+    expect(spec?.plugin_ids).toEqual(['broad-index-hold', 'risk-manager']);
+    expect(spec?.plugin_configs['broad-index-hold']).toEqual({ symbols: 'TECL' });
+    expect(spec?.plugin_configs['risk-manager']).toEqual({
+      exposure_mode: 'vol_target',
+      target_vol_pct: 20,
+      vol_window_days: 20,
+      exposure_cap: 1.0,
+      vol_target_benchmark: 'TECL',
+    });
+    expect(spec?.plugin_configs['__pretest_policy__']).toEqual({
+      sizing_pct: 1.0,
+      slippage_pct: 0.0005,
+      commission_pct: 0,
+    });
+  });
+
+  it('Vol-Managed SOXL (Agresivo) is wired to risk-manager exposure_mode:vol_target with the batch-11 winner config (tv=20%, w=20d, cap=1.0)', () => {
+    const spec = PRETEST_PORTFOLIOS_TO_SEED.find((p) => p.name === 'Vol-Managed SOXL (Agresivo)');
+    expect(spec).toBeDefined();
+    expect(spec?.plugin_ids).toEqual(['broad-index-hold', 'risk-manager']);
+    expect(spec?.plugin_configs['broad-index-hold']).toEqual({ symbols: 'SOXL' });
+    expect(spec?.plugin_configs['risk-manager']).toEqual({
+      exposure_mode: 'vol_target',
+      target_vol_pct: 20,
+      vol_window_days: 20,
+      exposure_cap: 1.0,
+      vol_target_benchmark: 'SOXL',
     });
     expect(spec?.plugin_configs['__pretest_policy__']).toEqual({
       sizing_pct: 1.0,
@@ -525,7 +565,7 @@ describe('StrategyBootstrapService — pretest seeding is decoupled from the mom
     expect(universeCalls).toHaveLength(0);
 
     // But pretest portfolios STILL get seeded, and PRETEST_SEED_KEY gets set.
-    expect(pretestCreate).toHaveBeenCalledTimes(9);
+    expect(pretestCreate).toHaveBeenCalledTimes(11);
     expect(store[PRETEST_SEED_KEY]).toBe('true');
   });
 
@@ -539,7 +579,7 @@ describe('StrategyBootstrapService — pretest seeding is decoupled from the mom
 
     expect(store[BOOTSTRAP_APPLIED_KEY]).toBe('true');
     expect(store[PRETEST_SEED_KEY]).toBe('true');
-    expect(pretestCreate).toHaveBeenCalledTimes(9);
+    expect(pretestCreate).toHaveBeenCalledTimes(11);
   });
 
   it('no-ops pretest seeding when PRETEST_SEED_KEY is already set, independently of the momentum flag', async () => {
