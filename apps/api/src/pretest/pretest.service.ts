@@ -409,13 +409,6 @@ export class PretestService {
 
     this.log.log(`Pretest ciclo: ${portfolio.name} (plugins: ${portfolio.plugin_ids.join(', ')})`);
 
-    // Market data for the strategy hooks: resolve the SAME `cycle.universe` KV key the
-    // real agent cycle reads (AgentsService._buildMarketContext) and fetch OHLCV so
-    // universe-dependent hooks (momentum-factor-12-1, trend-following, ...) receive
-    // real data. Without this, ctx["universe"] stays empty and those hooks never emit
-    // a signal — the portfolio would never trade.
-    const market = await this._buildMarketContext();
-
     // Construir plugins del pretest (solo los declarados, no los globalmente activos)
     const allPlugins = await this.plugins.findActive();
     const pretestPlugins = allPlugins.filter((p: HydratedPlugin) =>
@@ -456,6 +449,30 @@ export class PretestService {
       (p: HydratedPlugin) =>
         p.type === 'discipline' && pluginConfigs[p.id]?.['exposure_mode'] === 'vol_target',
     );
+    // The vol_target hook needs the benchmark symbol's own OHLCV to compute realized
+    // volatility. The benchmark (e.g. 'TECL', 'SOXL') is often NOT a member of the
+    // global `cycle.universe` momentum ranking set — it's the symbol this specific
+    // Vol-Managed portfolio unconditionally holds via broad-index-hold, not something
+    // ranked by momentum/trend hooks. Without this, ctx["ohlcv"][benchmark] is empty,
+    // compute_vol_target_exposure has no bars to work with, and returns None ->
+    // exposure_scalar collapses to the 0.0 fail-safe -> the portfolio NEVER trades.
+    // Fetching it here (in addition to `universe`) ensures the benchmark's real bars
+    // reach the hook regardless of whether it's also in the momentum universe.
+    const volTargetBenchmark = volTargetPlugin
+      ? (() => {
+          const raw = pluginConfigs[volTargetPlugin.id]?.['vol_target_benchmark'];
+          return typeof raw === 'string' && raw.trim() ? raw : 'SPY';
+        })()
+      : undefined;
+
+    // Market data for the strategy hooks: resolve the SAME `cycle.universe` KV key the
+    // real agent cycle reads (AgentsService._buildMarketContext) and fetch OHLCV so
+    // universe-dependent hooks (momentum-factor-12-1, trend-following, ...) receive
+    // real data. Without this, ctx["universe"] stays empty and those hooks never emit
+    // a signal — the portfolio would never trade. `volTargetBenchmark` is unioned into
+    // the fetch (but NOT into `universe` itself — it must not pollute momentum ranking).
+    const market = await this._buildMarketContext(volTargetBenchmark ? [volTargetBenchmark] : []);
+
     let exposureScalar = 1;
     if (volTargetPlugin) {
       try {
@@ -1138,8 +1155,13 @@ export class PretestService {
    * the network (bars are injected; runner.py exposes them as provider_tools.get_ohlcv).
    * Fail-soft: KV read errors fall back to DEFAULT_UNIVERSE; per-symbol OHLCV fetch
    * errors are skipped (logged warn), never thrown.
+   *
+   * `extraSymbols` are fetched ALONGSIDE the resolved universe (e.g. a vol_target
+   * discipline's benchmark symbol) but are deliberately NOT added to the returned
+   * `universe` array — they must reach ctx["ohlcv"] without being treated as a
+   * momentum/trend-following ranking candidate.
    */
-  private async _buildMarketContext(): Promise<{
+  private async _buildMarketContext(extraSymbols: string[] = []): Promise<{
     universe: string[];
     ohlcv: Record<string, unknown[]>;
   }> {
@@ -1165,9 +1187,14 @@ export class PretestService {
     const bars = Number((await this.kv.get('cycle.bars')) || 0) || 400;
     const dataProvider = (await this.kv.get('cycle.data_provider')) || 'yahoo-finance-provider';
 
+    // Union extraSymbols (e.g. a vol_target benchmark not in `universe`) into the
+    // fetch set — deduped, case-normalized to match `universe`'s uppercasing.
+    const extraNormalized = extraSymbols.map((s) => s.trim().toUpperCase()).filter(Boolean);
+    const fetchSymbols = Array.from(new Set([...universe, ...extraNormalized]));
+
     const ohlcv: Record<string, unknown[]> = {};
     await Promise.all(
-      universe.map(async (symbol) => {
+      fetchSymbols.map(async (symbol) => {
         try {
           const raw = await this.gateway.getOhlcv(dataProvider, symbol, timeframe, bars);
           ohlcv[symbol] = (raw ?? []).map((b) => ({

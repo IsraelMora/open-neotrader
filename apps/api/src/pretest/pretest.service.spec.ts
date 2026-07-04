@@ -4411,6 +4411,106 @@ describe('PretestService.runCycle — vol_target exposure scalar wiring', () => 
     expect(trades_simulated[0].quantity).toBe(250);
   });
 
+  // Bug reproduction (vol-managed-exposure-data): TECL/SOXL-style Vol-Managed portfolios
+  // set vol_target_benchmark to a symbol that is NOT a member of `cycle.universe` (the
+  // global momentum ranking set). Before the fix, `market.ohlcv` was built ONLY from
+  // `universe`, so ctx["ohlcv"][benchmark] was always {} for such a benchmark ->
+  // compute_vol_target_exposure had zero bars -> exposure_scalar collapsed to the
+  // 0.0 fail-safe -> the portfolio never traded, even though a valid entry signal
+  // existed. The fix unions the benchmark into the OHLCV fetch (without polluting
+  // `universe` itself, which momentum/trend hooks read for ranking).
+  it('fetches the vol_target benchmark OHLCV even when the benchmark is NOT in cycle.universe (TECL-style), enabling a real BUY fill', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('TECL', 40)));
+    const bars = Array.from({ length: 30 }, (_, i) => ({
+      date: `2024-01-${String(i + 1).padStart(2, '0')}`,
+      open: 40 + i * 0.1,
+      high: 41 + i * 0.1,
+      low: 39 + i * 0.1,
+      close: 40 + i * 0.1,
+      volume: 1000,
+    }));
+    const getOhlcv = jest.fn().mockResolvedValue(bars);
+    (gateway as unknown as { getOhlcv: typeof getOhlcv }).getOhlcv = getOhlcv;
+
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+    } as unknown as PluginsService;
+    // The mocked hook itself returns a positive scalar (mirrors what the REAL
+    // compute_vol_target_exposure would emit given real bars — see the apps/sandbox
+    // test for that computation). What this test proves is the DATA PLUMBING: the
+    // benchmark's real OHLCV reaches the hook's context even though TECL is absent
+    // from cycle.universe.
+    const sandboxCall = jest.fn().mockResolvedValue({ ok: true, result: { exposure_scalar: 0.6 } });
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+      call: sandboxCall,
+    } as unknown as SandboxGateway;
+    const row = makeVolTargetRow({
+      plugin_configs: {
+        'risk-manager': {
+          exposure_mode: 'vol_target',
+          vol_target_benchmark: 'TECL',
+          target_vol_pct: 20,
+          vol_window_days: 20,
+          exposure_cap: 1.0,
+        },
+        __pretest_policy__: { sizing_pct: 0.5, slippage_pct: 0, commission_pct: 0 },
+      },
+    });
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue(row),
+      },
+    } as unknown as PrismaService;
+    // cycle.universe deliberately does NOT include TECL — mirrors the real
+    // MOMENTUM_UNIVERSE seed ('SPY,QQQ,IWM,EFA,EEM,TLT,IEF,GLD,DBC,DBMF,BIL').
+    const kv = makeStubKv({ 'cycle.universe': 'SPY,QQQ,IWM,EFA,EEM,TLT,IEF,GLD,DBC,DBMF,BIL' });
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeAgentsWithBuy('TECL'),
+      kv,
+      makeStubAudit(),
+    );
+
+    const { trades_simulated } = await svc.runCycle('vt-portfolio');
+
+    // 1) The benchmark's OHLCV was actually fetched (data plumbing), despite not
+    //    being part of cycle.universe.
+    expect(getOhlcv).toHaveBeenCalledWith(
+      expect.any(String),
+      'TECL',
+      expect.any(String),
+      expect.any(Number),
+    );
+
+    // 2) The run_hook context passed to the discipline plugin carries the benchmark's
+    //    real bars — this is the crux of the fix: before it, ctx.ohlcv.TECL was [].
+    const [call] = sandboxCall.mock.calls[0] as [{ context: { ohlcv: Record<string, unknown[]> } }];
+    const benchmarkBars = call.context.ohlcv['TECL'];
+    expect(benchmarkBars).toBeDefined();
+    expect(benchmarkBars.length).toBeGreaterThan(20);
+
+    // 3) With real data flowing through, the emitted (real, non-fail-safe) exposure_scalar
+    //    scales sizing and produces an actual BUY fill — the portfolio was previously stuck
+    //    at 0 trades.
+    expect(trades_simulated).toHaveLength(1);
+    expect(trades_simulated[0].symbol).toBe('TECL');
+    expect(trades_simulated[0].quantity).toBeGreaterThan(0);
+  });
+
   it('fail-safe: sandbox.call rejecting collapses exposure_scalar to 0 (no new entries) AND emits an audit event', async () => {
     const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
     const memory = {
