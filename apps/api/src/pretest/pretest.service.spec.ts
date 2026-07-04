@@ -279,6 +279,178 @@ describe('PretestService._simulateFills (Phase 1)', () => {
   });
 });
 
+// ── action-vocabulary mapping (production bug: emit_trade_intent uses
+// long/short/exit/hold — pretest fill engine only understood
+// buy/sell/close/short/cover, so every long/exit/hold call was silently
+// skipped and paper pretest portfolios never traded) ──────────────────────────
+
+describe('PretestService._simulateFills — emit_trade_intent action-vocabulary mapping', () => {
+  describe('action="long" maps to an internal BUY fill', () => {
+    it('produces a buy trade (was previously skipped — 0 trades bug)', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+      const svc = makeService(gateway);
+      const state = makeState();
+
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('SPY', 'long')], state);
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('buy');
+      expect(trades[0].symbol).toBe('SPY');
+    });
+
+    it('applies via _applyTrades exactly like a native buy (position opened, cash debited)', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({ cash: 10_000 });
+
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('SPY', 'long')], state);
+      const next = asPrivate(svc)._applyTrades(state, trades);
+
+      expect(next.positions).toHaveLength(1);
+      expect(next.positions[0].symbol).toBe('SPY');
+      expect(next.positions[0].quantity).toBeGreaterThan(0);
+      expect(next.cash).toBeLessThan(10_000);
+    });
+  });
+
+  describe('action="short" still opens a short (native vocabulary unaffected)', () => {
+    it('produces a short trade', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+      const svc = makeService(gateway);
+      const state = makeState();
+
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('SPY', 'short')], state);
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('short');
+    });
+  });
+
+  describe('action="hold" is a no-op', () => {
+    it('produces no trade', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+      const svc = makeService(gateway);
+      const state = makeState();
+
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('SPY', 'hold')], state);
+
+      expect(trades).toHaveLength(0);
+    });
+  });
+
+  describe('action="exit" resolves by current position side', () => {
+    it('sells the full LONG position when one is held', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 120)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        positions: [{ symbol: 'SPY', quantity: 10, avg_price: 100 }],
+        cash: 5_000,
+      });
+
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('SPY', 'exit')], state);
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('close');
+      expect(trades[0].quantity).toBe(10);
+    });
+
+    it('covers the full SHORT position when one is held', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 90)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        positions: [{ symbol: 'SPY', quantity: -10, avg_price: 100 }],
+        cash: 5_000,
+      });
+
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('SPY', 'exit')], state);
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('cover');
+      expect(trades[0].quantity).toBe(10);
+    });
+
+    it('is a no-op (no crash, no trade) when no position is held', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+      const svc = makeService(gateway);
+      const state = makeState();
+
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('SPY', 'exit')], state);
+
+      expect(trades).toHaveLength(0);
+    });
+  });
+
+  describe('legacy buy/sell/close/cover synonyms remain accepted (backward-compat)', () => {
+    it('still accepts action="buy"', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+      const svc = makeService(gateway);
+      const state = makeState();
+
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('SPY', 'buy')], state);
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('buy');
+    });
+
+    it('still accepts action="sell" against a long position', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        positions: [{ symbol: 'SPY', quantity: 5, avg_price: 90 }],
+        cash: 5_000,
+      });
+
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('SPY', 'sell')], state);
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('sell');
+    });
+
+    it('still accepts action="cover" against a short position', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 90)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        positions: [{ symbol: 'SPY', quantity: -5, avg_price: 100 }],
+        cash: 5_000,
+      });
+
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('SPY', 'cover')], state);
+
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('cover');
+    });
+  });
+
+  describe('vol-managed exposure_scalar path: long intent still gets scaled by exposure_scalar', () => {
+    it('a "long" fill quantity is unaffected by _simulateFills itself (scaling happens in the separate rebalance pass), and produces a real buy that the vol-target rebalancer can subsequently scale', async () => {
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+      const svc = makeService(gateway);
+      const state = makeState({ cash: 10_000 });
+
+      const trades = await asPrivate(svc)._simulateFills([makeToolCall('SPY', 'long')], state);
+      expect(trades).toHaveLength(1);
+      const next = asPrivate(svc)._applyTrades(state, trades);
+
+      // Now simulate the vol-target rebalance pass scaling down to 50% exposure.
+      const rebalanceTrades = await (
+        svc as unknown as {
+          _buildVolTargetRebalanceTrades: (
+            s: PretestState,
+            scalar: number,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._buildVolTargetRebalanceTrades(next, 0.5);
+
+      // sizing_pct-of-cash entries are far below a 50%-of-equity target, so the
+      // rebalance pass scales the fresh long UP further — proving the
+      // exposure_scalar mechanism still runs, unmodified, on top of the
+      // mapped long->buy fill.
+      expect(rebalanceTrades.length).toBeGreaterThan(0);
+      expect(rebalanceTrades[0].action).toBe('buy');
+    });
+  });
+});
+
 // ── Phase 1.1.4-5: RED tests — _updateEquityMetrics uses MTM quotes ───────────
 
 describe('PretestService._updateEquityMetrics (Phase 1)', () => {

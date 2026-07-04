@@ -1191,6 +1191,54 @@ export class PretestService {
   }
 
   /**
+   * Maps the `emit_trade_intent` tool's real action vocabulary
+   * (`long`/`short`/`exit`/`hold` — see plugins/decision/tools.json) onto the
+   * internal fill-engine vocabulary (`buy`/`sell`/`close`/`short`/`cover`)
+   * consumed by `_calcQuantity`/`_applyTrades`.
+   *
+   * Bug fixed here: `_simulateFills` used to only accept the internal
+   * vocabulary directly, so every `long`/`exit`/`hold` tool call (the ONLY
+   * vocabulary the LLM actually emits) was silently skipped — paper pretest
+   * portfolios never filled a single trade in production.
+   *
+   * - `long`  → `buy` (open/add a long).
+   * - `short` → `short` (already native).
+   * - `exit`  → resolved by the CURRENT position side: `close` (sell) when
+   *   long, `cover` when short, skip (undefined) when flat — no-op, never
+   *   crashes.
+   * - `hold`  → skip (undefined) — explicit no-op.
+   * - Legacy `buy`/`sell`/`close`/`short`/`cover` synonyms are still accepted
+   *   as-is for backward compatibility with any other caller.
+   */
+  private _mapIntentAction(
+    rawAction: string | undefined,
+    symbol: string,
+    state: PretestState,
+  ): 'buy' | 'sell' | 'close' | 'short' | 'cover' | undefined {
+    if (!rawAction) return undefined;
+    switch (rawAction) {
+      case 'hold':
+        return undefined;
+      case 'long':
+        return 'buy';
+      case 'short':
+        return 'short';
+      case 'exit': {
+        const pos = state.positions.find((p) => p.symbol === symbol);
+        if (!pos || pos.quantity === 0) return undefined; // no position — no-op
+        return pos.quantity > 0 ? 'close' : 'cover';
+      }
+      case 'buy':
+      case 'sell':
+      case 'close':
+      case 'cover':
+        return rawAction;
+      default:
+        return undefined;
+    }
+  }
+
+  /**
    * Resolves fill prices via ProviderGateway.getQuote(null, symbol).last.
    * LLM-fabricated args['price'] is NEVER used.
    * Slippage is applied at fill time: buy = last*(1+slippage_pct), sell = last*(1-slippage_pct).
@@ -1205,15 +1253,9 @@ export class PretestService {
     for (const tc of toolCalls) {
       const args = tc.args;
       const symbol = args['symbol'] as string | undefined;
-      const action = (args['action'] as string | undefined)?.toLowerCase() as
-        | 'buy'
-        | 'sell'
-        | 'close'
-        | 'short'
-        | 'cover'
-        | undefined;
-      if (!symbol || !action || !['buy', 'sell', 'close', 'short', 'cover'].includes(action))
-        continue;
+      const rawAction = (args['action'] as string | undefined)?.toLowerCase();
+      const action = symbol ? this._mapIntentAction(rawAction, symbol, state) : undefined;
+      if (!symbol || !action) continue;
 
       let last: number;
       try {
