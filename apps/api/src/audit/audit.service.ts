@@ -57,7 +57,12 @@ export type AuditEventType =
   | 'vol_target_exposure_failed'
   // risk-discipline: prop-firm-style daily/weekly loss circuit-breaker tripped — new paper
   // entries (long/short) are blocked until the next UTC day/week. Exit/hold unaffected.
-  | 'loss_circuit_breaker_tripped';
+  | 'loss_circuit_breaker_tripped'
+  // unify-pretest-execution: a pretest portfolio's new entry (long/short) was rejected by
+  // the shared kernel risk floor (drawdown halt / max-open-positions / daily-weekly circuit
+  // breaker / mark-to-market fail-closed) — see GovernedPaperExecutionService. Makes a
+  // blocked pretest strategy visible instead of silently skipping the tool call.
+  | 'pretest_entry_rejected';
 
 export interface AuditPayload {
   cycle_id?: string;

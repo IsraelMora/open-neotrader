@@ -17,7 +17,14 @@
  * not cost-basis. getQuote failures are handled gracefully: skip fill or fallback to
  * last-known current_price / avg_price for MTM.
  */
-import { Injectable, Logger, NotFoundException, Inject, forwardRef } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  NotFoundException,
+  Inject,
+  forwardRef,
+  Optional,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { SandboxGateway } from '../sandbox/sandbox.gateway';
 import { PluginsService, HydratedPlugin } from '../plugins/plugins.service';
@@ -28,6 +35,8 @@ import { AgentsService } from '../agents/agents.service';
 import { KvService } from '../common/kv.service';
 import { kvBool, kvNum } from '../common/kv.util';
 import { AuditService } from '../audit/audit.service';
+import { GovernedPaperExecutionService } from '../execution/governed-paper-execution.service';
+import { GovernedAccountState, RiskPolicy } from '../execution/governed-account-state';
 
 /**
  * Per-portfolio fill policy. Stored under plugin_configs['__pretest_policy__'].
@@ -114,6 +123,17 @@ export interface PretestState {
   benchmark_return_pct?: number;
   /** Benchmark price at portfolio inception (first MTM). Internal baseline. */
   benchmark_start_price?: number;
+  // ── unify-pretest-execution: kernel risk-floor bookkeeping ──────────────────
+  // The same fields GovernedAccountState/GovernedPaperExecutionService.evaluateEntryGate
+  // uses for the live paper account — undefined until the first entry-gate evaluation
+  // for THIS portfolio (each pretest portfolio has its OWN independent baseline, never
+  // shared with the live paper account or with each other).
+  /** High-water-mark equity for the drawdown-halt gate. Defaults to `equity` when unset. */
+  hwm?: number;
+  day_key?: string;
+  day_start_equity?: number;
+  week_key?: string;
+  week_start_equity?: number;
 }
 
 export interface PretestPortfolio {
@@ -266,7 +286,24 @@ export class PretestService {
     private readonly agents: AgentsService,
     private readonly kv: KvService,
     private readonly audit: AuditService,
+    // GovernedPaperExecutionService — the SAME shared kernel-gated execution core
+    // TradeIntentService's paper branch uses. @Optional() so every existing direct
+    // `new PretestService(...)` test call site (which predates this dependency) keeps
+    // working unmodified — see the `governedPaperExec` getter below, which lazily builds
+    // one wired to this SAME `gateway`/`audit` when Nest (or a test) doesn't inject it.
+    @Optional() private readonly governedPaperExecInjected?: GovernedPaperExecutionService,
   ) {}
+
+  private _governedPaperExec?: GovernedPaperExecutionService;
+  /** Lazily-resolved governed-execution core — see constructor doc comment. */
+  private get governedPaperExec(): GovernedPaperExecutionService {
+    if (!this._governedPaperExec) {
+      this._governedPaperExec =
+        this.governedPaperExecInjected ??
+        new GovernedPaperExecutionService(this.gateway, this.audit);
+    }
+    return this._governedPaperExec;
+  }
 
   // ── CRUD ─────────────────────────────────────────────────────────────────────
 
@@ -497,22 +534,33 @@ export class PretestService {
     const effectivePolicy: PretestPolicy =
       exposureScalar === 1 ? policy : { ...policy, sizing_pct: policy.sizing_pct * exposureScalar };
 
-    // ── Simular fills (async: price from getQuote.last + slippage) ────────────
-    // Use validated tool_calls from the governed turn (providers already dropped by virtual guard).
-    const trades = await this._simulateFills(
+    // ── Kernel risk floor (shared with the live paper/real account) ───────────
+    // Gates NEW ENTRIES (long/short) through GovernedPaperExecutionService.evaluateEntryGate
+    // BEFORE they ever reach _simulateFills — pretest previously had NO risk floor at all.
+    // exit/hold are never gated (closeability invariant). A rejected entry is stripped here
+    // (never fills) and recorded via a 'pretest_entry_rejected' audit event. `gated.state`
+    // carries forward any hwm/day-week baseline changes and MUST be used for every
+    // downstream step.
+    const gated = await this._applyKernelRiskFloor(
+      id,
+      portfolio.name,
       turnResult.tool_calls,
       portfolio.state,
-      effectivePolicy,
     );
+
+    // ── Simular fills (async: price from getQuote.last + slippage) ────────────
+    // Use validated tool_calls from the governed turn (providers already dropped by virtual
+    // guard, and now also filtered by the kernel risk floor above).
+    const trades = await this._simulateFills(gated.toolCalls, gated.state, effectivePolicy);
 
     // ── Vol-target rebalance of EXISTING long positions toward exposureScalar ──
     const rebalanceTrades = volTargetPlugin
-      ? await this._buildVolTargetRebalanceTrades(portfolio.state, exposureScalar)
+      ? await this._buildVolTargetRebalanceTrades(gated.state, exposureScalar)
       : [];
 
     // Actualizar estado virtual (sync trade application + commission, async MTM equity)
     const newState = this._applyTrades(
-      portfolio.state,
+      gated.state,
       [...trades, ...rebalanceTrades],
       effectivePolicy,
     );
@@ -1188,6 +1236,181 @@ export class PretestService {
     );
 
     return { sizing_pct, slippage_pct, commission_pct, borrow_cost_pct };
+  }
+
+  /**
+   * Reads the SAME global KV `execution.*` risk-floor keys TradeIntentService reads for the
+   * live paper/real account (see TradeIntentService._readExecutionPolicy / ExecutionPolicy) —
+   * a pretest portfolio's RiskPolicy must always be sourced from this shared configuration,
+   * never a pretest-local override, so pretest can only ever be AS STRICT or STRICTER than the
+   * live account, never looser. Defaults mirror TradeIntentService.DEFAULT_EXECUTION_POLICY
+   * exactly (kept as a small, intentional duplication of literals rather than importing from
+   * trade-intent.service.ts, to avoid coupling PretestModule to TradeIntentModule).
+   */
+  private async _readRiskPolicy(): Promise<RiskPolicy> {
+    const [
+      rawMaxPosPct,
+      rawMaxOpenPos,
+      rawMaxDrawdown,
+      rawMaxShortNotionalPct,
+      rawLossBreakerEnabled,
+      rawMaxDailyLossPct,
+      rawMaxWeeklyLossPct,
+    ] = await Promise.all([
+      this.kv.get('execution.max_position_pct'),
+      this.kv.get('execution.max_open_positions'),
+      this.kv.get('execution.max_drawdown_halt_pct'),
+      this.kv.get('execution.max_short_notional_pct'),
+      this.kv.get('execution.loss_circuit_breaker_enabled'),
+      this.kv.get('execution.max_daily_loss_pct'),
+      this.kv.get('execution.max_weekly_loss_pct'),
+    ]);
+
+    let max_position_pct = kvNum(rawMaxPosPct, 0.1);
+    if (max_position_pct <= 0 || max_position_pct > 1) max_position_pct = 0.1;
+
+    let max_open_positions = Math.round(kvNum(rawMaxOpenPos, 10));
+    if (max_open_positions < 1) max_open_positions = 1;
+
+    let max_drawdown_halt_pct = kvNum(rawMaxDrawdown, 25);
+    if (max_drawdown_halt_pct <= 0 || max_drawdown_halt_pct > 100) max_drawdown_halt_pct = 25;
+
+    let max_short_notional_pct = kvNum(rawMaxShortNotionalPct, 0.1);
+    if (max_short_notional_pct <= 0 || max_short_notional_pct > 1) max_short_notional_pct = 0.1;
+
+    const loss_circuit_breaker_enabled = kvBool(rawLossBreakerEnabled, true);
+
+    let max_daily_loss_pct = kvNum(rawMaxDailyLossPct, 0.03);
+    if (max_daily_loss_pct <= 0 || max_daily_loss_pct > 1) max_daily_loss_pct = 0.03;
+
+    let max_weekly_loss_pct = kvNum(rawMaxWeeklyLossPct, 0.06);
+    if (max_weekly_loss_pct <= 0 || max_weekly_loss_pct > 1) max_weekly_loss_pct = 0.06;
+
+    return {
+      max_position_pct,
+      max_open_positions,
+      max_drawdown_halt_pct,
+      max_short_notional_pct,
+      loss_circuit_breaker_enabled,
+      max_daily_loss_pct,
+      max_weekly_loss_pct,
+    };
+  }
+
+  /** Best-effort audit of a pretest entry rejected by the shared kernel risk floor. */
+  private async _auditPretestEntryRejected(
+    pretestId: string,
+    pretestName: string,
+    symbol: string,
+    action: 'long' | 'short',
+    reason: string | undefined,
+  ): Promise<void> {
+    try {
+      await this.audit.log({
+        event_type: 'pretest_entry_rejected',
+        meta: { pretest_id: pretestId, pretest_name: pretestName, symbol, action, reason },
+      });
+    } catch (err) {
+      this.log.warn(`Failed to audit pretest_entry_rejected: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Applies the shared kernel risk floor (GovernedPaperExecutionService.evaluateEntryGate) to
+   * this cycle's tool calls, BEFORE they ever reach `_simulateFills`. This is the safety fix:
+   * pretest previously had NO risk floor at all (no drawdown halt, no max-open-positions, no
+   * daily/weekly circuit breaker) — a pretest portfolio could keep "trading" through an
+   * arbitrarily large drawdown. `exit`/`hold` tool calls are NEVER gated here (closeability
+   * invariant — same as the live account) and pass through untouched.
+   *
+   * A REJECTED long/short tool call is stripped from the returned list (so it never reaches
+   * `_mapIntentAction`/`_simulateFills` — no fill is ever computed for it) and is recorded via
+   * `pretest_entry_rejected` audit event, so a blocked pretest strategy stays observable
+   * instead of silently vanishing.
+   *
+   * Returns the (possibly baseline-reset — day/week rollover, or a fresh mark-to-market hwm)
+   * `state` alongside the filtered tool calls — callers MUST use this returned `state` for
+   * every downstream step (mirrors the live-account gate's contract).
+   *
+   * WITHIN-CYCLE max_open_positions reservation: `evaluateEntryGate` only checks the REAL
+   * (already-persisted) `positions.length` — it has no idea that an earlier tool call in this
+   * SAME cycle was already approved, because fills only happen later in `_simulateFills` /
+   * `_applyTrades`, once, after this whole loop. Without tracking that here, a cycle emitting
+   * 2-3 new-entry tool calls (the ReAct kernel allows up to 3) would gate every one of them
+   * against the SAME static `positions.length`, letting the ceiling be exceeded within a
+   * single cycle — looser than the live account, where each intent is processed/persisted
+   * individually so the next one sees the updated count. `reservedNewSymbols` tracks symbols
+   * provisionally allowed THIS cycle that are not already open positions; adding to an
+   * EXISTING position (a symbol already held, or already reserved this cycle) never consumes
+   * a reservation slot.
+   */
+  private async _applyKernelRiskFloor(
+    pretestId: string,
+    pretestName: string,
+    toolCalls: Array<{ plugin_id: string; function: string; args: Record<string, unknown> }>,
+    state: PretestState,
+  ): Promise<{
+    toolCalls: Array<{ plugin_id: string; function: string; args: Record<string, unknown> }>;
+    state: PretestState;
+  }> {
+    const riskPolicy = await this._readRiskPolicy();
+    let currentState = state;
+    const allowed: Array<{ plugin_id: string; function: string; args: Record<string, unknown> }> =
+      [];
+    const reservedNewSymbols = new Set<string>();
+
+    for (const tc of toolCalls) {
+      const symbol = tc.args['symbol'] as string | undefined;
+      const rawAction = (tc.args['action'] as string | undefined)?.toLowerCase();
+
+      if (!symbol || (rawAction !== 'long' && rawAction !== 'short')) {
+        // exit/hold/unrecognized — never gated here; unrecognized actions are still handled
+        // (or skipped) downstream by _mapIntentAction, unchanged.
+        allowed.push(tc);
+        continue;
+      }
+
+      const governedState: GovernedAccountState = currentState;
+      const gate = await this.governedPaperExec.evaluateEntryGate(governedState, riskPolicy);
+      currentState = { ...currentState, ...gate.state };
+
+      if (!gate.pass) {
+        this.log.warn(
+          `PRETEST ENTRY REJECTED [${pretestName}]: ${rawAction} ${symbol} — ${gate.reason}`,
+        );
+        await this._auditPretestEntryRejected(
+          pretestId,
+          pretestName,
+          symbol,
+          rawAction,
+          gate.reason,
+        );
+        continue; // strip — never reaches _simulateFills
+      }
+
+      // The shared gate above only saw the REAL open positions — it cannot know about other
+      // new-entry tool calls already approved earlier in THIS cycle (they haven't filled yet).
+      // Reject a NEW symbol here once the real + reserved-this-cycle count hits the ceiling.
+      // Adding to an already-held (or already-reserved) symbol never consumes a slot.
+      const alreadyHeld =
+        currentState.positions.some((p) => p.symbol === symbol) || reservedNewSymbols.has(symbol);
+      if (!alreadyHeld) {
+        const effectiveOpenCount = currentState.positions.length + reservedNewSymbols.size;
+        if (effectiveOpenCount >= riskPolicy.max_open_positions) {
+          const reason = `max open positions reached within this cycle (${effectiveOpenCount}/${riskPolicy.max_open_positions})`;
+          this.log.warn(
+            `PRETEST ENTRY REJECTED [${pretestName}]: ${rawAction} ${symbol} — ${reason}`,
+          );
+          await this._auditPretestEntryRejected(pretestId, pretestName, symbol, rawAction, reason);
+          continue; // strip — never reaches _simulateFills
+        }
+        reservedNewSymbols.add(symbol);
+      }
+
+      allowed.push(tc);
+    }
+
+    return { toolCalls: allowed, state: currentState };
   }
 
   /**

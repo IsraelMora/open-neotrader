@@ -9,6 +9,7 @@ import { AuditModule } from '../audit/audit.module';
 import { RealOrderModule } from '../real-order/real-order.module';
 import { RealReconciliationModule } from '../real-reconciliation/real-broker-reconciliation.module';
 import { KvService } from '../common/kv.service';
+import { GovernedPaperExecutionService } from '../execution/governed-paper-execution.service';
 
 @Module({
   imports: [
@@ -26,7 +27,10 @@ import { KvService } from '../common/kv.service';
     // this import does not create a circular module dependency.
     RealReconciliationModule,
   ],
-  providers: [TradeIntentService, KvService],
+  // GovernedPaperExecutionService — shared kernel-gated paper-execution core, also consumed
+  // by PretestModule. Declared here too (not exported from a shared module) since it only
+  // depends on ProviderGatewayService + optional AuditService, both already imported above.
+  providers: [TradeIntentService, KvService, GovernedPaperExecutionService],
   controllers: [TradeIntentController, ExecutionController],
   exports: [TradeIntentService],
 })
