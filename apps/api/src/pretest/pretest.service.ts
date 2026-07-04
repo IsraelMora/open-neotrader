@@ -583,6 +583,12 @@ export class PretestService {
     // guard, and now also filtered by the kernel risk floor above).
     const trades = await this._simulateFills(gated.toolCalls, gated.state, effectivePolicy);
 
+    if (volTargetPlugin) {
+      this.log.warn(
+        `[VOLD] ${portfolio.name} signalsLen=${signals.length} sig0=${JSON.stringify(signals[0])} llmTC=${turnResult.tool_calls.length} merged=${mergedToolCalls.length} gatedTC=${JSON.stringify(gated.toolCalls.map((t) => ({ s: t.args?.['symbol'], a: t.args?.['action'] })))} trades=${JSON.stringify(trades.map((t) => ({ s: t.symbol, a: t.action, q: t.quantity })))}`,
+      );
+    }
+
     // ── Vol-target rebalance of EXISTING long positions toward exposureScalar ──
     const rebalanceTrades = volTargetPlugin
       ? await this._buildVolTargetRebalanceTrades(gated.state, exposureScalar)
