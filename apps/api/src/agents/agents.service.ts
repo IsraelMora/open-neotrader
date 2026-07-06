@@ -553,7 +553,18 @@ export class AgentsService {
       const sr = iter.sandbox_results.find(
         (r) => r.plugin_id === d.plugin_id && r.function === d.function,
       );
-      const resultStr = sr ? JSON.stringify(sr.result).slice(0, 200) : 'null';
+      // A rejected sandbox call resolves as {ok:false, error} with NO `result` key.
+      // `JSON.stringify(undefined)` returns the value `undefined` (not a string), so a
+      // naive `.slice` here crashed the whole turn. Fall back to the error message,
+      // which is also more useful in the ReAct observation than an opaque 'null'.
+      let resultStr: string;
+      if (sr === undefined) {
+        resultStr = 'null';
+      } else if (sr.result !== undefined) {
+        resultStr = JSON.stringify(sr.result).slice(0, 200);
+      } else {
+        resultStr = `err:${String(sr.error ?? 'unknown').slice(0, 200)}`;
+      }
       return `  ${d.plugin_id}.${d.function}(…) -> ok=${String(sr?.ok ?? false)} result=${resultStr}`;
     });
     const toolBlock = toolLines.length > 0 ? `\ntools=[\n${toolLines.join('\n')}\n]` : '';
