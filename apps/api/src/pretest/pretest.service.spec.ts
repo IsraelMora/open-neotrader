@@ -126,8 +126,13 @@ type PrivateMethods = {
     tc: unknown[],
     s: PretestState,
     policy?: PretestPolicy,
+    referenceCloses?: Record<string, number>,
   ) => Promise<PretestTrade[]>;
-  _updateEquityMetrics: (s: PretestState, policy?: PretestPolicy) => Promise<void>;
+  _updateEquityMetrics: (
+    s: PretestState,
+    policy?: PretestPolicy,
+    referenceCloses?: Record<string, number>,
+  ) => Promise<void>;
   _applyTrades: (s: PretestState, trades: PretestTrade[], policy?: PretestPolicy) => PretestState;
   _applyBuy: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
   _applySell: (s: PretestState, t: PretestTrade, commission_pct: number) => void;
@@ -276,6 +281,83 @@ describe('PretestService._simulateFills (Phase 1)', () => {
 
       expect(trades).toHaveLength(0);
     });
+  });
+});
+
+// ── Fill-price integrity guard (production incident 2026-07-04: getQuote.last
+// returned ~half the true price for split-affected ETFs — IWM/SOXL/TECL — on a
+// market-closed weekend. Fills executed at that bad price recorded a cost basis
+// ~2x below reality, so later marking to the correct price produced phantom
+// +50–85% "gains" (Balanceado Momentum +84.8% with a 0% win-rate). The only
+// prior validation was `last <= 0`. This guard cross-checks the fill price
+// against the symbol's latest recent bar close — a DIFFERENT provider endpoint
+// (adjusted OHLCV) than getQuote (raw regularMarketPrice) — and refuses a fill
+// that deviates implausibly. Reference bars are already fetched by runCycle, so
+// the guard adds no network calls. ────────────────────────────────────────────
+describe('PretestService._simulateFills — fill-price integrity guard', () => {
+  it('skips a buy whose quote deviates ~2x from the reference bar close (the incident)', async () => {
+    // getQuote returns the bad half-price (144.40) while recent daily bars say ~298.
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('IWM', 144.4)));
+    const svc = makeService(gateway);
+    const state = makeState({ cash: 100_000 });
+
+    const trades = await asPrivate(svc)._simulateFills(
+      [makeToolCall('IWM', 'buy')],
+      state,
+      undefined,
+      { IWM: 298.9 },
+    );
+
+    expect(trades).toHaveLength(0);
+  });
+
+  it('allows a buy whose quote is within tolerance of the reference bar close', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('IWM', 295)));
+    const svc = makeService(gateway);
+    const state = makeState({ cash: 100_000 });
+
+    const trades = await asPrivate(svc)._simulateFills(
+      [makeToolCall('IWM', 'buy')],
+      state,
+      undefined,
+      { IWM: 298.9 },
+    );
+
+    expect(trades).toHaveLength(1);
+    expect(trades[0].price).toBeCloseTo(295, 2);
+  });
+
+  it('allows the fill when no reference price is available (cannot validate → do not over-block)', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('FOO', 144.4)));
+    const svc = makeService(gateway);
+    const state = makeState({ cash: 100_000 });
+
+    const trades = await asPrivate(svc)._simulateFills(
+      [makeToolCall('FOO', 'buy')],
+      state,
+      undefined,
+      {},
+    );
+
+    expect(trades).toHaveLength(1);
+  });
+
+  it('guards sell-side fills too: a bad-price sell is skipped and the position is left intact', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('IWM', 144.4)));
+    const svc = makeService(gateway);
+    const state = makeState({
+      cash: 0,
+      positions: [{ symbol: 'IWM', quantity: 100, avg_price: 290, current_price: 298 }],
+    });
+
+    const trades = await asPrivate(svc)._simulateFills(
+      [makeToolCall('IWM', 'sell')],
+      state,
+      undefined,
+      { IWM: 298.9 },
+    );
+
+    expect(trades).toHaveLength(0);
   });
 });
 
@@ -541,6 +623,49 @@ describe('PretestService._updateEquityMetrics (Phase 1)', () => {
       expect(state.positions[0].current_price).toBe(30_000);
       expect(state.equity).toBeCloseTo(2_000 + 30_000 * 1); // 32000
     });
+  });
+});
+
+// ── Mark-to-market price integrity guard ──────────────────────────────────────
+// A bad-but-positive quote (the 2026-07-04 half-price failure mode) passes the
+// existing `!isFinite || <=0` check and, at mark time, corrupts equity. Worse
+// than a fill: max_equity and max_drawdown_pct are MONOTONIC high-water-marks
+// (never shrink), so a single phantom tick is baked in permanently and poisons
+// the significance gate/ranking forever. The guard rejects an implausible mark
+// quote (vs the reference bar close) and falls back to last-known price. ───────
+describe('PretestService._updateEquityMetrics — mark-price integrity guard', () => {
+  it('rejects an implausible mark quote and does NOT poison max_drawdown_pct', async () => {
+    // getQuote returns the bad half-price; reference bar close says ~298.
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('IWM', 144.4)));
+    const svc = makeService(gateway);
+    const state = makeState({
+      cash: 0,
+      positions: [{ symbol: 'IWM', quantity: 100, avg_price: 290, current_price: 298 }],
+      max_equity: 30_000,
+    });
+
+    await asPrivate(svc)._updateEquityMetrics(state, undefined, { IWM: 298.9 });
+
+    // Falls back to last-known current_price (298), NOT the bad 144.40.
+    expect(state.positions[0].current_price).toBe(298);
+    expect(state.equity).toBeCloseTo(29_800);
+    // A ~52% phantom drawdown must NOT be baked into the monotonic HWM.
+    expect(state.max_drawdown_pct).toBeLessThan(5);
+  });
+
+  it('accepts a plausible mark quote within tolerance of the reference close', async () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('IWM', 305)));
+    const svc = makeService(gateway);
+    const state = makeState({
+      cash: 0,
+      positions: [{ symbol: 'IWM', quantity: 100, avg_price: 290, current_price: 298 }],
+      max_equity: 30_000,
+    });
+
+    await asPrivate(svc)._updateEquityMetrics(state, undefined, { IWM: 298.9 });
+
+    expect(state.positions[0].current_price).toBe(305);
+    expect(state.equity).toBeCloseTo(30_500);
   });
 });
 
@@ -4667,6 +4792,40 @@ describe('PretestService.runCycle — vol_target exposure scalar wiring', () => 
         }
       )._buildVolTargetRebalanceTrades(state, 0.5);
       expect(trades).toEqual([]);
+    });
+
+    // Third durable-corruption path (found in fresh review): the vol-target rebalance
+    // prices trades from _freshMarks' raw getQuote, which — for Vol-Managed TECL/SOXL,
+    // the exact incident symbols — could book a real buy/sell at the bad half-price and
+    // permanently corrupt avg_price. The guard rejects the implausible fresh mark so the
+    // rebalance falls back to the last-known price.
+    it('ignores an implausible fresh mark and rebalances at the last-known price', async () => {
+      // getQuote returns a bad ~half price (45, a 55% deviation like the ~52% incident);
+      // reference bar close says 100.
+      const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 45)));
+      const svc = makeService(gateway);
+      const state = makeState({
+        equity: 100_000,
+        cash: 0,
+        positions: [{ symbol: 'SPY', quantity: 800, avg_price: 100, current_price: 100 }],
+      });
+
+      const trades = await (
+        asPrivate(svc) as unknown as {
+          _buildVolTargetRebalanceTrades: (
+            s: PretestState,
+            scalar: number,
+            referenceCloses?: Record<string, number>,
+          ) => Promise<PretestTrade[]>;
+        }
+      )._buildVolTargetRebalanceTrades(state, 0.5, { SPY: 100 });
+
+      // With the bad mark rejected, priceOf falls back to current_price=100:
+      // invested 80_000, target 50_000 → SELL 300 @ 100 (NOT a phantom BUY @ 50).
+      expect(trades).toHaveLength(1);
+      expect(trades[0].action).toBe('sell');
+      expect(trades[0].price).toBeCloseTo(100, 2);
+      expect(trades[0].quantity).toBe(300);
     });
   });
 });

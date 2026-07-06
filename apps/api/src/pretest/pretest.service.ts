@@ -61,6 +61,20 @@ const POLICY_DEFAULTS: PretestPolicy = {
   borrow_cost_pct: 0.0001,
 };
 
+/**
+ * Fill-price integrity guard threshold. A simulated fill is rejected when its
+ * getQuote.last price deviates from the symbol's latest recent bar close by more
+ * than this fraction. Motivated by the 2026-07-04 incident: getQuote.last
+ * returned ~half the true price for split-affected ETFs (IWM/SOXL/TECL) on a
+ * market-closed weekend, so fills recorded a cost basis ~2x below reality and
+ * later marked to phantom +50-85% gains. The bad price was a clean ~100%
+ * deviation; 0.5 (50%) catches it with wide margin while still allowing the
+ * large-but-real single-day moves that 3x leveraged ETFs (SOXL/TECL) can print.
+ * The reference comes from getOhlcv (adjusted close) — a DIFFERENT provider
+ * endpoint than getQuote (raw regularMarketPrice) — giving an independent cross-check.
+ */
+const MAX_FILL_PRICE_DEVIATION = 0.5;
+
 /** Buy & hold benchmark for the alpha gate. SPY = broad US-equity index proxy. */
 const BENCHMARK_SYMBOL = 'SPY';
 
@@ -589,12 +603,19 @@ export class PretestService {
 
     // ── Simular fills (async: price from getQuote.last + slippage) ────────────
     // Use validated tool_calls from the governed turn (providers already dropped by virtual
-    // guard, and now also filtered by the kernel risk floor above).
-    const trades = await this._simulateFills(gated.toolCalls, gated.state, effectivePolicy);
+    // guard, and now also filtered by the kernel risk floor above). Reference closes from
+    // the already-fetched market bars arm the fill-price integrity guard at no extra cost.
+    const referenceCloses = this._latestCloses(market.ohlcv);
+    const trades = await this._simulateFills(
+      gated.toolCalls,
+      gated.state,
+      effectivePolicy,
+      referenceCloses,
+    );
 
     // ── Vol-target rebalance of EXISTING long positions toward exposureScalar ──
     const rebalanceTrades = volTargetPlugin
-      ? await this._buildVolTargetRebalanceTrades(gated.state, exposureScalar)
+      ? await this._buildVolTargetRebalanceTrades(gated.state, exposureScalar, referenceCloses)
       : [];
 
     // Actualizar estado virtual (sync trade application + commission, async MTM equity)
@@ -603,7 +624,7 @@ export class PretestService {
       [...trades, ...rebalanceTrades],
       effectivePolicy,
     );
-    await this._updateEquityMetrics(newState, effectivePolicy);
+    await this._updateEquityMetrics(newState, effectivePolicy, referenceCloses);
 
     await this.db.pretestPortfolio.update({
       where: { id },
@@ -1183,6 +1204,22 @@ export class PretestService {
    * `universe` array — they must reach ctx["ohlcv"] without being treated as a
    * momentum/trend-following ranking candidate.
    */
+  /**
+   * Latest close per symbol from the market bars, used as the independent
+   * reference for the fill-price integrity guard. Skips symbols with no usable
+   * final close (empty series / non-finite value) — the guard treats a missing
+   * reference as "cannot validate → allow".
+   */
+  private _latestCloses(ohlcv: Record<string, unknown[]>): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [symbol, bars] of Object.entries(ohlcv)) {
+      const lastBar = bars[bars.length - 1] as { close?: unknown } | undefined;
+      const close = Number(lastBar?.close);
+      if (Number.isFinite(close) && close > 0) out[symbol] = close;
+    }
+    return out;
+  }
+
   private async _buildMarketContext(extraSymbols: string[] = []): Promise<{
     universe: string[];
     ohlcv: Record<string, unknown[]>;
@@ -1565,10 +1602,29 @@ export class PretestService {
    * Slippage is applied at fill time: buy = last*(1+slippage_pct), sell = last*(1-slippage_pct).
    * On getQuote rejection: skip the trade entirely (log warning, no throw).
    */
+  /**
+   * True when `price` is close enough to the symbol's reference bar close to be a
+   * trustworthy quote — used for both fill prices and mark-to-market marks. When
+   * no finite/positive reference exists we CANNOT validate, so we allow it: the
+   * guard must never block on momentarily-unavailable reference data (that would
+   * silently halt all pretest trading/marking on any OHLCV outage). See
+   * MAX_FILL_PRICE_DEVIATION.
+   */
+  private _isQuotePlausible(
+    symbol: string,
+    last: number,
+    referenceCloses: Record<string, number>,
+  ): boolean {
+    const ref = referenceCloses[symbol];
+    if (!Number.isFinite(ref) || ref <= 0) return true;
+    return Math.abs(last / ref - 1) <= MAX_FILL_PRICE_DEVIATION;
+  }
+
   async _simulateFills(
     toolCalls: Array<{ plugin_id: string; function: string; args: Record<string, unknown> }>,
     state: PretestState,
     policy: PretestPolicy = POLICY_DEFAULTS,
+    referenceCloses: Record<string, number> = {},
   ): Promise<PretestTrade[]> {
     const trades: PretestTrade[] = [];
     for (const tc of toolCalls) {
@@ -1588,6 +1644,17 @@ export class PretestService {
       }
 
       if (last <= 0) continue;
+
+      // Fill-price integrity guard: refuse a quote that deviates implausibly from
+      // the symbol's latest recent bar close (independent provider endpoint).
+      // Prevents the 2026-07-04 phantom-gains incident from recurring.
+      if (!this._isQuotePlausible(symbol, last, referenceCloses)) {
+        this.log.warn(
+          `Fill skipped for ${symbol}: quote ${last} deviates >${MAX_FILL_PRICE_DEVIATION * 100}% ` +
+            `from reference close ${referenceCloses[symbol]} — likely bad/stale price data`,
+        );
+        continue;
+      }
 
       // Apply slippage: buy/cover (both buy-side executions) fill at a higher
       // price; sell/close/short (both sell-side executions) fill at a lower price.
@@ -1655,12 +1722,27 @@ export class PretestService {
   /** Fresh marks for every held long position; falls back to last-known mark
    * (or cost basis) on a getQuote failure — never throws. Extracted from
    * _buildVolTargetRebalanceTrades to keep its cognitive complexity low. */
-  private async _freshMarks(positions: PretestPosition[]): Promise<Map<string, number>> {
+  private async _freshMarks(
+    positions: PretestPosition[],
+    referenceCloses: Record<string, number> = {},
+  ): Promise<Map<string, number>> {
     const marks = new Map<string, number>();
     for (const pos of positions) {
       try {
         const quote = await this.gateway.getQuote(null, pos.symbol);
-        if (isFinite(quote.last) && quote.last > 0) marks.set(pos.symbol, quote.last);
+        // Same integrity guard as fills/MTM: an implausible mark here would price a
+        // real rebalance trade and permanently corrupt avg_price. Skip it so priceOf
+        // falls back to the last-known mark.
+        if (!isFinite(quote.last) || quote.last <= 0) {
+          /* unusable quote — silent skip, priceOf falls back to last-known mark */
+        } else if (this._isQuotePlausible(pos.symbol, quote.last, referenceCloses)) {
+          marks.set(pos.symbol, quote.last);
+        } else {
+          this.log.warn(
+            `Rebalance mark guard for ${pos.symbol}: quote ${quote.last} deviates ` +
+              `>${MAX_FILL_PRICE_DEVIATION * 100}% from reference close ${referenceCloses[pos.symbol]} — using last-known`,
+          );
+        }
       } catch {
         /* fall through to last-known mark below */
       }
@@ -1718,11 +1800,12 @@ export class PretestService {
   private async _buildVolTargetRebalanceTrades(
     state: PretestState,
     exposureScalar: number,
+    referenceCloses: Record<string, number> = {},
   ): Promise<PretestTrade[]> {
     const longPositions = state.positions.filter((p) => p.quantity > 0);
     if (longPositions.length === 0 || !isFinite(exposureScalar) || exposureScalar < 0) return [];
 
-    const marks = await this._freshMarks(longPositions);
+    const marks = await this._freshMarks(longPositions, referenceCloses);
     const priceOf = (pos: PretestPosition): number =>
       marks.get(pos.symbol) ?? pos.current_price ?? pos.avg_price;
 
@@ -1900,6 +1983,7 @@ export class PretestService {
   async _updateEquityMetrics(
     state: PretestState,
     policy: PretestPolicy = POLICY_DEFAULTS,
+    referenceCloses: Record<string, number> = {},
   ): Promise<void> {
     await Promise.all(
       state.positions.map(async (pos) => {
@@ -1912,6 +1996,16 @@ export class PretestService {
             const fallback = pos.current_price ?? pos.avg_price;
             this.log.warn(
               `MTM fallback for ${pos.symbol}: quote.last=${quote.last} is not a positive finite number, using ${fallback}`,
+            );
+            marketPrice = fallback;
+          } else if (!this._isQuotePlausible(pos.symbol, quote.last, referenceCloses)) {
+            // Bad-but-positive quote (the 2026-07-04 half-price failure mode). Accepting
+            // it here would permanently poison the monotonic max_equity / max_drawdown_pct
+            // HWMs and the significance gate. Fall back to the last-known price instead.
+            const fallback = pos.current_price ?? pos.avg_price;
+            this.log.warn(
+              `MTM guard for ${pos.symbol}: quote ${quote.last} deviates >${MAX_FILL_PRICE_DEVIATION * 100}% ` +
+                `from reference close ${referenceCloses[pos.symbol]} — using ${fallback}`,
             );
             marketPrice = fallback;
           } else {
@@ -1951,7 +2045,11 @@ export class PretestService {
     // untouched so the alpha gate simply skips (never blocks) this cycle.
     try {
       const bench = await this.gateway.getQuote(null, BENCHMARK_SYMBOL);
-      if (isFinite(bench.last) && bench.last > 0) {
+      if (
+        isFinite(bench.last) &&
+        bench.last > 0 &&
+        this._isQuotePlausible(BENCHMARK_SYMBOL, bench.last, referenceCloses)
+      ) {
         if (state.benchmark_start_price === undefined) {
           state.benchmark_start_price = bench.last;
         }
