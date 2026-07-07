@@ -40,4 +40,4 @@ vol_window      = { type = "integer", default = 21,  description = "Ventana (bar
 max_leverage    = { type = "number", default = 1.0,  description = "Tope de exposición con vol targeting (1.0 = sin apalancamiento)" }
 
 [skills]
-keys = ["backtester.run", "backtester.run_walk_forward", "backtester.run_cross_sectional"]
+keys = ["backtester.run", "backtester.run_walk_forward", "backtester.run_cross_sectional", "backtester.run_cross_sectional_walk_forward"]

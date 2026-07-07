@@ -14,6 +14,7 @@ Verdict:
 """
 from __future__ import annotations
 
+import statistics
 import sys
 from pathlib import Path
 
@@ -23,6 +24,7 @@ _SCRIPTS_STR = str(_SCRIPTS_DIR)
 if _SCRIPTS_STR not in sys.path:
     sys.path.insert(0, _SCRIPTS_STR)
 
+from cross_sectional import run_cross_sectional  # noqa: E402
 from engine import run_backtest  # noqa: E402
 from generate import generate_signals  # noqa: E402
 
@@ -263,4 +265,261 @@ def _backtest_window(
         "win_rate_pct": result.win_rate_pct,
         "profit_factor": result.profit_factor,
         "max_drawdown_pct": result.max_drawdown_pct,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-sectional (portfolio-level) walk-forward
+# ---------------------------------------------------------------------------
+#
+# Same ANCHORED walk-forward semantics as run_walk_forward() above (Pardo 2008):
+# IS always starts at bar 0 and grows; the OOS window slides forward each fold.
+# Window-boundary math (oos_total/oos_per_window/oos_end_idx/oos_start_idx/
+# is_end_idx) is IDENTICAL to run_walk_forward, and slicing reuses the same
+# _slice_prices helper. The engine itself is run_cross_sectional() (imported from
+# cross_sectional.py, not duplicated) on each window's price slice.
+#
+# WARMUP PREFIX (cross-sectional-specific, differs from the per-symbol version):
+# the per-symbol strategies warm up internally from each slice's own bars, but the
+# cross-sectional momentum engine needs `lookback+skip` PRIOR bars before it can
+# emit its first signal — a bare [oos_start, oos_end) slice of typical size (e.g.
+# 90 bars with lookback 252) cannot even run ("Insufficient overlapping history"),
+# and a slightly-larger bare slice would spend most of its bars in a warmup dead
+# zone (holdings=[], exact-zero returns) that silently DEFLATES OOS Sharpe. So
+# each OOS run receives a warmup prefix of exactly (lookback + skip + 1) bars taken
+# from the bars immediately BEFORE oos_start. This is legitimately no-lookahead:
+# every prefix bar is in the past relative to every OOS bar (it may overlap the IS
+# period — that is the past, which live trading would also have) and the prefix
+# never extends past oos_start into OOS-future data. Metrics isolation is enforced
+# via run_cross_sectional's `metrics_start_bar` config: signals may use the prefix,
+# but equity/metrics/benchmark are computed only from the true OOS start onward.
+# IS runs get the SAME metrics_start_bar treatment (their first lookback+skip+1
+# bars are also a dead zone) — the robustness ratio compares IS vs OOS Sharpe, and
+# excluding warmup on only one side would systematically bias the ratio.
+#
+# Verdict vocabulary and thresholds mirror run_walk_forward()/compute_verdict()
+# EXACTLY (same function, reused, not reimplemented) — only the per-window inputs
+# differ:
+#   - "valid window"   : per-symbol validity is `oos_trades >= min_trades` (enough
+#                        OOS trades to trust the ratio). The portfolio analog has
+#                        no discrete trade count; the equivalent floor is that BOTH
+#                        the IS and OOS cross-sectional backtests for that window
+#                        actually ran (`is_ok and oos_ok` — i.e. run_cross_sectional
+#                        didn't hit its own "Insufficient overlapping history"
+#                        error on that slice). A window that failed to produce a
+#                        result carries no statistical information, same as a
+#                        window with too few trades.
+#   - robustness_ratio : identical formula, reused verbatim — compute_robustness_ratio
+#                        (oos_sharpe / is_sharpe, 0 when |is_sharpe| <= 0.01).
+#   - ROBUSTO          : >= 50% of valid windows have robustness_ratio >= 0.5 (same
+#                        threshold, same compute_verdict call).
+#   - SOBREAJUSTADO    : < 50% of valid windows are robust (same).
+#   - INSUFICIENTE_DATOS: < 2 valid windows, OR fewer than _MIN_DATA_BARS total bars,
+#                        OR no price data (same floor as run_walk_forward).
+#
+# Additional cross-sectional-only aggregates (per the design brief, not present in
+# the per-symbol version): median_oos_sharpe (mean alone can be skewed by one
+# outlier window) and pct_positive_oos_windows (breadth check — are OOS windows
+# NET positive, independent of Sharpe).
+
+
+# Minimum EVALUATED (post-warmup) OOS bars per window — roughly one rebalance
+# period. Below this a window's OOS stats are statistically meaningless noise,
+# so the geometry is rejected upfront instead of quietly feeding the verdict.
+_MIN_OOS_EVAL_BARS = 21
+
+
+def _cs_wf_insufficient(error_msg: str | None = None) -> dict:
+    """Shared 'not enough data' shape — same fields/verdict as run_walk_forward's
+    early-return paths, adapted to the cross-sectional result shape."""
+    return {
+        "ok": True,
+        "n_windows": 0,
+        "avg_oos_sharpe": 0.0,
+        "median_oos_sharpe": 0.0,
+        "avg_robustness_ratio": 0.0,
+        "robust_windows": 0,
+        "total_windows": 0,
+        "verdict": "INSUFICIENTE_DATOS",
+        "windows": [],
+        "summary": ({"error": error_msg} if error_msg else {}),
+    }
+
+
+def run_cross_sectional_walk_forward(prices: dict, config: dict) -> dict:
+    """
+    Execute anchored walk-forward validation for the cross-sectional momentum
+    portfolio engine (run_cross_sectional). See the module comment above for how
+    this mirrors run_walk_forward()'s window-splitting, no-lookahead slicing, and
+    verdict vocabulary/thresholds.
+
+    Args:
+        prices : {symbol: [bars]} — same format as run_cross_sectional().
+        config : cross-sectional config (top_n, lookback, skip, vol_target,
+                 weighting, regime_filter, ...) PLUS walk-forward params:
+                   n_windows     (int,   default 5)
+                   in_sample_pct (float, default 0.7)
+                 The SAME config dict is passed to run_cross_sectional() for every
+                 IS/OOS slice in every window, with a single addition: this
+                 function sets `metrics_start_bar` to the warmup length
+                 (lookback+skip+1) so warmup bars never pollute window metrics
+                 (see the module comment above). Everything else is untouched.
+
+    Returns: same shape as run_walk_forward(), plus median_oos_sharpe and
+        summary.pct_positive_oos_windows. Each window entry also carries
+        is_dropped_symbols/oos_dropped_symbols (thin-symbol drops, capability 1),
+        is_ok/oos_ok (whether that slice's backtest ran at all) and
+        oos_warmup_start (index of the first warmup-prefix bar for the OOS run).
+    """
+    n_windows = int(config.get("n_windows", 5))
+    in_sample_pct = float(config.get("in_sample_pct", 0.7))
+    lookback = int(config.get("lookback", 252))
+    skip = int(config.get("skip", 21))  # same default as run_cross_sectional
+    # Warmup dead zone of the cross-sectional engine: lookback+skip bars before the
+    # first momentum read, +1 so the first EVALUATED bar already has a "yesterday"
+    # position/return. Used both as the OOS warmup-prefix length and as the
+    # metrics_start_bar for IS and OOS runs (symmetric — see module comment).
+    warmup_bars = lookback + skip + 1
+
+    if not prices:
+        return _cs_wf_insufficient("No price data")
+
+    ref_symbol = max(prices, key=lambda s: len(prices[s]))
+    n = len(prices[ref_symbol])
+
+    if n < _MIN_DATA_BARS:
+        return _cs_wf_insufficient(f"Need at least {_MIN_DATA_BARS} bars, got {n}")
+
+    oos_total = n - int(n * in_sample_pct)
+    oos_per_window = max(1, oos_total // n_windows)
+
+    # Anchored: window 0 has the SMALLEST in-sample slice (IS only grows from
+    # there). Validate lookback against that floor up front — a fail-fast check
+    # in the same spirit as cross_sectional.py's `skip >= lookback` guard, so a
+    # misconfigured lookback errors clearly instead of silently producing
+    # zero-signal windows.
+    smallest_is_end_idx = n - n_windows * oos_per_window
+    if lookback >= smallest_is_end_idx:
+        return _cs_wf_insufficient(
+            f"lookback ({lookback}) must be less than the smallest in-sample "
+            f"window size ({smallest_is_end_idx} bars) — reduce n_windows/lookback "
+            "or provide more price history"
+        )
+    # The OOS warmup prefix must fit entirely before the FIRST OOS window's start
+    # (which equals smallest_is_end_idx) — otherwise there is no full-warmup slice
+    # to give the earliest window.
+    if warmup_bars >= smallest_is_end_idx:
+        return _cs_wf_insufficient(
+            f"warmup (lookback {lookback} + skip {skip} + 1 = {warmup_bars} bars) "
+            f"must fit before the first OOS window start ({smallest_is_end_idx} "
+            "bars) — reduce n_windows/lookback/skip or provide more price history"
+        )
+    # Evaluated-OOS floor: each window's genuine (post-warmup) OOS span must be
+    # long enough to carry statistical meaning (~one rebalance period).
+    if oos_per_window < _MIN_OOS_EVAL_BARS:
+        return _cs_wf_insufficient(
+            f"oos window {oos_per_window} bars evaluated < {_MIN_OOS_EVAL_BARS} "
+            "minimum — increase limit or reduce n_windows/lookback"
+        )
+
+    window_results = []
+
+    for w in range(n_windows):
+        oos_end_idx = n - (n_windows - 1 - w) * oos_per_window
+        oos_start_idx = oos_end_idx - oos_per_window
+        is_end_idx = oos_start_idx  # IS = [0 .. is_end_idx)
+
+        if is_end_idx < 20 or oos_end_idx > n or oos_start_idx >= oos_end_idx:
+            continue
+
+        # OOS slice = (lookback+skip+1)-bar warmup prefix (the bars immediately
+        # BEFORE oos_start — strictly past data, never OOS-future) + the genuine
+        # OOS window. metrics_start_bar makes the engine evaluate metrics only
+        # from the genuine OOS start; the IS run gets the same metrics_start_bar
+        # so its own warmup dead zone is excluded symmetrically (unbiased ratio).
+        oos_warmup_start_idx = oos_start_idx - warmup_bars  # >= 1 by the guard above
+        is_prices = _slice_prices(prices, 0, is_end_idx)
+        oos_prices = _slice_prices(prices, oos_warmup_start_idx, oos_end_idx)
+        window_config = {**config, "metrics_start_bar": warmup_bars}
+
+        is_result = run_cross_sectional(is_prices, window_config)
+        oos_result = run_cross_sectional(oos_prices, window_config)
+
+        is_ok = bool(is_result.get("ok"))
+        oos_ok = bool(oos_result.get("ok"))
+
+        is_sharpe = is_result["metrics"]["sharpe_ratio"] if is_ok else 0.0
+        oos_sharpe = oos_result["metrics"]["sharpe_ratio"] if oos_ok else 0.0
+        robustness = (
+            compute_robustness_ratio(oos_sharpe, is_sharpe) if (is_ok and oos_ok) else 0.0
+        )
+
+        window_results.append({
+            "window_idx": w,
+            "is_start": 0,
+            "is_end": is_end_idx,
+            "oos_start": oos_start_idx,
+            "oos_end": oos_end_idx,
+            "oos_warmup_start": oos_warmup_start_idx,
+            "is_ok": is_ok,
+            "oos_ok": oos_ok,
+            "is_sharpe": round(is_sharpe, 3),
+            "oos_sharpe": round(oos_sharpe, 3),
+            "is_cagr_pct": round(is_result["metrics"]["cagr_pct"], 3) if is_ok else 0.0,
+            "oos_cagr_pct": round(oos_result["metrics"]["cagr_pct"], 3) if oos_ok else 0.0,
+            "is_max_drawdown_pct": (
+                round(is_result["metrics"]["max_drawdown_pct"], 3) if is_ok else 0.0
+            ),
+            "oos_max_drawdown_pct": (
+                round(oos_result["metrics"]["max_drawdown_pct"], 3) if oos_ok else 0.0
+            ),
+            "oos_total_return_pct": (
+                round(oos_result["metrics"]["total_return_pct"], 3) if oos_ok else 0.0
+            ),
+            "is_dropped_symbols": is_result.get("dropped_symbols", []) if is_ok else [],
+            "oos_dropped_symbols": oos_result.get("dropped_symbols", []) if oos_ok else [],
+            "robustness_ratio": round(robustness, 3),
+        })
+
+    if not window_results:
+        return _cs_wf_insufficient()
+
+    valid = [w for w in window_results if w["is_ok"] and w["oos_ok"]]
+
+    if not valid:
+        avg_oos_sharpe = median_oos_sharpe = avg_robustness = 0.0
+        pct_positive_oos = 0.0
+        robust_count = 0
+    else:
+        oos_sharpes = [w["oos_sharpe"] for w in valid]
+        avg_oos_sharpe = sum(oos_sharpes) / len(valid)
+        median_oos_sharpe = statistics.median(oos_sharpes)
+        avg_robustness = sum(w["robustness_ratio"] for w in valid) / len(valid)
+        robust_count = sum(1 for w in valid if w["robustness_ratio"] >= 0.5)
+        pct_positive_oos = sum(1 for w in valid if w["oos_total_return_pct"] > 0) / len(valid)
+
+    verdict = compute_verdict(robust_count, len(valid))
+
+    summary: dict = {}
+    if valid:
+        summary = {
+            "avg_oos_cagr_pct": round(sum(w["oos_cagr_pct"] for w in valid) / len(valid), 3),
+            "avg_oos_max_drawdown_pct": round(
+                sum(w["oos_max_drawdown_pct"] for w in valid) / len(valid), 3
+            ),
+            "pct_positive_oos_windows": round(pct_positive_oos, 3),
+            "pct_robust_windows": round(robust_count / len(valid), 3),
+        }
+
+    return {
+        "ok": True,
+        "n_windows": len(window_results),
+        "avg_oos_sharpe": round(avg_oos_sharpe, 3),
+        "median_oos_sharpe": round(median_oos_sharpe, 3),
+        "avg_robustness_ratio": round(avg_robustness, 3),
+        "robust_windows": robust_count,
+        "total_windows": len(valid),
+        "verdict": verdict,
+        "windows": window_results,
+        "summary": summary,
     }

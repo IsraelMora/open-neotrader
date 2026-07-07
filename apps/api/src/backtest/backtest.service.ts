@@ -3,6 +3,7 @@ import { ProviderGatewayService } from '../providers/provider-gateway.service';
 import { SandboxGateway } from '../sandbox/sandbox.gateway';
 import { RunBacktestDto } from './dto/run-backtest.dto';
 import { CrossSectionalDto } from './dto/cross-sectional.dto';
+import { CrossSectionalWalkForwardDto } from './dto/cross-sectional-walk-forward.dto';
 import { StrategyService } from '../strategy/strategy.service';
 
 /** Universo por defecto cuando una estrategia no define cycle.universe. */
@@ -83,6 +84,27 @@ export interface WalkForwardResponse {
   verdict: 'ROBUSTO' | 'SOBREAJUSTADO' | 'INSUFICIENTE_DATOS';
   n_windows: number;
   avg_oos_sharpe: number;
+  avg_robustness_ratio: number;
+  robust_windows: number;
+  total_windows: number;
+  windows: Record<string, unknown>[];
+  summary?: Record<string, unknown>;
+  /** Present when the backtested symbols came from a curated universe (see isCuratedUniverse). */
+  survivorship_warning?: string | null;
+}
+
+/**
+ * Anchored walk-forward validation result for the cross-sectional (portfolio-level)
+ * momentum engine. Same verdict vocabulary/thresholds as WalkForwardResponse, plus
+ * median_oos_sharpe (portfolio-level aggregate not present in the per-symbol version).
+ * RESEARCH-ONLY: this is never persisted (see BacktestController.crossSectionalWalkForward).
+ */
+export interface CrossSectionalWalkForwardResponse {
+  ok: true;
+  verdict: 'ROBUSTO' | 'SOBREAJUSTADO' | 'INSUFICIENTE_DATOS';
+  n_windows: number;
+  avg_oos_sharpe: number;
+  median_oos_sharpe: number;
   avg_robustness_ratio: number;
   robust_windows: number;
   total_windows: number;
@@ -330,6 +352,52 @@ export class BacktestService {
     const result = response.result as CrossSectionalResponse & { ok: boolean; error?: string };
     if (!result.ok) {
       throw new BadGatewayException(`Cross-sectional error: ${result.error ?? 'unknown error'}`);
+    }
+    return { ...result, survivorship_warning: survivorshipWarningFor(dto.symbols) };
+  }
+
+  /**
+   * Anchored walk-forward validation for the cross-sectional momentum portfolio engine —
+   * the portfolio-level analog of runWalkForward. RESEARCH-ONLY: never persists anything
+   * (no strategy_row_id, no DB write) — see BacktestController.crossSectionalWalkForward
+   * for why this route also skips WalkForwardTotpGuard.
+   */
+  async runCrossSectionalWalkForward(
+    dto: CrossSectionalWalkForwardDto,
+  ): Promise<CrossSectionalWalkForwardResponse> {
+    const prices = await this._buildPrices(dto);
+    const config: Record<string, unknown> = {
+      initial_capital: dto.capital ?? 10000,
+      ...(dto.top_n !== undefined ? { top_n: dto.top_n } : {}),
+      ...(dto.rebalance_days !== undefined ? { rebalance_days: dto.rebalance_days } : {}),
+      ...(dto.lookback !== undefined ? { lookback: dto.lookback } : {}),
+      ...(dto.skip !== undefined ? { skip: dto.skip } : {}),
+      ...(dto.commission_pct !== undefined ? { commission_pct: dto.commission_pct } : {}),
+      ...(dto.slippage_pct !== undefined ? { slippage_pct: dto.slippage_pct } : {}),
+      ...(dto.vol_target !== undefined ? { vol_target: dto.vol_target } : {}),
+      ...(dto.vol_window !== undefined ? { vol_window: dto.vol_window } : {}),
+      ...(dto.max_leverage !== undefined ? { max_leverage: dto.max_leverage } : {}),
+      n_windows: dto.n_windows ?? 5,
+      in_sample_pct: dto.in_sample_pct ?? 0.7,
+      ...(dto.params ?? {}),
+    };
+
+    const response = await this.sandbox.callPlugin(
+      'backtester',
+      'run_cross_sectional_walk_forward',
+      { prices, config },
+    );
+    if (!response.ok) {
+      throw new BadGatewayException(`Sandbox error: ${response.error ?? 'unknown error'}`);
+    }
+    const result = response.result as CrossSectionalWalkForwardResponse & {
+      ok: boolean;
+      error?: string;
+    };
+    if (!result.ok) {
+      throw new BadGatewayException(
+        `Cross-sectional walk-forward error: ${result.error ?? 'unknown error'}`,
+      );
     }
     return { ...result, survivorship_warning: survivorshipWarningFor(dto.symbols) };
   }

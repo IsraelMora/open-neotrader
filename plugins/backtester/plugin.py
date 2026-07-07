@@ -17,6 +17,9 @@ from cross_sectional import run_cross_sectional as _run_cross_sectional  # noqa:
 from engine import run_backtest  # noqa: E402
 from generate import generate_signals  # noqa: E402
 from walk_forward import run_walk_forward as _run_walk_forward  # noqa: E402
+from walk_forward import (  # noqa: E402
+    run_cross_sectional_walk_forward as _run_cross_sectional_walk_forward,
+)
 
 
 def run_cross_sectional(prices: dict, config: dict, _context=None) -> dict:
@@ -37,6 +40,29 @@ def run_cross_sectional(prices: dict, config: dict, _context=None) -> dict:
         return _run_cross_sectional(prices, config)
     except Exception as exc:  # noqa: BLE001 — surface as structured error
         return {"ok": False, "error": f"Cross-sectional backtest failed: {exc}"}
+
+
+def run_cross_sectional_walk_forward(prices: dict, config: dict, _context=None) -> dict:
+    """Anchored walk-forward validation for the cross-sectional momentum portfolio
+    engine (Pardo 2008 semantics, same as run_walk_forward but at the portfolio
+    level — reuses run_cross_sectional per IS/OOS window instead of duplicating
+    the engine).
+
+    Args:
+        prices: {symbol: [normalized bars with date/open/high/low/close/volume]}
+        config: {top_n, lookback, skip, vol_target, weighting, regime_filter, ...,
+                 n_windows, in_sample_pct}
+    Returns:
+        {ok, verdict, n_windows, avg_oos_sharpe, median_oos_sharpe,
+         avg_robustness_ratio, robust_windows, total_windows, windows, summary}
+        or {ok: False, error}
+    """
+    if not prices:
+        return {"ok": False, "error": "No price data provided"}
+    try:
+        return _run_cross_sectional_walk_forward(prices, config)
+    except Exception as exc:  # noqa: BLE001 — surface as structured error
+        return {"ok": False, "error": f"Cross-sectional walk-forward failed: {exc}"}
 
 
 def run(
