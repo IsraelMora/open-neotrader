@@ -355,6 +355,32 @@ export class PretestService {
     return this._hydrate(row);
   }
 
+  /**
+   * Equity time-series de los portfolios de pretest ACTIVOS, para el endpoint
+   * GET /pretest/nav-history. Últimos 500 puntos por portfolio, en orden cronológico
+   * ascendente — misma estrategia que SnapshotService.getHistory: `orderBy: 'desc'` +
+   * `take: 500` (los N más recientes) y luego `.reverse()` en memoria, NUNCA
+   * `orderBy: 'asc'` + take (eso devolvería los N más VIEJOS, no los más recientes).
+   */
+  async getNavHistory(): Promise<{ series: Record<string, { ts: string; equity: number }[]> }> {
+    const active = await this.db.pretestPortfolio.findMany({ where: { is_active: true } });
+    const series: Record<string, { ts: string; equity: number }[]> = {};
+
+    for (const p of active) {
+      const rows = await this.db.pretestNavSnapshot.findMany({
+        where: { portfolio_id: p.id },
+        orderBy: { ts: 'desc' },
+        take: 500,
+      });
+      series[p.name] = rows
+        .slice()
+        .reverse()
+        .map((r) => ({ ts: r.ts.toISOString(), equity: r.equity }));
+    }
+
+    return { series };
+  }
+
   /** Actualiza metadatos o configuración de un portfolio (nombre, plugins, config, estado activo). */
   async update(
     id: string,
@@ -634,6 +660,23 @@ export class PretestService {
         last_run_at: new Date(),
       },
     });
+
+    // nav-data-collection F2: persist a point-in-time equity snapshot for this pretest
+    // portfolio, right after its state row is persisted above. Fail-soft: an insert
+    // failure here must never break the cycle result.
+    try {
+      await this.db.pretestNavSnapshot.create({
+        data: {
+          portfolio_id: id,
+          equity: newState.equity,
+          cash: newState.cash,
+          positions_count: newState.positions.length,
+          run_count: portfolio.run_count + 1,
+        },
+      });
+    } catch (e) {
+      this.log.warn(`[NAV] pretest snapshot insert failed for portfolio ${id}: ${e}`);
+    }
 
     return {
       portfolio: { ...portfolio, state: newState },

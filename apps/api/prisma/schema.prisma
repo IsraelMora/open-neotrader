@@ -362,3 +362,19 @@ model PretestPortfolio {
 
   @@map("pretest_portfolios")
 }
+
+// nav-data-collection F2: point-in-time equity snapshot for a pretest portfolio, taken at
+// the end of every runCycle (after the portfolio's state row is persisted). Powers the
+// pretest equity time-series endpoint (GET /pretest/nav-history) — mirrors NavSnapshot's
+// role for the real/paper account, one level down for virtual pretest portfolios.
+model PretestNavSnapshot {
+  id               String   @id @default(cuid())
+  portfolio_id     String
+  ts               DateTime @default(now())
+  equity           Float
+  cash             Float
+  positions_count  Int
+  run_count        Int
+  @@index([portfolio_id])
+  @@map("pretest_nav_snapshots")
+}
