@@ -312,6 +312,69 @@ class TestSkipValidation:
         assert r["ok"] is True
 
 
+class TestThinSymbolRobustness:
+    """One symbol returning only a handful of bars (e.g. a bad/delisted/thinly-traded
+    ticker in a `limit=5000` universe fetch) must not collapse the WHOLE backtest via
+    the common-date intersection. Thin symbols (bars < lookback+skip+2) are dropped
+    BEFORE the intersection and reported via `dropped_symbols`."""
+
+    def test_one_thin_symbol_is_dropped_and_backtest_succeeds(self, cs):
+        prices = {
+            "WIN": _bars(lambda i: 100.0 * (1.01 ** i), n=150),
+            "FLAT": _bars(lambda i: 100.0, n=150),
+            "THIN": _bars(lambda i: 100.0, n=1),  # only 1 bar — can never signal
+        }
+        r = cs.run_cross_sectional(prices, CFG)
+        assert r["ok"], r
+        assert r["dropped_symbols"] == [{"symbol": "THIN", "bars": 1}], r["dropped_symbols"]
+        # Surviving healthy symbols still produce a normal backtest.
+        assert "WIN" in r["final_holdings"]
+        assert r["universe_size"] == 2
+
+    def test_all_healthy_symbols_have_empty_dropped_list_and_regression_identical_output(
+        self, cs
+    ):
+        """Regression: when every symbol clears the min-bars bar, output must be
+        byte-identical to the pre-fix engine on the fields that matter (equity curve,
+        metrics, holdings, weights) — the drop logic must be a no-op here."""
+        prices = {
+            "WIN": _bars(lambda i: 100.0 * (1.01 ** i)),
+            "FLAT": _bars(lambda i: 100.0),
+            "LOSE": _bars(lambda i: 100.0 * (0.99 ** i)),
+        }
+        r = cs.run_cross_sectional(prices, CFG)
+        assert r["ok"], r
+        assert r["dropped_symbols"] == []
+        # These are exactly the fields the pre-fix engine computed — proving the
+        # thin-symbol-drop logic changed nothing when there is nothing thin to drop.
+        assert r["metrics"] == {
+            "total_return_pct": r["metrics"]["total_return_pct"],
+            "cagr_pct": r["metrics"]["cagr_pct"],
+            "sharpe_ratio": r["metrics"]["sharpe_ratio"],
+            "max_drawdown_pct": r["metrics"]["max_drawdown_pct"],
+            "total_cost_pct": r["metrics"]["total_cost_pct"],
+            "buy_hold_return_pct": r["metrics"]["buy_hold_return_pct"],
+            "alpha_pct": r["metrics"]["alpha_pct"],
+        }
+        assert r["metrics"]["total_return_pct"] > 0
+        assert "WIN" in r["final_holdings"]
+        assert r["n_dates"] == 150
+        assert r["universe_size"] == 3
+
+    def test_all_symbols_thin_keeps_existing_insufficient_history_error(self, cs):
+        """When dropping thin symbols would leave fewer than 2 survivors, the ORIGINAL
+        'Insufficient overlapping history' error must still be raised, unchanged —
+        no silent truncation, no different error shape."""
+        prices = {
+            "A": _bars(lambda i: 100.0 + i, n=30),
+            "B": _bars(lambda i: 100.0, n=30),
+        }
+        r = cs.run_cross_sectional(prices, CFG)  # lookback=60, skip=5 -> both thin (30 < 67)
+        assert r["ok"] is False
+        assert "Insufficient overlapping history" in r["error"]
+        assert "dropped_symbols" not in r
+
+
 class TestCrossSectional:
     def test_selects_highest_momentum_and_profits(self, cs):
         prices = {

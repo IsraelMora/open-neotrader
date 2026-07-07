@@ -117,8 +117,33 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     # affected by this — only Sharpe is.
     periods_per_year = float(config.get("periods_per_year", 252))
 
-    # Common trading dates across the ENTIRE universe (so every symbol has a price).
-    date_sets = [{b["date"] for b in bars} for bars in prices.values() if bars]
+    # Thin-symbol robustness: a symbol whose fetch returned too few bars to EVER
+    # produce a momentum signal (needs at least lookback+skip+2 bars: lookback+skip
+    # to read momentum(i) at i=lookback, plus 1 more bar to have a "yesterday" for
+    # the return, plus 1 for the rebalance day itself) would otherwise collapse the
+    # ENTIRE universe's common-date intersection down to its own tiny history (one
+    # bad symbol truncating everyone). Drop it BEFORE computing the intersection and
+    # report it via `dropped_symbols` so callers see the coverage loss instead of a
+    # silent (or fatal) truncation.
+    min_bars_needed = lookback + skip + 2
+    bar_counts = {s: len(bars) for s, bars in prices.items()}
+    thin_symbols = [s for s, n in bar_counts.items() if n < min_bars_needed]
+    surviving_symbols = [s for s in prices if s not in thin_symbols]
+
+    if len(surviving_symbols) < 2:
+        # Not enough healthy symbols survive the drop to run a cross-sectional
+        # backtest at all. Fall back to evaluating the ORIGINAL, undropped universe
+        # so this error is byte-identical to pre-fix behavior (same message format,
+        # same computation) — no dropped_symbols reporting in this branch since
+        # nothing usable was salvaged.
+        working_prices = prices
+        dropped_symbols: list[dict] = []
+    else:
+        working_prices = {s: prices[s] for s in surviving_symbols}
+        dropped_symbols = [{"symbol": s, "bars": bar_counts[s]} for s in thin_symbols]
+
+    # Common trading dates across the (possibly thin-symbol-filtered) universe.
+    date_sets = [{b["date"] for b in bars} for bars in working_prices.values() if bars]
     if not date_sets:
         return {"ok": False, "error": "Empty price series"}
     common = sorted(set.intersection(*date_sets))
@@ -128,8 +153,8 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
             "error": f"Insufficient overlapping history: {len(common)} bars <= lookback {lookback}",
         }
 
-    px = {s: {b["date"]: b["close"] for b in bars} for s, bars in prices.items()}
-    symbols = list(prices.keys())
+    px = {s: {b["date"]: b["close"] for b in bars} for s, bars in working_prices.items()}
+    symbols = list(working_prices.keys())
 
     def momentum(sym: str, i: int) -> float | None:
         """12-1 style momentum at common-date index i (no lookahead)."""
@@ -326,6 +351,7 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
         "final_weights": weights,
         "n_dates": len(common),
         "universe_size": len(symbols),
+        "dropped_symbols": dropped_symbols,
     }
     if weighting == "inverse_vol":
         result["vol_weight_fallback_count"] = vol_weight_fallback_count
