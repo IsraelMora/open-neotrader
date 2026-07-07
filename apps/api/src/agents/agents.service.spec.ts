@@ -11987,3 +11987,55 @@ describe('F3(a) veto-ledger-source-plugin-fix — _resolveSignalSource must pref
     expect(args.data['source_plugin']).toBe('sentiment-analysis');
   });
 });
+
+describe('_toObservation — rejected tool call with no result key', () => {
+  function callToObservation(
+    service: AgentsService,
+    iterN: number,
+    iter: {
+      text: string;
+      tool_calls: ToolCallRequest[];
+      decisions: import('./agents.service').Decision[];
+      sandbox_results: import('./agents.service').SandboxResult[];
+    },
+  ): { render: string } {
+    return (
+      service as unknown as {
+        _toObservation: (n: number, i: typeof iter) => { render: string };
+      }
+    )._toObservation(iterN, iter);
+  }
+
+  // Regression: a rejected emit_trade_intent (long/short) returns {ok:false, error}
+  // with NO `result` key. `JSON.stringify(undefined)` yields the value `undefined`,
+  // so `.slice(0, 200)` threw "Cannot read properties of undefined (reading 'slice')",
+  // crashing any cycle that reached a 2nd ReAct turn after such a rejection.
+  it('does not throw when an allowed decision has ok:false and no result key, and surfaces the error', () => {
+    const service = makeAgentsService(makePlugins([], []), makeAudit());
+    const iter = {
+      text: 'razonamiento',
+      tool_calls: [] as ToolCallRequest[],
+      decisions: [
+        {
+          plugin_id: 'decision',
+          function: 'emit_trade_intent',
+          args: {},
+          allowed: true,
+        },
+      ] as import('./agents.service').Decision[],
+      sandbox_results: [
+        {
+          plugin_id: 'decision',
+          function: 'emit_trade_intent',
+          ok: false,
+          error: 'rationale requerido',
+        },
+      ] as import('./agents.service').SandboxResult[],
+    };
+
+    expect(() => callToObservation(service, 1, iter)).not.toThrow();
+    const { render } = callToObservation(service, 1, iter);
+    expect(render).toContain('ok=false');
+    expect(render).toContain('rationale requerido');
+  });
+});
