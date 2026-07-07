@@ -91,7 +91,7 @@ export default function NavChart() {
           error={error}
           onRetry={reload}
           isEmpty={!data || chartData.length < 2}
-          emptyText="Aún se acumulan puntos de NAV (se llenan cada ciclo)."
+          emptyText="La curva NAV requiere una estrategia aplicada — anda a Estrategias → aplicar."
         >
           {data && chartData.length >= 2 && tema && (
             <div>

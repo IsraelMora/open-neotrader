@@ -13,18 +13,37 @@ import { Search, X, Check } from 'lucide-react';
 import { fuzzyMatch } from '../lib/fuzzy';
 import { SearchInput } from './SearchInput';
 
+// Forma extendida de GET /api/universe/check — `ok`/`velas`/`ultimo_cierre`/`proveedor`
+// vienen de una extensión en curso en el backend; degradar con gracia cuando falten
+// (p.ej. sólo llega `registered`/`meta`).
 interface CheckResult {
-  ok: boolean;
+  ok?: boolean;
   symbol: string;
-  detail?: string;
+  registered?: boolean;
+  meta?: Record<string, unknown> | null;
   velas?: number;
   ultimo_cierre?: number;
   proveedor?: string;
+  detail?: string;
 }
 
 interface ConfigResponse extends JsonObject {
   universe?: Record<string, string>;
   universe_context?: Record<string, string>;
+}
+
+// `ok` es la señal fuerte cuando está presente; si falta, nos apoyamos en `registered`
+// como aproximación honesta (sin datos de velas todavía no sabemos si el proveedor sirve).
+function checkFailed(check: CheckResult): boolean {
+  if (check.ok !== undefined) return !check.ok;
+  return check.registered === false;
+}
+
+/** Descripción legible de las velas/proveedor cuando el backend las incluye (extensión en curso). */
+function velasDetail(check: CheckResult): string {
+  if (check.velas == null || check.ultimo_cierre == null) return '';
+  const proveedor = check.proveedor ? ` (proveedor: ${check.proveedor})` : '';
+  return ` · ${check.velas} velas, último cierre $${check.ultimo_cierre}${proveedor}`;
 }
 
 interface UniverseContentProps {
@@ -120,23 +139,24 @@ function UniverseContent({ uni, ctx, reload }: UniverseContentProps) {
           </div>
           {check && (
             <div
-              className={`rounded-md border px-3 py-2 text-[12px] ${check.ok ? 'border-accent/40 bg-accent/10' : 'border-danger/40 bg-danger/10'}`}
+              className={`rounded-md border px-3 py-2 text-[12px] ${checkFailed(check) ? 'border-danger/40 bg-danger/10' : 'border-accent/40 bg-accent/10'}`}
             >
-              {check.ok ? (
-                <span className="text-accent inline-flex items-center gap-1.5">
-                  <Check className="h-3.5 w-3.5" />
-                  {check.symbol}: {check.velas} velas, último cierre ${check.ultimo_cierre}{' '}
-                  (proveedor: {check.proveedor})
-                </span>
-              ) : (
+              {checkFailed(check) ? (
                 <span className="text-danger inline-flex items-center gap-1.5">
                   <X className="h-3.5 w-3.5" />
-                  {check.symbol}: {check.detail}. No se puede añadir sin datos.
+                  {check.symbol}: {check.detail ?? 'sin datos'}. No se puede añadir sin datos.
+                </span>
+              ) : (
+                <span className="text-accent inline-flex items-center gap-1.5">
+                  <Check className="h-3.5 w-3.5" />
+                  {check.symbol}
+                  {check.registered ? ' · ya registrado en el universo' : ''}
+                  {velasDetail(check)}
                 </span>
               )}
             </div>
           )}
-          {check?.ok && (
+          {check && !checkFailed(check) && (
             <div className="flex gap-2 items-center">
               <Input
                 value={desc}
