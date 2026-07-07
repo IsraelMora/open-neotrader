@@ -223,3 +223,90 @@ describe('SnapshotService.getRealEquityCurve', () => {
     });
   });
 });
+
+/**
+ * panel-backend-drift Fix 1 — SnapshotService.getHistory oldest-N ordering bug.
+ *
+ * getHistory used `orderBy: { ts: 'asc' }, take: limit`, which returns the OLDEST
+ * `limit` rows instead of the most recent `limit` rows. This mirrors the correct
+ * pattern already used by getRealEquityCurve: query `orderBy: { ts: 'desc' },
+ * take: limit` then reverse in memory, so the result stays chronologically
+ * ascending (oldest-of-the-window first) AND is bounded to the most recent window.
+ */
+describe('SnapshotService.getHistory — most-recent-N window bug', () => {
+  type NavSnapshotRow = {
+    id: string;
+    ts: Date;
+    cycle_id: string | null;
+    provider_id: string | null;
+    equity: number;
+    cash: number;
+    positions: string;
+    total_pnl: number;
+    meta: string | null;
+  };
+
+  function makeRow(n: number): NavSnapshotRow {
+    return {
+      id: `snap-${n}`,
+      ts: new Date(2026, 0, n), // increasing ts as n increases
+      cycle_id: null,
+      provider_id: 'alpaca',
+      equity: 1000 + n,
+      cash: 500,
+      positions: '[]',
+      total_pnl: n,
+      meta: null,
+    };
+  }
+
+  function makePrismaWithMostRecentDesc(
+    allRowsAsc: NavSnapshotRow[],
+    limit: number,
+  ): { navSnapshot: jest.Mocked<Pick<PrismaService['navSnapshot'], 'findMany'>> } {
+    // Simulate what Prisma would actually return for orderBy desc + take limit:
+    // the most recent `limit` rows, in descending order.
+    const mostRecentDesc = allRowsAsc
+      .slice()
+      .reverse()
+      .slice(0, limit);
+    return {
+      navSnapshot: {
+        findMany: jest.fn().mockResolvedValue(mostRecentDesc),
+      },
+    };
+  }
+
+  function makeService(prisma: ReturnType<typeof makePrismaWithMostRecentDesc>): SnapshotService {
+    return new (SnapshotService as unknown as new (db: unknown) => SnapshotService)(prisma);
+  }
+
+  it('returns the MOST RECENT `limit` rows (not the oldest), in ascending order', async () => {
+    // 10 synthetic rows, increasing ts; ask for the most recent 5.
+    const allRowsAsc = Array.from({ length: 10 }, (_, i) => makeRow(i + 1));
+    const prisma = makePrismaWithMostRecentDesc(allRowsAsc, 5);
+    const service = makeService(prisma);
+
+    const result = await service.getHistory(5);
+
+    // Expect rows 6..10 (the most recent 5), ascending.
+    expect(result.map((r) => r.id)).toEqual(['snap-6', 'snap-7', 'snap-8', 'snap-9', 'snap-10']);
+    // Ascending chronological order preserved.
+    for (let i = 1; i < result.length; i++) {
+      expect(result[i].ts.getTime()).toBeGreaterThan(result[i - 1].ts.getTime());
+    }
+  });
+
+  it('queries with orderBy desc + take limit (most-recent-N pattern)', async () => {
+    const allRowsAsc = Array.from({ length: 10 }, (_, i) => makeRow(i + 1));
+    const prisma = makePrismaWithMostRecentDesc(allRowsAsc, 5);
+    const service = makeService(prisma);
+
+    await service.getHistory(5);
+
+    expect(prisma.navSnapshot.findMany).toHaveBeenCalledWith({
+      orderBy: { ts: 'desc' },
+      take: 5,
+    });
+  });
+});

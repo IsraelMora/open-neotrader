@@ -104,13 +104,23 @@ export class SnapshotService {
     return this._hydrate(entry);
   }
 
-  /** Últimos N snapshots en orden cronológico. */
+  /**
+   * Últimos N snapshots en orden cronológico ascendente.
+   *
+   * Queries `orderBy: { ts: 'desc' }, take: limit` (most recent N rows) and reverses
+   * in memory, so the result is bounded to the most recent window AND chronologically
+   * ascending — same pattern as getRealEquityCurve. Do not go back to `orderBy: 'asc'`
+   * + take: that returns the OLDEST N rows, not the most recent N.
+   */
   async getHistory(limit = 90): Promise<NavEntry[]> {
     const rows = await this.db.navSnapshot.findMany({
-      orderBy: { ts: 'asc' },
+      orderBy: { ts: 'desc' },
       take: limit,
     });
-    return rows.map((r) => this._hydrate(r));
+    return rows
+      .slice()
+      .reverse()
+      .map((r) => this._hydrate(r));
   }
 
   /** Snapshot más reciente. */
@@ -138,11 +148,9 @@ export class SnapshotService {
    * Intentionally queries `orderBy: { ts: 'desc' }, take: limit` (most recent N rows)
    * and then reverses in memory before mapping, so the result is chronologically
    * ascending AND correctly bounded to the most recent N points. This is the correct
-   * pattern for a "last N, in order" query — contrast with the pre-existing
-   * `getHistory`/`getEquityCurve` (paper) methods, which use `orderBy: { ts: 'asc' },
-   * take: limit` and therefore return the OLDEST N rows, not the most recent N. That
-   * bug is left untouched (paper behavior must stay byte-for-byte identical); it must
-   * NOT be copied here.
+   * pattern for a "last N, in order" query — `getHistory` now uses the same pattern
+   * (panel-backend-drift fix). `getEquityCurve` (paper) still uses the older
+   * `orderBy: { ts: 'asc' }, take: limit` pattern and is out of scope for that fix.
    */
   async getRealEquityCurve(limit = 252): Promise<{ ts: string; equity: number; hwm: number }[]> {
     const rows = await this.db.realNavSnapshot.findMany({
