@@ -2789,6 +2789,40 @@ describe('PretestService._readGateThresholds — range validation (jd-fix-4)', (
   });
 });
 
+// ── panel-backend-drift follow-up: compare() must exclude deactivated portfolios ──
+
+describe('PretestService.compare — excludes deactivated portfolios (panel-backend-drift)', () => {
+  it('a deactivated portfolio does NOT appear in compare(); an active one still does', async () => {
+    const stateObj = makeState({ equity: 11_000, realized_pnl: 1_000 });
+    const activeRow = makePortfolioRow('active-1', stateObj, { name: 'Activo Vivo' });
+    const inactiveRow = {
+      ...makePortfolioRow('inactive-1', makeState({ equity: 15_000 }), { name: 'Trend Puro' }),
+      is_active: false,
+    };
+
+    // Emulates Prisma: honors a where.is_active filter when the query provides one;
+    // returns everything when the query does not filter (current buggy behavior).
+    const rows = [activeRow, inactiveRow];
+    const findMany = jest
+      .fn()
+      .mockImplementation((args?: { where?: { is_active?: boolean } }) =>
+        Promise.resolve(
+          args?.where?.is_active === undefined
+            ? rows
+            : rows.filter((r) => r.is_active === args.where!.is_active),
+        ),
+      );
+    const db = { pretestPortfolio: { findMany } } as unknown as PrismaService;
+    const svc = makeGateService(db, makeStubKv());
+
+    const result = await svc.compare();
+    const names = result.portfolios.map((p) => p.name);
+
+    expect(names).toContain('Activo Vivo');
+    expect(names).not.toContain('Trend Puro');
+  });
+});
+
 // ── Existing test 4.1.7 update note ──────────────────────────────────────────
 // Test 4.1.7 (gate ready:true) used an all-wins portfolio (loss_trades=0).
 // After adding min_loss_trades=3 that test now FAILS because 0 < 3.

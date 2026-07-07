@@ -666,9 +666,17 @@ export class PretestService {
     return results;
   }
 
-  /** Comparativa de rendimiento entre todos los portfolios de pretest. */
+  /**
+   * Comparativa de rendimiento entre los portfolios de pretest ACTIVOS.
+   * Deactivated portfolios keep stale archived state and must not appear in the
+   * panel's competition table — same is_active filter as runAllActive.
+   */
   async compare(): Promise<PretestCompare> {
-    const all = await this.findAll();
+    const rows = await this.db.pretestPortfolio.findMany({
+      where: { is_active: true },
+      orderBy: { created_at: 'desc' },
+    });
+    const all = rows.map((r) => this._hydrate(r));
     if (all.length === 0) return { portfolios: [], winner_by_return: '', winner_by_risk_adj: '' };
 
     // Read gate thresholds once for all portfolios

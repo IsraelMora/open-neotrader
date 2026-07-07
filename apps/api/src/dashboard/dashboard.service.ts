@@ -147,19 +147,28 @@ export class DashboardService {
 
   // ── Equity Curve ────────────────────────────────────────────────────────────
 
+  /**
+   * Queries `orderBy: { ts: 'desc' }, take: limit` (most recent N rows) and reverses
+   * in memory, so the curve is bounded to the most recent window AND chronologically
+   * ascending — same pattern as SnapshotService.getRealEquityCurve/getHistory. Do not
+   * go back to `orderBy: 'asc'` + take: that returns the OLDEST N rows.
+   */
   private async _buildEquityCurve(limit: number): Promise<EquityPoint[]> {
     const snaps = await this.db.navSnapshot.findMany({
-      orderBy: { ts: 'asc' },
+      orderBy: { ts: 'desc' },
       take: limit,
       select: { ts: true, equity: true, cash: true, total_pnl: true },
     });
 
-    return snaps.map((s) => ({
-      ts: s.ts.toISOString(),
-      equity: s.equity,
-      cash: s.cash,
-      pnl: s.total_pnl,
-    }));
+    return snaps
+      .slice()
+      .reverse()
+      .map((s) => ({
+        ts: s.ts.toISOString(),
+        equity: s.equity,
+        cash: s.cash,
+        pnl: s.total_pnl,
+      }));
   }
 
   // ── Provider Stats ──────────────────────────────────────────────────────────

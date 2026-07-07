@@ -6,6 +6,7 @@ import type { PluginsService } from '../plugins/plugins.service';
 import type { PluginEventsService } from '../plugins/plugin-events.service';
 import type { AuditService } from '../audit/audit.service';
 import type { CycleExecutorService } from '../cycle/cycle-executor.service';
+import type { ProviderGatewayService } from '../providers/provider-gateway.service';
 import { PanelService } from './panel.service';
 
 // ── Stubs ─────────────────────────────────────────────────────────────────────
@@ -52,6 +53,7 @@ function makePanelService(
     {} as unknown as PluginEventsService,
     {} as unknown as AuditService,
     makeCycleExecutorStub() as unknown as CycleExecutorService,
+    {} as unknown as ProviderGatewayService,
   );
 }
 

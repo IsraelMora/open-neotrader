@@ -16,6 +16,8 @@ import type { SandboxGateway } from '../sandbox/sandbox.gateway';
 import type { PluginEventsService } from '../plugins/plugin-events.service';
 import type { AuditService } from '../audit/audit.service';
 import type { CycleExecutorService } from '../cycle/cycle-executor.service';
+import type { ProviderGatewayService } from '../providers/provider-gateway.service';
+import { REAL_EXECUTION_HALTED_KEY } from '../common/real-execution-halt.util';
 
 // Placeholder: real tests for getConfig/saveConfig/chat can be added here.
 // For now this file confirms the module is importable and the moved tests are gone.
@@ -44,6 +46,7 @@ function makeSvcForSkills(plugins: PluginsService): PanelService {
     {} as unknown as PluginEventsService,
     {} as unknown as AuditService,
     { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
+    {} as unknown as ProviderGatewayService,
   );
 }
 
@@ -117,5 +120,270 @@ describe('PanelService.getSkills() — returns {from_plugins, n_plugins} from pr
 
     expect(result.n_plugins).toBe(1);
     expect(result.from_plugins).toHaveLength(3);
+  });
+});
+
+// ── doctor() — panel-backend-drift Fix 2: real `checks` array ───────────────────
+
+interface DoctorDeps {
+  plugins: { active: number; total: number };
+  sandboxOk: boolean;
+  llmReady: boolean;
+  halted?: boolean;
+}
+
+function makeSvcForDoctor(deps: DoctorDeps): PanelService {
+  const pluginRows = [
+    ...Array.from({ length: deps.plugins.active }, (_, i) => ({
+      id: `active-${i}`,
+      active: true,
+    })),
+    ...Array.from({ length: deps.plugins.total - deps.plugins.active }, (_, i) => ({
+      id: `inactive-${i}`,
+      active: false,
+    })),
+  ];
+
+  const configEntry = {
+    findUnique: jest.fn().mockImplementation(({ where: { key } }: { where: { key: string } }) => {
+      if (key === REAL_EXECUTION_HALTED_KEY) {
+        return Promise.resolve(
+          deps.halted === undefined ? null : { key, value: deps.halted ? 'true' : 'false' },
+        );
+      }
+      return Promise.resolve(null);
+    }),
+  };
+
+  return new PanelService(
+    { configEntry } as unknown as PrismaService,
+    {} as unknown as AgentsService,
+    {
+      getReadiness: jest.fn().mockReturnValue({ credentialPresent: deps.llmReady }),
+    } as unknown as LlmService,
+    {
+      call: jest.fn().mockResolvedValue(deps.sandboxOk ? { ok: true } : null),
+    } as unknown as SandboxGateway,
+    { findAll: jest.fn().mockResolvedValue(pluginRows) } as unknown as PluginsService,
+    {} as unknown as PluginEventsService,
+    {} as unknown as AuditService,
+    { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
+    {} as unknown as ProviderGatewayService,
+  );
+}
+
+describe('PanelService.doctor() — checks[] contract (panel-backend-drift Fix 2)', () => {
+  it('all healthy: every check ok, plugins_active > 0', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 2, total: 3 },
+      sandboxOk: true,
+      llmReady: true,
+    });
+
+    const result = await svc.doctor();
+
+    // Existing fields stay exactly as-is.
+    expect(result.ok).toBe(true);
+    expect(result.plugins_registered).toBe(3);
+    expect(result.plugins_active).toBe(2);
+    expect(result.sandbox_reachable).toBe(true);
+    expect(result.llm_ready).toBe(true);
+
+    expect(Array.isArray(result.checks)).toBe(true);
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_reachable']).toMatchObject({ ok: true, level: 'ok' });
+    expect(byName['llm_ready']).toMatchObject({ ok: true, level: 'ok' });
+    expect(byName['plugins_active']).toMatchObject({ ok: true, level: 'ok' });
+  });
+
+  it('sandbox unreachable: check reports error level', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: false,
+      llmReady: true,
+    });
+
+    const result = await svc.doctor();
+
+    expect(result.sandbox_reachable).toBe(false);
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_reachable']).toMatchObject({ ok: false, level: 'error' });
+  });
+
+  it('llm not ready: check reports error level', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: false,
+    });
+
+    const result = await svc.doctor();
+
+    expect(result.llm_ready).toBe(false);
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['llm_ready']).toMatchObject({ ok: false, level: 'error' });
+  });
+
+  it('no active plugins (but registered > 0): plugins_active check reports warn level', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 0, total: 4 },
+      sandboxOk: true,
+      llmReady: true,
+    });
+
+    const result = await svc.doctor();
+
+    expect(result.plugins_active).toBe(0);
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['plugins_active']).toMatchObject({ ok: false, level: 'warn' });
+  });
+
+  it('real_execution.halted=true: check reports warn level with detail', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      halted: true,
+    });
+
+    const result = await svc.doctor();
+
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['real_execution_halted']).toMatchObject({ ok: false, level: 'warn' });
+  });
+
+  it('real_execution.halted=false (default): check reports ok level', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      halted: false,
+    });
+
+    const result = await svc.doctor();
+
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['real_execution_halted']).toMatchObject({ ok: true, level: 'ok' });
+  });
+});
+
+// ── checkUniverseSymbol() — panel-backend-drift Fix 3: real data verification ──
+
+function makeSvcForUniverse(
+  gateway: Partial<Pick<ProviderGatewayService, 'getDefaultProvider' | 'getOhlcv'>>,
+  cfgEntries: { key: string; value: string }[] = [],
+): PanelService {
+  const configEntry = {
+    findMany: jest.fn().mockResolvedValue(cfgEntries),
+  };
+
+  return new PanelService(
+    { configEntry } as unknown as PrismaService,
+    {} as unknown as AgentsService,
+    {} as unknown as LlmService,
+    {} as unknown as SandboxGateway,
+    {} as unknown as PluginsService,
+    {} as unknown as PluginEventsService,
+    {} as unknown as AuditService,
+    { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
+    gateway as unknown as ProviderGatewayService,
+  );
+}
+
+describe('PanelService.checkUniverseSymbol() — real OHLCV verification (Fix 3)', () => {
+  it('success: fetches OHLCV via the default provider and returns velas/ultimo_cierre/proveedor', async () => {
+    const bars = Array.from({ length: 30 }, (_, i) => ({
+      ts: `2026-01-${String(i + 1).padStart(2, '0')}T00:00:00.000Z`,
+      open: 100 + i,
+      high: 101 + i,
+      low: 99 + i,
+      close: 100.5 + i,
+      volume: 1000,
+    }));
+    const gateway = {
+      getDefaultProvider: jest.fn().mockReturnValue({ plugin: { id: 'alpaca' } }),
+      getOhlcv: jest.fn().mockResolvedValue(bars),
+    };
+    const svc = makeSvcForUniverse(gateway);
+
+    const result = await svc.checkUniverseSymbol('aapl');
+
+    expect(gateway.getDefaultProvider).toHaveBeenCalled();
+    expect(gateway.getOhlcv).toHaveBeenCalledWith('alpaca', 'AAPL', '1d', 30);
+    expect(result).toMatchObject({
+      ok: true,
+      symbol: 'AAPL',
+      velas: 30,
+      ultimo_cierre: bars[29].close,
+      proveedor: 'alpaca',
+    });
+  });
+
+  it('failure: gateway throws → ok:false with detail, never rethrows', async () => {
+    const gateway = {
+      getDefaultProvider: jest.fn().mockReturnValue({ plugin: { id: 'alpaca' } }),
+      getOhlcv: jest.fn().mockRejectedValue(new Error('boom: provider unreachable')),
+    };
+    const svc = makeSvcForUniverse(gateway);
+
+    const result = await svc.checkUniverseSymbol('MSFT');
+
+    expect(result.ok).toBe(false);
+    expect(result.symbol).toBe('MSFT');
+    expect(typeof result.detail).toBe('string');
+    expect(result.detail).toContain('boom');
+  });
+
+  it('failure: gateway returns empty bars → ok:false with detail', async () => {
+    const gateway = {
+      getDefaultProvider: jest.fn().mockReturnValue({ plugin: { id: 'alpaca' } }),
+      getOhlcv: jest.fn().mockResolvedValue([]),
+    };
+    const svc = makeSvcForUniverse(gateway);
+
+    const result = await svc.checkUniverseSymbol('TSLA');
+
+    expect(result.ok).toBe(false);
+    expect(result.symbol).toBe('TSLA');
+    expect(typeof result.detail).toBe('string');
+  });
+
+  it('failure: no default provider available → ok:false with detail, no crash', async () => {
+    const gateway = {
+      getDefaultProvider: jest.fn().mockReturnValue(null),
+      getOhlcv: jest.fn(),
+    };
+    const svc = makeSvcForUniverse(gateway);
+
+    const result = await svc.checkUniverseSymbol('BTC');
+
+    expect(result.ok).toBe(false);
+    expect(gateway.getOhlcv).not.toHaveBeenCalled();
+    expect(typeof result.detail).toBe('string');
+  });
+
+  it('preserves existing registered/meta fields from the universe config', async () => {
+    const gateway = {
+      getDefaultProvider: jest.fn().mockReturnValue({ plugin: { id: 'alpaca' } }),
+      getOhlcv: jest.fn().mockResolvedValue([
+        {
+          ts: '2026-01-01T00:00:00.000Z',
+          open: 1,
+          high: 1,
+          low: 1,
+          close: 42,
+          volume: 1,
+        },
+      ]),
+    };
+    const svc = makeSvcForUniverse(gateway, [
+      { key: 'universe', value: JSON.stringify({ AAPL: { kind: 'equity' } }) },
+    ]);
+
+    const result = await svc.checkUniverseSymbol('aapl');
+
+    expect(result.registered).toBe(true);
+    expect(result.meta).toEqual({ kind: 'equity' });
+    expect(result.ok).toBe(true);
   });
 });
