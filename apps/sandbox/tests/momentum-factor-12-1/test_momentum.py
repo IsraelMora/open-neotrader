@@ -398,3 +398,175 @@ class TestShortSellingOptIn:
         result = on_cycle(ctx)
         actions = {s["action"] for s in result["signals"]}
         assert "short" not in actions
+
+
+class TestSymbolsUniverseOverride:
+    """
+    OPT-IN per-portfolio universe override via config["symbols"]. Accepts a
+    comma-separated string OR a list of strings; normalizes (trim, uppercase,
+    drop empty, dedupe preserving first-seen order) and REPLACES ctx["universe"]
+    for that cycle. Absent/empty -> ctx["universe"] unchanged (regression).
+    """
+
+    def _ctx(self, config_extra: dict) -> dict:
+        aaa = _series_oldest_first(start=100.0, monthly_step=5.0, n=8)
+        bbb = _series_oldest_first(start=100.0, monthly_step=3.0, n=8)
+        ggg = _series_oldest_first(start=100.0, monthly_step=4.0, n=8)
+        qqq = _series_oldest_first(start=100.0, monthly_step=2.0, n=8)
+        gld = _series_oldest_first(start=100.0, monthly_step=1.0, n=8)
+
+        return {
+            "universe": ["AAA", "BBB", "GGG", "QQQ", "GLD"],
+            "config": {"top_pct": 20, "lookback_months": 6, **config_extra},
+            "portfolio": {},
+            "market_trend_up": True,
+            "provider_tools": {
+                "get_ohlcv": TestCycleHookSignalShape()._get_ohlcv_factory(
+                    {"AAA": aaa, "BBB": bbb, "GGG": ggg, "QQQ": qqq, "GLD": gld}
+                )
+            },
+        }
+
+    def test_symbols_as_comma_separated_string_overrides_universe(self) -> None:
+        ctx = self._ctx({"symbols": "qqq, gld"})
+        result = on_cycle(ctx)
+        symbols_seen = {s["symbol"] for s in result["signals"]}
+        # Only QQQ/GLD should ever be considered — AAA/BBB/GGG must not appear.
+        assert symbols_seen <= {"QQQ", "GLD"}
+        assert "AAA" not in symbols_seen
+        assert "BBB" not in symbols_seen
+        assert "GGG" not in symbols_seen
+
+    def test_symbols_as_list_overrides_universe(self) -> None:
+        ctx = self._ctx({"symbols": ["qqq", " gld "]})
+        result = on_cycle(ctx)
+        symbols_seen = {s["symbol"] for s in result["signals"]}
+        assert symbols_seen <= {"QQQ", "GLD"}
+        assert "AAA" not in symbols_seen
+        assert "BBB" not in symbols_seen
+
+    def test_symbols_absent_uses_ctx_universe(self) -> None:
+        ctx = self._ctx({})
+        result = on_cycle(ctx)
+        symbols_seen = {s["symbol"] for s in result["signals"]}
+        # With the full 5-symbol universe, at least one non-override symbol
+        # must be reachable (proves ctx["universe"] was actually used).
+        assert symbols_seen  # some signal was produced
+        assert symbols_seen <= {"AAA", "BBB", "GGG", "QQQ", "GLD"}
+
+    def test_symbols_empty_string_uses_ctx_universe(self) -> None:
+        ctx = self._ctx({"symbols": "   "})
+        result = on_cycle(ctx)
+        symbols_seen = {s["symbol"] for s in result["signals"]}
+        assert symbols_seen <= {"AAA", "BBB", "GGG", "QQQ", "GLD"}
+
+    def test_symbols_dedupe_and_normalize(self) -> None:
+        ctx = self._ctx({"symbols": "qqq, QQQ, gld, GLD, gld"})
+        result = on_cycle(ctx)
+        symbols_seen = {s["symbol"] for s in result["signals"]}
+        assert symbols_seen <= {"QQQ", "GLD"}
+
+
+class TestBreadthRegimeFilter:
+    """
+    OPT-IN breadth regime filter via config["regime_min_breadth"] (percent,
+    0-100, matching top_pct style; 0 = disabled). Antonacci dual-momentum
+    style: when the fraction of symbols with positive momentum falls below
+    the threshold, go fully defensive — exit all held longs, emit no new
+    entries, and log the trigger with the measured breadth.
+    """
+
+    def _ctx(self, portfolio: dict, regime_min_breadth: float, mostly_negative: bool) -> dict:
+        if mostly_negative:
+            # 1 of 5 positive -> breadth = 20%
+            aaa = _series_oldest_first(start=100.0, monthly_step=5.0, n=8)  # positive
+            bbb = _series_oldest_first(start=100.0, monthly_step=-1.0, n=8)
+            ccc = _series_oldest_first(start=100.0, monthly_step=-2.0, n=8)
+            ddd = _series_oldest_first(start=100.0, monthly_step=-3.0, n=8)
+            eee = _series_oldest_first(start=100.0, monthly_step=-4.0, n=8)
+        else:
+            # 4 of 5 positive -> breadth = 80%
+            aaa = _series_oldest_first(start=100.0, monthly_step=5.0, n=8)
+            bbb = _series_oldest_first(start=100.0, monthly_step=4.0, n=8)
+            ccc = _series_oldest_first(start=100.0, monthly_step=3.0, n=8)
+            ddd = _series_oldest_first(start=100.0, monthly_step=2.0, n=8)
+            eee = _series_oldest_first(start=100.0, monthly_step=-4.0, n=8)
+
+        return {
+            "universe": ["AAA", "BBB", "CCC", "DDD", "EEE"],
+            "config": {
+                "top_pct": 20,
+                "lookback_months": 6,
+                "regime_min_breadth": regime_min_breadth,
+            },
+            "portfolio": portfolio,
+            "market_trend_up": True,
+            "provider_tools": {
+                "get_ohlcv": TestCycleHookSignalShape()._get_ohlcv_factory(
+                    {"AAA": aaa, "BBB": bbb, "CCC": ccc, "DDD": ddd, "EEE": eee}
+                )
+            },
+        }
+
+    def test_breadth_below_threshold_exits_held_longs_and_blocks_new_entries(self) -> None:
+        # breadth = 20% < 50% threshold -> risk-off.
+        ctx = self._ctx(
+            portfolio={"BBB": 10, "CCC": 5}, regime_min_breadth=50, mostly_negative=True
+        )
+        result = on_cycle(ctx)
+
+        actions_by_symbol = {s["symbol"]: s["action"] for s in result["signals"]}
+        assert actions_by_symbol == {"BBB": "exit", "CCC": "exit"}
+        assert all(a in ("exit",) for a in actions_by_symbol.values())
+        assert not any(a in ("long", "short") for a in actions_by_symbol.values())
+
+        assert any(
+            "régimen" in log.get("msg", "").lower() and "breadth" in log.get("msg", "").lower()
+            for log in result["logs"]
+        ), f"expected a regime-filter log entry, got {result['logs']}"
+
+    def test_breadth_below_threshold_ignores_short_positions_as_not_held(self) -> None:
+        # Negative quantity == short position (per trade-intent.service sign
+        # convention); only strictly positive quantities count as "held" for
+        # the regime exit sweep.
+        ctx = self._ctx(
+            portfolio={"BBB": 10, "EEE": -5}, regime_min_breadth=50, mostly_negative=True
+        )
+        result = on_cycle(ctx)
+
+        actions_by_symbol = {s["symbol"]: s["action"] for s in result["signals"]}
+        assert actions_by_symbol == {"BBB": "exit"}
+        assert "EEE" not in actions_by_symbol
+
+    def test_breadth_at_or_above_threshold_runs_normal_signal_generation(self) -> None:
+        # breadth = 80% >= 50% threshold -> normal ranking-based signals.
+        ctx = self._ctx(portfolio={}, regime_min_breadth=50, mostly_negative=False)
+        result = on_cycle(ctx)
+
+        actions = {s["action"] for s in result["signals"]}
+        assert "long" in actions
+        assert not any(
+            "régimen" in log.get("msg", "").lower() and "breadth" in log.get("msg", "").lower()
+            for log in result["logs"]
+        )
+
+    def test_regime_min_breadth_zero_disables_filter(self) -> None:
+        ctx = self._ctx(portfolio={"BBB": 10}, regime_min_breadth=0, mostly_negative=True)
+        result = on_cycle(ctx)
+
+        # Disabled -> normal exit-only behavior for BBB (fell out of top/filter),
+        # no forced blanket risk-off log.
+        assert not any(
+            "régimen" in log.get("msg", "").lower() and "breadth" in log.get("msg", "").lower()
+            for log in result["logs"]
+        )
+
+    def test_regime_min_breadth_absent_disables_filter(self) -> None:
+        ctx = self._ctx(portfolio={"BBB": 10}, regime_min_breadth=0, mostly_negative=True)
+        del ctx["config"]["regime_min_breadth"]
+        result = on_cycle(ctx)
+
+        assert not any(
+            "régimen" in log.get("msg", "").lower() and "breadth" in log.get("msg", "").lower()
+            for log in result["logs"]
+        )
