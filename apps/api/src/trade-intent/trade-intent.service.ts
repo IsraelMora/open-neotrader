@@ -1598,10 +1598,29 @@ export class TradeIntentService {
       });
     }
 
-    this.log.warn(
-      `REAL ORDER SUBMITTED [${id}]: ${side.toUpperCase()} ${qty} ${symbol} — ` +
-        `real_order_id=${realOrder.id} status=${realOrder.status}`,
-    );
+    // Distinguish a GENUINE fresh broker submission from a DEDUP return: RealOrderService.submit's
+    // symbol-scoped guard (see its class doc, "Fix 4") can return a NON-TERMINAL row that was
+    // created by an EARLIER, DIFFERENT trade_intent_id (e.g. a stuck pending_submit row the
+    // broker has no record of — RealOrderService.recoverInflight's "confirmed-not-found" branch
+    // deliberately leaves such rows non-terminal forever, see recoverRow doc). In that case
+    // submit() made NO new create()/placeOrder call this cycle — logging "SUBMITTED" would be a
+    // misleading success-shaped message for an order the broker never actually received THIS
+    // time. This was the production incident: an hourly-regenerating "exit SPY" intent kept
+    // logging a fresh-looking "REAL ORDER SUBMITTED" every cycle even though nothing new ever
+    // reached the broker after the very first (stuck) attempt.
+    if (realOrder.trade_intent_id !== id) {
+      this.log.warn(
+        `REAL ORDER ALREADY PENDING [${id}]: ${side.toUpperCase()} ${qty} ${symbol} — deduped ` +
+          `against an existing non-terminal real_order_id=${realOrder.id} ` +
+          `(trade_intent_id=${realOrder.trade_intent_id}, status=${realOrder.status}) — ` +
+          `NO new broker call was made this cycle`,
+      );
+    } else {
+      this.log.warn(
+        `REAL ORDER SUBMITTED [${id}]: ${side.toUpperCase()} ${qty} ${symbol} — ` +
+          `real_order_id=${realOrder.id} status=${realOrder.status}`,
+      );
+    }
 
     // Fire-and-forget: kick off the fast-poll backoff burst so a fast-filling order is
     // reflected without waiting for the steady-state reconciliation interval. NEVER awaited

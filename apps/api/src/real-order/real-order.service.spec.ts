@@ -558,6 +558,127 @@ describe('RealOrderService.recoverInflight — broker never received it', () => 
   });
 });
 
+// ── recoverInflight — bounded escalation for hopeless rows ───────────────────────
+//
+// Production incident: "broker confirms no record of row <id> ... left as-is, no
+// resubmit" repeated for the SAME 2 rows every ~15s indefinitely (14 such submit_failed
+// rows at one point). recoverInflight() re-checks EVERY row in RECOVERABLE_STATUSES
+// forever with no escalation — once the broker has AUTHORITATIVELY confirmed (a clean
+// null response, not a lookup error) that it has no record of an order across several
+// consecutive checks, there is no new information to gain from checking again. The fix:
+// after CONFIRMED_ABSENT_ESCALATION_THRESHOLD (3) CONSECUTIVE confirmed-not-found
+// responses for the SAME row, transition it to a genuinely terminal 'confirmed_absent'
+// status (excluded from RECOVERABLE_STATUSES, so future polls never re-select it) and
+// emit exactly ONE audit/warn log at the transition. A broker response in between
+// (found, or even a lookup error) resets the consecutive counter — only CONSECUTIVE
+// confirmations count, mirroring the existing R8 submitFailureTimestamps pattern.
+
+describe('RealOrderService.recoverInflight — bounded escalation for hopeless rows (Fix: unbounded polling)', () => {
+  it('does NOT escalate before the threshold: 2 consecutive confirmed-not-found responses leave the row untouched (no update call)', async () => {
+    const stuckRow = makeRow({ id: 'ro_stuck', status: 'submit_failed' });
+    const prisma = makePrisma({ findManyResult: [stuckRow] });
+    const gateway = makeGateway({ getOrderByClientIdResult: null });
+    const svc = makeService(prisma, gateway);
+
+    await svc.recoverInflight();
+    await svc.recoverInflight();
+
+    expect((prisma.realOrder.update as jest.Mock).mock.calls).toHaveLength(0);
+    expect(gateway.placeOrder).not.toHaveBeenCalled();
+  });
+
+  it('escalates to confirmed_absent after exactly 3 CONSECUTIVE confirmed-not-found responses, with exactly ONE update call and never a resubmit', async () => {
+    const stuckRow = makeRow({ id: 'ro_stuck2', status: 'submit_failed' });
+    const prisma = makePrisma({ findManyResult: [stuckRow] });
+    const gateway = makeGateway({ getOrderByClientIdResult: null });
+    const svc = makeService(prisma, gateway);
+
+    await svc.recoverInflight();
+    await svc.recoverInflight();
+    await svc.recoverInflight();
+
+    const updateCalls = (prisma.realOrder.update as jest.Mock).mock.calls as unknown[][];
+    expect(updateCalls).toHaveLength(1);
+    const data = callArg(updateCalls, 0);
+    expect(data.data['status']).toBe('confirmed_absent');
+    expect(gateway.placeOrder).not.toHaveBeenCalled();
+
+    // A further poll of the SAME already-escalated row must not escalate again
+    // (no second update call) — recoverInflight in production would no longer even
+    // select this row once its status is confirmed_absent (see the query-scoping test
+    // below); this call merely proves recoverRow itself doesn't double-fire.
+    await svc.recoverInflight();
+    expect((prisma.realOrder.update as jest.Mock).mock.calls).toHaveLength(1);
+  });
+
+  it('a broker response in between resets the consecutive count: 2 confirmed-absent + 1 found + 2 confirmed-absent never escalates', async () => {
+    const row = makeRow({ id: 'ro_reset', status: 'pending_submit' });
+    const prisma = makePrisma({ findManyResult: [row] });
+    const gateway = makeGateway();
+    const svc = makeService(prisma, gateway);
+
+    gateway.getOrderByClientId.mockResolvedValueOnce(null);
+    await svc.recoverInflight();
+    gateway.getOrderByClientId.mockResolvedValueOnce(null);
+    await svc.recoverInflight();
+    gateway.getOrderByClientId.mockResolvedValueOnce({
+      broker_order_id: 'bo_found',
+      client_order_id: row.client_order_id,
+      status: 'new',
+      filled_qty: 0,
+      filled_avg_price: null,
+      raw: {},
+    });
+    await svc.recoverInflight();
+    gateway.getOrderByClientId.mockResolvedValueOnce(null);
+    await svc.recoverInflight();
+    gateway.getOrderByClientId.mockResolvedValueOnce(null);
+    await svc.recoverInflight();
+
+    const updateCalls = (prisma.realOrder.update as jest.Mock).mock.calls as unknown[][];
+    const escalations = updateCalls.filter(
+      (c) => (c[0] as { data: Record<string, unknown> }).data['status'] === 'confirmed_absent',
+    );
+    expect(escalations).toHaveLength(0);
+  });
+
+  it('a lookup-error (not a confirmed-not-found) resets the consecutive count too — only CONSECUTIVE confirmations from the broker itself count', async () => {
+    const row = makeRow({ id: 'ro_reset_err', status: 'pending_submit' });
+    const prisma = makePrisma({ findManyResult: [row] });
+    const gateway = makeGateway();
+    const svc = makeService(prisma, gateway);
+
+    gateway.getOrderByClientId.mockResolvedValueOnce(null);
+    await svc.recoverInflight();
+    gateway.getOrderByClientId.mockResolvedValueOnce(null);
+    await svc.recoverInflight();
+    gateway.getOrderByClientId.mockRejectedValueOnce(new Error('network down'));
+    await svc.recoverInflight();
+    gateway.getOrderByClientId.mockResolvedValueOnce(null);
+    await svc.recoverInflight();
+    gateway.getOrderByClientId.mockResolvedValueOnce(null);
+    await svc.recoverInflight();
+
+    expect((prisma.realOrder.update as jest.Mock).mock.calls).toHaveLength(0);
+  });
+
+  it('the recoverInflight query never includes confirmed_absent — escalated rows are structurally excluded from future automatic polling', async () => {
+    const prisma = makePrisma({ findManyResult: [] });
+    const gateway = makeGateway();
+    const svc = makeService(prisma, gateway);
+
+    await svc.recoverInflight();
+
+    const findManyCalls = (prisma.realOrder.findMany as jest.Mock).mock.calls as unknown[][];
+    expect(findManyCalls.length).toBeGreaterThan(0);
+    const args = findManyCalls[0][0] as { where: { status: { in: string[] } } };
+    expect(args.where.status.in).not.toContain('confirmed_absent');
+    expect(args.where.status.in).toEqual(
+      expect.arrayContaining(['pending_submit', 'submit_failed']),
+    );
+  });
+});
+
 // ── submit — per-intent idempotency (Fix 1) ──────────────────────────────────────
 
 describe('RealOrderService.submit — per-intent idempotency', () => {
@@ -616,9 +737,14 @@ describe('RealOrderService.submit — per-intent idempotency', () => {
     expect(findFirstCalls.length).toBeGreaterThan(0);
     const args = findFirstCalls[0][0] as { where: { status: { notIn: string[] } } };
     const actualSorted = [...args.where.status.notIn].sort((a, b) => a.localeCompare(b));
-    const expectedSorted = ['canceled', 'expired', 'filled', 'rejected', 'submit_failed'].sort(
-      (a, b) => a.localeCompare(b),
-    );
+    const expectedSorted = [
+      'canceled',
+      'confirmed_absent',
+      'expired',
+      'filled',
+      'rejected',
+      'submit_failed',
+    ].sort((a, b) => a.localeCompare(b));
     expect(actualSorted).toEqual(expectedSorted);
   });
 
@@ -741,9 +867,14 @@ describe('RealOrderService.submit — symbol-scoped guard (Fix 4)', () => {
     expect(symbolGuardArgs.where.broker_plugin_id).toBe('alpaca');
     expect(symbolGuardArgs.where.side).toBe('sell');
     const actualSorted = [...symbolGuardArgs.where.status.notIn].sort((a, b) => a.localeCompare(b));
-    const expectedSorted = ['canceled', 'expired', 'filled', 'rejected', 'submit_failed'].sort(
-      (a, b) => a.localeCompare(b),
-    );
+    const expectedSorted = [
+      'canceled',
+      'confirmed_absent',
+      'expired',
+      'filled',
+      'rejected',
+      'submit_failed',
+    ].sort((a, b) => a.localeCompare(b));
     expect(actualSorted).toEqual(expectedSorted);
   });
 });

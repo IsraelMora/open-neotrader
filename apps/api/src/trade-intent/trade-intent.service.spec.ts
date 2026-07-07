@@ -7,6 +7,7 @@
  * Real-money execution is intentionally NOT wired. Any mode != "paper" must throw.
  */
 
+import { Logger } from '@nestjs/common';
 import { TradeIntentService } from './trade-intent.service';
 import { GovernedPaperExecutionService } from '../execution/governed-paper-execution.service';
 
@@ -99,13 +100,22 @@ function makeReconciliation(): MockReconciliation {
  */
 function makeRealOrderService(): MockRealOrder {
   return {
-    submit: jest.fn().mockResolvedValue({
-      id: 'ro_default',
-      status: 'submitted',
-      client_order_id: 'nt-default',
-      broker_order_id: 'broker_default',
-      error: null,
-    }),
+    // trade_intent_id echoes the SAME id the caller submitted for — this is the
+    // "genuinely fresh submission" shape (see RealOrderService.submit: a freshly
+    // create()'d row always carries the caller's own tradeIntentId). Tests that want
+    // to simulate a DEDUP return against an EARLIER, DIFFERENT trade intent (see the
+    // "ALREADY PENDING" phantom-log regression test) override this per-test with an
+    // explicit, different trade_intent_id.
+    submit: jest.fn().mockImplementation((args: { tradeIntentId: string }) =>
+      Promise.resolve({
+        id: 'ro_default',
+        trade_intent_id: args.tradeIntentId,
+        status: 'submitted',
+        client_order_id: 'nt-default',
+        broker_order_id: 'broker_default',
+        error: null,
+      }),
+    ),
   };
 }
 
@@ -2969,6 +2979,70 @@ describe('TradeIntentService', () => {
       expect(result.status).toBe('executed');
       expect(result.realized_pnl).toBe(100);
       expect(prisma.portfolio.upsert).toHaveBeenCalled();
+    });
+
+    // Production incident: an hourly "SELL SPY" exit intent kept logging "REAL ORDER
+    // SUBMITTED" even though the broker never received a NEW order — RealOrderService.submit's
+    // symbol-scoped dedup guard (Fix 4, see real-order.service.ts) was returning a STALE
+    // non-terminal row created by an EARLIER trade intent (a stuck pending_submit row the
+    // broker has no record of — see RealOrderService.recoverInflight's "confirmed-not-found"
+    // branch), and _executeReal logged unconditional success as long as the returned row's
+    // status wasn't literally 'submit_failed'. Root-cause fix: _executeReal must only claim
+    // "SUBMITTED" when the returned row was actually created for THIS trade_intent_id — a
+    // mismatch means submit() deduped against a different (earlier) intent's row and made
+    // NO new broker call this cycle.
+    it('(e) exit resolves to real but RealOrderService dedups against an EARLIER trade intent (stuck stale order) → logs "ALREADY PENDING", never the misleading "REAL ORDER SUBMITTED" (production hourly phantom-log bug)', async () => {
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('false');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        return Promise.resolve(null);
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ id: 'ti_002', action: 'exit', symbol: 'SPY' }),
+      );
+      mockPaperPortfolio(prisma);
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 10_900,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'SPY',
+            qty: 19.21,
+            avg_entry: 400,
+            market_value: 7684,
+            unrealized_pnl: 0,
+            side: 'long',
+          },
+        ],
+        total_market_value: 7684,
+        total_pnl: 0,
+        ts: new Date().toISOString(),
+      });
+      // Dedup return: a stuck row from an EARLIER (different) trade_intent_id — no new
+      // create()/placeOrder happened this cycle (see RealOrderService.submit's symbol-scoped
+      // guard doc comment).
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_stuck',
+        trade_intent_id: 'ti_previous_cycle',
+        status: 'pending_submit',
+        client_order_id: 'nt-previous-cycle',
+        broker_order_id: null,
+        error: null,
+      });
+      prisma.tradeIntent.update.mockResolvedValue(
+        pendingIntent({ id: 'ti_002', status: 'real_pending', decided_by: 'autonomous' }),
+      );
+      const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+
+      await service.autoProcess('ti_002');
+
+      const messages = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(messages.some((m) => m.includes('REAL ORDER SUBMITTED'))).toBe(false);
+      expect(messages.some((m) => m.includes('ALREADY PENDING'))).toBe(true);
+
+      warnSpy.mockRestore();
     });
   });
 
