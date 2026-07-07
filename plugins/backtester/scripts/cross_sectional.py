@@ -18,7 +18,10 @@ from datetime import date as _date
 
 
 def _annualized_metrics(
-    equity_curve: list[dict], daily_returns: list[float], capital: float
+    equity_curve: list[dict],
+    daily_returns: list[float],
+    capital: float,
+    periods_per_year: float = 252,
 ) -> dict:
     final_eq = equity_curve[-1]["equity"] if equity_curve else capital
     total_return = (final_eq / capital - 1.0) * 100 if capital > 0 else 0.0
@@ -41,7 +44,7 @@ def _annualized_metrics(
         var = sum((r - mean_r) ** 2 for r in daily_returns) / (len(daily_returns) - 1)
         std = math.sqrt(var)
         if std > 0:
-            sharpe = (mean_r / std) * math.sqrt(252)
+            sharpe = (mean_r / std) * math.sqrt(periods_per_year)
 
     # Max drawdown (equity floors at >= 0 by construction)
     peak = capital
@@ -72,6 +75,11 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     rebalance_days = max(1, int(config.get("rebalance_days", 21)))
     lookback = int(config.get("lookback", 252))
     skip = int(config.get("skip", 21))
+    if skip >= lookback:
+        return {
+            "ok": False,
+            "error": f"skip ({skip}) must be less than lookback ({lookback})",
+        }
     capital = float(config.get("initial_capital", 10000))
     # Transaction costs charged on the notional traded at each rebalance (and on the
     # initial entry from cash). Without this the portfolio rebalances for free, which
@@ -98,6 +106,16 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     vol_target = float(config.get("vol_target", 0.0))
     vol_window = max(2, int(config.get("vol_window", 21)))
     max_leverage = float(config.get("max_leverage", 1.0))
+    # Position weighting at each rebalance: "equal" (default, unchanged behavior) or
+    # "inverse_vol" (risk parity — weight_i ∝ 1/realized_vol_i over the trailing
+    # `vol_window` bars, reusing the vol_target config above). Falls back to equal
+    # weight for a given rebalance (not silently) when a selected name lacks enough
+    # trailing history for a valid vol estimate.
+    weighting = str(config.get("weighting", "equal"))
+    # Annualization factor for bar-count-based metrics (Sharpe's sqrt(N) scaling).
+    # CAGR here is calendar-date-span-based (see _annualized_metrics), so it is NOT
+    # affected by this — only Sharpe is.
+    periods_per_year = float(config.get("periods_per_year", 252))
 
     # Common trading dates across the ENTIRE universe (so every symbol has a price).
     date_sets = [{b["date"] for b in bars} for bars in prices.values() if bars]
@@ -154,9 +172,66 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     equity_curve: list[dict] = []
     daily_returns: list[float] = []
     prev_val = capital
+    vol_weight_fallback_count = 0
 
     def _equal_weights(names: list[str]) -> dict[str, float]:
         return {s: 1.0 / len(names) for s in names} if names else {}
+
+    def _inverse_vol_weights(names: list[str], i: int) -> tuple[dict[str, float], bool]:
+        """Inverse-realized-vol weights for `names` at rebalance index i.
+
+        Realized vol per name = std of daily returns over the trailing `vol_window`
+        bars STRICTLY BEFORE i (bar i itself is never touched — no lookahead). Falls
+        back to equal weight for this rebalance only (returns `fell_back=True`) when
+        any name lacks at least 2 valid trailing returns, or has zero realized vol.
+        """
+        if not names:
+            return {}, False
+        vols: dict[str, float | None] = {}
+        for s in names:
+            rets = []
+            for k in range(max(1, i - vol_window), i):
+                p0 = px[s].get(common[k - 1])
+                p1 = px[s].get(common[k])
+                if p0 and p1 and p0 > 0:
+                    rets.append(p1 / p0 - 1.0)
+            if len(rets) < 2:
+                vols[s] = None
+                continue
+            mean_r = sum(rets) / len(rets)
+            var = sum((r - mean_r) ** 2 for r in rets) / (len(rets) - 1)
+            vols[s] = math.sqrt(var)
+        if any(v is None or v <= 0 for v in vols.values()):
+            return _equal_weights(names), True
+        inv = {s: 1.0 / vols[s] for s in names}  # type: ignore[operator]
+        total = sum(inv.values())
+        if total <= 0:
+            return _equal_weights(names), True
+        w = {s: inv[s] / total for s in names}
+        # Cap any single weight at 0.5 (avoid degenerate concentration). Naively
+        # rescaling ALL weights to sum to 1 after a flat min(0.5, w) would re-inflate
+        # the capped name back above 0.5 (dividing 0.5 by a sub-1 total). Instead,
+        # fix violators at exactly 0.5 and redistribute the remaining budget
+        # proportionally among the non-violators (iterating in case that push creates
+        # a new violator), so the cap actually holds and weights still sum to 1.
+        cap = 0.5
+        for _ in range(len(w)):
+            over = {s for s, wv in w.items() if wv > cap + 1e-12}
+            if not over:
+                break
+            remaining_names = [s for s in w if s not in over]
+            remaining_budget = 1.0 - cap * len(over)
+            remaining_sum = sum(w[s] for s in remaining_names)
+            new_w = dict.fromkeys(over, cap)
+            if remaining_names:
+                if remaining_sum > 0:
+                    for s in remaining_names:
+                        new_w[s] = (w[s] / remaining_sum) * remaining_budget
+                else:
+                    for s in remaining_names:
+                        new_w[s] = remaining_budget / len(remaining_names)
+            w = new_w
+        return w, False
 
     for i in range(len(common)):
         date = common[i]
@@ -178,7 +253,12 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
 
             # Charge cost on the traded notional: sum of |Δweight| across all names
             # (covers both the names sold and the names bought, incl. entry from cash).
-            new_weights = _equal_weights(holdings)
+            if weighting == "inverse_vol":
+                new_weights, fell_back = _inverse_vol_weights(holdings, i)
+                if fell_back:
+                    vol_weight_fallback_count += 1
+            else:
+                new_weights = _equal_weights(holdings)
             traded = sum(
                 abs(new_weights.get(s, 0.0) - weights.get(s, 0.0))
                 for s in set(new_weights) | set(weights)
@@ -190,17 +270,20 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
             # Set vol-target exposure for the upcoming holding period.
             exposure = _exposure(holdings, i)
 
-        # Apply one day of equal-weight return from yesterday's holdings, scaled by the
-        # vol-target exposure (the un-invested fraction sits in cash, earning 0).
+        # Apply one day of weighted return from yesterday's holdings (equal-weight
+        # unless `weighting: inverse_vol`), scaled by the vol-target exposure (the
+        # un-invested fraction sits in cash, earning 0).
         if holdings and i > 0:
-            rets = []
+            weighted_ret = 0.0
+            have_any = False
             for s in holdings:
                 p0 = px[s].get(common[i - 1])
                 p1 = px[s].get(date)
                 if p0 and p1 and p0 > 0:
-                    rets.append(p1 / p0 - 1.0)
-            if rets:
-                equity *= 1.0 + exposure * (sum(rets) / len(rets))
+                    weighted_ret += weights.get(s, 0.0) * (p1 / p0 - 1.0)
+                    have_any = True
+            if have_any:
+                equity *= 1.0 + exposure * weighted_ret
 
         equity = max(0.0, equity)
         equity_curve.append({"date": date, "equity": round(equity, 2)})
@@ -208,7 +291,7 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
             daily_returns.append(equity / prev_val - 1.0)
         prev_val = equity
 
-    metrics = _annualized_metrics(equity_curve, daily_returns, capital)
+    metrics = _annualized_metrics(equity_curve, daily_returns, capital, periods_per_year)
     metrics["total_cost_pct"] = round((total_cost / capital * 100) if capital > 0 else 0.0, 2)
 
     # Benchmark: equal-weight of the WHOLE universe, daily-compounded over the SAME
@@ -229,11 +312,15 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     metrics["buy_hold_return_pct"] = round(bench_ret, 2)
     metrics["alpha_pct"] = round(metrics["total_return_pct"] - bench_ret, 2)
 
-    return {
+    result = {
         "ok": True,
         "metrics": metrics,
         "equity_curve": equity_curve,
         "final_holdings": holdings,
+        "final_weights": weights,
         "n_dates": len(common),
         "universe_size": len(symbols),
     }
+    if weighting == "inverse_vol":
+        result["vol_weight_fallback_count"] = vol_weight_fallback_count
+    return result

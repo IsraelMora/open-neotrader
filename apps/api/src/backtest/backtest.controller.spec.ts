@@ -10,6 +10,7 @@ import { BacktestController } from './backtest.controller';
 import { BacktestService } from './backtest.service';
 import type { BacktestResponse } from './backtest.service';
 import { RunBacktestDto } from './dto/run-backtest.dto';
+import { CrossSectionalDto } from './dto/cross-sectional.dto';
 import { WalkForwardTotpGuard } from './guards/walk-forward-totp.guard';
 
 // ── DTO validation tests ──────────────────────────────────────────────────────
@@ -87,6 +88,25 @@ describe('RunBacktestDto — validation', () => {
   it('accepts null provider_id', async () => {
     const errors = await validate(dto({ provider_id: null }));
     expect(errors).toHaveLength(0);
+  });
+});
+
+describe('CrossSectionalDto — validation', () => {
+  function dto(overrides: Record<string, unknown> = {}): CrossSectionalDto {
+    return plainToInstance(CrossSectionalDto, {
+      symbols: ['AAPL'],
+      ...overrides,
+    });
+  }
+
+  it('accepts skip=147 (Novy-Marx 12-7 style skip, unlocked by the raised cap)', async () => {
+    const errors = await validate(dto({ skip: 147 }));
+    expect(errors).toHaveLength(0);
+  });
+
+  it('rejects skip=201 (above the raised cap)', async () => {
+    const errors = await validate(dto({ skip: 201 }));
+    expect(errors.some((e) => e.property === 'skip')).toBe(true);
   });
 });
 
