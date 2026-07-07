@@ -966,3 +966,106 @@ describe('ProviderGatewayService — Yahoo 429 hardening', () => {
     }
   });
 });
+
+// ── Yahoo deep-history: period1/period2 instead of range=max ──────────────────
+//
+// CONFIRMED against live Yahoo: range=max silently returns MONTHLY bars even
+// though interval=1d was requested (meta.dataGranularity === '1mo'). For a
+// limit beyond what the range buckets cover (yahooRange() would otherwise
+// fall back to 'max'), the gateway must request an explicit period1/period2
+// window instead, which Yahoo honors with real daily granularity.
+
+describe('ProviderGatewayService — Yahoo deep-history period1/period2', () => {
+  it('limit beyond range buckets (>2520): sends period1/period2, not range=max', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('fc.yahoo.com')) return Promise.resolve(fakeResponse({ ok: true }));
+      return Promise.resolve(fakeResponse({ ok: true, json: YAHOO_CHART_OK }));
+    });
+
+    const svc = makeYahooService();
+    await svc.getOhlcv('yahoo-finance-provider', 'SPY', '1d', 5000);
+
+    const calls = fetchMock.mock.calls as [string, RequestInit][];
+    const chartCall = calls.find((c) => !c[0].includes('fc.yahoo.com'));
+    const [url] = chartCall!;
+
+    expect(url).toMatch(/period1=\d+/);
+    expect(url).toMatch(/period2=\d+/);
+    expect(url).not.toMatch(/range=max/);
+  });
+
+  it('limit within existing range buckets (<=2520): unchanged, still uses range=<token>', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('fc.yahoo.com')) return Promise.resolve(fakeResponse({ ok: true }));
+      return Promise.resolve(fakeResponse({ ok: true, json: YAHOO_CHART_OK }));
+    });
+
+    const svc = makeYahooService();
+    await svc.getOhlcv('yahoo-finance-provider', 'SPY', '1d', 400);
+
+    const calls = fetchMock.mock.calls as [string, RequestInit][];
+    const chartCall = calls.find((c) => !c[0].includes('fc.yahoo.com'));
+    const [url] = chartCall!;
+
+    expect(url).toMatch(/range=2y/);
+    expect(url).not.toMatch(/period1=/);
+  });
+});
+
+// ── Yahoo granularity integrity guard (normalizeBars) ──────────────────────────
+//
+// Guards against silently treating monthly bars as daily bars: if Yahoo's
+// response declares a dataGranularity that doesn't match what was requested,
+// normalizeBars must throw instead of returning corrupted-looking data.
+
+function yahooChartWithGranularity(dataGranularity?: string) {
+  return {
+    chart: {
+      result: [
+        {
+          timestamp: [1704067200],
+          ...(dataGranularity ? { meta: { dataGranularity } } : {}),
+          indicators: {
+            quote: [{ open: [1], high: [2], low: [0.5], close: [1.5], volume: [1000] }],
+          },
+        },
+      ],
+    },
+  };
+}
+
+describe('ProviderGatewayService — Yahoo granularity integrity guard', () => {
+  it('throws when Yahoo returns monthly bars for a daily request (silent downgrade)', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('fc.yahoo.com')) return Promise.resolve(fakeResponse({ ok: true }));
+      return Promise.resolve(fakeResponse({ ok: true, json: yahooChartWithGranularity('1mo') }));
+    });
+
+    const svc = makeYahooService();
+    await expect(svc.getOhlcv('yahoo-finance-provider', 'SPY', '1d', 5000)).rejects.toThrow(/1mo/);
+  });
+
+  it('does not throw when dataGranularity matches the requested interval (regression)', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('fc.yahoo.com')) return Promise.resolve(fakeResponse({ ok: true }));
+      return Promise.resolve(fakeResponse({ ok: true, json: yahooChartWithGranularity('1d') }));
+    });
+
+    const svc = makeYahooService();
+    const result = await svc.getOhlcv('yahoo-finance-provider', 'SPY', '1d', 200);
+
+    expect(result).toHaveLength(1);
+  });
+
+  it('does not throw when meta.dataGranularity is missing (regression safety net)', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('fc.yahoo.com')) return Promise.resolve(fakeResponse({ ok: true }));
+      return Promise.resolve(fakeResponse({ ok: true, json: yahooChartWithGranularity() }));
+    });
+
+    const svc = makeYahooService();
+    const result = await svc.getOhlcv('yahoo-finance-provider', 'SPY', '1d', 200);
+
+    expect(result).toHaveLength(1);
+  });
+});

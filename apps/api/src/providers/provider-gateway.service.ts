@@ -279,7 +279,7 @@ export class ProviderGatewayService implements OnModuleInit {
       range: this.yahooRange(limit),
     });
 
-    const bars = this.normalizeBars(raw, fmt);
+    const bars = this.normalizeBars(raw, fmt, tf);
     // Honor the requested bar count: providers like Yahoo only accept a coarse `range`
     // bucket and over-fetch, so slice to the LAST `limit` bars (most recent).
     const limited = limit > 0 && bars.length > limit ? bars.slice(-limit) : bars;
@@ -662,7 +662,10 @@ export class ProviderGatewayService implements OnModuleInit {
     endpointKey: string,
     params: Record<string, unknown>,
   ): Promise<unknown> {
-    const url = this.buildRequestUrl(manifest, endpointKey, params);
+    let url = this.buildRequestUrl(manifest, endpointKey, params);
+    if (manifest.api.format === 'generic' && endpointKey === 'ohlcv') {
+      url = this.maybeRewriteYahooDeepHistoryUrl(url, params);
+    }
     const headers = this.buildAuthHeaders(manifest);
     const timeoutMs = 10_000;
 
@@ -968,7 +971,7 @@ export class ProviderGatewayService implements OnModuleInit {
 
   // ── Normalización ─────────────────────────────────────────────────────────
 
-  private normalizeBars(raw: unknown, format: string): OhlcvBar[] {
+  private normalizeBars(raw: unknown, format: string, requestedInterval?: string): OhlcvBar[] {
     if (format === 'alpaca') {
       const data = raw as { bars?: AlpacaBar[] };
       return (data.bars ?? []).map((b) => ({
@@ -1018,43 +1021,8 @@ export class ProviderGatewayService implements OnModuleInit {
     }
     // Yahoo Finance: estructura chart.result[0] con timestamps + indicators
     if (format === 'generic') {
-      const yahoo = raw as {
-        chart?: {
-          result?: [
-            {
-              timestamp?: number[];
-              indicators?: {
-                quote?: [
-                  {
-                    open?: number[];
-                    high?: number[];
-                    low?: number[];
-                    close?: number[];
-                    volume?: number[];
-                  },
-                ];
-                adjclose?: [{ adjclose?: number[] }];
-              };
-            },
-          ];
-        };
-      };
-      const result = yahoo?.chart?.result?.[0];
-      if (result?.timestamp) {
-        const timestamps = result.timestamp;
-        const q = result.indicators?.quote?.[0];
-        const adjClose = result.indicators?.adjclose?.[0]?.adjclose;
-        return timestamps
-          .map((ts, i) => ({
-            ts: new Date(ts * 1000).toISOString(),
-            open: Number(q?.open?.[i] ?? 0),
-            high: Number(q?.high?.[i] ?? 0),
-            low: Number(q?.low?.[i] ?? 0),
-            close: Number(adjClose?.[i] ?? q?.close?.[i] ?? 0),
-            volume: Number(q?.volume?.[i] ?? 0),
-          }))
-          .filter((b) => b.close > 0);
-      }
+      const bars = this.normalizeYahooBars(raw, requestedInterval);
+      if (bars) return bars;
     }
 
     // Formato genérico: intenta inferir campos comunes
@@ -1067,6 +1035,65 @@ export class ProviderGatewayService implements OnModuleInit {
       close: Number(b['c'] ?? b['close'] ?? 0),
       volume: Number(b['v'] ?? b['volume'] ?? 0),
     }));
+  }
+
+  /**
+   * Normaliza la respuesta de Yahoo Finance (chart.result[0]). Retorna `null`
+   * si la respuesta no trae `timestamp` (deja que el llamador caiga al parser
+   * genérico de fallback).
+   *
+   * Guarda contra el downgrade silencioso de granularidad de Yahoo (range=max
+   * → velas mensuales): si la respuesta declara un `dataGranularity` que no
+   * coincide con lo solicitado, falla ruidosamente en vez de tratar velas
+   * mensuales como diarias. `dataGranularity` ausente se trata como OK (red
+   * de seguridad para respuestas que no lo incluyen).
+   */
+  private normalizeYahooBars(raw: unknown, requestedInterval?: string): OhlcvBar[] | null {
+    const yahoo = raw as {
+      chart?: {
+        result?: [
+          {
+            timestamp?: number[];
+            meta?: { dataGranularity?: string };
+            indicators?: {
+              quote?: [
+                {
+                  open?: number[];
+                  high?: number[];
+                  low?: number[];
+                  close?: number[];
+                  volume?: number[];
+                },
+              ];
+              adjclose?: [{ adjclose?: number[] }];
+            };
+          },
+        ];
+      };
+    };
+    const result = yahoo?.chart?.result?.[0];
+    if (!result?.timestamp) return null;
+
+    const dataGranularity = result.meta?.dataGranularity;
+    if (dataGranularity && requestedInterval && dataGranularity !== requestedInterval) {
+      throw new Error(
+        `Yahoo devolvió granularidad ${dataGranularity} para un pedido ${requestedInterval} (range demasiado largo) — datos descartados`,
+      );
+    }
+
+    const timestamps = result.timestamp;
+    const q = result.indicators?.quote?.[0];
+    const adjClose = result.indicators?.adjclose?.[0]?.adjclose;
+    return timestamps
+      .map((ts, i) => ({
+        ts: new Date(ts * 1000).toISOString(),
+        open: Number(q?.open?.[i] ?? 0),
+        high: Number(q?.high?.[i] ?? 0),
+        low: Number(q?.low?.[i] ?? 0),
+        close: Number(adjClose?.[i] ?? q?.close?.[i] ?? 0),
+        volume: Number(q?.volume?.[i] ?? 0),
+      }))
+      .filter((b) => b.close > 0);
   }
 
   private normalizeQuote(raw: unknown, format: string, symbol: string): Quote {
@@ -1159,6 +1186,34 @@ export class ProviderGatewayService implements OnModuleInit {
       if (limit <= bars) return range;
     }
     return 'max';
+  }
+
+  /** Largest bar count covered by a discrete yahooRange() bucket (the '10y' bucket). Beyond this, yahooRange() falls back to 'max'. */
+  private static readonly YAHOO_DEEP_HISTORY_LIMIT = 2520;
+
+  /**
+   * CONFIRMED against live Yahoo: `range=max` silently returns MONTHLY bars
+   * even when `interval=1d` is requested (response `meta.dataGranularity`
+   * === '1mo') — e.g. SPY range=max returns 403 monthly bars instead of
+   * thousands of daily bars. For a `limit` beyond what the range buckets
+   * cover (where yahooRange() would otherwise fall back to 'max'), replace
+   * the `range=<token>` query segment with an explicit `period1`/`period2`
+   * window — Yahoo honors `interval` correctly with an explicit date range.
+   *
+   * `period2` is now; `period1` is now minus `limit * 1.6` calendar days
+   * (margin for weekends/holidays when `limit` is a bar count), floored at 0.
+   * No-op for any other request (limit within existing buckets, or not a
+   * Yahoo ohlcv request — callers already gate on that).
+   */
+  private maybeRewriteYahooDeepHistoryUrl(url: string, params: Record<string, unknown>): string {
+    const limit = Number(params['limit']);
+    if (!Number.isFinite(limit) || limit <= ProviderGatewayService.YAHOO_DEEP_HISTORY_LIMIT) {
+      return url;
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    const marginSeconds = Math.round(limit * 1.6 * 86_400);
+    const period1 = Math.max(0, nowSec - marginSeconds);
+    return url.replace(/range=[^&]*/, `period1=${period1}&period2=${nowSec}`);
   }
 
   // ── TOML parser mínimo ────────────────────────────────────────────────────
