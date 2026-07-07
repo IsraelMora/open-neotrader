@@ -238,6 +238,40 @@ export class TradeIntentService {
       throw new Error(`Invalid confidence ${dto.confidence}. Must be a number in [0, 1].`);
     }
 
+    // DUPLICATE-IN-CYCLE FIX: a single governed cycle can emit several tool calls that each
+    // resolve to the SAME (symbol, action) — e.g. the LLM repeating "EEM long @67.59" 6x
+    // seconds apart within one cycle. Only the FIRST such intent for a given cycle_id proceeds
+    // normally; later ones are recorded (not executed) with a distinct status. Scoped strictly
+    // to cycle_id — the SAME symbol+action in a DIFFERENT (or absent) cycle_id is never deduped
+    // here, and this never touches the separate real-money client_order_id idempotency layer.
+    if (dto.cycle_id) {
+      const priorInCycle = await this.db.tradeIntent.findFirst({
+        where: { cycle_id: dto.cycle_id, symbol: dto.symbol, action: dto.action },
+        orderBy: { created_at: 'asc' },
+      });
+      if (priorInCycle) {
+        return this.db.tradeIntent.create({
+          data: {
+            cycle_id: dto.cycle_id,
+            symbol: dto.symbol,
+            action: dto.action,
+            confidence: dto.confidence,
+            rationale: dto.rationale,
+            timeframe: dto.timeframe ?? '1d',
+            mode: 'paper',
+            status: 'duplicate',
+            decided_at: new Date(),
+            decided_by: 'autonomous',
+            result_json: JSON.stringify({
+              reason:
+                `duplicate ${dto.action} intent for ${dto.symbol} within cycle ${dto.cycle_id}` +
+                ` — an earlier intent (${String(priorInCycle.id)}) already handled it this cycle`,
+            }),
+          },
+        });
+      }
+    }
+
     const created = await this.db.tradeIntent.create({
       data: {
         cycle_id: dto.cycle_id ?? null,
@@ -1851,7 +1885,7 @@ export class TradeIntentService {
     // Execute the trade in-memory — shared fill math (GovernedPaperExecutionService),
     // identical to the historical _executePaper/_executePaperLong/_executePaperShort
     // (commissionPct omitted → defaults to 0, byte-identical to the pre-refactor behavior).
-    const { quantity, realized_pnl, newState } = this.governedPaperExec.executeFill(
+    const { quantity, realized_pnl, newState, noPosition } = this.governedPaperExec.executeFill(
       action,
       symbol,
       fillPrice,
@@ -1872,6 +1906,26 @@ export class TradeIntentService {
         data: JSON.stringify(newState),
       },
     });
+
+    // PHANTOM-EXIT FIX: an "exit" with NO matching open paper position is NOT a real trade —
+    // recording it as status='executed' with a fabricated quantity=0/fill_price produces fake
+    // "$0" rows in the trade history (e.g. an hourly SPY exit signal firing when the paper
+    // portfolio holds no SPY). This ONLY changes what gets RECORDED — the exit itself was
+    // already fully processed above (never blocked; closeability invariant untouched) and the
+    // real-money path (_executeReal) is a completely separate code path, unaffected here.
+    if (action === 'exit' && noPosition) {
+      return this.db.tradeIntent.update({
+        where: { id },
+        data: {
+          status: 'skipped',
+          decided_at: new Date(),
+          decided_by,
+          result_json: JSON.stringify({
+            reason: `exit skipped — no open position found for ${symbol}`,
+          }),
+        },
+      });
+    }
 
     // Persist result on the TradeIntent row.
     return this.db.tradeIntent.update({
