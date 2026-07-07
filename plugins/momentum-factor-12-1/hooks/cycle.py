@@ -15,6 +15,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from momentum import apply_trend_filter, compute_momentum_ranks  # noqa: E402
 
 
+def _normalize_symbols(raw_symbols) -> list[str]:
+    """Comma-separated string OR list of strings -> trimmed/upper/deduped list,
+    preserving first-seen order. Mirrors plugins/broad-index-hold's parsing
+    convention for its own `symbols` config key."""
+    if isinstance(raw_symbols, str):
+        candidates = [s.strip().upper() for s in raw_symbols.split(",") if s.strip()]
+    elif isinstance(raw_symbols, list):
+        candidates = [str(s).strip().upper() for s in raw_symbols if str(s).strip()]
+    else:
+        candidates = []
+
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for symbol in candidates:
+        if symbol not in seen:
+            seen.add(symbol)
+            normalized.append(symbol)
+    return normalized
+
+
 def on_cycle(ctx: dict) -> dict:
     """
     Args:
@@ -31,6 +51,14 @@ def on_cycle(ctx: dict) -> dict:
     config: dict = ctx.get("config", {})
     portfolio: dict = ctx.get("portfolio", {})
 
+    # Override de universo por portfolio — OPT-IN. Cuando `symbols` está
+    # presente y no queda vacío tras normalizar, REEMPLAZA ctx["universe"]
+    # para este ciclo. Ausente/vacío -> comportamiento original (usa
+    # ctx["universe"] sin modificar).
+    symbols_override = _normalize_symbols(config.get("symbols"))
+    if symbols_override:
+        universe = symbols_override
+
     top_pct = config.get("top_pct", 20) / 100.0
     lookback_months = config.get("lookback_months", 12)
     market_trend_up: bool = ctx.get("market_trend_up", True)
@@ -38,6 +66,9 @@ def on_cycle(ctx: dict) -> dict:
     # idéntico al original cuando no se activa explícitamente por config.
     enable_short: bool = bool(config.get("enable_short", False))
     short_bottom_pct = config.get("short_bottom_pct", 10) / 100.0
+    # Filtro de régimen por amplitud (breadth) — OPT-IN, estilo Antonacci dual
+    # momentum. Valor en PORCENTAJE 0-100 (igual que top_pct), 0 = desactivado.
+    regime_min_breadth = config.get("regime_min_breadth", 0) or 0
 
     signals = []
     logs = []
@@ -106,6 +137,47 @@ def on_cycle(ctx: dict) -> dict:
         enable_short=enable_short,
         short_bottom_pct=short_bottom_pct,
     )
+
+    # Filtro de régimen por amplitud (breadth) — Antonacci dual momentum. Se
+    # mide ANTES del filtro de tendencia (que solo cancela "long", no altera
+    # return_12_1) sobre los símbolos con momentum efectivamente calculado
+    # (`ranks` ya excluye los que no tuvieron datos suficientes).
+    if regime_min_breadth and ranks:
+        positive_count = sum(1 for r in ranks if r.return_12_1 > 0)
+        breadth = positive_count / len(ranks)
+        if breadth * 100 < regime_min_breadth:
+            # RISK-OFF: reemplaza por completo la lógica normal de señales —
+            # solo exits de posiciones largas actualmente en cartera (cantidad
+            # positiva; una cantidad negativa representa un short abierto y no
+            # se toca aquí para no generar señales duplicadas/conflictivas).
+            for symbol, quantity in portfolio.items():
+                if quantity > 0:
+                    signals.append(
+                        {
+                            "type": "momentum_signal",
+                            "symbol": symbol,
+                            "action": "exit",
+                            "rank": None,
+                            "return_12_1": None,
+                            "percentile": None,
+                            "volatility_12m": None,
+                            "vol_adjusted_score": None,
+                            "confidence": None,
+                        }
+                    )
+            logs.append(
+                {
+                    "level": "warning",
+                    "msg": (
+                        "Filtro de régimen activado: breadth "
+                        f"{breadth * 100:.1f}% < mínimo {regime_min_breadth}% — "
+                        "modo defensivo, sin nuevas entradas long/short, "
+                        "saliendo de posiciones largas existentes."
+                    ),
+                }
+            )
+            return {"signals": signals, "logs": logs}
+
     ranks = apply_trend_filter(ranks, market_trend_up)
 
     for r in ranks:

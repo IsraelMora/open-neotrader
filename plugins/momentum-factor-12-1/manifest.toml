@@ -46,6 +46,20 @@ max     = 50
 label   = "% inferior a shortear"
 description = "Porcentaje inferior del universo candidato a short (ej. 10 = peor 10%). Solo aplica si enable_short=true, y solo a símbolos con retorno 12-1 negativo."
 
+[config.symbols]
+type    = "string"
+default = ""
+label   = "Símbolos (override de universo)"
+description = "Lista de símbolos separados por coma (ej. 'SPY,QQQ,GLD') que reemplaza el universo global para este portfolio. Vacío (default) = usa el universo activo sin cambios."
+
+[config.regime_min_breadth]
+type    = "number"
+default = 0
+min     = 0
+max     = 100
+label   = "% mínimo de amplitud (breadth) para operar"
+description = "Filtro de régimen estilo Antonacci (dual momentum): porcentaje del universo que debe tener momentum positivo para permitir nuevas señales long/short. Si la amplitud medida cae por debajo de este umbral, el plugin entra en modo defensivo (cierra posiciones largas existentes, no abre nuevas). 0 (default) = filtro desactivado."
+
 [config.rebalance_frequency]
 type    = "string"
 enum    = ["weekly", "monthly", "quarterly"]
