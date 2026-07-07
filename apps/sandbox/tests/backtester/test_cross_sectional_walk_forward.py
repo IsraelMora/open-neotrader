@@ -102,11 +102,11 @@ class TestAnchoredWindowing:
 
 
 class TestNoLookahead:
-    def test_oos_result_unaffected_by_corrupting_data_outside_its_own_window(self, wf):
-        """Corrupt every bar OUTSIDE a given window's [oos_start, oos_end) range with an
-        extreme sentinel price, and prove that window's OOS result is identical to the
-        clean-data run — the OOS backtest for a window must only ever see its own
-        sliced bars, never IS data or other-window data."""
+    def test_oos_result_unaffected_by_corrupting_oos_future_data(self, wf):
+        """Corrupt every bar AFTER a given window's oos_end with an extreme sentinel
+        price, and prove that window's OOS result is identical to the clean-data run —
+        the OOS backtest for a window must never see OOS-future bars. (Bars BEFORE the
+        OOS start are legitimately visible as the warmup prefix — they are the past.)"""
         n = 300
         clean = {
             "A": _bars(_regime_change(n=n), n=n),
@@ -116,21 +116,22 @@ class TestNoLookahead:
         assert clean_result["ok"] and clean_result["windows"]
 
         target = clean_result["windows"][0]
-        oos_start, oos_end = target["oos_start"], target["oos_end"]
+        oos_end = target["oos_end"]
+        assert oos_end < n  # window 0 must have OOS-future bars to corrupt
 
         SENTINEL = 1e9
 
-        def corrupt_outside(bars: list[dict]) -> list[dict]:
+        def corrupt_after(bars: list[dict]) -> list[dict]:
             out = []
             for i, b in enumerate(bars):
-                if oos_start <= i < oos_end:
+                if i < oos_end:
                     out.append(b)
                 else:
                     out.append({**b, "open": SENTINEL, "high": SENTINEL,
                                 "low": SENTINEL, "close": SENTINEL})
             return out
 
-        corrupted = {sym: corrupt_outside(bars) for sym, bars in clean.items()}
+        corrupted = {sym: corrupt_after(bars) for sym, bars in clean.items()}
         corrupted_result = wf.run_cross_sectional_walk_forward(corrupted, CS_CFG)
         assert corrupted_result["ok"]
 
@@ -141,14 +142,17 @@ class TestNoLookahead:
         assert corrupted_target["oos_cagr_pct"] == target["oos_cagr_pct"]
         assert corrupted_target["oos_total_return_pct"] == target["oos_total_return_pct"]
 
-    def test_oos_call_receives_only_its_own_date_range(self, wf, monkeypatch):
+    def test_oos_call_receives_warmup_prefix_plus_own_window_only(self, wf, monkeypatch):
         """Directly assert the date range passed into run_cross_sectional for the OOS
-        call of each window never includes dates from before its own oos_start index."""
+        call of each window is EXACTLY the (lookback+skip+1) warmup bars immediately
+        preceding oos_start, followed by the window's own [oos_start, oos_end) bars —
+        never any OOS-future bar, and never more warmup than documented."""
         n = 300
         prices = {
             "A": _bars(_regime_change(n=n), n=n),
             "B": _bars(lambda i: 100.0, n=n),
         }
+        warmup = CS_CFG["lookback"] + CS_CFG["skip"] + 1
         calls = []
         real_run_cross_sectional = wf.run_cross_sectional
 
@@ -162,16 +166,75 @@ class TestNoLookahead:
         assert r["ok"]
         # 2 calls per window (IS, OOS) in window order.
         assert len(calls) == 2 * len(r["windows"])
+        all_dates = [b["date"] for b in prices["A"]]
         for idx, window in enumerate(r["windows"]):
             is_dates = calls[2 * idx]["A"]
             oos_dates = calls[2 * idx + 1]["A"]
-            all_dates = [b["date"] for b in prices["A"]]
-            expected_is = all_dates[: window["is_end"]]
-            expected_oos = all_dates[window["oos_start"]: window["oos_end"]]
-            assert is_dates == expected_is
+            oos_start, oos_end = window["oos_start"], window["oos_end"]
+            # Warmup prefix ends exactly at the bar before OOS start.
+            assert window["oos_warmup_start"] == oos_start - warmup
+            expected_prefix = all_dates[oos_start - warmup: oos_start]
+            expected_oos = all_dates[oos_start - warmup: oos_end]
+            assert is_dates == all_dates[: window["is_end"]]
             assert oos_dates == expected_oos
-            # No overlap between IS and OOS date sets passed in.
-            assert not (set(is_dates) & set(oos_dates))
+            assert oos_dates[:warmup] == expected_prefix
+            # The ONLY overlap between IS and OOS inputs is the warmup prefix
+            # (past data relative to every OOS bar) — never anything else.
+            assert set(is_dates) & set(oos_dates) == set(expected_prefix)
+
+
+class TestSymmetricWarmup:
+    def test_both_is_and_oos_runs_get_metrics_start_bar_equal_to_warmup(
+        self, wf, monkeypatch
+    ):
+        """IS runs must ALSO evaluate metrics only after the warmup dead zone
+        (metrics_start_bar = lookback+skip+1), symmetric with the OOS runs: the
+        robustness ratio compares IS vs OOS sharpe, and excluding warmup on only
+        one side would bias the ratio."""
+        n = 300
+        prices = {
+            "A": _bars(_regime_change(n=n), n=n),
+            "B": _bars(lambda i: 100.0, n=n),
+        }
+        warmup = CS_CFG["lookback"] + CS_CFG["skip"] + 1
+        seen = []
+        real_run_cross_sectional = wf.run_cross_sectional
+
+        def spy(px, cfg, _context=None):
+            seen.append(cfg.get("metrics_start_bar"))
+            return real_run_cross_sectional(px, cfg)
+
+        monkeypatch.setattr(wf, "run_cross_sectional", spy)
+        r = wf.run_cross_sectional_walk_forward(prices, CS_CFG)
+        assert r["ok"]
+        assert seen, "expected at least one window to run"
+        assert all(msb == warmup for msb in seen), seen
+
+
+class TestProductionDefaults:
+    def test_production_default_shape_produces_valid_windows_and_real_verdict(self, wf):
+        """The feature's own default request shape (limit 1500, lookback 252, skip 21,
+        n_windows 5, in_sample_pct 0.7) must produce VALID windows and a real verdict —
+        before the warmup-prefix fix every OOS slice (90 bars < lookback+1) failed and
+        the verdict was deterministically INSUFICIENTE_DATOS."""
+        n = 1500
+        prices = {
+            "WIN": _bars(lambda i: 100.0 * (1.003 ** i), n=n),
+            "FLAT": _bars(lambda i: 100.0, n=n),
+            "LOSE": _bars(lambda i: 100.0 * (0.998 ** i), n=n),
+        }
+        cfg = {
+            "lookback": 252, "skip": 21, "n_windows": 5, "in_sample_pct": 0.7,
+            "initial_capital": 10000,
+        }
+        r = wf.run_cross_sectional_walk_forward(prices, cfg)
+        assert r["ok"], r
+        assert r["verdict"] != "INSUFICIENTE_DATOS", r
+        assert r["total_windows"] == 5, r
+        for w in r["windows"]:
+            assert w["is_ok"] and w["oos_ok"], w
+            # Evaluated OOS span (excluding warmup) meets the statistical floor.
+            assert w["oos_end"] - w["oos_start"] >= 21, w
 
 
 class TestAggregateMath:
@@ -274,14 +337,52 @@ class TestValidation:
         assert "lookback" in r["summary"]["error"].lower()
 
     def test_lookback_below_the_floor_is_accepted(self, wf):
+        # n=210, in_sample_pct=0.7 -> oos_total=63, n_windows=3 -> oos_per_window=21
+        # (exactly the minimum evaluated-OOS floor); warmup 10+1+1=12 < smallest IS 147.
+        prices = {
+            "A": _bars(lambda i: 100.0 + i, n=210),
+            "B": _bars(lambda i: 100.0, n=210),
+        }
+        cfg = {**CS_CFG, "n_windows": 3, "in_sample_pct": 0.7, "lookback": 10, "skip": 1}
+        r = wf.run_cross_sectional_walk_forward(prices, cfg)
+        assert r["ok"] is True
+        assert "error" not in r["summary"]
+
+    def test_oos_window_below_evaluated_floor_is_rejected_with_actionable_message(self, wf):
+        """Part B safety net: even with warmup prefixes, an OOS window evaluated span
+        below ~one rebalance period (21 bars) is statistically meaningless — fail fast
+        upfront with a message naming the numbers, instead of returning a verdict
+        built on noise."""
+        # n=100, in_sample_pct=0.7 -> oos_total=30, n_windows=3 -> oos_per_window=10 < 21.
         prices = {
             "A": _bars(lambda i: 100.0 + i, n=100),
             "B": _bars(lambda i: 100.0, n=100),
         }
         cfg = {**CS_CFG, "n_windows": 3, "in_sample_pct": 0.7, "lookback": 10, "skip": 1}
         r = wf.run_cross_sectional_walk_forward(prices, cfg)
+        assert r["ok"] is True  # mirrors run_walk_forward's INSUFICIENTE_DATOS shape
+        assert r["verdict"] == "INSUFICIENTE_DATOS"
+        msg = r["summary"]["error"]
+        assert "10" in msg and "21" in msg, msg  # names the actual vs minimum bars
+
+    def test_warmup_that_cannot_fit_before_first_oos_window_is_rejected(self, wf):
+        """The warmup prefix (lookback+skip+1 bars) must fit entirely before the FIRST
+        OOS window's start — otherwise there is no full-warmup slice to give it."""
+        # n=150, in_sample_pct=0.3 -> oos_total=105, n_windows=3 -> oos_per_window=35,
+        # smallest is_end = 150-105 = 45. lookback=40 < 45 passes the lookback check,
+        # but warmup = 40+4+1 = 45 >= 45 -> the prefix cannot fit -> reject.
+        prices = {
+            "A": _bars(lambda i: 100.0 + i, n=150),
+            "B": _bars(lambda i: 100.0, n=150),
+        }
+        cfg = {
+            **CS_CFG, "n_windows": 3, "in_sample_pct": 0.3,
+            "lookback": 40, "skip": 4,
+        }
+        r = wf.run_cross_sectional_walk_forward(prices, cfg)
         assert r["ok"] is True
-        assert "error" not in r["summary"]
+        assert r["verdict"] == "INSUFICIENTE_DATOS"
+        assert "warmup" in r["summary"]["error"].lower()
 
     def test_no_price_data_is_insuficiente_datos(self, wf):
         r = wf.run_cross_sectional_walk_forward({}, CS_CFG)
