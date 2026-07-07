@@ -17,7 +17,13 @@ import type { PluginEventsService } from '../plugins/plugin-events.service';
 import type { AuditService } from '../audit/audit.service';
 import type { CycleExecutorService } from '../cycle/cycle-executor.service';
 import type { ProviderGatewayService } from '../providers/provider-gateway.service';
+import type { Alert } from '../alerts/alerts.service';
+import type { AlertsService } from '../alerts/alerts.service';
 import { REAL_EXECUTION_HALTED_KEY } from '../common/real-execution-halt.util';
+
+function makeAlertsStub(active: Alert[] = []): AlertsService {
+  return { getActive: jest.fn().mockResolvedValue(active) } as unknown as AlertsService;
+}
 
 // Placeholder: real tests for getConfig/saveConfig/chat can be added here.
 // For now this file confirms the module is importable and the moved tests are gone.
@@ -47,6 +53,7 @@ function makeSvcForSkills(plugins: PluginsService): PanelService {
     {} as unknown as AuditService,
     { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
     {} as unknown as ProviderGatewayService,
+    makeAlertsStub(),
   );
 }
 
@@ -169,6 +176,7 @@ function makeSvcForDoctor(deps: DoctorDeps): PanelService {
     {} as unknown as AuditService,
     { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
     {} as unknown as ProviderGatewayService,
+    makeAlertsStub(),
   );
 }
 
@@ -287,6 +295,7 @@ function makeSvcForUniverse(
     {} as unknown as AuditService,
     { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
     gateway as unknown as ProviderGatewayService,
+    makeAlertsStub(),
   );
 }
 
@@ -385,5 +394,132 @@ describe('PanelService.checkUniverseSymbol() — real OHLCV verification (Fix 3)
     expect(result.registered).toBe(true);
     expect(result.meta).toEqual({ kind: 'equity' });
     expect(result.ok).toBe(true);
+  });
+});
+
+// ── getNotifications() — surfaces AlertsService active alerts (panel-honesty) ──
+
+function makeAlert(overrides: Partial<Alert> = {}): Alert {
+  return {
+    id: 'alert-1',
+    ts: new Date('2026-01-01T00:00:00.000Z'),
+    type: 'BROKER_DRIFT',
+    severity: 'CRITICAL',
+    symbol: null,
+    message: 'broker drift detected',
+    meta: null,
+    resolved: false,
+    ...overrides,
+  };
+}
+
+function makeSvcForNotifications(
+  alertsSvc: AlertsService,
+  cfgNotifs: { level: string; title: string; source: string; body: string; ts: string }[] = [],
+): PanelService {
+  const configEntry = {
+    findUnique: jest.fn().mockImplementation(({ where: { key } }: { where: { key: string } }) => {
+      if (key === 'notifications') {
+        return Promise.resolve({ key, value: JSON.stringify(cfgNotifs) });
+      }
+      return Promise.resolve(null);
+    }),
+  };
+
+  return new PanelService(
+    { configEntry } as unknown as PrismaService,
+    {} as unknown as AgentsService,
+    { getReadiness: jest.fn().mockReturnValue({ credentialPresent: true }) } as unknown as LlmService,
+    { call: jest.fn().mockResolvedValue({ ok: true }) } as unknown as SandboxGateway,
+    { findAll: jest.fn().mockResolvedValue([{ id: 'p1', active: true }]) } as unknown as PluginsService,
+    {} as unknown as PluginEventsService,
+    {} as unknown as AuditService,
+    { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
+    {} as unknown as ProviderGatewayService,
+    alertsSvc,
+  );
+}
+
+describe('PanelService.getNotifications() — surfaces active alerts (panel-honesty)', () => {
+  it('maps a CRITICAL active alert to level=error, source=alerts, and counts it in n_errors', async () => {
+    const alertsSvc = makeAlertsStub([makeAlert({ severity: 'CRITICAL', message: 'drift!' })]);
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+
+    const alertItem = result.items.find((i) => i.source === 'alerts');
+    expect(alertItem).toMatchObject({ level: 'error', source: 'alerts', body: 'drift!' });
+    expect(result.n_errors).toBeGreaterThanOrEqual(1);
+  });
+
+  it('maps a WARN-ish active alert to level=warn and counts it in n_warnings', async () => {
+    const alertsSvc = makeAlertsStub([
+      makeAlert({ severity: 'WARN' as Alert['severity'], message: 'careful' }),
+    ]);
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+
+    const alertItem = result.items.find((i) => i.source === 'alerts');
+    expect(alertItem).toMatchObject({ level: 'warn', source: 'alerts' });
+    expect(result.n_warnings).toBeGreaterThanOrEqual(1);
+  });
+
+  it('maps any other severity to level=info', async () => {
+    const alertsSvc = makeAlertsStub([makeAlert({ severity: 'LOW', message: 'fyi' })]);
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+
+    const alertItem = result.items.find((i) => i.source === 'alerts');
+    expect(alertItem).toMatchObject({ level: 'info', source: 'alerts' });
+  });
+
+  it('only queries active (unresolved) alerts — never getRecent', async () => {
+    const getRecent = jest.fn();
+    const alertsSvc = {
+      getActive: jest.fn().mockResolvedValue([]),
+      getRecent,
+    } as unknown as AlertsService;
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    await svc.getNotifications();
+
+    expect(alertsSvc.getActive).toHaveBeenCalledTimes(1);
+    expect(getRecent).not.toHaveBeenCalled();
+  });
+
+  it('excludes resolved alerts (getActive never returns resolved=true entries)', async () => {
+    const alertsSvc = makeAlertsStub([]);
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+
+    expect(result.items.find((i) => i.source === 'alerts')).toBeUndefined();
+  });
+
+  it('fail-soft: if AlertsService.getActive throws, getNotifications still returns previous behavior without throwing', async () => {
+    const alertsSvc = {
+      getActive: jest.fn().mockRejectedValue(new Error('db down')),
+    } as unknown as AlertsService;
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+
+    expect(result.items.find((i) => i.source === 'alerts')).toBeUndefined();
+    expect(typeof result.n_errors).toBe('number');
+    expect(typeof result.n_warnings).toBe('number');
+  });
+
+  it('does not change the existing item shape ({level, title, source, body, ts})', async () => {
+    const alertsSvc = makeAlertsStub([makeAlert()]);
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+    const alertItem = result.items.find((i) => i.source === 'alerts');
+
+    expect(Object.keys(alertItem!).sort()).toEqual(
+      ['level', 'title', 'source', 'body', 'ts'].sort(),
+    );
   });
 });

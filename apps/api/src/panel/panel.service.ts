@@ -9,6 +9,7 @@ import { AuditService } from '../audit/audit.service';
 import { UniverseEditDto } from './dto/universe-edit.dto';
 import { CycleExecutorService } from '../cycle/cycle-executor.service';
 import { ProviderGatewayService } from '../providers/provider-gateway.service';
+import { AlertsService } from '../alerts/alerts.service';
 import { REAL_EXECUTION_HALTED_KEY } from '../common/real-execution-halt.util';
 import { kvBool } from '../common/kv.util';
 
@@ -41,6 +42,7 @@ export class PanelService {
     @Inject(forwardRef(() => CycleExecutorService))
     private readonly cycleExecutor: CycleExecutorService,
     private readonly gateway: ProviderGatewayService,
+    private readonly alerts: AlertsService,
   ) {}
 
   // ── Config ────────────────────────────────────────────────────────────────
@@ -309,11 +311,38 @@ export class PanelService {
     const pluginNotifs = await this.getCfgKey<typeof items>('notifications', []);
     items.push(...pluginNotifs);
 
+    // Alertas activas (no resueltas) persistidas por AlertsService — p.ej. BROKER_DRIFT,
+    // RECONCILIATION_HALTED. Fail-soft: si la consulta falla, no debe romper getNotifications.
+    try {
+      const activeAlerts = await this.alerts.getActive();
+      for (const alert of activeAlerts) {
+        items.push({
+          level: this._mapAlertSeverityToLevel(alert.severity),
+          title: alert.type,
+          source: 'alerts',
+          body: alert.message,
+          ts: alert.ts.toISOString(),
+        });
+      }
+    } catch (err) {
+      this.log.warn(
+        `getNotifications: fallo consultando alertas activas — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
     return {
       items,
       n_errors: items.filter((i) => i.level === 'error').length,
       n_warnings: items.filter((i) => i.level === 'warn').length,
     };
+  }
+
+  /** Mapea la severidad de una alerta al nivel usado en items de notificaciones. */
+  private _mapAlertSeverityToLevel(severity: string): 'error' | 'warn' | 'info' {
+    const s = severity.toLowerCase();
+    if (s === 'critical') return 'error';
+    if (s === 'warn' || s === 'warning') return 'warn';
+    return 'info';
   }
 
   // ── Logs ──────────────────────────────────────────────────────────────────
