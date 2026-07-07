@@ -41,5 +41,49 @@
       },
       "required": ["strategy_id", "prices"]
     }
+  },
+  {
+    "name": "run_cross_sectional_walk_forward",
+    "description": "Ejecuta validación walk-forward out-of-sample (Pardo 2008) para el motor de momentum cross-sectional (portfolio-level), reutilizando run_cross_sectional en cada ventana IS/OOS. Divide el historial en N ventanas anchored IS/OOS, calcula el ratio de robustez (Sharpe_OOS / Sharpe_IS) por ventana y devuelve veredicto ROBUSTO | SOBREAJUSTADO | INSUFICIENTE_DATOS, junto con la media/mediana de Sharpe OOS y el % de ventanas OOS con retorno positivo.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "prices": {
+          "type": "object",
+          "description": "Precios OHLCV por símbolo del universo: {SYMBOL: [{date, open, high, low, close, volume}]}",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "date":   { "type": "string" },
+                "open":   { "type": "number" },
+                "high":   { "type": "number" },
+                "low":    { "type": "number" },
+                "close":  { "type": "number" },
+                "volume": { "type": "number" }
+              },
+              "required": ["date", "close"]
+            }
+          }
+        },
+        "config": {
+          "type": "object",
+          "properties": {
+            "n_windows":       { "type": "integer", "description": "Número de ventanas walk-forward (default 5)" },
+            "in_sample_pct":   { "type": "number",  "description": "Fracción IS por ventana (default 0.7)" },
+            "top_n":           { "type": "integer", "description": "Número de activos a mantener (top-N por momentum)" },
+            "rebalance_days":  { "type": "integer", "description": "Cada cuántas barras rebalancear (~mensual)" },
+            "lookback":        { "type": "integer", "description": "Ventana de momentum en barras (~12 meses)" },
+            "skip":            { "type": "integer", "description": "Barras recientes a saltar (momentum 12-1)" },
+            "commission_pct":  { "type": "number",  "description": "Comisión por operación (default 0.001)" },
+            "slippage_pct":    { "type": "number",  "description": "Slippage estimado (default 0.0005)" },
+            "vol_target":      { "type": "number",  "description": "Objetivo de volatilidad anualizada (0 desactiva)" },
+            "weighting":       { "type": "string",  "description": "'equal' (default) o 'inverse_vol' (risk parity)" }
+          }
+        }
+      },
+      "required": ["prices"]
+    }
   }
 ]
