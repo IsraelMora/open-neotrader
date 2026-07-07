@@ -220,16 +220,22 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
             if not over:
                 break
             remaining_names = [s for s in w if s not in over]
+            if not remaining_names:
+                # No non-violating name to redistribute the freed budget to
+                # (a sole holding, or every name tied/over in this iteration).
+                # There is nothing "degenerate" to fix here — capping without
+                # a valid redistribution target would just shrink total
+                # exposure below 1.0, so leave weights as-is.
+                break
             remaining_budget = 1.0 - cap * len(over)
             remaining_sum = sum(w[s] for s in remaining_names)
             new_w = dict.fromkeys(over, cap)
-            if remaining_names:
-                if remaining_sum > 0:
-                    for s in remaining_names:
-                        new_w[s] = (w[s] / remaining_sum) * remaining_budget
-                else:
-                    for s in remaining_names:
-                        new_w[s] = remaining_budget / len(remaining_names)
+            if remaining_sum > 0:
+                for s in remaining_names:
+                    new_w[s] = (w[s] / remaining_sum) * remaining_budget
+            else:
+                for s in remaining_names:
+                    new_w[s] = remaining_budget / len(remaining_names)
             w = new_w
         return w, False
 

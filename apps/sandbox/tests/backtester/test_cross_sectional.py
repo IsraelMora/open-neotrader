@@ -251,6 +251,28 @@ class TestInverseVolWeighting:
         assert abs(w["X"] - 0.5) < 0.02, w
         assert abs(sum(w.values()) - 1.0) < 1e-9, w
 
+    def test_inverse_vol_single_holding_is_not_capped_to_half(self, cs):
+        # top_n=1 -> exactly one name survives momentum selection. Its pre-cap
+        # inverse-vol weight is always 1.0 (only name to normalize against), so
+        # the 0.5 cap must NOT apply here: there is no other name to redistribute
+        # the freed budget to, so capping would silently drop half the equity
+        # exposure for this rebalance instead of holding the sole name at 100%.
+        prices = {
+            "WIN": _bars(lambda i: 100.0 * (1.01 ** i) * (1.01 if i % 2 == 0 else 0.99)),
+            "LOSE": _bars(lambda i: 100.0 * (0.99 ** i)),
+        }
+        cfg = {
+            "top_n": 1, "lookback": 60, "skip": 5, "rebalance_days": 20,
+            "initial_capital": 10000, "commission_pct": 0.0, "slippage_pct": 0.0,
+            "weighting": "inverse_vol", "vol_window": 21,
+        }
+        r = cs.run_cross_sectional(prices, cfg)
+        assert r["ok"], r
+        assert r["final_holdings"] == ["WIN"]
+        w = r["final_weights"]
+        assert abs(w["WIN"] - 1.0) < 1e-9, w
+        assert abs(sum(w.values()) - 1.0) < 1e-9, w
+
     def test_insufficient_vol_history_falls_back_to_equal_weight(self, cs):
         prices = {
             "A": _bars(lambda i: 100.0 + i, n=30),
