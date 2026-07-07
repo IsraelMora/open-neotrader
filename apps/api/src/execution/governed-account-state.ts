@@ -89,6 +89,16 @@ export interface FillResult {
   quantity: number;
   realized_pnl: number | null;
   newState: GovernedAccountState;
+  /**
+   * Set to `true` ONLY for an `exit` that found no matching open position to close (a
+   * phantom/no-op exit). Callers MUST use this to distinguish "nothing to close" from a
+   * genuine (even zero-qty) fill — see TradeIntentService._runPaperExecution, which records
+   * this case with a distinct terminal status instead of fabricating a fake `executed` trade
+   * with fill_price/quantity. Never set for long/short/hold, and NEVER affects whether the
+   * exit itself is allowed — exits remain unconditionally closeable; this only changes what
+   * gets RECORDED when there is literally nothing to close.
+   */
+  noPosition?: boolean;
 }
 
 export interface EvaluateAndExecuteResult extends FillResult {

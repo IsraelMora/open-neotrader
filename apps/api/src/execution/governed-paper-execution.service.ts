@@ -388,7 +388,10 @@ export class GovernedPaperExecutionService {
       const posIdx = newState.positions.findIndex((p) => p.symbol === symbol);
       if (posIdx < 0) {
         newState.hwm = Math.max(baseHwm, newState.equity);
-        return { quantity: 0, realized_pnl: null, newState };
+        // No position to close — signal this to the caller via noPosition so it can record
+        // a distinct "nothing to close" outcome instead of a fabricated executed/qty=0 fill.
+        // The exit is still fully processed (never blocked) — only the RECORDING differs.
+        return { quantity: 0, realized_pnl: null, newState, noPosition: true };
       }
       const pos = newState.positions[posIdx];
       const quantity = pos.quantity;

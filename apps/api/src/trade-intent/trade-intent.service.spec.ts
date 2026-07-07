@@ -19,6 +19,7 @@ type MockPrisma = {
     create: jest.Mock;
     findMany: jest.Mock;
     findUnique: jest.Mock;
+    findFirst: jest.Mock;
     update: jest.Mock;
   };
   portfolio: {
@@ -43,6 +44,7 @@ function makePrisma(): MockPrisma {
       create: jest.fn(),
       findMany: jest.fn(),
       findUnique: jest.fn(),
+      findFirst: jest.fn().mockResolvedValue(null),
       update: jest.fn(),
     },
     portfolio: {
@@ -985,8 +987,13 @@ describe('TradeIntentService', () => {
         last: 200,
         ts: new Date().toISOString(),
       });
+      // MSFT was never actually opened in this scenario (only AAPL was), so this exit finds no
+      // paper position — the closeability invariant still holds (it is NOT rejected/halted, and
+      // the halt-blocked long above proves the gate WAS active); the phantom-exit fix (Bug 1)
+      // means a no-op exit like this is now recorded as 'skipped', not a fabricated 'executed'.
       const stillExits = await service.autoProcess('ti_exit2');
-      expect(stillExits.status).toBe('executed');
+      expect(stillExits.status).toBe('skipped');
+      expect(stillExits.status).not.toBe('rejected');
     });
 
     it('hwm rises with new equity highs — no false halt when a new all-time-high is reached', async () => {
@@ -1240,6 +1247,333 @@ describe('TradeIntentService', () => {
         oc({ data: oc({ status: 'failed' }) }),
       );
       expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── phantom exit fix (Bug 1) ──────────────────────────────────────────────────
+
+  describe('paper exit with no existing position (phantom exit fix)', () => {
+    it('exit with NO existing paper position → status=skipped, NOT a fabricated executed/qty0/fill_price row', async () => {
+      kv.get.mockResolvedValue(null); // default policy: paper, autonomous=true
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'SPY' }),
+      );
+      mockPaperPortfolio(prisma); // positions: [] — no SPY position to close
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'SPY',
+        bid: 449,
+        ask: 451,
+        last: 450,
+        ts: new Date().toISOString(),
+      });
+      const skipped = pendingIntent({
+        status: 'skipped',
+        decided_by: 'autonomous',
+        result_json: JSON.stringify({ reason: 'exit skipped — no open position found for SPY' }),
+      });
+      prisma.tradeIntent.update.mockResolvedValue(skipped);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          where: { id: 'ti_001' },
+          data: oc({
+            status: 'skipped',
+            result_json: expect.stringMatching(/no open position/i) as string,
+          }),
+        }),
+      );
+      // Must NOT fabricate an executed fill: no quantity/fill_price written for this no-op.
+      const [[updateCall]] = prisma.tradeIntent.update.mock.calls as [
+        [{ data: Record<string, unknown> }],
+      ];
+      expect(updateCall.data.status).not.toBe('executed');
+      expect(updateCall.data.quantity).toBeUndefined();
+      expect(updateCall.data.fill_price).toBeUndefined();
+      expect(result.status).toBe('skipped');
+    });
+
+    it('exit with an EXISTING paper position still executes normally (regression guard)', async () => {
+      kv.get.mockResolvedValue(null);
+      const portfolioWithPosition = JSON.stringify({
+        equity: 11_500,
+        cash: 10_000,
+        positions: [{ symbol: 'AAPL', quantity: 10, avg_price: 140 }],
+      });
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      prisma.portfolio.findUnique.mockResolvedValue({
+        name: 'paper',
+        data: portfolioWithPosition,
+        updatedAt: new Date(),
+      });
+      mockAaplQuote(gateway);
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      const executed = pendingIntent({
+        status: 'executed',
+        fill_price: 150,
+        quantity: 10,
+        realized_pnl: 100,
+        decided_by: 'autonomous',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(executed);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(prisma.tradeIntent.update).toHaveBeenCalledWith(
+        oc({
+          data: oc({
+            status: 'executed',
+            fill_price: 150,
+            quantity: 10,
+          }),
+        }),
+      );
+      const [[updateCall]] = prisma.tradeIntent.update.mock.calls as [
+        [{ data: Record<string, unknown> }],
+      ];
+      expect(updateCall.data.status).not.toBe('skipped');
+      expect(result.status).toBe('executed');
+      expect(result.quantity).toBe(10);
+    });
+
+    it('real-money mode exit path is completely unaffected by the paper no-position change', async () => {
+      // real=true + broker configured + walk-forward passes + broker HOLDS a position for the
+      // symbol → mode resolves to 'real' (_resolveExitRouting), routing through _executeReal —
+      // a structurally separate code path from _runPaperExecution/executeFill, which is the
+      // only place the phantom-exit fix lives.
+      kv.get.mockImplementation((key: string) => {
+        if (key === 'execution.real') return Promise.resolve('true');
+        if (key === 'execution.broker_plugin_id') return Promise.resolve('alpaca-provider');
+        if (key === 'strategy.applied') return Promise.resolve('s_live');
+        return Promise.resolve(null);
+      });
+      prisma.strategy.findUnique.mockResolvedValue({
+        id: 's_live',
+        walk_forward_verdict: 'ROBUSTO',
+        walk_forward_checked_at: new Date(),
+      });
+      prisma.realNavSnapshot.findFirst.mockResolvedValue({
+        id: 'nav_1',
+        ts: new Date(),
+        broker_plugin_id: 'alpaca-provider',
+        equity: 10_000,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: '[]',
+        total_pnl: 0,
+        hwm: 10_000,
+        source: 'poll',
+        meta: null,
+      });
+      prisma.realPosition.count.mockResolvedValue(0);
+      prisma.tradeIntent.findUnique.mockResolvedValue(
+        pendingIntent({ action: 'exit', symbol: 'AAPL' }),
+      );
+      mockAaplQuote(gateway);
+      mockPaperPortfolio(prisma); // paper has NO position — proves paper is irrelevant here
+      gateway.getPortfolio.mockResolvedValue({
+        provider_id: 'alpaca-provider',
+        equity: 10_900,
+        cash: 10_000,
+        buying_power: 10_000,
+        positions: [
+          {
+            symbol: 'AAPL',
+            qty: 6,
+            avg_entry: 150,
+            market_value: 900,
+            unrealized_pnl: 0,
+            side: 'long',
+          },
+        ],
+        total_market_value: 900,
+        total_pnl: 0,
+        ts: new Date().toISOString(),
+      });
+      realOrderService.submit.mockResolvedValue({
+        id: 'ro_real_unaffected',
+        status: 'submitted',
+        client_order_id: 'nt-ti_001-real-unaffected',
+        broker_order_id: 'order_real_unaffected',
+        error: null,
+      });
+      const pending = pendingIntent({
+        status: 'real_pending',
+        fill_price: null,
+        quantity: null,
+        decided_by: 'autonomous',
+      });
+      prisma.tradeIntent.update.mockResolvedValue(pending);
+
+      const result = await service.autoProcess('ti_001');
+
+      expect(realOrderService.submit).toHaveBeenCalledWith(
+        oc({ symbol: 'AAPL', side: 'sell', requestedQty: 6 }),
+      );
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(result.status).toBe('real_pending');
+      // Paper portfolio must never be touched by a real close.
+      expect(prisma.portfolio.upsert).not.toHaveBeenCalled();
+      // No 'skipped' status ever produced on the real path.
+      const updateCalls = prisma.tradeIntent.update.mock.calls as [{ data: { status?: string } }][];
+      const statuses = updateCalls.map(([arg]) => arg.data.status);
+      expect(statuses).not.toContain('skipped');
+    });
+  });
+
+  // ── duplicate-in-cycle fix (Bug 2) ────────────────────────────────────────────
+
+  describe('duplicate (symbol, action) intents within the same cycle (dedup fix)', () => {
+    it('second identical (symbol, action) intent within the SAME cycle is recorded as duplicate, not executed', async () => {
+      kv.get.mockResolvedValue(null); // autonomous=true, paper defaults
+
+      // First intent for cycle "cyc_1": no prior intent found → proceeds normally.
+      prisma.tradeIntent.findFirst.mockResolvedValueOnce(null);
+      const created1 = pendingIntent({
+        id: 'ti_1',
+        cycle_id: 'cyc_1',
+        action: 'long',
+        symbol: 'EEM',
+      });
+      prisma.tradeIntent.create.mockResolvedValueOnce(created1);
+      prisma.tradeIntent.findUnique.mockResolvedValueOnce(created1);
+      mockPaperPortfolio(prisma);
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'EEM',
+        bid: 67.5,
+        ask: 67.68,
+        last: 67.59,
+        ts: new Date().toISOString(),
+      });
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      const executed1 = pendingIntent({ id: 'ti_1', status: 'executed', decided_by: 'autonomous' });
+      prisma.tradeIntent.update.mockResolvedValueOnce(executed1);
+
+      const result1 = await service.recordIntent({
+        cycle_id: 'cyc_1',
+        symbol: 'EEM',
+        action: 'long',
+        confidence: 0.7,
+        rationale: 'momentum',
+      });
+      expect(result1.status).toBe('executed');
+
+      // Second, IDENTICAL intent — same cycle_id, symbol, action, seconds later.
+      prisma.tradeIntent.findFirst.mockResolvedValueOnce(created1);
+      const duplicateRow = pendingIntent({
+        id: 'ti_2',
+        cycle_id: 'cyc_1',
+        action: 'long',
+        symbol: 'EEM',
+        status: 'duplicate',
+      });
+      prisma.tradeIntent.create.mockResolvedValueOnce(duplicateRow);
+
+      const result2 = await service.recordIntent({
+        cycle_id: 'cyc_1',
+        symbol: 'EEM',
+        action: 'long',
+        confidence: 0.7,
+        rationale: 'momentum',
+      });
+
+      expect(result2.status).toBe('duplicate');
+      expect(prisma.tradeIntent.create).toHaveBeenLastCalledWith(
+        oc({
+          data: oc({
+            status: 'duplicate',
+            cycle_id: 'cyc_1',
+            symbol: 'EEM',
+            action: 'long',
+          }),
+        }),
+      );
+      // The duplicate must NEVER reach autoProcess/execution — findUnique (called by
+      // autoProcess) fires only once total, for the FIRST intent.
+      expect(prisma.tradeIntent.findUnique).toHaveBeenCalledTimes(1);
+    });
+
+    it('same (symbol, action) intent in a DIFFERENT cycle is NOT deduped — both execute normally', async () => {
+      kv.get.mockResolvedValue(null);
+
+      // Cycle "cyc_a": first EEM long executes normally.
+      prisma.tradeIntent.findFirst.mockResolvedValueOnce(null);
+      const createdA = pendingIntent({
+        id: 'ti_a',
+        cycle_id: 'cyc_a',
+        action: 'long',
+        symbol: 'EEM',
+      });
+      prisma.tradeIntent.create.mockResolvedValueOnce(createdA);
+      prisma.tradeIntent.findUnique.mockResolvedValueOnce(createdA);
+      mockPaperPortfolio(prisma);
+      gateway.getQuote.mockResolvedValue({
+        symbol: 'EEM',
+        bid: 67.5,
+        ask: 67.68,
+        last: 67.59,
+        ts: new Date().toISOString(),
+      });
+      prisma.portfolio.upsert.mockResolvedValue({
+        name: 'paper',
+        data: '{}',
+        updatedAt: new Date(),
+      });
+      prisma.tradeIntent.update.mockResolvedValueOnce(
+        pendingIntent({ id: 'ti_a', status: 'executed', decided_by: 'autonomous' }),
+      );
+
+      const resultA = await service.recordIntent({
+        cycle_id: 'cyc_a',
+        symbol: 'EEM',
+        action: 'long',
+        confidence: 0.7,
+        rationale: 'momentum',
+      });
+      expect(resultA.status).toBe('executed');
+
+      // Cycle "cyc_b" (a LATER, different cycle): the SAME symbol+action must be allowed
+      // again — no cross-cycle dedup. findFirst is scoped to cycle_id, so it finds nothing
+      // for "cyc_b" even though "cyc_a" had an identical intent.
+      prisma.tradeIntent.findFirst.mockResolvedValueOnce(null);
+      const createdB = pendingIntent({
+        id: 'ti_b',
+        cycle_id: 'cyc_b',
+        action: 'long',
+        symbol: 'EEM',
+      });
+      prisma.tradeIntent.create.mockResolvedValueOnce(createdB);
+      prisma.tradeIntent.findUnique.mockResolvedValueOnce(createdB);
+      prisma.tradeIntent.update.mockResolvedValueOnce(
+        pendingIntent({ id: 'ti_b', status: 'executed', decided_by: 'autonomous' }),
+      );
+
+      const resultB = await service.recordIntent({
+        cycle_id: 'cyc_b',
+        symbol: 'EEM',
+        action: 'long',
+        confidence: 0.7,
+        rationale: 'momentum',
+      });
+
+      expect(resultB.status).toBe('executed');
+      expect(prisma.tradeIntent.findFirst).toHaveBeenNthCalledWith(
+        2,
+        oc({ where: oc({ cycle_id: 'cyc_b', symbol: 'EEM', action: 'long' }) }),
+      );
+      // Both intents actually executed — findUnique (autoProcess) fired for BOTH.
+      expect(prisma.tradeIntent.findUnique).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -4338,8 +4672,13 @@ describe('TradeIntentService', () => {
         (args: { data: Record<string, unknown> }) =>
           Promise.resolve(pendingIntent({ status: 'executed', ...args.data })) as unknown,
       );
+      // portfolioAtDailyLoss has NO open positions, so this exit (default symbol AAPL) finds
+      // nothing to close — the closeability invariant still holds (NOT rejected/halted, unlike
+      // the blocked long above); with the phantom-exit fix (Bug 1) this is now recorded as
+      // 'skipped' rather than a fabricated 'executed'/quantity=0 row.
       const exitResult = await service.autoProcess('ti_002');
-      expect(exitResult.status).toBe('executed');
+      expect(exitResult.status).toBe('skipped');
+      expect(exitResult.status).not.toBe('rejected');
     });
 
     it('blocks a new entry once WEEKLY loss >= default max_weekly_loss_pct (6%), independent of the daily check', async () => {
