@@ -6,6 +6,7 @@ import type { PluginsService } from '../plugins/plugins.service';
 import type { PluginEventsService } from '../plugins/plugin-events.service';
 import type { AuditService } from '../audit/audit.service';
 import type { PanelService } from '../panel/panel.service';
+import type { SnapshotService } from '../snapshot/snapshot.service';
 
 // ── Stubs ─────────────────────────────────────────────────────────────────────
 
@@ -61,6 +62,16 @@ function makePanelStub(): jest.Mocked<Pick<PanelService, 'appendLog'>> {
   return { appendLog: jest.fn().mockResolvedValue(undefined) };
 }
 
+function makeSnapshotStub(
+  opts: { takeSnapshotThrows?: boolean } = {},
+): jest.Mocked<Pick<SnapshotService, 'takeSnapshot'>> {
+  return {
+    takeSnapshot: opts.takeSnapshotThrows
+      ? jest.fn().mockRejectedValue(new Error('snapshot failed'))
+      : jest.fn().mockResolvedValue(null),
+  };
+}
+
 /**
  * Build a minimal CycleExecutorService for unit tests.
  * We inject only what the tested methods need.
@@ -73,6 +84,7 @@ function makeCycleExecutorService(opts: {
   pluginEventsStub?: ReturnType<typeof makePluginEventsStub>;
   auditStub?: ReturnType<typeof makeAuditStub>;
   panelStub?: ReturnType<typeof makePanelStub>;
+  snapshotStub?: ReturnType<typeof makeSnapshotStub>;
 }): CycleExecutorService {
   const agents = opts.agentsStub ?? makeAgentsStub({});
   const sandbox = opts.sandboxStub ?? makeSandboxStub();
@@ -80,6 +92,7 @@ function makeCycleExecutorService(opts: {
   const pluginEvents = opts.pluginEventsStub ?? makePluginEventsStub();
   const audit = opts.auditStub ?? makeAuditStub();
   const panel = opts.panelStub ?? makePanelStub();
+  const snapshot = opts.snapshotStub ?? makeSnapshotStub();
 
   const service = new (CycleExecutorService as unknown as new (
     agents: unknown,
@@ -88,7 +101,8 @@ function makeCycleExecutorService(opts: {
     pluginEvents: unknown,
     audit: unknown,
     panel: unknown,
-  ) => CycleExecutorService)(agents, sandbox, plugins, pluginEvents, audit, panel);
+    snapshot: unknown,
+  ) => CycleExecutorService)(agents, sandbox, plugins, pluginEvents, audit, panel, snapshot);
 
   // Force runState.running to the desired value via any-cast (private field)
   if (opts.cycleRunning) {
@@ -360,5 +374,45 @@ describe('CycleExecutorService.executeCycle (via runCycle)', () => {
 
     const state = (service as unknown as { runState: { running: boolean } }).runState;
     expect(state.running).toBe(false);
+  });
+});
+
+// ── NAV snapshot wiring (nav-data-collection F1) ─────────────────────────────
+
+describe('CycleExecutorService.executeCycle — NAV snapshot wiring', () => {
+  it('calls snapshotService.takeSnapshot exactly once per completed cycle, with the cycle id', async () => {
+    const snapshotStub = makeSnapshotStub();
+    const service = makeCycleExecutorService({ cycleRunning: false, snapshotStub });
+
+    service.runCycle(false);
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(snapshotStub.takeSnapshot).toHaveBeenCalledTimes(1);
+    const [calledCycleId] = snapshotStub.takeSnapshot.mock.calls[0] as [string];
+    expect(typeof calledCycleId).toBe('string');
+    expect(calledCycleId.length).toBeGreaterThan(0);
+  });
+
+  it('fail-soft: snapshotService.takeSnapshot rejecting does not fail the cycle', async () => {
+    const snapshotStub = makeSnapshotStub({ takeSnapshotThrows: true });
+    const auditStub = makeAuditStub();
+    const service = makeCycleExecutorService({ cycleRunning: false, snapshotStub, auditStub });
+
+    service.runCycle(false);
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Cycle result is unaffected by the snapshot rejection.
+    const state = (
+      service as unknown as { runState: { running: boolean; last: { ok: boolean } | null } }
+    ).runState;
+    expect(state.running).toBe(false);
+    expect(state.last?.ok).toBe(true);
+
+    // No cycle_fail audit event was recorded because of the snapshot error.
+    const eventTypes = auditStub.log.mock.calls.map(
+      (call: unknown[]) => (call[0] as { event_type: string }).event_type,
+    );
+    expect(eventTypes).not.toContain('cycle_fail');
+    expect(eventTypes).toContain('cycle_complete');
   });
 });

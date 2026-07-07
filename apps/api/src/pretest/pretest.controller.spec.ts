@@ -32,6 +32,7 @@ function makePretestServiceStub(
     runAllActive: jest.fn().mockResolvedValue([]),
     gate: jest.fn().mockResolvedValue({ ready: true, reasons: [], metrics: {} }),
     runCycle: jest.fn().mockResolvedValue({}),
+    getNavHistory: jest.fn().mockResolvedValue({ series: {} }),
   };
 }
 
@@ -124,5 +125,27 @@ describe('F4-S4 Phase 4 — PretestController POST /pretest/:id/promote', () => 
     await controller.promote('pf-4', { confirm: true });
 
     expect(svcMock.promote).toHaveBeenCalledWith('pf-4', { confirm: true });
+  });
+});
+
+describe('nav-data-collection F2 — GET /pretest/nav-history', () => {
+  it('delegates to PretestService.getNavHistory and returns its result as-is', async () => {
+    const seriesResult = {
+      series: { 'My Portfolio': [{ ts: '2026-01-01T00:00:00.000Z', equity: 100 }] },
+    };
+    const svcMock = {
+      getNavHistory: jest.fn().mockResolvedValue(seriesResult),
+    } as unknown as jest.Mocked<Partial<PretestService>>;
+
+    const module: TestingModule = await Test.createTestingModule({
+      controllers: [PretestController],
+      providers: [{ provide: PretestService, useValue: svcMock }],
+    }).compile();
+
+    const controller = module.get<PretestController>(PretestController);
+    const result = controller.navHistory();
+
+    expect(svcMock.getNavHistory).toHaveBeenCalledTimes(1);
+    await expect(result).resolves.toEqual(seriesResult);
   });
 });

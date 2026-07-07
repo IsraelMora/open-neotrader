@@ -127,6 +127,14 @@ export class PretestController {
     return this.svc.runAllActive();
   }
 
+  @Get('nav-history')
+  @ApiOperation({
+    summary: 'Equity time-series de portfolios de pretest activos (últimos 500 puntos c/u)',
+  })
+  navHistory() {
+    return this.svc.getNavHistory();
+  }
+
   @Get(':id/gate')
   @ApiOperation({ summary: 'Evaluate significance gate for a pretest portfolio (read-only)' })
   getGate(@Param('id') id: string) {

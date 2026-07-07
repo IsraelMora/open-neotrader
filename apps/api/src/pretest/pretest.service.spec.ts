@@ -5776,3 +5776,148 @@ describe('PretestService.runCycle — runs declared plugins regardless of global
     expect(calledPluginIds).toEqual([]);
   });
 });
+
+// ── nav-data-collection F2: pretest equity time-series ──────────────────────
+
+describe('PretestService.runCycle — pretest NAV snapshot wiring (nav-data-collection F2)', () => {
+  function makeWiring(pretestNavSnapshotCreate: jest.Mock, initialRunCount = 0) {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('AAPL', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([]),
+      findAll: jest.fn().mockResolvedValue([]),
+    } as unknown as PluginsService;
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({ ok: true, result: { pending_signals: [] } }),
+    } as unknown as SandboxGateway;
+
+    const portfolioRow = {
+      id: 'nav-portfolio',
+      name: 'NAV Portfolio',
+      description: null,
+      initial_capital: 100_000,
+      plugin_ids: JSON.stringify([]),
+      plugin_configs: JSON.stringify({}),
+      state: JSON.stringify(makeState({ equity: 100_000, cash: 100_000 })),
+      run_count: initialRunCount,
+      last_run_at: null,
+      is_active: true,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(portfolioRow),
+        update: jest.fn().mockResolvedValue(portfolioRow),
+      },
+      pretestNavSnapshot: {
+        create: pretestNavSnapshotCreate,
+      },
+    } as unknown as PrismaService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      makeStubAgents(),
+      makeStubKv(),
+      makeStubAudit(),
+    );
+
+    return { svc, db };
+  }
+
+  it('writes one PretestNavSnapshot row per completed runCycle, with the portfolio id, equity, cash and incremented run_count', async () => {
+    const create = jest.fn().mockResolvedValue({});
+    const { svc } = makeWiring(create, 3);
+
+    await svc.runCycle('nav-portfolio');
+
+    expect(create).toHaveBeenCalledTimes(1);
+    const [args] = create.mock.calls[0] as [{ data: Record<string, unknown> }];
+    expect(args.data['portfolio_id']).toBe('nav-portfolio');
+    expect(typeof args.data['equity']).toBe('number');
+    expect(typeof args.data['cash']).toBe('number');
+    expect(args.data['positions_count']).toBe(0);
+    expect(args.data['run_count']).toBe(4);
+  });
+
+  it('fail-soft: PretestNavSnapshot insert rejecting does not fail runCycle', async () => {
+    const create = jest.fn().mockRejectedValue(new Error('insert failed'));
+    const { svc } = makeWiring(create);
+
+    await expect(svc.runCycle('nav-portfolio')).resolves.toBeDefined();
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('PretestService.getNavHistory (nav-data-collection F2)', () => {
+  function row(portfolioId: string, ts: Date, equity: number) {
+    return {
+      id: `${portfolioId}-${ts.getTime()}`,
+      portfolio_id: portfolioId,
+      ts,
+      equity,
+      cash: 0,
+      positions_count: 0,
+      run_count: 0,
+    };
+  }
+
+  it('returns { series: { [portfolio_name]: [{ts, equity}] } } for ACTIVE portfolios only', async () => {
+    const activePortfolio = {
+      id: 'active-1',
+      name: 'Active One',
+      is_active: true,
+    };
+    const findMany = jest.fn().mockResolvedValue([activePortfolio]);
+    const snapshotFindMany = jest
+      .fn()
+      .mockResolvedValue([
+        row('active-1', new Date('2026-01-02'), 110),
+        row('active-1', new Date('2026-01-01'), 100),
+      ]);
+
+    const db = {
+      pretestPortfolio: { findMany },
+      pretestNavSnapshot: { findMany: snapshotFindMany },
+    } as unknown as PrismaService;
+
+    const svc = makeGateService(db);
+    const result = await svc.getNavHistory();
+
+    expect(findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { is_active: true } }));
+    expect(result.series['Active One']).toEqual([
+      { ts: new Date('2026-01-01').toISOString(), equity: 100 },
+      { ts: new Date('2026-01-02').toISOString(), equity: 110 },
+    ]);
+  });
+
+  it('queries the most-recent 500 rows per portfolio via orderBy desc + take, then returns them in ascending order (not the oldest 500)', async () => {
+    const activePortfolio = { id: 'p1', name: 'P1', is_active: true };
+    const findMany = jest.fn().mockResolvedValue([activePortfolio]);
+    const snapshotFindMany = jest.fn().mockResolvedValue([]);
+
+    const db = {
+      pretestPortfolio: { findMany },
+      pretestNavSnapshot: { findMany: snapshotFindMany },
+    } as unknown as PrismaService;
+
+    const svc = makeGateService(db);
+    await svc.getNavHistory();
+
+    expect(snapshotFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { portfolio_id: 'p1' },
+        orderBy: { ts: 'desc' },
+        take: 500,
+      }),
+    );
+  });
+});

@@ -5,6 +5,7 @@ import { PluginsService } from '../plugins/plugins.service';
 import { PluginEventsService } from '../plugins/plugin-events.service';
 import { AuditService } from '../audit/audit.service';
 import { PanelService } from '../panel/panel.service';
+import { SnapshotService } from '../snapshot/snapshot.service';
 
 /** Estado en memoria del último ciclo ejecutado: si está corriendo ahora y el resultado previo. */
 export interface RunState {
@@ -30,6 +31,7 @@ export class CycleExecutorService {
     private readonly audit: AuditService,
     @Inject(forwardRef(() => PanelService))
     private readonly panel: PanelService,
+    private readonly snapshot: SnapshotService,
   ) {}
 
   /** Devuelve el estado en memoria del ciclo actual (sincrono, sin I/O). */
@@ -93,6 +95,15 @@ export class CycleExecutorService {
         skills_read: skillsRead,
         skills_written: skillsWritten,
       });
+
+      // nav-data-collection F1: take a NAV snapshot at the end of every completed cycle.
+      // Fail-soft: any error is caught here and NEVER breaks the cycle.
+      try {
+        await this.snapshot.takeSnapshot(cycleId);
+      } catch (e) {
+        this.log.warn(`[NAV] takeSnapshot failed for cycle ${cycleId} — snapshot not taken: ${e}`);
+      }
+
       await this.panel.appendLog('agent_cycles', {
         ok: this.runState.last?.ok,
         dry_run: dryRun,
