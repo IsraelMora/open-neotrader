@@ -9,6 +9,7 @@ import type { OhlcvBar } from '../providers/provider-gateway.service';
 import type { SandboxGateway } from '../sandbox/sandbox.gateway';
 import type { ProviderGatewayService } from '../providers/provider-gateway.service';
 import { RunBacktestDto } from './dto/run-backtest.dto';
+import { CrossSectionalWalkForwardDto } from './dto/cross-sectional-walk-forward.dto';
 import { plainToInstance } from 'class-transformer';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -401,5 +402,126 @@ describe('BacktestService — runCrossSectional', () => {
     expect(payload.config.lookback).toBe(200);
     expect(payload.config.skip).toBe(20);
     expect(payload.prices).toBeDefined();
+  });
+});
+
+describe('BacktestService — runCrossSectionalWalkForward', () => {
+  const CS_WF_OK = {
+    ok: true,
+    result: {
+      ok: true,
+      verdict: 'ROBUSTO',
+      n_windows: 3,
+      avg_oos_sharpe: 0.5,
+      median_oos_sharpe: 0.45,
+      avg_robustness_ratio: 0.6,
+      robust_windows: 2,
+      total_windows: 3,
+      windows: [],
+      summary: {},
+    },
+  };
+
+  function makeCsWfDto(
+    overrides: Partial<CrossSectionalWalkForwardDto> = {},
+  ): CrossSectionalWalkForwardDto {
+    return plainToInstance(CrossSectionalWalkForwardDto, {
+      symbols: ['AAPL', 'MSFT', 'NVDA'],
+      ...overrides,
+    });
+  }
+
+  it('calls backtester.run_cross_sectional_walk_forward with prices + config', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox, callPlugin } = makeSandbox(CS_WF_OK);
+    const svc = makeService(gateway, sandbox);
+    const result = await svc.runCrossSectionalWalkForward(
+      makeCsWfDto({ top_n: 2, lookback: 200, skip: 20, n_windows: 4, in_sample_pct: 0.6 }),
+    );
+
+    expect(result.verdict).toBe('ROBUSTO');
+    expect(result.median_oos_sharpe).toBeCloseTo(0.45);
+    const [plugin, fn, payload] = callPlugin.mock.calls[0] as [
+      string,
+      string,
+      {
+        prices: unknown;
+        config: {
+          top_n: number;
+          lookback: number;
+          skip: number;
+          n_windows: number;
+          in_sample_pct: number;
+        };
+      },
+    ];
+    expect(plugin).toBe('backtester');
+    expect(fn).toBe('run_cross_sectional_walk_forward');
+    expect(payload.config.top_n).toBe(2);
+    expect(payload.config.lookback).toBe(200);
+    expect(payload.config.skip).toBe(20);
+    expect(payload.config.n_windows).toBe(4);
+    expect(payload.config.in_sample_pct).toBeCloseTo(0.6, 10);
+    expect(payload.prices).toBeDefined();
+  });
+
+  it('defaults n_windows=5 / in_sample_pct=0.7 when omitted', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox, callPlugin } = makeSandbox(CS_WF_OK);
+    const svc = makeService(gateway, sandbox);
+    await svc.runCrossSectionalWalkForward(makeCsWfDto());
+
+    const payload = (callPlugin.mock.calls[0] as unknown[])[2] as {
+      config: { n_windows: number; in_sample_pct: number };
+    };
+    expect(payload.config.n_windows).toBe(5);
+    expect(payload.config.in_sample_pct).toBeCloseTo(0.7, 10);
+  });
+
+  it('throws BadGatewayException when sandbox returns ok:false', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox } = makeSandbox({ ok: false, error: 'sandbox timeout' });
+    const svc = makeService(gateway, sandbox);
+
+    await expect(svc.runCrossSectionalWalkForward(makeCsWfDto())).rejects.toThrow(
+      BadGatewayException,
+    );
+  });
+
+  it('throws BadGatewayException when sandbox result.ok is false', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox } = makeSandbox({
+      ok: true,
+      result: { ok: false, error: 'Insufficient overlapping history' },
+    });
+    const svc = makeService(gateway, sandbox);
+
+    await expect(svc.runCrossSectionalWalkForward(makeCsWfDto())).rejects.toThrow(
+      BadGatewayException,
+    );
+  });
+
+  it('does NOT write to the DB and does NOT require StrategyService at all for the happy path', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox } = makeSandbox(CS_WF_OK);
+    const { svc, recordWalkForward } = makeServiceWithStrategies(gateway, sandbox);
+
+    const result = await svc.runCrossSectionalWalkForward(makeCsWfDto());
+
+    expect(result.verdict).toBe('ROBUSTO');
+    expect(recordWalkForward).not.toHaveBeenCalled();
+  });
+
+  it('includes survivorship_warning when symbols match the curated default universe', async () => {
+    const { gateway } = makeGateway();
+    const { sandbox } = makeSandbox(CS_WF_OK);
+    const svc = makeService(gateway, sandbox);
+    const result = await svc.runCrossSectionalWalkForward(
+      makeCsWfDto({
+        symbols: ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META'],
+      }),
+    );
+
+    expect(result.survivorship_warning).toBeTruthy();
   });
 });

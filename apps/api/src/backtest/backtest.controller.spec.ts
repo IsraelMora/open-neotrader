@@ -11,6 +11,7 @@ import { BacktestService } from './backtest.service';
 import type { BacktestResponse } from './backtest.service';
 import { RunBacktestDto } from './dto/run-backtest.dto';
 import { CrossSectionalDto } from './dto/cross-sectional.dto';
+import { CrossSectionalWalkForwardDto } from './dto/cross-sectional-walk-forward.dto';
 import { WalkForwardTotpGuard } from './guards/walk-forward-totp.guard';
 
 // ── DTO validation tests ──────────────────────────────────────────────────────
@@ -110,6 +111,50 @@ describe('CrossSectionalDto — validation', () => {
   });
 });
 
+describe('CrossSectionalWalkForwardDto — validation', () => {
+  function dto(overrides: Record<string, unknown> = {}): CrossSectionalWalkForwardDto {
+    return plainToInstance(CrossSectionalWalkForwardDto, {
+      symbols: ['AAPL', 'MSFT'],
+      ...overrides,
+    });
+  }
+
+  it('accepts a minimal valid request', async () => {
+    const errors = await validate(dto());
+    expect(errors).toHaveLength(0);
+  });
+
+  it('accepts explicit n_windows and in_sample_pct within bounds', async () => {
+    const errors = await validate(dto({ n_windows: 4, in_sample_pct: 0.6 }));
+    expect(errors).toHaveLength(0);
+  });
+
+  it('rejects n_windows below 2', async () => {
+    const errors = await validate(dto({ n_windows: 1 }));
+    expect(errors.some((e) => e.property === 'n_windows')).toBe(true);
+  });
+
+  it('rejects n_windows above 20', async () => {
+    const errors = await validate(dto({ n_windows: 21 }));
+    expect(errors.some((e) => e.property === 'n_windows')).toBe(true);
+  });
+
+  it('rejects in_sample_pct below 0.3', async () => {
+    const errors = await validate(dto({ in_sample_pct: 0.1 }));
+    expect(errors.some((e) => e.property === 'in_sample_pct')).toBe(true);
+  });
+
+  it('rejects in_sample_pct above 0.9', async () => {
+    const errors = await validate(dto({ in_sample_pct: 0.95 }));
+    expect(errors.some((e) => e.property === 'in_sample_pct')).toBe(true);
+  });
+
+  it('still enforces the base CrossSectionalDto bounds (e.g. lookback)', async () => {
+    const errors = await validate(dto({ lookback: 1 }));
+    expect(errors.some((e) => e.property === 'lookback')).toBe(true);
+  });
+});
+
 // ── Controller tests ──────────────────────────────────────────────────────────
 
 const MOCK_RESPONSE: BacktestResponse = {
@@ -197,5 +242,65 @@ describe('BacktestController', () => {
       | unknown[]
       | undefined;
     expect(guards ?? []).not.toContain(WalkForwardTotpGuard);
+  });
+
+  it(
+    'POST /backtest/cross-sectional/walk-forward has no WalkForwardTotpGuard ' +
+      '(research-only, nothing persisted)',
+    () => {
+      const controllerProto: Record<string, object> =
+        BacktestController.prototype as unknown as Record<string, object>;
+      const guards = Reflect.getMetadata(
+        '__guards__',
+        controllerProto['crossSectionalWalkForward'],
+      ) as unknown[] | undefined;
+      expect(guards ?? []).not.toContain(WalkForwardTotpGuard);
+    },
+  );
+});
+
+describe('BacktestController — crossSectionalWalkForward', () => {
+  let controller: BacktestController;
+  let runCrossSectionalWalkForwardMock: jest.Mock;
+
+  const MOCK_CS_WF_RESPONSE = {
+    ok: true as const,
+    verdict: 'ROBUSTO' as const,
+    n_windows: 3,
+    avg_oos_sharpe: 0.5,
+    median_oos_sharpe: 0.45,
+    avg_robustness_ratio: 0.6,
+    robust_windows: 2,
+    total_windows: 3,
+    windows: [],
+  };
+
+  beforeEach(async () => {
+    runCrossSectionalWalkForwardMock = jest.fn().mockResolvedValue(MOCK_CS_WF_RESPONSE);
+
+    const module: TestingModule = await Test.createTestingModule({
+      controllers: [BacktestController],
+      providers: [
+        {
+          provide: BacktestService,
+          useValue: { runCrossSectionalWalkForward: runCrossSectionalWalkForwardMock },
+        },
+      ],
+    }).compile();
+
+    controller = module.get<BacktestController>(BacktestController);
+  });
+
+  it('delegates to BacktestService.runCrossSectionalWalkForward', async () => {
+    const dto = plainToInstance(CrossSectionalWalkForwardDto, {
+      symbols: ['AAPL', 'MSFT', 'NVDA'],
+      n_windows: 3,
+      in_sample_pct: 0.7,
+    });
+
+    const result = await controller.crossSectionalWalkForward(dto);
+
+    expect(runCrossSectionalWalkForwardMock).toHaveBeenCalledWith(dto);
+    expect(result).toEqual(MOCK_CS_WF_RESPONSE);
   });
 });
