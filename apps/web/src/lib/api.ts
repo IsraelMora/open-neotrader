@@ -111,6 +111,7 @@ export const api = {
   saveConfig: (cfg: JsonObject) => client.post('api/config', { json: cfg }).json<JsonObject>(),
   doctor: () => client.get('api/doctor').json<JsonObject>(),
   portfolios: () => client.get('api/portfolios').json<JsonObject>(),
+  dashboard: () => client.get('api/dashboard').json<JsonObject>(),
   chat: (question: string, history?: JsonObject[]) =>
     client.post('api/chat', { json: { question, history } }).json<JsonObject>(),
   trades: (limit = 200) => client.get(`api/trades?limit=${limit}`).json<JsonObject>(),
@@ -167,6 +168,28 @@ export const api = {
       return_pct: number | null;
       sharpe: number | null;
       max_drawdown_pct: number | null;
+    }>(),
+  // ── Pretest (competencia real de portfolios) ─────────────────────────────
+  pretestCompare: () =>
+    client.get('api/pretest/compare').json<{
+      portfolios: Array<{
+        id: string;
+        name: string;
+        equity: number;
+        return_pct: number;
+        max_drawdown_pct: number;
+        total_trades: number;
+        win_rate: number;
+        realized_pnl: number;
+        plugin_count: number;
+        gate_status: 'READY' | 'NOT_READY';
+        expectancy: number;
+        avg_win: number;
+        avg_loss: number;
+        payoff_ratio: number | null;
+      }>;
+      winner_by_return: string;
+      winner_by_risk_adj: string;
     }>(),
 
   universeCheck: (symbol: string, kind = 'equity') =>

@@ -34,21 +34,24 @@ interface TradesContentProps {
   setPage: React.Dispatch<React.SetStateAction<number>>;
   q: string;
   setQ: (v: string) => void;
+  mostrarHolds: boolean;
+  setMostrarHolds: (v: boolean) => void;
 }
 
 export default function Trades() {
   const { data, loading, error, reload } = useResource<TradesResponse>(
     () => api.trades(2000) as unknown as Promise<TradesResponse>,
   );
-  const [filtro, setFiltro] = useState('todas');
+  const [filtro, setFiltro] = useState('todos');
   const [page, setPage] = useState(1);
   const [q, setQ] = useState('');
+  const [mostrarHolds, setMostrarHolds] = useState(false);
 
   return (
     <Card>
       <CardHeader
         title="Histórico de operaciones"
-        hint="Todas las órdenes ejecutadas por las carteras, recientes primero."
+        hint="Todas las órdenes ejecutadas, recientes primero. Los holds (valor $0) están ocultos por defecto."
       />
       <CardBody>
         <AsyncBoundary loading={loading} error={error} onRetry={reload} isEmpty={!data}>
@@ -61,6 +64,8 @@ export default function Trades() {
               setPage={setPage}
               q={q}
               setQ={setQ}
+              mostrarHolds={mostrarHolds}
+              setMostrarHolds={setMostrarHolds}
             />
           )}
         </AsyncBoundary>
@@ -69,12 +74,24 @@ export default function Trades() {
   );
 }
 
-function TradesContent({ trades, filtro, setFiltro, page, setPage, q, setQ }: TradesContentProps) {
-  const carteras = ['todas', ...Array.from(new Set(trades.map((t) => t.cartera)))];
+function TradesContent({
+  trades,
+  filtro,
+  setFiltro,
+  page,
+  setPage,
+  q,
+  setQ,
+  mostrarHolds,
+  setMostrarHolds,
+}: TradesContentProps) {
+  // `cartera` es en realidad el MODO de ejecución (paper|live), no una cartera distinta.
+  const modos = ['todos', ...Array.from(new Set(trades.map((t) => t.cartera)))];
   const filtradas = useMemo(() => {
-    const base = filtro === 'todas' ? trades : trades.filter((t) => t.cartera === filtro);
+    let base = filtro === 'todos' ? trades : trades.filter((t) => t.cartera === filtro);
+    if (!mostrarHolds) base = base.filter((t) => t.lado !== 'hold');
     return fuzzyFilter(base, q, ['symbol', 'cartera', 'lado']);
-  }, [trades, filtro, q]);
+  }, [trades, filtro, q, mostrarHolds]);
   const totalPages = Math.max(1, Math.ceil(filtradas.length / PER_PAGE));
   const pageSafe = Math.min(page, totalPages);
   const slice = filtradas.slice((pageSafe - 1) * PER_PAGE, pageSafe * PER_PAGE);
@@ -84,27 +101,38 @@ function TradesContent({ trades, filtro, setFiltro, page, setPage, q, setQ }: Tr
       <div className="mb-3 flex items-center gap-3 flex-wrap">
         <SearchInput value={q} onChange={setQ} placeholder="Buscar símbolo, lado… (difuso)" />
       </div>
-      <div className="mb-3 flex gap-2 flex-wrap">
-        {carteras.map((c) => (
+      <div className="mb-3 flex gap-2 flex-wrap items-center">
+        {modos.map((m) => (
           <Button
-            key={c}
+            key={m}
             size="sm"
-            variant={filtro === c ? 'default' : 'secondary'}
+            variant={filtro === m ? 'default' : 'secondary'}
             onClick={() => {
-              setFiltro(c);
+              setFiltro(m);
               setPage(1);
             }}
           >
-            {c}
+            {m}
           </Button>
         ))}
+        <span className="w-px h-5 bg-edge/60 mx-1" />
+        <Button
+          size="sm"
+          variant={mostrarHolds ? 'default' : 'outline'}
+          onClick={() => {
+            setMostrarHolds(!mostrarHolds);
+            setPage(1);
+          }}
+        >
+          mostrar holds
+        </Button>
       </div>
       <div className="overflow-x-auto">
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>Fecha</TableHead>
-              <TableHead>Cartera</TableHead>
+              <TableHead>Modo</TableHead>
               <TableHead>Símbolo</TableHead>
               <TableHead>Lado</TableHead>
               <TableHead className="text-right">Valor</TableHead>

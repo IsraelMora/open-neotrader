@@ -10,26 +10,35 @@ import { api } from '../lib/api';
 
 type IconComponent = React.ComponentType<{ className?: string }>;
 
-const ICON: Record<string, IconComponent> = { error: CircleX, aviso: TriangleAlert, info: Info };
+// Niveles reales emitidos por el backend (panel.service.ts): 'error' | 'warn'.
+// Los plugins pueden escribir otros niveles libres en la clave 'notifications' del config
+// (p.ej. 'info') — se soportan mostrando el icono/tono genérico por defecto.
+const ICON: Record<string, IconComponent> = { error: CircleX, warn: TriangleAlert, info: Info };
 const ICON_COLOR: Record<string, string> = {
   error: 'text-danger',
-  aviso: 'text-warn',
+  warn: 'text-warn',
   info: 'text-info',
 };
-const TONE: Record<string, string> = { error: 'danger', aviso: 'warn', info: 'info' };
+const TONE: Record<string, string> = { error: 'danger', warn: 'warn', info: 'info' };
+// Etiquetas en español para los botones de filtro (las claves de datos quedan en inglés).
+const LABEL: Record<string, string> = {
+  todos: 'todos',
+  error: 'error',
+  warn: 'aviso',
+  info: 'info',
+};
 
 interface NotificationItem {
-  nivel: string;
-  titulo: string;
-  veces: number;
-  fuente: string;
+  level: string;
+  title: string;
+  source: string;
+  body: string;
   ts?: string;
-  detalle: string;
 }
 
 interface NotificationsData {
-  n_errores: number;
-  n_avisos: number;
+  n_errors: number;
+  n_warnings: number;
   items: NotificationItem[];
 }
 
@@ -62,23 +71,23 @@ function NotificationsContent({
   filtro: string;
   setFiltro: (f: string) => void;
 }) {
-  const items = filtro === 'todos' ? data.items : data.items.filter((i) => i.nivel === filtro);
+  const items = filtro === 'todos' ? data.items : data.items.filter((i) => i.level === filtro);
   return (
     <div className="space-y-5">
       <div className="grid grid-cols-3 gap-4">
         <Card>
           <CardBody>
             <div className="text-[11px] uppercase text-mut">Errores</div>
-            <div className={`text-2xl font-bold ${data.n_errores ? 'text-danger' : 'text-accent'}`}>
-              <NumberTicker value={data.n_errores} />
+            <div className={`text-2xl font-bold ${data.n_errors ? 'text-danger' : 'text-accent'}`}>
+              <NumberTicker value={data.n_errors} />
             </div>
           </CardBody>
         </Card>
         <Card>
           <CardBody>
             <div className="text-[11px] uppercase text-mut">Avisos</div>
-            <div className={`text-2xl font-bold ${data.n_avisos ? 'text-warn' : 'text-accent'}`}>
-              <NumberTicker value={data.n_avisos} />
+            <div className={`text-2xl font-bold ${data.n_warnings ? 'text-warn' : 'text-accent'}`}>
+              <NumberTicker value={data.n_warnings} />
             </div>
           </CardBody>
         </Card>
@@ -98,34 +107,33 @@ function NotificationsContent({
         />
         <CardBody>
           <div className="mb-3 flex gap-2">
-            {['todos', 'error', 'aviso', 'info'].map((f) => (
+            {['todos', 'error', 'warn', 'info'].map((f) => (
               <Button
                 key={f}
                 size="sm"
                 variant={filtro === f ? 'default' : 'ghost'}
                 onClick={() => setFiltro(f)}
               >
-                {f}
+                {LABEL[f]}
               </Button>
             ))}
           </div>
           <div className="space-y-2 max-h-[65vh] overflow-y-auto">
             {items.map((i, idx) => {
-              const I: IconComponent = ICON[i.nivel] || Info;
+              const I: IconComponent = ICON[i.level] || Info;
               return (
                 <div
                   key={idx}
                   className="flex items-start gap-3 rounded-md border border-edge/60 px-3 py-2"
                 >
-                  <I className={`h-4 w-4 shrink-0 ${ICON_COLOR[i.nivel] || 'text-mut'}`} />
+                  <I className={`h-4 w-4 shrink-0 ${ICON_COLOR[i.level] || 'text-mut'}`} />
                   <div className="flex-1">
                     <div className="flex items-center gap-2">
-                      <span className="text-[13px] text-ink font-medium">{i.titulo}</span>
-                      {i.veces > 1 && <span className="text-[11px] text-mut num">×{i.veces}</span>}
-                      <Badge tone={TONE[i.nivel]}>{i.fuente}</Badge>
+                      <span className="text-[13px] text-ink font-medium">{i.title}</span>
+                      <Badge tone={TONE[i.level]}>{i.source}</Badge>
                       {i.ts && <span className="text-[11px] text-mut num">{i.ts}</span>}
                     </div>
-                    <p className="text-[12px] text-mut mt-0.5 leading-snug">{i.detalle}</p>
+                    <p className="text-[12px] text-mut mt-0.5 leading-snug">{i.body}</p>
                   </div>
                 </div>
               );
