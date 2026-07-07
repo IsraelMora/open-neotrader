@@ -8,6 +8,7 @@ import { PluginsModule } from '../plugins/plugins.module';
 import { AuditModule } from '../audit/audit.module';
 import { AgentsController } from '../agents/agents.controller';
 import { CycleExecutorModule } from '../cycle/cycle-executor.module';
+import { ProvidersModule } from '../providers/providers.module';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { CycleExecutorModule } from '../cycle/cycle-executor.module';
     PluginsModule,
     AuditModule,
     forwardRef(() => CycleExecutorModule),
+    ProvidersModule,
   ],
   // AgentsController lives here (not in AgentsModule) because it depends on PanelService,
   // which is provided by this module. Hosting it here avoids a circular module dependency

@@ -8,11 +8,22 @@ import { PluginEventsService } from '../plugins/plugin-events.service';
 import { AuditService } from '../audit/audit.service';
 import { UniverseEditDto } from './dto/universe-edit.dto';
 import { CycleExecutorService } from '../cycle/cycle-executor.service';
+import { ProviderGatewayService } from '../providers/provider-gateway.service';
+import { REAL_EXECUTION_HALTED_KEY } from '../common/real-execution-halt.util';
+import { kvBool } from '../common/kv.util';
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [k: string]: JsonValue };
 
 // Log stream names: cualquier slug de letras minúsculas, números y guiones bajos
 const VALID_LOG_STREAM = /^[a-z][a-z0-9_]{0,63}$/;
+
+/** Un chequeo de salud individual reportado en `doctor().checks`. */
+export interface CheckItem {
+  name: string;
+  ok: boolean;
+  level: 'error' | 'warn' | 'ok';
+  detail?: string;
+}
 
 /** Fachada principal del panel: config, estado del agente, ciclos, chat, portfolios, logs y universo de activos. */
 @Injectable()
@@ -29,6 +40,7 @@ export class PanelService {
     private readonly audit: AuditService,
     @Inject(forwardRef(() => CycleExecutorService))
     private readonly cycleExecutor: CycleExecutorService,
+    private readonly gateway: ProviderGatewayService,
   ) {}
 
   // ── Config ────────────────────────────────────────────────────────────────
@@ -117,21 +129,62 @@ export class PanelService {
 
   /** Diagnóstico de salud: sandbox alcanzable, plugins registrados y activos. */
   async doctor() {
-    const [plugins, sandboxRes] = await Promise.all([
+    const [plugins, sandboxRes, haltedRow] = await Promise.all([
       this.plugins.findAll(),
       this.sandbox.call({ cmd: 'list_plugins', active_ids: [] }).catch(() => null),
+      this.db.configEntry.findUnique({ where: { key: REAL_EXECUTION_HALTED_KEY } }),
     ]);
     const llm = this.llm.getReadiness();
+    const pluginsRegistered = plugins.length;
+    const pluginsActive = plugins.filter((p) => p.active).length;
+    const sandboxReachable = sandboxRes?.ok ?? false;
+    const llmReady = llm.credentialPresent;
+    const realExecutionHalted = kvBool(haltedRow?.value ?? null, false);
+
+    // Frontend health-card contract: a structured list of individual checks derived
+    // from the same flags below (additive — every pre-existing field is untouched).
+    const checks: CheckItem[] = [
+      {
+        name: 'sandbox_reachable',
+        ok: sandboxReachable,
+        level: sandboxReachable ? 'ok' : 'error',
+        ...(sandboxReachable ? {} : { detail: 'El runner.py del sandbox no respondió.' }),
+      },
+      {
+        name: 'llm_ready',
+        ok: llmReady,
+        level: llmReady ? 'ok' : 'error',
+        ...(llmReady ? {} : { detail: llm.detail }),
+      },
+      {
+        name: 'plugins_active',
+        ok: pluginsActive > 0,
+        level: pluginsActive > 0 ? 'ok' : 'warn',
+        ...(pluginsActive > 0
+          ? {}
+          : { detail: `0 plugins activos de ${pluginsRegistered} registrados.` }),
+      },
+      {
+        name: 'real_execution_halted',
+        ok: !realExecutionHalted,
+        level: realExecutionHalted ? 'warn' : 'ok',
+        ...(realExecutionHalted
+          ? { detail: 'El kill-switch de ejecución real está activo (real_execution.halted).' }
+          : {}),
+      },
+    ];
+
     return {
       ok: true,
-      plugins_registered: plugins.length,
-      plugins_active: plugins.filter((p) => p.active).length,
-      sandbox_reachable: sandboxRes?.ok ?? false,
+      plugins_registered: pluginsRegistered,
+      plugins_active: pluginsActive,
+      sandbox_reachable: sandboxReachable,
       // Surfaces a missing/misconfigured LLM credential: if false, cycles can't decide
       // or trade. This is the single highest-signal "why isn't it trading" check.
-      llm_ready: llm.credentialPresent,
+      llm_ready: llmReady,
       llm_backend: llm.backend,
       llm_detail: llm.detail,
+      checks,
       timestamp: new Date().toISOString(),
     };
   }
