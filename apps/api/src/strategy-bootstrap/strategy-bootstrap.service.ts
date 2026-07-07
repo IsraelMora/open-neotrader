@@ -57,6 +57,7 @@ export const PLUGINS_TO_ACTIVATE = [
   'risk-manager',
   'macro-calendar-guard',
   'market-context',
+  'broad-index-hold',
 ] as const;
 
 export const PLUGINS_TO_DEACTIVATE = [

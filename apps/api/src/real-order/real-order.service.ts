@@ -50,9 +50,20 @@ const RECOVERABLE_STATUSES = ['pending_submit', 'submit_failed'];
  * Terminal statuses for a RealOrder — a row in one of these states can never receive
  * further broker activity, so it must NOT block a fresh submit() for the same
  * trade_intent_id. Mirrors the partial unique index's WHERE clause exactly (see
- * migration 0016) — keep these in sync.
+ * migrations 0016 and 0017) — keep these in sync.
+ *
+ * 'confirmed_absent' (see CONFIRMED_ABSENT_ESCALATION_THRESHOLD below) is deliberately
+ * terminal here (never blocks a fresh submit for the same intent) but is NOT in
+ * RECOVERABLE_STATUSES — that's what stops recoverInflight() from ever selecting it again.
  */
-const TERMINAL_STATUSES = ['filled', 'canceled', 'rejected', 'expired', 'submit_failed'];
+const TERMINAL_STATUSES = [
+  'filled',
+  'canceled',
+  'rejected',
+  'expired',
+  'submit_failed',
+  'confirmed_absent',
+];
 
 /**
  * R8 kill-switch threshold: this many CONSECUTIVE submit_failed events within
@@ -62,6 +73,26 @@ const TERMINAL_STATUSES = ['filled', 'canceled', 'rejected', 'expired', 'submit_
  */
 const SUBMIT_FAILURE_THRESHOLD = 3;
 const SUBMIT_FAILURE_WINDOW_MS = 5 * 60_000;
+
+/**
+ * Fix (unbounded recoverInflight polling): production incident — "broker confirms no
+ * record of row <id> ... left as-is, no resubmit" repeated for the SAME rows every ~15s
+ * indefinitely. Once the broker has AUTHORITATIVELY confirmed (a clean `null` response
+ * from getOrderByClientId, NOT a lookup error/exception) that it has no record of an
+ * order across this many CONSECUTIVE recoverInflight() checks, there is no new
+ * information left to gain by asking again — the row is escalated to the terminal
+ * 'confirmed_absent' status (excluded from RECOVERABLE_STATUSES, so future polls never
+ * select it again) and ONE audit/warn log is emitted at the transition.
+ *
+ * A simple in-memory per-row counter is enough here (mirrors the R8 submitFailureTimestamps
+ * pattern above) — deliberately does not survive a process restart; a fresh process just
+ * re-starts the count from zero for a still-stuck row, which is an acceptable, existing
+ * fail-soft tradeoff (same rationale as R8). Only CONSECUTIVE confirmed-not-found
+ * responses count: a broker-has-it response OR a lookup error/exception resets the streak
+ * for that row (the broker responding at all, even with an error, is new information —
+ * NOT a repeat confirmation of absence).
+ */
+const CONFIRMED_ABSENT_ESCALATION_THRESHOLD = 3;
 
 export interface SubmitArgs {
   tradeIntentId: string;
@@ -79,6 +110,12 @@ export class RealOrderService implements OnModuleInit {
 
   /** In-memory sliding window of recent CONSECUTIVE submit_failed timestamps (ms epoch). */
   private submitFailureTimestamps: number[] = [];
+
+  /**
+   * In-memory per-row count of CONSECUTIVE "broker confirms no record" responses seen by
+   * recoverRow() — keyed by RealOrder.id. See CONFIRMED_ABSENT_ESCALATION_THRESHOLD doc.
+   */
+  private readonly confirmedAbsentCounts = new Map<string, number>();
 
   constructor(
     private readonly db: PrismaService,
@@ -358,7 +395,9 @@ export class RealOrderService implements OnModuleInit {
       );
     } catch (err) {
       // Lookup-error branch — fail-soft per row: one broker-lookup failure never
-      // blocks recovering the rest.
+      // blocks recovering the rest. Not a confirmation of absence (the broker didn't
+      // actually answer) — resets any prior confirmed-absent streak for this row.
+      this.confirmedAbsentCounts.delete(row.id);
       this.log.warn(
         `recoverInflight: getOrderByClientId failed for row ${row.id} (client_order_id=${row.client_order_id}) — left as-is: ${String(err)}`,
       );
@@ -366,13 +405,16 @@ export class RealOrderService implements OnModuleInit {
     }
 
     if (brokerOrder === null) {
-      // Confirmed-not-found branch (broker returned a confirmed 404) — leave the row
-      // retryable, do NOT resubmit here.
-      this.log.log(
-        `recoverInflight: broker confirms no record of row ${row.id} (client_order_id=${row.client_order_id}) — left as-is, no resubmit`,
-      );
+      // Confirmed-not-found branch (broker returned a confirmed 404). Bounded escalation
+      // (see CONFIRMED_ABSENT_ESCALATION_THRESHOLD doc): after enough CONSECUTIVE
+      // confirmations, stop polling this row forever instead of leaving it retryable
+      // indefinitely — the production incident this fixes.
+      await this._handleConfirmedAbsent(row);
       return;
     }
+    // Broker DID answer (even affirmatively with a real record) — resets any prior
+    // confirmed-absent streak; only CONSECUTIVE confirmed-not-found responses count.
+    this.confirmedAbsentCounts.delete(row.id);
 
     // Broker-has-it branch — reconcile the row to broker truth.
     //
@@ -406,6 +448,59 @@ export class RealOrderService implements OnModuleInit {
         last_reconciled_at: new Date(),
       },
     });
+  }
+
+  /**
+   * Handles a single CONFIRMED-NOT-FOUND response for `row` (broker returned a clean
+   * `null`, i.e. it authoritatively has no record of this order). Tracks a CONSECUTIVE
+   * count in-memory (see confirmedAbsentCounts doc); below the threshold, the row is left
+   * exactly as it was (retryable, no DB write — matches the pre-fix behavior so a first
+   * or second confirmed-not-found response is never mistaken for a permanent condition).
+   * At the threshold, escalates the row to the terminal 'confirmed_absent' status in ONE
+   * update() call and emits ONE audit/warn log — never resubmits (mirrors the
+   * no-blind-resubmit invariant: this only ever writes a terminal label, never calls
+   * placeOrder).
+   */
+  private async _handleConfirmedAbsent(row: RealOrder): Promise<void> {
+    const count = (this.confirmedAbsentCounts.get(row.id) ?? 0) + 1;
+
+    if (count < CONFIRMED_ABSENT_ESCALATION_THRESHOLD) {
+      this.confirmedAbsentCounts.set(row.id, count);
+      this.log.log(
+        `recoverInflight: broker confirms no record of row ${row.id} (client_order_id=${row.client_order_id}) ` +
+          `— left as-is, no resubmit (confirmed-absent count=${count}/${CONFIRMED_ABSENT_ESCALATION_THRESHOLD})`,
+      );
+      return;
+    }
+
+    // Threshold reached — escalate to a genuinely terminal status so this row is
+    // structurally excluded from every future recoverInflight() poll (it is NOT in
+    // RECOVERABLE_STATUSES). Reset the in-memory counter first so a failure in the
+    // update below (caught, logged, row left as-is) simply restarts the count from
+    // zero on the next tick rather than getting stuck mid-escalation.
+    this.confirmedAbsentCounts.delete(row.id);
+    try {
+      await this.db.realOrder.update({
+        where: { id: row.id },
+        data: {
+          status: 'confirmed_absent',
+          error:
+            `Broker confirmed no record of this order across ${count} consecutive ` +
+            `recovery checks — abandoning further automatic polling (client_order_id=${row.client_order_id}). ` +
+            `Requires manual review.`,
+        },
+      });
+      this.log.warn(
+        `recoverInflight: ESCALATED row ${row.id} (client_order_id=${row.client_order_id}) to ` +
+          `confirmed_absent after ${count} consecutive broker confirmed-not-found responses — ` +
+          `no longer polled by recoverInflight`,
+      );
+    } catch (err) {
+      this.log.error(
+        `recoverInflight: failed to escalate row ${row.id} to confirmed_absent — will retry ` +
+          `escalation on a future tick: ${String(err)}`,
+      );
+    }
   }
 
   /** Broker responses are untyped Record<string, unknown> — extract "id" defensively. */

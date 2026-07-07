@@ -149,6 +149,21 @@ describe('StrategyBootstrapService', () => {
     }
   });
 
+  it('activates broad-index-hold (needed by the seeded Vol-Managed pretest portfolios — regression for the silent-no-trade bug)', async () => {
+    const { kv } = makeKv();
+    const { db, updateMany } = makeDb();
+    const { llm } = makeLlm();
+    const svc = new StrategyBootstrapService(db, kv, llm);
+
+    await svc.run();
+
+    expect(PLUGINS_TO_ACTIVATE).toContain('broad-index-hold');
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: 'broad-index-hold' },
+      data: { active: true },
+    });
+  });
+
   it('deactivates sentiment-analysis (news now comes from the kernel web_search tool, not the plugin)', async () => {
     const { kv } = makeKv();
     const { db, updateMany } = makeDb();
