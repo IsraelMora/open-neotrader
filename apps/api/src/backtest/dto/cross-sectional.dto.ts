@@ -71,11 +71,11 @@ export class CrossSectionalDto {
   @Type(() => Number)
   lookback?: number;
 
-  /** Recent bars to skip (12-1 momentum → ~21). */
+  /** Recent bars to skip (12-1 momentum → ~21; up to 200 unlocks Novy-Marx 12-7 style skips). */
   @IsOptional()
   @IsInt()
   @Min(0)
-  @Max(60)
+  @Max(200)
   @Type(() => Number)
   skip?: number;
 

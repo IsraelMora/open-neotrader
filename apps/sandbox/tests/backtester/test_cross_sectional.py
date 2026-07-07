@@ -9,6 +9,7 @@ Run: cd apps/sandbox && python3 -m pytest tests/backtester/test_cross_sectional.
 from __future__ import annotations
 
 import datetime
+import math
 
 import pytest
 
@@ -140,6 +141,175 @@ class TestRegimeFilter:
         # without the filter it would still hold the riser
         r2 = cs.run_cross_sectional(prices, {**CFG, "top_n": 2})
         assert "UP" in r2["final_holdings"]
+
+
+class TestPeriodsPerYear:
+    """`periods_per_year` (default 252) scales Sharpe's sqrt(N) annualization factor.
+    CAGR is calendar-date-span-based (not bar-count-based), so it is NOT affected —
+    only the bar-count/sqrt(N)-based Sharpe scaling is."""
+
+    _prices = {
+        "WIN": _bars(lambda i: 100.0 * (1.01 ** i)),
+        "FLAT": _bars(lambda i: 100.0),
+        "LOSE": _bars(lambda i: 100.0 * (0.99 ** i)),
+    }
+
+    def test_default_and_explicit_252_are_byte_identical(self, cs):
+        default = cs.run_cross_sectional(self._prices, CFG)
+        explicit = cs.run_cross_sectional(self._prices, {**CFG, "periods_per_year": 252})
+        assert default["ok"] and explicit["ok"]
+        assert default["metrics"] == explicit["metrics"]
+        assert default["equity_curve"] == explicit["equity_curve"]
+
+    def test_sharpe_scales_by_sqrt_ratio_of_periods_per_year(self, cs):
+        r252 = cs.run_cross_sectional(self._prices, CFG)
+        r52 = cs.run_cross_sectional(self._prices, {**CFG, "periods_per_year": 52})
+        assert r252["ok"] and r52["ok"]
+        # CAGR is calendar-date-based -> unaffected by periods_per_year.
+        assert r252["metrics"]["cagr_pct"] == r52["metrics"]["cagr_pct"]
+        sharpe_252 = r252["metrics"]["sharpe_ratio"]
+        sharpe_52 = r52["metrics"]["sharpe_ratio"]
+        assert sharpe_252 != 0
+        expected_ratio = math.sqrt(52 / 252)
+        actual_ratio = sharpe_52 / sharpe_252
+        assert abs(actual_ratio - expected_ratio) < 0.01, (actual_ratio, expected_ratio)
+
+
+class TestInverseVolWeighting:
+    """weighting config: "equal" (default, byte-identical) | "inverse_vol" (risk parity —
+    weight_i ∝ 1/realized_vol_i over trailing vol_window bars, strictly no-lookahead).
+    Falls back to equal weight for a rebalance when a name lacks enough vol history."""
+
+    def test_weighting_absent_and_equal_are_identical(self, cs):
+        prices = {
+            "WIN": _bars(lambda i: 100.0 * (1.01 ** i)),
+            "FLAT": _bars(lambda i: 100.0),
+            "LOSE": _bars(lambda i: 100.0 * (0.99 ** i)),
+        }
+        default = cs.run_cross_sectional(prices, CFG)
+        explicit_equal = cs.run_cross_sectional(prices, {**CFG, "weighting": "equal"})
+        assert default["ok"] and explicit_equal["ok"]
+        assert default["metrics"] == explicit_equal["metrics"]
+        assert default["equity_curve"] == explicit_equal["equity_curve"]
+        assert default["final_holdings"] == explicit_equal["final_holdings"]
+        assert default["final_weights"] == explicit_equal["final_weights"]
+        # Baseline sanity (matches TestCrossSectional.test_selects_highest_momentum_and_profits).
+        assert default["metrics"]["total_return_pct"] > 0
+        assert "WIN" in default["final_holdings"]
+
+    def test_inverse_vol_weights_lower_vol_symbol_roughly_double(self, cs):
+        # A: alternating +1%/-1% around a strong uptrend (drift dominates the endpoint
+        # noise so momentum stays reliably positive regardless of sampling phase) ->
+        # realized vol ~1%. B/C/D: same drift, alternating +2%/-2% -> realized vol ~2%.
+        # Four names (not two) so A's higher inverse-vol share stays comfortably under
+        # the 0.5 cap and this test isolates the ratio, not the cap (see the dedicated
+        # cap test below).
+        def a(i):
+            return 100.0 * (1.002 ** i) * (1.01 if i % 2 == 0 else 0.99)
+
+        def hi_vol(i):
+            return 100.0 * (1.002 ** i) * (1.02 if i % 2 == 0 else 0.98)
+
+        prices = {
+            "A": _bars(a, n=150),
+            "B": _bars(hi_vol, n=150),
+            "C": _bars(hi_vol, n=150),
+            "D": _bars(hi_vol, n=150),
+        }
+        cfg = {
+            "top_n": 4, "lookback": 60, "skip": 5, "rebalance_days": 20,
+            "initial_capital": 10000, "commission_pct": 0.0, "slippage_pct": 0.0,
+            "weighting": "inverse_vol", "vol_window": 21,
+        }
+        r = cs.run_cross_sectional(prices, cfg)
+        assert r["ok"], r
+        assert set(r["final_holdings"]) == {"A", "B", "C", "D"}
+        w = r["final_weights"]
+        ratio = w["A"] / w["B"]
+        assert 1.7 < ratio < 2.3, w
+
+    def test_inverse_vol_weight_is_capped_at_0_5_and_renormalized(self, cs):
+        def flat_ish(i):
+            return 100.0 * (1.0005 ** i) * (1.0001 if i % 2 == 0 else 0.9999)
+
+        def volatile(i):
+            return 100.0 * (1.0005 ** i) * (1.01 if i % 2 == 0 else 0.99)
+
+        prices = {
+            "X": _bars(flat_ish, n=150),
+            "Y": _bars(volatile, n=150),
+            "Z": _bars(volatile, n=150),
+        }
+        cfg = {
+            "top_n": 3, "lookback": 60, "skip": 5, "rebalance_days": 20,
+            "initial_capital": 10000, "commission_pct": 0.0, "slippage_pct": 0.0,
+            "weighting": "inverse_vol", "vol_window": 21,
+        }
+        r = cs.run_cross_sectional(prices, cfg)
+        assert r["ok"], r
+        w = r["final_weights"]
+        assert abs(w["X"] - 0.5) < 0.02, w
+        assert abs(sum(w.values()) - 1.0) < 1e-9, w
+
+    def test_inverse_vol_single_holding_is_not_capped_to_half(self, cs):
+        # top_n=1 -> exactly one name survives momentum selection. Its pre-cap
+        # inverse-vol weight is always 1.0 (only name to normalize against), so
+        # the 0.5 cap must NOT apply here: there is no other name to redistribute
+        # the freed budget to, so capping would silently drop half the equity
+        # exposure for this rebalance instead of holding the sole name at 100%.
+        prices = {
+            "WIN": _bars(lambda i: 100.0 * (1.01 ** i) * (1.01 if i % 2 == 0 else 0.99)),
+            "LOSE": _bars(lambda i: 100.0 * (0.99 ** i)),
+        }
+        cfg = {
+            "top_n": 1, "lookback": 60, "skip": 5, "rebalance_days": 20,
+            "initial_capital": 10000, "commission_pct": 0.0, "slippage_pct": 0.0,
+            "weighting": "inverse_vol", "vol_window": 21,
+        }
+        r = cs.run_cross_sectional(prices, cfg)
+        assert r["ok"], r
+        assert r["final_holdings"] == ["WIN"]
+        w = r["final_weights"]
+        assert abs(w["WIN"] - 1.0) < 1e-9, w
+        assert abs(sum(w.values()) - 1.0) < 1e-9, w
+
+    def test_insufficient_vol_history_falls_back_to_equal_weight(self, cs):
+        prices = {
+            "A": _bars(lambda i: 100.0 + i, n=30),
+            "B": _bars(lambda i: 100.0 * (1.001 ** i), n=30),
+        }
+        cfg = {
+            "top_n": 2, "lookback": 2, "skip": 1, "rebalance_days": 1,
+            "initial_capital": 10000, "commission_pct": 0.0, "slippage_pct": 0.0,
+            "weighting": "inverse_vol", "vol_window": 21,
+        }
+        r = cs.run_cross_sectional(prices, cfg)
+        assert r["ok"], r
+        assert r["vol_weight_fallback_count"] >= 1
+
+
+class TestSkipValidation:
+    """skip must be strictly less than lookback — momentum(i) reads px at i-skip and
+    i-lookback; skip >= lookback would silently produce a zero/negative/garbage window
+    instead of a real 12-1-style momentum read. Fail loud, not silent garbage."""
+
+    def test_skip_equal_to_lookback_is_rejected(self, cs):
+        prices = {"A": _bars(lambda i: 100.0 + i), "B": _bars(lambda i: 100.0)}
+        r = cs.run_cross_sectional(prices, {**CFG, "lookback": 60, "skip": 60})
+        assert r["ok"] is False
+        assert "skip" in r["error"].lower()
+        assert "lookback" in r["error"].lower()
+
+    def test_skip_greater_than_lookback_is_rejected(self, cs):
+        prices = {"A": _bars(lambda i: 100.0 + i), "B": _bars(lambda i: 100.0)}
+        r = cs.run_cross_sectional(prices, {**CFG, "lookback": 60, "skip": 90})
+        assert r["ok"] is False
+        assert "skip" in r["error"].lower()
+
+    def test_skip_less_than_lookback_is_accepted(self, cs):
+        prices = {"A": _bars(lambda i: 100.0 + i), "B": _bars(lambda i: 100.0)}
+        r = cs.run_cross_sectional(prices, {**CFG, "lookback": 60, "skip": 5})
+        assert r["ok"] is True
 
 
 class TestCrossSectional:
