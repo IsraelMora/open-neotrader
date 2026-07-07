@@ -375,6 +375,76 @@ class TestThinSymbolRobustness:
         assert "dropped_symbols" not in r
 
 
+class TestMetricsStartBar:
+    """`metrics_start_bar` (default 0): signals/momentum/rebalances use ALL bars, but
+    equity_curve, ALL metrics (cagr/sharpe/max_dd/total_return/costs) and the benchmark
+    are computed ONLY from that common-date index onward, with equity renormalized to
+    initial_capital at that bar. Lets callers (walk-forward OOS windows) prepend warmup
+    history so the strategy is fully warm from the first evaluated bar WITHOUT the
+    warmup dead zone deflating Sharpe/CAGR."""
+
+    def test_default_and_explicit_zero_are_byte_identical(self, cs):
+        prices = {
+            "WIN": _bars(lambda i: 100.0 * (1.01 ** i)),
+            "FLAT": _bars(lambda i: 100.0),
+            "LOSE": _bars(lambda i: 100.0 * (0.99 ** i)),
+        }
+        default = cs.run_cross_sectional(prices, CFG)
+        explicit = cs.run_cross_sectional(prices, {**CFG, "metrics_start_bar": 0})
+        assert default["ok"] and explicit["ok"]
+        assert default == explicit
+
+    def test_metrics_exclude_wild_warmup_and_reflect_only_evaluated_period(self, cs):
+        """Warmup period has wild returns, evaluated period is dead flat → all metrics
+        must be ~0 (flat), proving the wild warmup is fully excluded, and the equity
+        curve must start at the evaluation bar renormalized to initial capital."""
+        msb = 60
+
+        def wild_then_flat(i):
+            if i < msb:
+                return 100.0 * (1.25 if i % 2 == 0 else 0.8)
+            return 100.0
+
+        prices = {
+            "A": _bars(wild_then_flat, n=120),
+            "B": _bars(lambda i: 100.0, n=120),
+        }
+        cfg = {
+            "top_n": 1, "lookback": 20, "skip": 2, "rebalance_days": 10,
+            "initial_capital": 10000, "commission_pct": 0.0, "slippage_pct": 0.0,
+            "metrics_start_bar": msb,
+        }
+        r = cs.run_cross_sectional(prices, cfg)
+        assert r["ok"], r
+        assert r["metrics"]["sharpe_ratio"] == 0.0
+        assert r["metrics"]["total_return_pct"] == 0.0
+        assert r["metrics"]["max_drawdown_pct"] == 0.0
+        assert r["metrics"]["cagr_pct"] == 0.0
+        # Evaluated equity curve starts at the evaluation bar, renormalized to capital.
+        assert r["equity_curve"][0]["date"] == prices["A"][msb]["date"]
+        assert r["equity_curve"][0]["equity"] == 10000
+        assert len(r["equity_curve"]) == 120 - msb
+        assert r["evaluated_bars"] == 120 - msb
+
+    def test_metrics_start_bar_at_or_beyond_history_is_rejected(self, cs):
+        prices = {
+            "A": _bars(lambda i: 100.0 + i, n=150),
+            "B": _bars(lambda i: 100.0, n=150),
+        }
+        r = cs.run_cross_sectional(prices, {**CFG, "metrics_start_bar": 150})
+        assert r["ok"] is False
+        assert "metrics_start_bar" in r["error"]
+
+    def test_negative_metrics_start_bar_is_rejected(self, cs):
+        prices = {
+            "A": _bars(lambda i: 100.0 + i, n=150),
+            "B": _bars(lambda i: 100.0, n=150),
+        }
+        r = cs.run_cross_sectional(prices, {**CFG, "metrics_start_bar": -1})
+        assert r["ok"] is False
+        assert "metrics_start_bar" in r["error"]
+
+
 class TestCrossSectional:
     def test_selects_highest_momentum_and_profits(self, cs):
         prices = {

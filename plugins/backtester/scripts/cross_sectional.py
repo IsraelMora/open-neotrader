@@ -116,6 +116,20 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     # CAGR here is calendar-date-span-based (see _annualized_metrics), so it is NOT
     # affected by this — only Sharpe is.
     periods_per_year = float(config.get("periods_per_year", 252))
+    # Metrics evaluation offset (warmup exclusion). Signals/momentum/rebalances still
+    # use ALL bars, but equity_curve, ALL metrics (total_return/cagr/sharpe/max_dd/
+    # costs) and the benchmark comparison are computed ONLY from this common-date
+    # index onward, with equity renormalized to initial_capital at that bar. Lets a
+    # caller (e.g. walk-forward OOS windows) prepend warmup history so the strategy
+    # is fully warm from the first evaluated bar WITHOUT the warmup dead zone
+    # (holdings=[], exact-zero returns) silently deflating Sharpe/CAGR. Default 0 =
+    # evaluate everything (byte-identical to prior behavior).
+    metrics_start_bar = int(config.get("metrics_start_bar", 0))
+    if metrics_start_bar < 0:
+        return {
+            "ok": False,
+            "error": f"metrics_start_bar ({metrics_start_bar}) must be >= 0",
+        }
 
     # Thin-symbol robustness: a symbol whose fetch returned too few bars to EVER
     # produce a momentum signal (needs at least lookback+skip+2 bars: lookback+skip
@@ -151,6 +165,14 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
         return {
             "ok": False,
             "error": f"Insufficient overlapping history: {len(common)} bars <= lookback {lookback}",
+        }
+    if metrics_start_bar >= len(common):
+        return {
+            "ok": False,
+            "error": (
+                f"metrics_start_bar ({metrics_start_bar}) must be less than the "
+                f"overlapping history ({len(common)} bars)"
+            ),
         }
 
     px = {s: {b["date"]: b["close"] for b in bars} for s, bars in working_prices.items()}
@@ -198,6 +220,10 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
     daily_returns: list[float] = []
     prev_val = capital
     vol_weight_fallback_count = 0
+    # Unrounded per-bar equity + raw cost events (bar index, dollars) — needed to
+    # renormalize the evaluated window when metrics_start_bar > 0.
+    raw_equities: list[float] = []
+    cost_events: list[tuple[int, float]] = []
 
     def _equal_weights(names: list[str]) -> dict[str, float]:
         return {s: 1.0 / len(names) for s in names} if names else {}
@@ -297,6 +323,7 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
             cost = cost_pct * traded * equity
             equity = max(0.0, equity - cost)
             total_cost += cost
+            cost_events.append((i, cost))
             weights = new_weights
             # Set vol-target exposure for the upcoming holding period.
             exposure = _exposure(holdings, i)
@@ -317,20 +344,51 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
                 equity *= 1.0 + exposure * weighted_ret
 
         equity = max(0.0, equity)
+        raw_equities.append(equity)
         equity_curve.append({"date": date, "equity": round(equity, 2)})
         if i > 0 and prev_val > 0:
             daily_returns.append(equity / prev_val - 1.0)
         prev_val = equity
 
-    metrics = _annualized_metrics(equity_curve, daily_returns, capital, periods_per_year)
-    metrics["total_cost_pct"] = round((total_cost / capital * 100) if capital > 0 else 0.0, 2)
+    if metrics_start_bar > 0:
+        # Evaluate ONLY from metrics_start_bar onward: renormalize equity to
+        # initial_capital at that bar (ratios are preserved, so daily returns are
+        # unchanged) and restrict returns/costs to the evaluated window. The full-run
+        # curve above stays untouched for the default path.
+        base = raw_equities[metrics_start_bar]
+        if base <= 0:
+            return {
+                "ok": False,
+                "error": (
+                    f"Equity depleted during the warmup period "
+                    f"(metrics_start_bar={metrics_start_bar})"
+                ),
+            }
+        equity_curve = [
+            {"date": common[i], "equity": round(raw_equities[i] / base * capital, 2)}
+            for i in range(metrics_start_bar, len(common))
+        ]
+        daily_returns = [
+            raw_equities[i] / raw_equities[i - 1] - 1.0
+            for i in range(metrics_start_bar + 1, len(common))
+            if raw_equities[i - 1] > 0
+        ]
+        eval_cost = sum(c for bar, c in cost_events if bar >= metrics_start_bar)
+        metrics = _annualized_metrics(equity_curve, daily_returns, capital, periods_per_year)
+        metrics["total_cost_pct"] = round(eval_cost / base * 100 if base > 0 else 0.0, 2)
+    else:
+        metrics = _annualized_metrics(equity_curve, daily_returns, capital, periods_per_year)
+        metrics["total_cost_pct"] = round(
+            (total_cost / capital * 100) if capital > 0 else 0.0, 2
+        )
 
     # Benchmark: equal-weight of the WHOLE universe, daily-compounded over the SAME
-    # common dates (consistent with how the strategy equity is built). This is robust
+    # common dates (consistent with how the strategy equity is built), starting at
+    # metrics_start_bar (0 by default → identical to prior behavior). This is robust
     # to a single symbol's bad/split-glitched first print, unlike a naive p_last/p_first
     # ratio which one outlier can blow up.
     bench_eq = capital
-    for i in range(1, len(common)):
+    for i in range(metrics_start_bar + 1, len(common)):
         rets = []
         for s in symbols:
             p0 = px[s].get(common[i - 1])
@@ -353,6 +411,9 @@ def run_cross_sectional(prices: dict[str, list[dict]], config: dict, _context=No
         "universe_size": len(symbols),
         "dropped_symbols": dropped_symbols,
     }
+    if metrics_start_bar > 0:
+        result["metrics_start_bar"] = metrics_start_bar
+        result["evaluated_bars"] = len(common) - metrics_start_bar
     if weighting == "inverse_vol":
         result["vol_weight_fallback_count"] = vol_weight_fallback_count
     return result
