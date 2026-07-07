@@ -9,7 +9,7 @@ export default function Journal() {
     <Card>
       <CardHeader
         title="Evidencia y disciplina"
-        hint="Candado de parámetros, n_trials, DSR — la red anti-overfitting."
+        hint="Candado de parámetros y umbrales de gates — disciplina anti-overfitting."
       />
       <CardBody>
         <AsyncBoundary

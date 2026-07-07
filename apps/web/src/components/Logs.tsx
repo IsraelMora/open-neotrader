@@ -8,14 +8,9 @@ import { api } from '../lib/api';
 import { useResource } from '../lib/useResource';
 import { AsyncBoundary } from './ui/AsyncBoundary';
 
-const STREAMS = [
-  'agent_cycles',
-  'alerts',
-  'nav',
-  'alpaca_orders',
-  'binance_orders',
-  'data_degradation',
-];
+// Solo 'agent_cycles' tiene un writer en apps/api hoy; el resto se puede
+// re-añadir cuando existan writers para esos streams.
+const STREAMS = ['agent_cycles'];
 
 type Nivel = 'error' | 'warn' | 'ok' | 'trace';
 

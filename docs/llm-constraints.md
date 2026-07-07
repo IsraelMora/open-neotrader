@@ -4,11 +4,16 @@
 
 El LLM en OpenNeoTrader es un **lector y consejero**, no un ejecutor.
 
-El kernel (AgentsService) es **neutral por diseño**: no impone restricciones de riesgo ni
-guardarraíles propios. La disciplina y el veto son responsabilidad exclusiva de los plugins
-de tipo `discipline`, evaluados en la capa de veto (`_runVetoLayer()` en `agents.service.ts`).
-Esta separación permite que distintos operadores configuren su propia política de riesgo
-mediante plugins, sin parches en el núcleo.
+El kernel es neutral **a nivel de invocación de skills**: el LLM solo puede llamar funciones
+whitelisteadas declaradas en el manifest del plugin activo. Pero el riesgo es **seguro por
+defecto** (opt-out, no opt-in): `TradeIntentService` aplica un piso de riesgo del kernel
+independiente de los plugins activos — un halt por drawdown máximo y un techo de tamaño por
+operación (`max_position_pct`), tanto en el camino autónomo como en el de aprobación humana.
+`exit`/`hold` siempre evitan cualquier gate (una posición siempre debe poder cerrarse). La
+disciplina y el veto ADICIONALES son responsabilidad de los plugins de tipo `discipline`,
+evaluados en la capa de veto (`_runVetoLayer()` en `agents.service.ts`): solo pueden AÑADIR
+más restricción sobre el piso del kernel, nunca relajarlo. Esta separación permite que
+distintos operadores configuren disciplina extra mediante plugins, sin parches en el núcleo.
 
 ```
 LO QUE PUEDE HACER EL LLM:
@@ -64,15 +69,18 @@ LO QUE NO PUEDE HACER EL LLM:
 5. Resultado guardado en PostgreSQL (AuditEntry, NavSnapshot, AlertEntry)
 ```
 
-## Veto y disciplina — mecanismo opt-in
+## Veto y disciplina — piso del kernel + opt-in
 
-El kernel no implementa ningún servicio de decisión ni guardarraíl de no-ampliación propios.
-El control de riesgo se implementa mediante plugins de tipo `discipline`:
+El kernel ya aplica un piso de riesgo obligatorio vía `TradeIntentService` (halt por drawdown
+máximo, techo de tamaño por operación) independientemente de qué plugins estén activos. Sobre
+ese piso, la disciplina ADICIONAL se implementa mediante plugins de tipo `discipline`:
 
 - Los plugins `discipline` se ejecutan en la capa de veto (`_runVetoLayer()`)
-- Pueden aprobar, modificar o vetar señales pendientes (`pending_signals`)
-- Si no hay ningún plugin `discipline` activo, no se aplica ningún veto
-- Cada operador configura su política de riesgo instalando los plugins que necesita
+- Pueden aprobar, modificar o vetar señales pendientes (`pending_signals`), siempre por encima
+  del piso del kernel — nunca pueden relajarlo
+- Si no hay ningún plugin `discipline` activo, sigue aplicándose el piso del kernel (drawdown +
+  tamaño por operación); solo se pierde la disciplina extra opt-in
+- Cada operador configura disciplina adicional instalando los plugins que necesita
 
 Ejemplo de plugin discipline activado:
 
