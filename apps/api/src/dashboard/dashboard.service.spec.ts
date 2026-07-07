@@ -25,12 +25,30 @@ function makeRow(n: number): NavSnapshotEquityRow {
   };
 }
 
-function makePrisma(mostRecentDesc: NavSnapshotEquityRow[]): jest.Mocked<
-  Pick<
-    PrismaService,
-    'navSnapshot' | 'auditEntry' | 'plugin' | 'alertEntry'
-  >
-> {
+/** Minimal own shape (not derived from PrismaService's overloaded delegate types) so
+ * mocked methods stay plain jest.fn() references — avoids @typescript-eslint/unbound-method
+ * false positives that trigger when Pick<PrismaService, ...> carries the real delegates. */
+interface FakePrisma {
+  navSnapshot: {
+    findFirst: jest.Mock;
+    findMany: jest.Mock;
+    groupBy: jest.Mock;
+  };
+  auditEntry: {
+    count: jest.Mock;
+    findFirst: jest.Mock;
+    groupBy: jest.Mock;
+  };
+  plugin: {
+    count: jest.Mock;
+    findMany: jest.Mock;
+  };
+  alertEntry: {
+    count: jest.Mock;
+  };
+}
+
+function makePrisma(mostRecentDesc: NavSnapshotEquityRow[]): FakePrisma {
   return {
     navSnapshot: {
       findFirst: jest.fn().mockResolvedValue(null),
@@ -49,16 +67,11 @@ function makePrisma(mostRecentDesc: NavSnapshotEquityRow[]): jest.Mocked<
     alertEntry: {
       count: jest.fn().mockResolvedValue(0),
     },
-  } as unknown as jest.Mocked<
-    Pick<PrismaService, 'navSnapshot' | 'auditEntry' | 'plugin' | 'alertEntry'>
-  >;
+  };
 }
 
 function makeService(prisma: ReturnType<typeof makePrisma>): DashboardService {
-  return new DashboardService(
-    prisma as unknown as PrismaService,
-    {} as unknown as PluginsService,
-  );
+  return new DashboardService(prisma as unknown as PrismaService, {} as unknown as PluginsService);
 }
 
 describe('DashboardService.getDashboard().equity_curve — most-recent-N window bug', () => {

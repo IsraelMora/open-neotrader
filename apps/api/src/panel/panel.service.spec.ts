@@ -158,7 +158,9 @@ function makeSvcForDoctor(deps: DoctorDeps): PanelService {
   return new PanelService(
     { configEntry } as unknown as PrismaService,
     {} as unknown as AgentsService,
-    { getReadiness: jest.fn().mockReturnValue({ credentialPresent: deps.llmReady }) } as unknown as LlmService,
+    {
+      getReadiness: jest.fn().mockReturnValue({ credentialPresent: deps.llmReady }),
+    } as unknown as LlmService,
     {
       call: jest.fn().mockResolvedValue(deps.sandboxOk ? { ok: true } : null),
     } as unknown as SandboxGateway,
@@ -172,7 +174,11 @@ function makeSvcForDoctor(deps: DoctorDeps): PanelService {
 
 describe('PanelService.doctor() — checks[] contract (panel-backend-drift Fix 2)', () => {
   it('all healthy: every check ok, plugins_active > 0', async () => {
-    const svc = makeSvcForDoctor({ plugins: { active: 2, total: 3 }, sandboxOk: true, llmReady: true });
+    const svc = makeSvcForDoctor({
+      plugins: { active: 2, total: 3 },
+      sandboxOk: true,
+      llmReady: true,
+    });
 
     const result = await svc.doctor();
 
@@ -191,7 +197,11 @@ describe('PanelService.doctor() — checks[] contract (panel-backend-drift Fix 2
   });
 
   it('sandbox unreachable: check reports error level', async () => {
-    const svc = makeSvcForDoctor({ plugins: { active: 1, total: 1 }, sandboxOk: false, llmReady: true });
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: false,
+      llmReady: true,
+    });
 
     const result = await svc.doctor();
 
@@ -201,7 +211,11 @@ describe('PanelService.doctor() — checks[] contract (panel-backend-drift Fix 2
   });
 
   it('llm not ready: check reports error level', async () => {
-    const svc = makeSvcForDoctor({ plugins: { active: 1, total: 1 }, sandboxOk: true, llmReady: false });
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: false,
+    });
 
     const result = await svc.doctor();
 
@@ -211,7 +225,11 @@ describe('PanelService.doctor() — checks[] contract (panel-backend-drift Fix 2
   });
 
   it('no active plugins (but registered > 0): plugins_active check reports warn level', async () => {
-    const svc = makeSvcForDoctor({ plugins: { active: 0, total: 4 }, sandboxOk: true, llmReady: true });
+    const svc = makeSvcForDoctor({
+      plugins: { active: 0, total: 4 },
+      sandboxOk: true,
+      llmReady: true,
+    });
 
     const result = await svc.doctor();
 

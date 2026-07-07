@@ -266,10 +266,7 @@ describe('SnapshotService.getHistory — most-recent-N window bug', () => {
   ): { navSnapshot: jest.Mocked<Pick<PrismaService['navSnapshot'], 'findMany'>> } {
     // Simulate what Prisma would actually return for orderBy desc + take limit:
     // the most recent `limit` rows, in descending order.
-    const mostRecentDesc = allRowsAsc
-      .slice()
-      .reverse()
-      .slice(0, limit);
+    const mostRecentDesc = allRowsAsc.slice().reverse().slice(0, limit);
     return {
       navSnapshot: {
         findMany: jest.fn().mockResolvedValue(mostRecentDesc),
