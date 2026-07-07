@@ -346,17 +346,53 @@ export class PanelService {
   // La validación de si el símbolo existe y qué kind tiene es responsabilidad
   // del plugin provider activo.
 
-  /** Comprueba si un símbolo (normalizado a mayúsculas) existe en el universo de activos configurado. */
+  /**
+   * Comprueba si un símbolo (normalizado a mayúsculas) existe en el universo de activos
+   * configurado y, además, verifica datos reales trayendo velas OHLCV recientes del
+   * provider por defecto. Fail-soft: cualquier fallo del gateway (sin provider, error de
+   * red, velas vacías) nunca escapa como excepción — se refleja en `ok:false` + `detail`.
+   */
   async checkUniverseSymbol(symbol: string) {
     if (!symbol?.trim()) throw new BadRequestException('símbolo vacío');
     const sym = symbol.trim().toUpperCase();
     const cfg = await this.getConfig();
     const universe = (cfg['universe'] as Record<string, unknown>) ?? {};
     const exists = sym in universe;
+
+    let ok = false;
+    let velas: number | undefined;
+    let ultimo_cierre: number | undefined;
+    let proveedor: string | undefined;
+    let detail: string | undefined;
+
+    try {
+      const provider = this.gateway.getDefaultProvider();
+      if (!provider) {
+        detail = 'Sin provider activo con credenciales configuradas';
+      } else {
+        const bars = await this.gateway.getOhlcv(provider.plugin.id, sym, '1d', 30);
+        if (!bars || bars.length === 0) {
+          detail = `El provider "${provider.plugin.id}" no devolvió velas para ${sym}`;
+        } else {
+          velas = bars.length;
+          ultimo_cierre = bars[bars.length - 1].close;
+          proveedor = provider.plugin.id;
+          ok = true;
+        }
+      }
+    } catch (err) {
+      detail = err instanceof Error ? err.message : String(err);
+    }
+
     return {
+      ok,
       symbol: sym,
       registered: exists,
       meta: exists ? universe[sym] : null,
+      ...(velas !== undefined ? { velas } : {}),
+      ...(ultimo_cierre !== undefined ? { ultimo_cierre } : {}),
+      ...(proveedor !== undefined ? { proveedor } : {}),
+      ...(detail !== undefined ? { detail } : {}),
     };
   }
 

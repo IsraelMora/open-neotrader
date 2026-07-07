@@ -248,3 +248,124 @@ describe('PanelService.doctor() — checks[] contract (panel-backend-drift Fix 2
     expect(byName['real_execution_halted']).toMatchObject({ ok: true, level: 'ok' });
   });
 });
+
+// ── checkUniverseSymbol() — panel-backend-drift Fix 3: real data verification ──
+
+function makeSvcForUniverse(
+  gateway: Partial<Pick<ProviderGatewayService, 'getDefaultProvider' | 'getOhlcv'>>,
+  cfgEntries: { key: string; value: string }[] = [],
+): PanelService {
+  const configEntry = {
+    findMany: jest.fn().mockResolvedValue(cfgEntries),
+  };
+
+  return new PanelService(
+    { configEntry } as unknown as PrismaService,
+    {} as unknown as AgentsService,
+    {} as unknown as LlmService,
+    {} as unknown as SandboxGateway,
+    {} as unknown as PluginsService,
+    {} as unknown as PluginEventsService,
+    {} as unknown as AuditService,
+    { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
+    gateway as unknown as ProviderGatewayService,
+  );
+}
+
+describe('PanelService.checkUniverseSymbol() — real OHLCV verification (Fix 3)', () => {
+  it('success: fetches OHLCV via the default provider and returns velas/ultimo_cierre/proveedor', async () => {
+    const bars = Array.from({ length: 30 }, (_, i) => ({
+      ts: `2026-01-${String(i + 1).padStart(2, '0')}T00:00:00.000Z`,
+      open: 100 + i,
+      high: 101 + i,
+      low: 99 + i,
+      close: 100.5 + i,
+      volume: 1000,
+    }));
+    const gateway = {
+      getDefaultProvider: jest.fn().mockReturnValue({ plugin: { id: 'alpaca' } }),
+      getOhlcv: jest.fn().mockResolvedValue(bars),
+    };
+    const svc = makeSvcForUniverse(gateway);
+
+    const result = await svc.checkUniverseSymbol('aapl');
+
+    expect(gateway.getDefaultProvider).toHaveBeenCalled();
+    expect(gateway.getOhlcv).toHaveBeenCalledWith('alpaca', 'AAPL', '1d', 30);
+    expect(result).toMatchObject({
+      ok: true,
+      symbol: 'AAPL',
+      velas: 30,
+      ultimo_cierre: bars[29].close,
+      proveedor: 'alpaca',
+    });
+  });
+
+  it('failure: gateway throws → ok:false with detail, never rethrows', async () => {
+    const gateway = {
+      getDefaultProvider: jest.fn().mockReturnValue({ plugin: { id: 'alpaca' } }),
+      getOhlcv: jest.fn().mockRejectedValue(new Error('boom: provider unreachable')),
+    };
+    const svc = makeSvcForUniverse(gateway);
+
+    const result = await svc.checkUniverseSymbol('MSFT');
+
+    expect(result.ok).toBe(false);
+    expect(result.symbol).toBe('MSFT');
+    expect(typeof result.detail).toBe('string');
+    expect(result.detail).toContain('boom');
+  });
+
+  it('failure: gateway returns empty bars → ok:false with detail', async () => {
+    const gateway = {
+      getDefaultProvider: jest.fn().mockReturnValue({ plugin: { id: 'alpaca' } }),
+      getOhlcv: jest.fn().mockResolvedValue([]),
+    };
+    const svc = makeSvcForUniverse(gateway);
+
+    const result = await svc.checkUniverseSymbol('TSLA');
+
+    expect(result.ok).toBe(false);
+    expect(result.symbol).toBe('TSLA');
+    expect(typeof result.detail).toBe('string');
+  });
+
+  it('failure: no default provider available → ok:false with detail, no crash', async () => {
+    const gateway = {
+      getDefaultProvider: jest.fn().mockReturnValue(null),
+      getOhlcv: jest.fn(),
+    };
+    const svc = makeSvcForUniverse(gateway);
+
+    const result = await svc.checkUniverseSymbol('BTC');
+
+    expect(result.ok).toBe(false);
+    expect(gateway.getOhlcv).not.toHaveBeenCalled();
+    expect(typeof result.detail).toBe('string');
+  });
+
+  it('preserves existing registered/meta fields from the universe config', async () => {
+    const gateway = {
+      getDefaultProvider: jest.fn().mockReturnValue({ plugin: { id: 'alpaca' } }),
+      getOhlcv: jest.fn().mockResolvedValue([
+        {
+          ts: '2026-01-01T00:00:00.000Z',
+          open: 1,
+          high: 1,
+          low: 1,
+          close: 42,
+          volume: 1,
+        },
+      ]),
+    };
+    const svc = makeSvcForUniverse(gateway, [
+      { key: 'universe', value: JSON.stringify({ AAPL: { kind: 'equity' } }) },
+    ]);
+
+    const result = await svc.checkUniverseSymbol('aapl');
+
+    expect(result.registered).toBe(true);
+    expect(result.meta).toEqual({ kind: 'equity' });
+    expect(result.ok).toBe(true);
+  });
+});
