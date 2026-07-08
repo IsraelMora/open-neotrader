@@ -142,6 +142,7 @@ export class PanelService {
     const sandboxReachable = sandboxRes?.ok ?? false;
     const llmReady = llm.credentialPresent;
     const realExecutionHalted = kvBool(haltedRow?.value ?? null, false);
+    const netnsStatus = this.sandbox.getIsolationStatus();
 
     // Frontend health-card contract: a structured list of individual checks derived
     // from the same flags below (additive — every pre-existing field is untouched).
@@ -174,6 +175,7 @@ export class PanelService {
           ? { detail: 'El kill-switch de ejecución real está activo (real_execution.halted).' }
           : {}),
       },
+      this._sandboxNetnsCheck(netnsStatus),
     ];
 
     return {
@@ -188,6 +190,37 @@ export class PanelService {
       llm_detail: llm.detail,
       checks,
       timestamp: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Builds the 'sandbox_netns' doctor check from SandboxGateway.getIsolationStatus().
+   * mode='off' is an explicit operator choice (ok regardless of active). mode='auto'
+   * silently degrading to active=false is now visible as a warn. mode='require' with
+   * active=false should never actually happen (startup fails first) — reported as
+   * error defensively.
+   */
+  private _sandboxNetnsCheck(status: { mode: string; active: boolean }): CheckItem {
+    if (status.mode === 'off') {
+      return { name: 'sandbox_netns', ok: status.active, level: 'ok' };
+    }
+    if (status.active) {
+      return { name: 'sandbox_netns', ok: true, level: 'ok' };
+    }
+    if (status.mode === 'require') {
+      return {
+        name: 'sandbox_netns',
+        ok: false,
+        level: 'error',
+        detail: 'SANDBOX_NETNS_ISOLATION=require pero el aislamiento de red no está activo.',
+      };
+    }
+    return {
+      name: 'sandbox_netns',
+      ok: false,
+      level: 'warn',
+      detail:
+        'SANDBOX_NETNS_ISOLATION=auto degradó silenciosamente: el sandbox corre sin aislamiento de red.',
     };
   }
 

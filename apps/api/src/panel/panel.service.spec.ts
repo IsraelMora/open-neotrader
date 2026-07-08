@@ -137,6 +137,7 @@ interface DoctorDeps {
   sandboxOk: boolean;
   llmReady: boolean;
   halted?: boolean;
+  netns?: { mode: string; active: boolean };
 }
 
 function makeSvcForDoctor(deps: DoctorDeps): PanelService {
@@ -170,6 +171,9 @@ function makeSvcForDoctor(deps: DoctorDeps): PanelService {
     } as unknown as LlmService,
     {
       call: jest.fn().mockResolvedValue(deps.sandboxOk ? { ok: true } : null),
+      getIsolationStatus: jest
+        .fn()
+        .mockReturnValue(deps.netns ?? { mode: 'auto', active: true }),
     } as unknown as SandboxGateway,
     { findAll: jest.fn().mockResolvedValue(pluginRows) } as unknown as PluginsService,
     {} as unknown as PluginEventsService,
@@ -272,6 +276,90 @@ describe('PanelService.doctor() — checks[] contract (panel-backend-drift Fix 2
 
     const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
     expect(byName['real_execution_halted']).toMatchObject({ ok: true, level: 'ok' });
+  });
+});
+
+// ── doctor() — sandbox_netns check (panel-honesty Fix 2) ────────────────────────
+
+describe('PanelService.doctor() — sandbox_netns check (panel-honesty Fix 2)', () => {
+  it('mode=auto, active=true → ok', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'auto', active: true },
+    });
+
+    const result = await svc.doctor();
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_netns']).toMatchObject({ ok: true, level: 'ok' });
+  });
+
+  it('mode=auto, active=false → warn (silent degrade, now visible)', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'auto', active: false },
+    });
+
+    const result = await svc.doctor();
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_netns']).toMatchObject({ ok: false, level: 'warn' });
+  });
+
+  it('mode=off, active=false → ok (explicit operator choice, not a failure)', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'off', active: false },
+    });
+
+    const result = await svc.doctor();
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_netns']).toMatchObject({ ok: false, level: 'ok' });
+  });
+
+  it('mode=require, active=false → error (defensive — should not actually occur)', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'require', active: false },
+    });
+
+    const result = await svc.doctor();
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_netns']).toMatchObject({ ok: false, level: 'error' });
+  });
+
+  it('mode=require, active=true → ok', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'require', active: true },
+    });
+
+    const result = await svc.doctor();
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_netns']).toMatchObject({ ok: true, level: 'ok' });
+  });
+
+  it('preserves every previously-existing check alongside the new sandbox_netns check', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'auto', active: true },
+    });
+
+    const result = await svc.doctor();
+    const names = result.checks.map((c) => c.name).sort();
+    expect(names).toEqual(
+      ['sandbox_reachable', 'llm_ready', 'plugins_active', 'real_execution_halted', 'sandbox_netns'].sort(),
+    );
   });
 });
 
@@ -430,7 +518,10 @@ function makeSvcForNotifications(
     { configEntry } as unknown as PrismaService,
     {} as unknown as AgentsService,
     { getReadiness: jest.fn().mockReturnValue({ credentialPresent: true }) } as unknown as LlmService,
-    { call: jest.fn().mockResolvedValue({ ok: true }) } as unknown as SandboxGateway,
+    {
+      call: jest.fn().mockResolvedValue({ ok: true }),
+      getIsolationStatus: jest.fn().mockReturnValue({ mode: 'auto', active: true }),
+    } as unknown as SandboxGateway,
     { findAll: jest.fn().mockResolvedValue([{ id: 'p1', active: true }]) } as unknown as PluginsService,
     {} as unknown as PluginEventsService,
     {} as unknown as AuditService,

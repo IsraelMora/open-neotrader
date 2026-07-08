@@ -172,6 +172,15 @@ export class SandboxGateway implements OnModuleInit {
     );
   }
 
+  /**
+   * Public runtime-visibility accessor for netns isolation state: exposes the configured
+   * mode and whether isolation is actually active (resolved by onModuleInit). Before
+   * onModuleInit runs, active reflects the not-yet-resolved default (false).
+   */
+  getIsolationStatus(): { mode: NetnsIsolationMode; active: boolean } {
+    return { mode: this.netnsMode, active: this.netnsActive };
+  }
+
   /** Envía un comando al runner.py y retorna la respuesta parseada. Mata el proceso si supera el timeout. */
   async call(req: SandboxRequest): Promise<SandboxResponse> {
     return new Promise((resolve) => {
