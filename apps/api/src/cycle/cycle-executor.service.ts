@@ -79,7 +79,7 @@ export class CycleExecutorService {
         this.runState.last = { ok: res.ok, dry_run: true, started_at: startedAt, error: res.error };
       } else {
         const context = prompt ?? startedAt;
-        const result = await this.agents.runCycle(context);
+        const result = await this.agents.runCycle(context, undefined, cycleId);
         decisions = result.decisions.length;
         skillsRead = result.llm_response?.skills_read ?? [];
         skillsWritten = result.llm_response?.skills_written ?? [];

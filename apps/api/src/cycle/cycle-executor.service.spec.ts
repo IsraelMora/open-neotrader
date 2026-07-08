@@ -393,6 +393,25 @@ describe('CycleExecutorService.executeCycle — NAV snapshot wiring', () => {
     expect(calledCycleId.length).toBeGreaterThan(0);
   });
 
+  it('threads the SAME cycleId into agents.runCycle (3rd arg) that is passed to takeSnapshot', async () => {
+    const snapshotStub = makeSnapshotStub();
+    const agentsStub = makeAgentsStub({});
+    const service = makeCycleExecutorService({ cycleRunning: false, snapshotStub, agentsStub });
+
+    service.runCycle(false);
+    await new Promise((r) => setTimeout(r, 10));
+
+    // The executor generates ONE cycleId per cycle: the id passed to takeSnapshot
+    // must be the SAME id threaded into agents.runCycle so ML/LTM outcome backfill
+    // (WHERE cycle_id = ...) matches the signals/episodes written under that id.
+    expect(snapshotStub.takeSnapshot).toHaveBeenCalledTimes(1);
+    const [snapshotCycleId] = snapshotStub.takeSnapshot.mock.calls[0] as [string];
+
+    expect(agentsStub.runCycle).toHaveBeenCalledTimes(1);
+    const runCycleArgs = agentsStub.runCycle.mock.calls[0] as unknown[];
+    expect(runCycleArgs[2]).toBe(snapshotCycleId);
+  });
+
   it('fail-soft: snapshotService.takeSnapshot rejecting does not fail the cycle', async () => {
     const snapshotStub = makeSnapshotStub({ takeSnapshotThrows: true });
     const auditStub = makeAuditStub();

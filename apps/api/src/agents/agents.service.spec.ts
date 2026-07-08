@@ -688,6 +688,51 @@ describe('AgentsService.runCycle — cycle_complete emitted exactly once', () =>
   });
 });
 
+// ── cycle_id threading: runCycle honours the caller-provided cycleId ──────────
+
+describe('AgentsService.runCycle — cycleId threading', () => {
+  function makeThreadingService(audit: ReturnType<typeof makeAudit>): AgentsService {
+    const llm = makeLlm('ok');
+    const plugins = makeFullPlugins(null, []);
+    const sandbox = makeFullSandbox();
+    const memory = makeMemory();
+    return new AgentsService(
+      llm as unknown as LlmService,
+      sandbox as unknown as SandboxGateway,
+      plugins as unknown as PluginsService,
+      memory as unknown as ContextMemoryService,
+      audit as unknown as AuditService,
+      { createBulk: jest.fn().mockResolvedValue([]) } as unknown as AlertsService,
+    );
+  }
+
+  it('uses the provided cycleId for the cycle_start / cycle_complete audit events', async () => {
+    const audit = makeAudit();
+    const service = makeThreadingService(audit);
+    const providedId = 'executor-cycle-id-123';
+
+    await service.runCycle('some context', undefined, providedId);
+
+    // Every cycle-lifecycle audit event must carry the caller's id so downstream
+    // ML/LTM outcome backfill (WHERE cycle_id = ...) matches signals/episodes.
+    expect(findAuditEvent(audit, 'cycle_start')?.['cycle_id']).toBe(providedId);
+    expect(findAuditEvent(audit, 'cycle_complete')?.['cycle_id']).toBe(providedId);
+  });
+
+  it('falls back to a generated UUID when no cycleId is provided', async () => {
+    const audit = makeAudit();
+    const service = makeThreadingService(audit);
+
+    await service.runCycle('some context');
+
+    const startId = findAuditEvent(audit, 'cycle_start')?.['cycle_id'];
+    expect(typeof startId).toBe('string');
+    expect(startId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    // The generated id is consistent across the cycle's lifecycle events.
+    expect(findAuditEvent(audit, 'cycle_complete')?.['cycle_id']).toBe(startId);
+  });
+});
+
 // ── Fix #2: runGovernedTurn exposes authoritative signalsEmitted ──────────────
 
 describe('AgentsService.runGovernedTurn — signalsEmitted in result', () => {
