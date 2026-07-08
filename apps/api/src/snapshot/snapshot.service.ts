@@ -1,6 +1,6 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { ProviderGatewayService, Portfolio } from '../providers/provider-gateway.service';
+import { ProviderGatewayService } from '../providers/provider-gateway.service';
 import { LongTermMemoryService } from '../long-term-memory/long-term-memory.service';
 import { MlSignalRecordService } from '../ml-signal-record/ml-signal-record.service';
 import { KvService } from '../common/kv.service';
@@ -38,13 +38,70 @@ export class SnapshotService {
     private readonly kv?: KvService,
   ) {}
 
-  /** Toma un snapshot del NAV actual desde el provider por defecto. */
+  /**
+   * Toma un snapshot del NAV actual desde la wallet paper del KERNEL (no del provider
+   * por defecto — ver nota kernel-nav-source).
+   *
+   * kernel-nav-source: `getPortfolio(null)` lee la cuenta del PROVIDER POR DEFECTO
+   * (Alpaca paper broker, saldo demo ~$100k), lo que conflaba el NAV paper del kernel
+   * con lo que sea que devuelva el provider activo. La wallet paper real del kernel es
+   * la fila Prisma `Portfolio` (`@@map("portfolio")`) identificada por `name: 'paper'`;
+   * su columna JSON `data` ya trae el PaperState persistido por el fill path de
+   * ejecución paper (equity/cash/positions/hwm). Se lee esa fila TAL CUAL — sin
+   * mark-to-market ni fetch de cotizaciones — y ya no se llama al gateway.
+   *
+   * `provider_id` se etiqueta como `'kernel-paper'` para distinguir honestamente esta
+   * fuente de un provider externo real (p.ej. 'alpaca'); no hay restricción de schema
+   * sobre los valores de esta columna (String? libre).
+   *
+   * total-pnl-honesty: `total_pnl = equity - initial_equity`, donde `initial_equity` es
+   * el campo opcional homónimo del PaperState (sembrado por un futuro flujo de
+   * reset/init — este método NUNCA lo escribe, solo lo lee). Si `initial_equity` no
+   * está seteado (wallet nunca reseteada), el baseline cae a `equity` y el P&L es 0 de
+   * forma honesta — nunca se fabrica un número. Antes esto quedaba hardcodeado en 0
+   * SIEMPRE, lo que envenenaba silenciosamente dashboard/episode_memory/ml_signal_record
+   * con una etiqueta de P&L falsa de "breakeven" (BLOCKER).
+   *
+   * Guard de estado corrupto: si tras el parse `equity` o `cash` no son números finitos
+   * (JSON válido pero datos basura), se trata como fallo — se loguea warn y se retorna
+   * null SIN llamar a navSnapshot.create, para no persistir una fila parcial/NaN.
+   */
   async takeSnapshot(cycleId?: string): Promise<NavEntry | null> {
-    let portfolio: Portfolio;
+    let paperRow: { data: string } | null;
     try {
-      portfolio = await this.gateway.getPortfolio(null);
+      paperRow = await this.db.portfolio.findUnique({ where: { name: 'paper' } });
     } catch (err) {
-      this.log.warn(`No se pudo obtener portfolio para snapshot: ${err}`);
+      this.log.warn(`No se pudo leer la wallet paper del kernel para snapshot: ${err}`);
+      return null;
+    }
+
+    if (!paperRow) {
+      this.log.warn("No existe fila de portfolio 'paper' del kernel todavía — snapshot omitido");
+      return null;
+    }
+
+    let paperState: {
+      equity: number;
+      cash: number;
+      positions?: unknown[];
+      initial_equity?: number;
+    };
+    try {
+      paperState = JSON.parse(paperRow.data) as {
+        equity: number;
+        cash: number;
+        positions?: unknown[];
+        initial_equity?: number;
+      };
+    } catch (err) {
+      this.log.warn(`No se pudo parsear la wallet paper del kernel para snapshot: ${err}`);
+      return null;
+    }
+
+    if (!Number.isFinite(paperState.equity) || !Number.isFinite(paperState.cash)) {
+      this.log.warn(
+        'Estado de la wallet paper del kernel inválido (equity/cash no numérico) — snapshot omitido',
+      );
       return null;
     }
 
@@ -58,15 +115,21 @@ export class SnapshotService {
       }
     }
 
+    const equity = paperState.equity;
+    const cash = paperState.cash;
+    const positions = paperState.positions ?? [];
+    const baselineEquity = paperState.initial_equity ?? equity;
+    const totalPnl = equity - baselineEquity;
+
     const entry = await this.db.navSnapshot.create({
       data: {
         cycle_id: cycleId ?? null,
-        provider_id: portfolio.provider_id,
+        provider_id: 'kernel-paper',
         strategy_id: strategyId,
-        equity: portfolio.equity,
-        cash: portfolio.cash,
-        positions: JSON.stringify(portfolio.positions),
-        total_pnl: portfolio.total_pnl,
+        equity,
+        cash,
+        positions: JSON.stringify(positions),
+        total_pnl: totalPnl,
       },
     });
 
@@ -75,7 +138,7 @@ export class SnapshotService {
     // Failure NEVER breaks the snapshot.
     if (cycleId && this.longTermMemory) {
       try {
-        await this.longTermMemory.updateOutcome(cycleId, portfolio.total_pnl, portfolio.equity);
+        await this.longTermMemory.updateOutcome(cycleId, totalPnl, equity);
       } catch (e) {
         this.log.warn(
           `[LTM] updateOutcome failed for cycle ${cycleId} — episode outcome not backfilled: ${e}`,
@@ -89,11 +152,7 @@ export class SnapshotService {
     // Failure NEVER breaks the snapshot.
     if (cycleId && this.mlSignalRecord) {
       try {
-        await this.mlSignalRecord.updateOutcomeAggregate(
-          cycleId,
-          portfolio.total_pnl,
-          portfolio.equity,
-        );
+        await this.mlSignalRecord.updateOutcomeAggregate(cycleId, totalPnl, equity);
       } catch (e) {
         this.log.warn(
           `[ML] updateOutcomeAggregate failed for cycle ${cycleId} — ml outcome not backfilled: ${e}`,

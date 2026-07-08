@@ -12,45 +12,66 @@
 import { SnapshotService } from '../../snapshot/snapshot.service';
 import { MlSignalRecordService } from '../ml-signal-record.service';
 import type { PrismaService } from '../../prisma/prisma.service';
-import type { ProviderGatewayService, Portfolio } from '../../providers/provider-gateway.service';
+import type { ProviderGatewayService } from '../../providers/provider-gateway.service';
 import type { LongTermMemoryService } from '../../long-term-memory/long-term-memory.service';
 
 const CYCLE_ID = 'ml-snap-cycle-001';
 
-const fakePortfolio: Portfolio = {
-  provider_id: 'alpaca',
-  equity: 10500,
+// kernel-nav-source: takeSnapshot now reads the kernel's own paper wallet (Prisma
+// `portfolio` row named 'paper') instead of gateway.getPortfolio(null). total_pnl is
+// derived as `equity - initial_equity` (baseline defaults to `equity` — i.e. 0 P&L —
+// when initial_equity is unknown, never a fabricated number). This fixture carries a
+// real initial_equity so the pnl assertions below are meaningful (not tautological
+// 0===0): equity 10500 - initial_equity 10000 = 500.
+const INITIAL_EQUITY = 10000;
+const EQUITY = 10500;
+const EXPECTED_PNL = EQUITY - INITIAL_EQUITY;
+
+const fakePaperState = {
+  equity: EQUITY,
   cash: 5000,
-  buying_power: 5000,
-  positions: [],
-  total_market_value: 5500,
-  total_pnl: 500,
-  ts: new Date().toISOString(),
+  positions: [] as unknown[],
+  hwm: EQUITY,
+  initial_equity: INITIAL_EQUITY,
+};
+
+const fakePaperRow = {
+  name: 'paper',
+  data: JSON.stringify(fakePaperState),
+  updatedAt: new Date(),
 };
 
 const fakeEntry = {
   id: 'snap-ml-1',
   ts: new Date(),
   cycle_id: CYCLE_ID,
-  provider_id: 'alpaca',
-  equity: 10500,
+  provider_id: 'kernel-paper',
+  equity: EQUITY,
   cash: 5000,
   positions: '[]',
-  total_pnl: 500,
+  total_pnl: EXPECTED_PNL,
   meta: null,
 };
 
 function makeGateway(): jest.Mocked<Pick<ProviderGatewayService, 'getPortfolio'>> {
   return {
-    getPortfolio: jest.fn().mockResolvedValue(fakePortfolio),
+    getPortfolio: jest.fn().mockResolvedValue(undefined),
   };
 }
 
-function makePrisma(): jest.Mocked<Pick<PrismaService, 'navSnapshot'>> {
+interface MockPrisma {
+  navSnapshot: jest.Mocked<Pick<PrismaService['navSnapshot'], 'create'>>;
+  portfolio: jest.Mocked<Pick<PrismaService['portfolio'], 'findUnique'>>;
+}
+
+function makePrisma(): MockPrisma {
   return {
     navSnapshot: {
       create: jest.fn().mockResolvedValue(fakeEntry),
-    } as unknown as PrismaService['navSnapshot'],
+    },
+    portfolio: {
+      findUnique: jest.fn().mockResolvedValue(fakePaperRow),
+    },
   };
 }
 
@@ -104,8 +125,8 @@ describe('SnapshotService + MlSignalRecordService (ml-feature-extractor-s1)', ()
     expect(mlSvc.updateOutcomeAggregate).toHaveBeenCalledTimes(1);
     expect(mlSvc.updateOutcomeAggregate).toHaveBeenCalledWith(
       CYCLE_ID,
-      fakePortfolio.total_pnl,
-      fakePortfolio.equity,
+      fakeEntry.total_pnl,
+      fakePaperState.equity,
     );
   });
 
@@ -118,7 +139,7 @@ describe('SnapshotService + MlSignalRecordService (ml-feature-extractor-s1)', ()
     const result = await svc.takeSnapshot(CYCLE_ID);
 
     expect(result).toBeDefined();
-    expect(result!.total_pnl).toBe(500);
+    expect(result!.total_pnl).toBe(fakeEntry.total_pnl);
   });
 
   it('@Optional absent (no mlSignalRecord) → takeSnapshot runs fine, no crash', async () => {
@@ -159,8 +180,8 @@ describe('SnapshotService + MlSignalRecordService (ml-feature-extractor-s1)', ()
     const [calledCycleId, calledPnl, calledEquity] = (mlSvc.updateOutcomeAggregate as jest.Mock)
       .mock.calls[0] as [string, number, number];
     expect(calledCycleId).toBe(CYCLE_ID);
-    expect(calledPnl).toBe(fakePortfolio.total_pnl); // realized AFTER the decision
-    expect(calledEquity).toBe(fakePortfolio.equity); // realized AFTER the decision
+    expect(calledPnl).toBe(fakeEntry.total_pnl); // realized AFTER the decision
+    expect(calledEquity).toBe(fakePaperState.equity); // realized AFTER the decision
   });
 
   it('both LTM and ML backfill are called in same takeSnapshot (no interference)', async () => {
@@ -174,13 +195,13 @@ describe('SnapshotService + MlSignalRecordService (ml-feature-extractor-s1)', ()
 
     expect(ltm.updateOutcome).toHaveBeenCalledWith(
       CYCLE_ID,
-      fakePortfolio.total_pnl,
-      fakePortfolio.equity,
+      fakeEntry.total_pnl,
+      fakePaperState.equity,
     );
     expect(mlSvc.updateOutcomeAggregate).toHaveBeenCalledWith(
       CYCLE_ID,
-      fakePortfolio.total_pnl,
-      fakePortfolio.equity,
+      fakeEntry.total_pnl,
+      fakePaperState.equity,
     );
   });
 });
