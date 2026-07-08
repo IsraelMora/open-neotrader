@@ -62,7 +62,11 @@ export type AuditEventType =
   // the shared kernel risk floor (drawdown halt / max-open-positions / daily-weekly circuit
   // breaker / mark-to-market fail-closed) — see GovernedPaperExecutionService. Makes a
   // blocked pretest strategy visible instead of silently skipping the tool call.
-  | 'pretest_entry_rejected';
+  | 'pretest_entry_rejected'
+  // deterministic-mode-divergence: per-turn telemetry comparing the signals fed
+  // into a governed turn (cycle/pretest) against what the LLM actually emitted —
+  // answers "did the LLM add value, or is it a rubber stamp?".
+  | 'llm_divergence';
 
 export interface AuditPayload {
   cycle_id?: string;

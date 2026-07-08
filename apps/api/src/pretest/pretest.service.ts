@@ -52,6 +52,17 @@ export interface PretestPolicy {
    * has an effect when a short position is actually open — zero impact on
    * long-only portfolios (default enable_short=false everywhere). */
   borrow_cost_pct: number;
+  /**
+   * 'llm_gated' (default): every runCycle calls agents.runGovernedTurn — the
+   * original, always-on behavior.
+   * 'deterministic': skip the LLM call entirely for this portfolio. Used for
+   * passive portfolios (e.g. broad-index-hold + risk-manager) whose trades
+   * are synthesized deterministically by `_synthesizePassiveHoldToolCalls`
+   * regardless of what the LLM says — its output is provably inessential for
+   * them, and skipping it saves an LLM call (and quota) every cycle.
+   * Any value other than 'deterministic' fails safe to 'llm_gated'.
+   */
+  execution_mode: 'llm_gated' | 'deterministic';
 }
 
 const POLICY_DEFAULTS: PretestPolicy = {
@@ -59,6 +70,7 @@ const POLICY_DEFAULTS: PretestPolicy = {
   slippage_pct: 0,
   commission_pct: 0,
   borrow_cost_pct: 0.0001,
+  execution_mode: 'llm_gated',
 };
 
 /**
@@ -571,26 +583,12 @@ export class PretestService {
       ? (hookCtx['pending_signals'] as unknown[])
       : [];
 
-    // ── LLM en modo pretest ───────────────────────────────────────────────────
-    const memCtx = await this.memory.toContextString();
-    const context = [
-      memCtx,
-      `[PRETEST: ${portfolio.name}]`,
-      `[Capital virtual: $${portfolio.state.equity.toFixed(2)}]`,
-      `[SEÑALES PRETEST]\n${JSON.stringify(signals, null, 2)}`,
-      systemPrompt ?? '',
-      '\nEres un agente en modo PRETEST/paper. Las órdenes son virtuales (no reales), pero DEBÉS emitir emit_trade_intent para registrar cada decisión que tomarías — no te limites a describirla en texto.',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+    // ── Leer política de fills del portfolio ──────────────────────────────────
+    // Read BEFORE the LLM turn: execution_mode gates whether the LLM turn runs at all.
+    const policy = this._readPolicy(portfolio);
 
-    // Route the LLM call through the governed turn kernel (audit, tool validation, virtual guard).
-    // virtual_only:true ensures no provider (broker) tool-calls reach the sandbox.
-    const turnResult = await this.agents.runGovernedTurn({
-      source: 'pretest',
-      context,
-      virtual_only: true,
-    });
+    // ── LLM en modo pretest (or deterministic skip) ───────────────────────────
+    const turnResult = await this._runPretestLlmOrSkip(portfolio, systemPrompt, signals, policy);
 
     // ── Deterministic passive-holder execution (broad-index-hold and friends) ──
     // A passive-hold strategy (e.g. broad-index-hold: "hold the configured index
@@ -604,8 +602,6 @@ export class PretestService {
     // path as everything else below.
     const mergedToolCalls = this._synthesizePassiveHoldToolCalls(signals, turnResult.tool_calls);
 
-    // ── Leer política de fills del portfolio ──────────────────────────────────
-    const policy = this._readPolicy(portfolio);
     // Vol-target scaling: new-entry sizing is throttled by exposureScalar (1 = no-op).
     // This is the "gate new entries" half of the mechanism; the other half —
     // rebalancing EXISTING positions toward the scalar — is _buildVolTargetRebalanceTrades below.
@@ -684,6 +680,52 @@ export class PretestService {
       llm_text: turnResult.text,
       trades_simulated: trades,
     };
+  }
+
+  /**
+   * Runs the pretest LLM turn, or skips it entirely for execution_mode:'deterministic'
+   * portfolios — see the `execution_mode` doc on PretestPolicy. A passive portfolio's
+   * trades are synthesized deterministically downstream by
+   * `_synthesizePassiveHoldToolCalls` regardless of what the LLM says, so its output
+   * is provably inessential; skipping it saves an LLM call (and quota) every cycle.
+   * Absent key or any value other than 'deterministic' (see _readPolicy) preserves the
+   * original always-on llm_gated behavior byte-for-byte.
+   */
+  private async _runPretestLlmOrSkip(
+    portfolio: PretestPortfolio,
+    systemPrompt: string | undefined,
+    signals: unknown[],
+    policy: PretestPolicy,
+  ): Promise<Pick<import('../agents/agents.service').GovernedTurnResult, 'text' | 'tool_calls'>> {
+    if (policy.execution_mode === 'deterministic') {
+      this.log.log(
+        `[pretest ${portfolio.name}] execution_mode=deterministic — skipping LLM governed turn`,
+      );
+      return { text: '', tool_calls: [] };
+    }
+
+    const memCtx = await this.memory.toContextString();
+    const context = [
+      memCtx,
+      `[PRETEST: ${portfolio.name}]`,
+      `[Capital virtual: $${portfolio.state.equity.toFixed(2)}]`,
+      `[SEÑALES PRETEST]\n${JSON.stringify(signals, null, 2)}`,
+      systemPrompt ?? '',
+      '\nEres un agente en modo PRETEST/paper. Las órdenes son virtuales (no reales), pero DEBÉS emitir emit_trade_intent para registrar cada decisión que tomarías — no te limites a describirla en texto.',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
+    // Route the LLM call through the governed turn kernel (audit, tool validation, virtual guard).
+    // virtual_only:true ensures no provider (broker) tool-calls reach the sandbox.
+    return this.agents.runGovernedTurn({
+      source: 'pretest',
+      context,
+      virtual_only: true,
+      // llm_divergence telemetry: compares these sandbox-emitted signals against
+      // what the LLM actually emitted this turn (signalsEmitted).
+      signals_proposed: signals,
+    });
   }
 
   /**
@@ -1371,8 +1413,10 @@ export class PretestService {
       0,
       Math.min(1, coerce(raw['borrow_cost_pct'], POLICY_DEFAULTS.borrow_cost_pct)),
     );
+    const execution_mode: PretestPolicy['execution_mode'] =
+      raw['execution_mode'] === 'deterministic' ? 'deterministic' : 'llm_gated';
 
-    return { sizing_pct, slippage_pct, commission_pct, borrow_cost_pct };
+    return { sizing_pct, slippage_pct, commission_pct, borrow_cost_pct, execution_mode };
   }
 
   /**
