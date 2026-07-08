@@ -32,8 +32,9 @@ const TICK_MS = 60_000;
  * - Overlap guard: a `running` flag skips a tick while a previous run is still in flight.
  * - Fail-soft: tick() NEVER throws — KV read errors and PretestService.runAllActive()
  *   rejections are caught, logged, and never propagate out of the timer callback.
- * - Does NOT run at startup: onModuleInit seeds `lastRunAt` to "now", so the first
- *   actual run happens one full interval later (not immediately on boot).
+ * - Does NOT run at startup: onModuleInit seeds `lastRunAt` to the current fixed
+ *   time slot, so the first actual run happens at the next slot boundary (not
+ *   immediately on boot).
  */
 @Injectable()
 export class PretestSchedulerService implements OnModuleInit, OnModuleDestroy {
@@ -47,10 +48,21 @@ export class PretestSchedulerService implements OnModuleInit, OnModuleDestroy {
     private readonly pretest: PretestService,
   ) {}
 
-  onModuleInit(): void {
-    // Do NOT run at startup — seed lastRunAt to "now" so the first eligible run is
-    // one full interval later, not immediately on boot.
-    this.lastRunAt = Date.now();
+  async onModuleInit(): Promise<void> {
+    // Align to fixed time slots based on the configured interval (or default).
+    // Seed lastRunAt to the current slot so we do NOT run immediately on boot,
+    // but subsequent runs stay anchored to predictable wall-clock boundaries.
+    let intervalMs = DEFAULT_INTERVAL_MS;
+    try {
+      const raw = await this.kv.get(CONFIG_KEY);
+      intervalMs = kvNum(raw, DEFAULT_INTERVAL_MS);
+    } catch (err: unknown) {
+      this.log.warn(`Pretest scheduler: fallo leyendo config KV al iniciar — ${String(err)}`);
+    }
+    this.lastRunAt = this._currentSlot(
+      Date.now(),
+      intervalMs > 0 ? intervalMs : DEFAULT_INTERVAL_MS,
+    );
     this.ticker = setInterval(() => void this.tick(), TICK_MS);
     this.log.log('Pretest scheduler iniciado');
   }
@@ -60,6 +72,24 @@ export class PretestSchedulerService implements OnModuleInit, OnModuleDestroy {
       clearInterval(this.ticker);
       this.ticker = null;
     }
+  }
+
+  /**
+   * The current time slot for a given interval, anchored at the Unix epoch.
+   * Runs always start at fixed multiples of the interval (e.g. 00:00, 04:00, 08:00
+   * for a 4h interval), regardless of when the process booted.
+   */
+  private _currentSlot(now: number, intervalMs: number): number {
+    return Math.floor(now / intervalMs) * intervalMs;
+  }
+
+  /**
+   * True when the current slot is strictly after the last executed slot.
+   * A null lastRunAt is treated as "never run" and is considered due.
+   */
+  private _isDue(now: number, intervalMs: number, lastRunAt: number | null): boolean {
+    const slot = this._currentSlot(now, intervalMs);
+    return lastRunAt === null || slot > lastRunAt;
   }
 
   /**
@@ -82,11 +112,12 @@ export class PretestSchedulerService implements OnModuleInit, OnModuleDestroy {
 
     if (intervalMs <= 0) return; // disabled
 
-    const last = this.lastRunAt ?? Date.now();
-    if (Date.now() < last + intervalMs) return; // not due yet
+    const now = Date.now();
+    const slot = this._currentSlot(now, intervalMs);
+    if (!this._isDue(now, intervalMs, this.lastRunAt)) return; // not due yet
 
     this.running = true;
-    this.lastRunAt = Date.now();
+    this.lastRunAt = slot; // mark the whole slot as executed
     try {
       const results = await this.pretest.runAllActive();
       const failed = results.filter((r) => !r.ok);
