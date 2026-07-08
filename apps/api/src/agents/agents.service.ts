@@ -468,9 +468,18 @@ export class AgentsService {
    * Ejecuta un ciclo completo del agente: enriquece el contexto con memoria, corre los hooks de plugins,
    * aplica el veto de discipline plugins, consulta el LLM y ejecuta las tool calls aprobadas.
    * `context` es el prompt/contexto inicial del ciclo; `systemPrompt` sobreescribe el system prompt del LLM.
+   * `cycleId`, cuando se provee, es el identificador único del ciclo generado por el llamador
+   * (p. ej. CycleExecutorService). Al pasarlo, este mismo id enlaza las señales (`ml_signal_record`),
+   * los episodios de memoria de largo plazo y los `nav_snapshots` de este ciclo, de modo que el backfill
+   * de outcomes (UPDATE ... WHERE cycle_id = cycleId) coincida con las filas escritas aquí. Si se omite,
+   * se genera un UUID nuevo.
    */
-  async runCycle(context: string, systemPrompt?: string): Promise<AgentCycleResult> {
-    const cycle_id = randomUUID();
+  async runCycle(
+    context: string,
+    systemPrompt?: string,
+    cycleId?: string,
+  ): Promise<AgentCycleResult> {
+    const cycle_id = cycleId ?? randomUUID();
 
     await this.audit.log({ cycle_id, event_type: 'cycle_start' });
 
