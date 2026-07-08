@@ -864,7 +864,7 @@ describe('VetoAnalyzerService — backfill scheduler', () => {
     svc.onModuleDestroy();
   });
 
-  it('uses the default interval (6h) when the KV key is absent', async () => {
+  it('is DISABLED BY DEFAULT when the KV key is absent (no UI consumer of the sweep output — pure background cost until an operator opts in)', async () => {
     const svc = makeServiceWithKv(makePrisma([]), makeGateway([]), makeKv({}));
     const backfillSpy = jest.spyOn(svc, 'backfill').mockResolvedValue({
       evaluated: 0,
@@ -877,11 +877,36 @@ describe('VetoAnalyzerService — backfill scheduler', () => {
 
     await svc.onModuleInit();
 
-    // Just before 6h → no tick yet.
+    // No operator opt-in via KV → no timer at all, ever.
+    await jest.advanceTimersByTimeAsync(SIX_HOURS_MS * 10);
+    expect(backfillSpy).toHaveBeenCalledTimes(0);
+
+    // onModuleDestroy must be safe even when no timer was ever started.
+    expect(() => svc.onModuleDestroy()).not.toThrow();
+  });
+
+  it('an explicit positive KV interval opts back in and runs exactly as before', async () => {
+    const svc = makeServiceWithKv(
+      makePrisma([]),
+      makeGateway([]),
+      makeKv({ 'veto.backfill_interval_ms': String(SIX_HOURS_MS) }),
+    );
+    const backfillSpy = jest.spyOn(svc, 'backfill').mockResolvedValue({
+      evaluated: 0,
+      insufficientData: 0,
+      unsupportedAction: 0,
+      invalidRefPrice: 0,
+      pending: 0,
+      errors: 0,
+    });
+
+    await svc.onModuleInit();
+
+    // Just before the configured interval → no tick yet.
     await jest.advanceTimersByTimeAsync(SIX_HOURS_MS - 1000);
     expect(backfillSpy).toHaveBeenCalledTimes(0);
 
-    // At 6h → exactly one tick.
+    // At the configured interval → exactly one tick.
     await jest.advanceTimersByTimeAsync(1000);
     expect(backfillSpy).toHaveBeenCalledTimes(1);
 

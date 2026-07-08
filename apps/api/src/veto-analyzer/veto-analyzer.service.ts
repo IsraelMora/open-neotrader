@@ -125,14 +125,21 @@ const DEFAULT_TIMEFRAME = '1d';
 const DEFAULT_COST_BPS = 10;
 
 /**
- * KV key controlling the automatic backfill sweep cadence (ms). A missing/invalid value
- * falls back to DEFAULT_BACKFILL_INTERVAL_MS; a value <= 0 explicitly DISABLES the
- * scheduler (no timer is started at all) so an operator can turn the sweep off from KV
- * without a redeploy. Mirrors the guarded kvNum read used by RealBrokerReconciliationService.
+ * KV key controlling the automatic backfill sweep cadence (ms). DISABLED BY DEFAULT:
+ * a missing/invalid KV value falls back to DEFAULT_BACKFILL_INTERVAL_MS = 0, which
+ * disables the scheduler (no timer is started at all) — same <=0-disables idiom used
+ * elsewhere in this codebase (e.g. PretestSchedulerService, RealBrokerReconciliationService).
+ * There are zero UI consumers of cf_pnl/backfill output today, so the automatic sweep is
+ * pure background cost (provider OHLCV calls + DB writes) with no visibility to justify
+ * running it unattended. An operator opts IN by setting an explicit positive value (ms,
+ * e.g. 21600000 for 6h) for this KV key — the scheduler then runs exactly as it did
+ * before this change. The HTTP endpoints and the VetoDecision ledger write are completely
+ * unaffected by this default — they remain a useful audit trail regardless of whether the
+ * automatic sweep runs.
  */
 const BACKFILL_INTERVAL_KEY = 'veto.backfill_interval_ms';
-/** Default cadence for the automatic backfill sweep — 6 hours. cf_pnl is not time-sensitive. */
-const DEFAULT_BACKFILL_INTERVAL_MS = 6 * 60 * 60_000;
+/** Disabled by default — see BACKFILL_INTERVAL_KEY doc above for the opt-in rationale. */
+const DEFAULT_BACKFILL_INTERVAL_MS = 0;
 /** Extra bars fetched beyond the strict decision-to-now need, to absorb non-trading gaps. */
 const FETCH_LIMIT_BUFFER = 20;
 /** Hard cap on a single fetch's bar count — protects providers from unbounded requests for old decisions. */
@@ -290,7 +297,12 @@ export class VetoAnalyzerService implements OnModuleInit, OnModuleDestroy {
    * steady-state loop pattern (guarded kvNum read, OnModuleInit/OnModuleDestroy timer,
    * overlap guard, fail-soft tick). Deliberately does NOT run a sweep at startup — the
    * first sweep happens one interval later, so app boot stays fast and does not fan out
-   * a provider OHLCV burst. A KV interval <= 0 disables the loop entirely (no timer).
+   * a provider OHLCV burst.
+   *
+   * DISABLED BY DEFAULT (see BACKFILL_INTERVAL_KEY doc): with no KV override this reads
+   * intervalMs=0 and the method returns without starting a timer at all. An operator
+   * opts in by setting `veto.backfill_interval_ms` to a positive value in KV; any value
+   * <= 0 (explicit or via the disabled-by-default fallback) disables the loop entirely.
    */
   async onModuleInit(): Promise<void> {
     const intervalMs = await this._readBackfillIntervalMs();
