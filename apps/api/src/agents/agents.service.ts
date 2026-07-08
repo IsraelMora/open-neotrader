@@ -69,6 +69,15 @@ export interface GovernedTurnInput {
    * no real broker orders are placed even if a provider tool-call slips through.
    */
   virtual_only?: boolean;
+  /**
+   * Raw signals fed into this turn (post-veto approved signals for 'cycle', the
+   * sandbox-emitted pending_signals for 'pretest'), used ONLY for `llm_divergence`
+   * telemetry — never for validation/execution. Entries without a string
+   * `symbol`+`action` are ignored when computing telemetry. Optional; omitted
+   * (e.g. chat/reflection turns, or callers that predate this field) means
+   * telemetry treats it as an empty list.
+   */
+  signals_proposed?: unknown[];
 }
 
 /** Result of a single governed LLM turn (validate + dispatch + audit). */
@@ -909,6 +918,18 @@ export class AgentsService {
     // last is always defined: loop runs at least once (maxTurns >= 1)
     const finalIter = last!;
 
+    // ── LLM divergence telemetry (fail-soft; internally scoped to cycle/pretest) ──
+    // "Did the LLM add value over the approved signals, or is it a rubber stamp?"
+    // was previously unanswerable. Computes ONE audit event per turn comparing
+    // input.signals_proposed (what was fed in) against allSignals (what the LLM
+    // actually emitted across every ReAct iteration this turn).
+    await this._auditLlmDivergence(
+      cycle_id,
+      input.source,
+      input.signals_proposed ?? [],
+      allSignals,
+    );
+
     return {
       cycle_id,
       text: finalIter.text,
@@ -922,6 +943,78 @@ export class AgentsService {
       signalsEmitted: allSignals,
       turns_used: turn,
     };
+  }
+
+  /**
+   * Best-effort extraction of a {symbol, action} pair from a raw signal object of
+   * unknown shape (sandbox hook output / veto-approved signal). Returns null when
+   * either field is missing or not a string — never throws.
+   */
+  private _toSignalPair(raw: unknown): { symbol: string; action: string } | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const o = raw as Record<string, unknown>;
+    const symbol = o['symbol'];
+    const action = o['action'];
+    if (typeof symbol !== 'string' || typeof action !== 'string' || !symbol || !action) return null;
+    return { symbol, action };
+  }
+
+  /** Normalized comparison key for a {symbol, action} pair: uppercase symbol, lowercase action. */
+  private _signalKey(pair: { symbol: string; action: string }): string {
+    return `${pair.symbol.toUpperCase()}|${pair.action.toLowerCase()}`;
+  }
+
+  /**
+   * Computes and persists ONE 'llm_divergence' audit event comparing the signals
+   * proposed to this turn against what the LLM actually emitted. Scoped to
+   * source 'cycle'/'pretest' — chat/reflection turns have no signals concept, so
+   * this is a silent no-op for them. Fail-soft: any error here (bad input shape,
+   * audit backend failure) is caught and logged — it must NEVER break the
+   * governed turn or the cycle it belongs to.
+   */
+  private async _auditLlmDivergence(
+    cycle_id: string,
+    source: GovernedTurnInput['source'],
+    rawSignalsProposed: unknown[],
+    llmEmitted: { symbol: string; action: string }[],
+  ): Promise<void> {
+    if (source !== 'cycle' && source !== 'pretest') return;
+    try {
+      const signalsProposed = rawSignalsProposed
+        .map((s) => this._toSignalPair(s))
+        .filter((s): s is { symbol: string; action: string } => s !== null);
+
+      const proposedKeys = new Set(signalsProposed.map((s) => this._signalKey(s)));
+      const emittedKeys = new Set(llmEmitted.map((s) => this._signalKey(s)));
+
+      let agreed = 0;
+      for (const k of emittedKeys) if (proposedKeys.has(k)) agreed++;
+      let llm_only = 0;
+      for (const k of emittedKeys) if (!proposedKeys.has(k)) llm_only++;
+      let signal_only = 0;
+      for (const k of proposedKeys) if (!emittedKeys.has(k)) signal_only++;
+      // refused_all: there WERE approved signals to act on, but the LLM emitted
+      // nothing at all this turn — the clearest "rubber stamp did nothing" signature.
+      const refused_all = signalsProposed.length > 0 && llmEmitted.length === 0;
+
+      await this.audit.log({
+        cycle_id,
+        event_type: 'llm_divergence',
+        meta: {
+          source,
+          signals_proposed: signalsProposed,
+          llm_emitted: llmEmitted,
+          agreed,
+          llm_only,
+          signal_only,
+          refused_all,
+        },
+      });
+    } catch (err) {
+      this.log.warn(
+        `[llm_divergence] telemetry failed (fail-soft, turn unaffected): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /** Fallback capital when KV `cycle.capital` is unset (override via PATCH /cycle/config). */
@@ -1166,6 +1259,9 @@ export class AgentsService {
       system_prompt: systemPrompt,
       cycle_id,
       _activePlugins: activePlugins,
+      // llm_divergence telemetry: compares these post-veto approved signals
+      // against what the LLM actually emitted this turn (signalsEmitted).
+      signals_proposed: approvedSignals,
     });
 
     const {

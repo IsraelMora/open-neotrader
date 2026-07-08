@@ -1087,6 +1087,215 @@ describe('AgentsService.runGovernedTurn — pretest source (PR3)', () => {
   });
 });
 
+// ── LLM divergence telemetry (deterministic-mode-divergence change) ───────────
+//
+// The system could not answer "did the LLM add value over the approved signals?".
+// runGovernedTurn now computes, for source:'cycle' and source:'pretest' turns, ONE
+// 'llm_divergence' audit event comparing the signals fed in (input.signals_proposed,
+// raw/unnormalized) against what the LLM actually emitted (signalsEmitted). The
+// comparison key is (symbol, action) normalized uppercase-symbol/lowercase-action.
+// Telemetry is fail-soft: an audit.log failure here must never propagate into the turn.
+
+describe('AgentsService.runGovernedTurn — llm_divergence telemetry (deterministic-mode-divergence)', () => {
+  function makeDecisionToolCallText(symbol: string, action: string): string {
+    return `<tool_calls>[{"tool":"decision__emit_trade_intent","args":{"symbol":"${symbol}","action":"${action}","confidence":0.8,"rationale":"r"}}]</tool_calls>`;
+  }
+
+  const decisionTool = {
+    plugin_id: 'decision',
+    name: 'decision__emit_trade_intent',
+    description: 'Emit a trade decision',
+    input_schema: { type: 'object', properties: {} },
+  };
+
+  it('agreement: LLM emits the same symbol+action as the one proposed signal', async () => {
+    const llm = makeLlm(makeDecisionToolCallText('AAPL', 'long'));
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('Emit a decision.', [decisionTool]);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'skill' }] as never);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'cycle ctx',
+      signals_proposed: [{ symbol: 'AAPL', action: 'long' }],
+    });
+
+    const ev = findAuditEvent(audit, 'llm_divergence');
+    expect(ev).toBeDefined();
+    expect(ev).toMatchObject({
+      event_type: 'llm_divergence',
+      meta: expect.objectContaining({
+        signals_proposed: [{ symbol: 'AAPL', action: 'long' }],
+        llm_emitted: [{ symbol: 'AAPL', action: 'long' }],
+        agreed: 1,
+        llm_only: 0,
+        signal_only: 0,
+        refused_all: false,
+      }) as unknown,
+    });
+  });
+
+  it('divergence: LLM emits a different symbol than the one proposed signal (both llm_only and signal_only)', async () => {
+    const llm = makeLlm(makeDecisionToolCallText('MSFT', 'long'));
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('Emit a decision.', [decisionTool]);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'skill' }] as never);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'cycle ctx',
+      signals_proposed: [{ symbol: 'AAPL', action: 'long' }],
+    });
+
+    const ev = findAuditEvent(audit, 'llm_divergence');
+    expect(ev).toMatchObject({
+      meta: expect.objectContaining({
+        agreed: 0,
+        llm_only: 1,
+        signal_only: 1,
+        refused_all: false,
+      }) as unknown,
+    });
+  });
+
+  it('ignore: LLM emits ZERO tool calls despite an approved signal (refused_all=true, signal_only=1)', async () => {
+    const llm = makeLlm('plain text, no decision made');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'cycle ctx',
+      signals_proposed: [{ symbol: 'AAPL', action: 'long' }],
+    });
+
+    const ev = findAuditEvent(audit, 'llm_divergence');
+    expect(ev).toMatchObject({
+      meta: expect.objectContaining({
+        llm_emitted: [],
+        agreed: 0,
+        llm_only: 0,
+        signal_only: 1,
+        refused_all: true,
+      }) as unknown,
+    });
+  });
+
+  it('no signals proposed and LLM emits nothing: refused_all is false (nothing to refuse)', async () => {
+    const llm = makeLlm('plain text, nothing proposed either');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    await service.runGovernedTurn({ source: 'cycle', context: 'cycle ctx' });
+
+    const ev = findAuditEvent(audit, 'llm_divergence');
+    expect(ev).toMatchObject({
+      meta: expect.objectContaining({
+        signals_proposed: [],
+        llm_emitted: [],
+        agreed: 0,
+        llm_only: 0,
+        signal_only: 0,
+        refused_all: false,
+      }) as unknown,
+    });
+  });
+
+  it('comparison key normalizes symbol uppercase / action lowercase', async () => {
+    const llm = makeLlm(makeDecisionToolCallText('AAPL', 'long'));
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('Emit a decision.', [decisionTool]);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'skill' }] as never);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'cycle ctx',
+      // lowercase symbol, uppercase action — must still match AAPL/long via normalization
+      signals_proposed: [{ symbol: 'aapl', action: 'LONG' }],
+    });
+
+    const ev = findAuditEvent(audit, 'llm_divergence');
+    expect(ev).toMatchObject({
+      meta: expect.objectContaining({ agreed: 1, llm_only: 0, signal_only: 0 }) as unknown,
+    });
+  });
+
+  it('works for source:pretest exactly as for source:cycle', async () => {
+    const llm = makeLlm(makeDecisionToolCallText('AAPL', 'long'));
+    const audit = makeAudit();
+    const plugins = makeFullPlugins('Emit a decision.', [decisionTool]);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'skill' }] as never);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    await service.runGovernedTurn({
+      source: 'pretest',
+      context: 'pretest ctx',
+      virtual_only: true,
+      signals_proposed: [{ symbol: 'AAPL', action: 'long' }],
+    });
+
+    const ev = findAuditEvent(audit, 'llm_divergence');
+    expect(ev).toMatchObject({
+      meta: expect.objectContaining({ agreed: 1, llm_only: 0, signal_only: 0 }) as unknown,
+    });
+  });
+
+  it('does NOT emit llm_divergence for source:chat (no signals concept)', async () => {
+    const llm = makeLlm('chat reply');
+    const audit = makeAudit();
+    const plugins = makeFullPlugins(null, []);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    await service.runGovernedTurn({ source: 'chat', context: 'hello' });
+
+    expect(findAuditEvent(audit, 'llm_divergence')).toBeUndefined();
+  });
+
+  it('fail-soft: an audit.log failure for llm_divergence must never propagate into the turn', async () => {
+    const llm = makeLlm(makeDecisionToolCallText('AAPL', 'long'));
+    const audit = makeAudit();
+    (audit.log as jest.Mock).mockImplementation(
+      (entry: Record<string, unknown>): Promise<void> =>
+        entry['event_type'] === 'llm_divergence'
+          ? Promise.reject(new Error('audit backend down'))
+          : Promise.resolve(undefined),
+    );
+    const plugins = makeFullPlugins('Emit a decision.', [decisionTool]);
+    plugins.findActive.mockResolvedValue([{ id: 'decision', type: 'skill' }] as never);
+    const sandbox = makeSandbox();
+    const memory = makeMemory();
+    const service = makeFullAgentsService(llm, audit, plugins, sandbox, memory);
+
+    // Must resolve normally — telemetry failure must not break the governed turn.
+    const result = await service.runGovernedTurn({
+      source: 'cycle',
+      context: 'cycle ctx',
+      signals_proposed: [{ symbol: 'AAPL', action: 'long' }],
+    });
+
+    expect(result.signalsEmitted).toEqual([{ symbol: 'AAPL', action: 'long' }]);
+  });
+});
+
 // ── Phase A1: Extra-plugin invocation (PRE/POST stage ordering + cycle_abort) ─
 
 type ExtraSandboxStub = jest.Mocked<
