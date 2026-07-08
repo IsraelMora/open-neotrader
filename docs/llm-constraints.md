@@ -28,7 +28,9 @@ LO QUE NO PUEDE HACER EL LLM:
   ✗ Leer/escribir archivos (solo a través de tools del plugin)
   ✗ Hacer peticiones HTTP directas
      (bajo SANDBOX_STRICT=true, el sandbox bloquea la red en-proceso vía import guard;
-      el aislamiento completo a nivel OS se aplica en F5 / despliegue en Docker)
+      además SandboxGateway aplica aislamiento de red a nivel OS por subprocess con
+      `unshare -rn` según SANDBOX_NETNS_ISOLATION — solo el modo `require` es garantía
+      dura; `auto` degrada con warning si el host no lo soporta)
 ```
 
 ## Flujo completo de una consulta LLM
@@ -57,16 +59,22 @@ LO QUE NO PUEDE HACER EL LLM:
 3. Respuesta del LLM:
    {
      "text": "Dado el FOMC inminente, recomiendo reducir exposición...",
-     "tool_calls": []
+     "tool_calls": [ { "name": "propose_allocation", "arguments": { ... } } ]
    }
-   Nota: tool_calls es actualmente siempre [] — el pipeline de ejecución de
-   tool calls LLM→sandbox NO está implementado todavía (previsto para F2).
-   AgentsService parsea texto estructurado; los tool calls nativos del LLM
-   no se procesan en la versión actual.
+   Los tool calls nativos del LLM SÍ se ejecutan: runGovernedTurn()
+   (agents.service.ts) corre un loop ReAct acotado. En cada iteración
+   (_runSingleIteration) los tool calls se validan contra la whitelist
+   (_validateToolCalls: manifests de los plugins activos + KERNEL_TOOL_REGISTRY)
+   y solo los aprobados se ejecutan (_executeToolCalls). Límites: máximo de
+   iteraciones (REACT_MAX_TURNS, configurable por KV) y presupuesto
+   anti-amplificación de tool calls compartido entre TODAS las iteraciones
+   del turno (REACT_MAX_TOOL_CALLS, default 3). Un tool call no declarado en
+   el manifest de un plugin activo ni en el registro del kernel se descarta.
 
-4. SandboxGateway ejecuta las acciones resultantes en el sandbox Python
+4. SandboxGateway ejecuta los tool calls aprobados en el sandbox Python
 
-5. Resultado guardado en PostgreSQL (AuditEntry, NavSnapshot, AlertEntry)
+5. Resultado auditado en SQLite vía Prisma + better-sqlite3
+   (AuditEntry, NavSnapshot, AlertEntry)
 ```
 
 ## Veto y disciplina — piso del kernel + opt-in
@@ -103,18 +111,22 @@ Un plugin malicioso podría intentar:
    → Mitigación: bajo `SANDBOX_STRICT=true`, `isolation.py` bloquea en-proceso los módulos
      de red (`socket`, `requests`, `urllib`, `http`, `subprocess`, etc.) antes de cargar
      cualquier código de plugin
-   → Nota: este bloqueo es en-proceso Python (no a nivel OS). Un atacante con acceso nativo
-     podría eludirlo. El aislamiento OS completo (Docker `--network=none`, seccomp) se
-     aplica en despliegue (F5). En desarrollo bare-metal, `SANDBOX_STRICT=false` desactiva
-     los guards con un aviso explícito en stderr.
+   → Nota: este bloqueo es en-proceso Python (advisory) — un atacante con acceso nativo
+     podría eludirlo. El aislamiento a nivel OS lo aplica `SandboxGateway` por subprocess
+     con `unshare -rn` (network namespace sin privilegios), controlado por
+     `SANDBOX_NETNS_ISOLATION`: `require` es garantía dura (falla el arranque si no está
+     disponible); `auto` (default) degrada silenciosamente a solo-warning si el host no lo
+     soporta; `off` lo desactiva. En desarrollo bare-metal, `SANDBOX_STRICT=false` desactiva
+     los guards en-proceso con un aviso explícito en stderr.
 
 3. **Acceso a archivos del host**: intentar abrir `/etc/passwd` u otras rutas del sistema
    → Mitigación: bajo `SANDBOX_STRICT=true`, `open()` está restringido a rutas bajo
      `NEUROTRADER_PLUGINS_DIR` (via `install_open_guard()` en `isolation.py`)
 
 4. **Datos corruptos**: retornar un resultado con valores extremos
-   → Mitigación: plugins `discipline` pueden vetar señales fuera de rango;
-     la política de riesgo es responsabilidad del operador vía plugins, no del kernel
+   → Mitigación: el piso de riesgo del kernel (`TradeIntentService`: halt por drawdown,
+     techo de tamaño por operación) acota el daño aunque no haya plugins; además los
+     plugins `discipline` pueden vetar señales fuera de rango por encima de ese piso
 
 5. **Timing attacks**: tardar mucho para afectar el ciclo
    → Mitigación: timeout configurable por plugin, kill automático
