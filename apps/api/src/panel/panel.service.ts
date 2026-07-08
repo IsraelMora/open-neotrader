@@ -372,9 +372,9 @@ export class PanelService {
 
   /** Mapea la severidad de una alerta al nivel usado en items de notificaciones. */
   private _mapAlertSeverityToLevel(severity: string): 'error' | 'warn' | 'info' {
-    const s = severity.toLowerCase();
-    if (s === 'critical') return 'error';
-    if (s === 'warn' || s === 'warning') return 'warn';
+    const s = severity.toUpperCase();
+    if (s === 'CRITICAL') return 'error';
+    if (s === 'HIGH') return 'warn';
     return 'info';
   }
 

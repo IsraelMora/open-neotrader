@@ -552,10 +552,8 @@ describe('PanelService.getNotifications() — surfaces active alerts (panel-hone
     expect(result.n_errors).toBeGreaterThanOrEqual(1);
   });
 
-  it('maps a WARN-ish active alert to level=warn and counts it in n_warnings', async () => {
-    const alertsSvc = makeAlertsStub([
-      makeAlert({ severity: 'WARN' as Alert['severity'], message: 'careful' }),
-    ]);
+  it('maps a HIGH severity active alert to level=warn and counts it in n_warnings', async () => {
+    const alertsSvc = makeAlertsStub([makeAlert({ severity: 'HIGH', message: 'careful' })]);
     const svc = makeSvcForNotifications(alertsSvc);
 
     const result = await svc.getNotifications();
@@ -565,14 +563,20 @@ describe('PanelService.getNotifications() — surfaces active alerts (panel-hone
     expect(result.n_warnings).toBeGreaterThanOrEqual(1);
   });
 
-  it('maps any other severity to level=info', async () => {
-    const alertsSvc = makeAlertsStub([makeAlert({ severity: 'LOW', message: 'fyi' })]);
+  it('maps MEDIUM and LOW severity to level=info', async () => {
+    const alertsSvc = makeAlertsStub([makeAlert({ severity: 'MEDIUM', message: 'fyi' })]);
     const svc = makeSvcForNotifications(alertsSvc);
 
     const result = await svc.getNotifications();
 
     const alertItem = result.items.find((i) => i.source === 'alerts');
     expect(alertItem).toMatchObject({ level: 'info', source: 'alerts' });
+
+    const alertsSvcLow = makeAlertsStub([makeAlert({ severity: 'LOW', message: 'fyi' })]);
+    const svcLow = makeSvcForNotifications(alertsSvcLow);
+    const resultLow = await svcLow.getNotifications();
+    const alertItemLow = resultLow.items.find((i) => i.source === 'alerts');
+    expect(alertItemLow).toMatchObject({ level: 'info', source: 'alerts' });
   });
 
   it('only queries active (unresolved) alerts — never getRecent', async () => {
