@@ -10,8 +10,9 @@
  *
  * Fail-soft: reconcileOrder() NEVER throws to its caller. A broker lookup
  * error is logged and `last_reconciled_at` is bumped (no status change); the
- * caller (a future polling loop, not implemented in this slice) can simply
- * retry on the next tick.
+ * caller (the polling loop implemented below — fastPollOrder() /
+ * reconcileAllOpenOrders() on onModuleInit()'s steady interval) simply
+ * retries on the next tick.
  *
  * No-fabricated-fill invariant: a fill is only recorded when the broker
  * reports status "filled" AND filled_qty/filled_avg_price are both finite and

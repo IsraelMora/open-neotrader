@@ -73,18 +73,6 @@ function ParamField({
   );
 }
 
-function modoLabel(generalBloqueado: boolean, general: boolean): string {
-  if (generalBloqueado) return 'deshabilitado (manda por-operación)';
-  if (general) return 'activado';
-  return 'desactivado';
-}
-
-function modoTone(generalBloqueado: boolean, general: boolean): string {
-  if (generalBloqueado) return 'mut';
-  if (general) return 'ok';
-  return 'mut';
-}
-
 function bloqueoMsg(porOp: boolean): string {
   if (porOp) {
     return 'Edición pausada: la IA gestiona la cartera por operación (AI-first). Desactiva la gestión por operación para editar los parámetros a mano.';
@@ -138,12 +126,11 @@ function ParametrosContent({
 
   const advisor = data.advisor as Record<string, unknown> | undefined;
   const iaFirst = data.ia_first as Record<string, unknown> | undefined;
-  const general = !!advisor?.auto_mode; // ① autogestión general
-  const porOp = !!iaFirst?.enabled; // ② gestión por operación (AI-first)
+  const general = !!advisor?.auto_mode; // autogestión general (adopción de parámetros validados)
+  const porOp = !!iaFirst?.enabled; // gestión por operación (AI-first)
 
   // Precedencia de autonomía: por-operación > general > manual.
   const manualBloqueado = general || porOp;
-  const generalBloqueado = porOp;
 
   const set = (path: string, val: unknown) => {
     const next = structuredClone(data) as Record<string, Record<string, unknown>>;
@@ -154,118 +141,8 @@ function ParametrosContent({
     setData(next as JsonObject);
   };
 
-  // Los toggles de automatización guardan al instante (cambian el modo).
-  function handleSetAuto(sec: string, key: string, val: unknown) {
-    const next = structuredClone(data) as Record<string, Record<string, unknown>>;
-    next[sec][key] = val;
-    void run(
-      () =>
-        api.saveConfig(next as JsonObject).then((r) => {
-          setData((r as { config: JsonObject }).config);
-        }),
-      { success: '✓ Guardado.' },
-    );
-  }
-
   return (
     <div className="space-y-5">
-      {/* ───────── Modo de gestión (antes vista Automatización) ───────── */}
-      <div className="flex items-center gap-2 text-[12px] text-mut">
-        <Bot className="h-4 w-4" /> Modo de gestión de parámetros — quién decide los valores. Más
-        automatización = mejor adaptación, más coste de cuota LLM. Precedencia: por-operación &gt;
-        general &gt; manual.
-      </div>
-
-      <Card>
-        <CardHeader
-          title="① Autogestión general de parámetros"
-          icon={<Bot className="h-4 w-4" />}
-          hint="Barato: 1 consulta LLM por cooldown. Adopta solo parámetros YA validados por backtest."
-        />
-        <CardBody className="space-y-3">
-          <div className="flex items-center gap-3">
-            <Switch
-              checked={general}
-              disabled={generalBloqueado}
-              onCheckedChange={(v) => handleSetAuto('advisor', 'auto_mode', v)}
-            />
-            <Badge tone={modoTone(generalBloqueado, general)}>
-              {modoLabel(generalBloqueado, general)}
-            </Badge>
-          </div>
-          <p className="text-[12px] text-mut leading-relaxed">
-            Antes de cada ciclo, el agente elige los parámetros ÓPTIMOS entre los candidatos que ya
-            pasaron el backtest pre-registrado y los adopta (journaleado como AUTO). No inventa
-            parámetros: solo escoge entre los validados. Respeta el candado anti-overfitting.
-          </p>
-          <div
-            className={`flex items-center gap-3 ${generalBloqueado ? 'opacity-40 pointer-events-none' : ''}`}
-          >
-            <label className="text-[12px] text-mut">Cooldown entre adopciones (h)</label>
-            <input
-              type="number"
-              value={advisor?.auto_cooldown_hours as number | undefined}
-              disabled={generalBloqueado}
-              onChange={(e) => set('advisor.auto_cooldown_hours', parseInt(e.target.value))}
-              onBlur={() =>
-                void run(
-                  () =>
-                    api.saveConfig(data).then((r) => {
-                      setData((r as { config: JsonObject }).config);
-                    }),
-                  { success: '✓ Guardado.' },
-                )
-              }
-              className="w-20 rounded-md border border-edge bg-bg px-2 py-1 text-sm text-ink num outline-none focus:border-accent/50 disabled:opacity-50"
-            />
-          </div>
-        </CardBody>
-      </Card>
-
-      <Card>
-        <CardHeader
-          title="② Gestión por operación (AI-first)"
-          icon={<Bot className="h-4 w-4" />}
-          hint="Más costoso: 2ª consulta LLM cada ciclo. La IA decide la cartera completa con criterio propio."
-        />
-        <CardBody className="space-y-3">
-          <div className="flex items-center gap-3">
-            <Switch
-              checked={porOp}
-              onCheckedChange={(v) => handleSetAuto('ia_first', 'enabled', v)}
-            />
-            <Badge tone={porOp ? 'ok' : 'mut'}>{porOp ? 'activado' : 'desactivado'}</Badge>
-          </div>
-          <p className="text-[12px] text-mut leading-relaxed">
-            En cada ciclo, la IA recibe todas las señales + skills de estrategia y propone la
-            asignación con su propio criterio (cartera "ia"), dentro de un sobre de riesgo de acero
-            (sin apalancamiento, tope por activo). Compite en paper contra principal/sombra — el NAV
-            decide.
-            <strong className="text-warn"> Consume una 2ª llamada LLM por ciclo</strong> (más
-            cuota).
-          </p>
-          <div className="flex items-center gap-3">
-            <label className="text-[12px] text-mut">Tope por activo</label>
-            <input
-              type="number"
-              step="0.05"
-              value={iaFirst?.per_asset_cap as number | undefined}
-              onChange={(e) => set('ia_first.per_asset_cap', parseFloat(e.target.value))}
-              onBlur={() =>
-                void run(
-                  () =>
-                    api.saveConfig(data).then((r) => {
-                      setData((r as { config: JsonObject }).config);
-                    }),
-                  { success: '✓ Guardado.' },
-                )
-              }
-              className="w-20 rounded-md border border-edge bg-bg px-2 py-1 text-sm text-ink num outline-none focus:border-accent/50"
-            />
-          </div>
-        </CardBody>
-      </Card>
-
       {/* ───────── Parámetros manuales (riesgo/señales) ───────── */}
       <Card>
         <CardHeader
