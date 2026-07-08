@@ -18,14 +18,21 @@ import type { LongTermMemoryService } from '../../long-term-memory/long-term-mem
 const CYCLE_ID = 'ml-snap-cycle-001';
 
 // kernel-nav-source: takeSnapshot now reads the kernel's own paper wallet (Prisma
-// `portfolio` row named 'paper') instead of gateway.getPortfolio(null). The stored
-// PaperState carries no total_pnl, so snapshots persist total_pnl 0 (schema default)
-// and the backfill receives pnl 0 + the stored paper equity.
+// `portfolio` row named 'paper') instead of gateway.getPortfolio(null). total_pnl is
+// derived as `equity - initial_equity` (baseline defaults to `equity` — i.e. 0 P&L —
+// when initial_equity is unknown, never a fabricated number). This fixture carries a
+// real initial_equity so the pnl assertions below are meaningful (not tautological
+// 0===0): equity 10500 - initial_equity 10000 = 500.
+const INITIAL_EQUITY = 10000;
+const EQUITY = 10500;
+const EXPECTED_PNL = EQUITY - INITIAL_EQUITY;
+
 const fakePaperState = {
-  equity: 10500,
+  equity: EQUITY,
   cash: 5000,
   positions: [] as unknown[],
-  hwm: 10500,
+  hwm: EQUITY,
+  initial_equity: INITIAL_EQUITY,
 };
 
 const fakePaperRow = {
@@ -39,10 +46,10 @@ const fakeEntry = {
   ts: new Date(),
   cycle_id: CYCLE_ID,
   provider_id: 'kernel-paper',
-  equity: 10500,
+  equity: EQUITY,
   cash: 5000,
   positions: '[]',
-  total_pnl: 0,
+  total_pnl: EXPECTED_PNL,
   meta: null,
 };
 

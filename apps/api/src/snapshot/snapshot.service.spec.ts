@@ -21,6 +21,13 @@
  *   injected, sourced from the kernel paper row (not the gateway).
  * - updateOutcome() throws → snapshot still written, no rethrow.
  * - @Optional null (no LTM) → takeSnapshot still returns NavEntry, no crash.
+ *
+ * total-pnl-honesty (BLOCKER fix): total_pnl is `equity - initial_equity` (baseline
+ * defaults to `equity` — i.e. 0 P&L — when initial_equity is unknown, never a fabricated
+ * number). Also:
+ * - Malformed-but-parseable state (equity/cash not a finite number) → null returned,
+ *   navSnapshot.create NOT called (no partial/NaN row written).
+ * - A non-empty positions array round-trips correctly through the snapshot.
  */
 import { SnapshotService } from './snapshot.service';
 import type { PrismaService } from '../prisma/prisma.service';
@@ -197,6 +204,115 @@ describe('kernel-nav-source — SnapshotService.takeSnapshot reads the kernel pa
         data: oc({ strategy_id: null }),
       }),
     );
+  });
+});
+
+describe('total-pnl-honesty — SnapshotService.takeSnapshot malformed-state guard', () => {
+  it('non-finite equity in paper state → returns null, does not write a snapshot, warns', async () => {
+    const badRow = {
+      name: 'paper',
+      data: JSON.stringify({ equity: 'not-a-number', cash: 5000, positions: [] }),
+      updatedAt: new Date(),
+    };
+    const prisma = makePrisma(badRow);
+    const gateway = makeGateway();
+    const service = makeSnapshotService(prisma, gateway);
+    const logWarnSpy = jest.spyOn(
+      (service as unknown as { log: { warn: () => void } }).log,
+      'warn',
+    );
+
+    const result = await service.takeSnapshot(CYCLE_ID);
+
+    expect(result).toBeNull();
+    expect(prisma.navSnapshot.create).not.toHaveBeenCalled();
+    expect(logWarnSpy).toHaveBeenCalled();
+  });
+
+  it('missing cash (non-finite) in paper state → returns null, does not write a snapshot, warns', async () => {
+    const badRow = {
+      name: 'paper',
+      data: JSON.stringify({ equity: 10500, positions: [] }), // cash missing → undefined
+      updatedAt: new Date(),
+    };
+    const prisma = makePrisma(badRow);
+    const gateway = makeGateway();
+    const service = makeSnapshotService(prisma, gateway);
+    const logWarnSpy = jest.spyOn(
+      (service as unknown as { log: { warn: () => void } }).log,
+      'warn',
+    );
+
+    const result = await service.takeSnapshot(CYCLE_ID);
+
+    expect(result).toBeNull();
+    expect(prisma.navSnapshot.create).not.toHaveBeenCalled();
+    expect(logWarnSpy).toHaveBeenCalled();
+  });
+});
+
+describe('total-pnl-honesty — SnapshotService.takeSnapshot positions round-trip', () => {
+  it('a non-empty positions array round-trips correctly into the snapshot entry', async () => {
+    const positions = [
+      { symbol: 'AAPL', quantity: 10, avg_price: 150 },
+      { symbol: 'TSLA', quantity: -2, avg_price: 220 },
+    ];
+    const row = {
+      name: 'paper',
+      data: JSON.stringify({ equity: 10500, cash: 5000, positions }),
+      updatedAt: new Date(),
+    };
+    const prisma = makePrisma(row);
+    prisma.navSnapshot.create = jest
+      .fn()
+      .mockImplementation((args: { data: Record<string, unknown> }) =>
+        Promise.resolve({
+          ...fakeEntry,
+          ...args.data,
+        }),
+      );
+    const gateway = makeGateway();
+    const service = makeSnapshotService(prisma, gateway);
+
+    const result = await service.takeSnapshot(CYCLE_ID);
+
+    expect(prisma.navSnapshot.create).toHaveBeenCalledWith(
+      oc({ data: oc({ positions: JSON.stringify(positions) }) }),
+    );
+    expect(result).toBeDefined();
+    expect(result!.positions).toEqual(positions);
+  });
+});
+
+describe('total-pnl-honesty — SnapshotService.takeSnapshot total_pnl = equity - initial_equity', () => {
+  it('initial_equity present → total_pnl is the real, nonzero equity delta', async () => {
+    const row = {
+      name: 'paper',
+      data: JSON.stringify({ equity: 12000, cash: 3000, positions: [], initial_equity: 10000 }),
+      updatedAt: new Date(),
+    };
+    const prisma = makePrisma(row);
+    const gateway = makeGateway();
+    const service = makeSnapshotService(prisma, gateway);
+
+    await service.takeSnapshot(CYCLE_ID);
+
+    expect(prisma.navSnapshot.create).toHaveBeenCalledWith(oc({ data: oc({ total_pnl: 2000 }) }));
+  });
+
+  it('initial_equity absent → total_pnl is honestly 0 (no fabricated baseline)', async () => {
+    const row = {
+      name: 'paper',
+      data: JSON.stringify({ equity: 12000, cash: 3000, positions: [] }),
+      updatedAt: new Date(),
+    };
+    const prisma = makePrisma(row);
+    const gateway = makeGateway();
+    const service = makeSnapshotService(prisma, gateway);
+
+    await service.takeSnapshot(CYCLE_ID);
+
+    expect(prisma.navSnapshot.create).toHaveBeenCalledWith(oc({ data: oc({ total_pnl: 0 }) }));
   });
 });
 

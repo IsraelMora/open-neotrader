@@ -52,9 +52,19 @@ export class SnapshotService {
    *
    * `provider_id` se etiqueta como `'kernel-paper'` para distinguir honestamente esta
    * fuente de un provider externo real (p.ej. 'alpaca'); no hay restricción de schema
-   * sobre los valores de esta columna (String? libre). `total_pnl` no existe en el
-   * PaperState del kernel (no se trackea ahí), así que se deja en el default de schema
-   * (0) en vez de inventar un cálculo — mantiene el método simple, tal como se pidió.
+   * sobre los valores de esta columna (String? libre).
+   *
+   * total-pnl-honesty: `total_pnl = equity - initial_equity`, donde `initial_equity` es
+   * el campo opcional homónimo del PaperState (sembrado por un futuro flujo de
+   * reset/init — este método NUNCA lo escribe, solo lo lee). Si `initial_equity` no
+   * está seteado (wallet nunca reseteada), el baseline cae a `equity` y el P&L es 0 de
+   * forma honesta — nunca se fabrica un número. Antes esto quedaba hardcodeado en 0
+   * SIEMPRE, lo que envenenaba silenciosamente dashboard/episode_memory/ml_signal_record
+   * con una etiqueta de P&L falsa de "breakeven" (BLOCKER).
+   *
+   * Guard de estado corrupto: si tras el parse `equity` o `cash` no son números finitos
+   * (JSON válido pero datos basura), se trata como fallo — se loguea warn y se retorna
+   * null SIN llamar a navSnapshot.create, para no persistir una fila parcial/NaN.
    */
   async takeSnapshot(cycleId?: string): Promise<NavEntry | null> {
     let paperRow: { data: string } | null;
@@ -70,15 +80,28 @@ export class SnapshotService {
       return null;
     }
 
-    let paperState: { equity: number; cash: number; positions?: unknown[] };
+    let paperState: {
+      equity: number;
+      cash: number;
+      positions?: unknown[];
+      initial_equity?: number;
+    };
     try {
       paperState = JSON.parse(paperRow.data) as {
         equity: number;
         cash: number;
         positions?: unknown[];
+        initial_equity?: number;
       };
     } catch (err) {
       this.log.warn(`No se pudo parsear la wallet paper del kernel para snapshot: ${err}`);
+      return null;
+    }
+
+    if (!Number.isFinite(paperState.equity) || !Number.isFinite(paperState.cash)) {
+      this.log.warn(
+        'Estado de la wallet paper del kernel inválido (equity/cash no numérico) — snapshot omitido',
+      );
       return null;
     }
 
@@ -95,7 +118,8 @@ export class SnapshotService {
     const equity = paperState.equity;
     const cash = paperState.cash;
     const positions = paperState.positions ?? [];
-    const totalPnl = 0; // no trackeado en el PaperState del kernel — ver nota arriba.
+    const baselineEquity = paperState.initial_equity ?? equity;
+    const totalPnl = equity - baselineEquity;
 
     const entry = await this.db.navSnapshot.create({
       data: {

@@ -59,6 +59,13 @@ export interface PaperState {
   cash: number;
   positions: PaperPosition[];
   max_drawdown_pct?: number;
+  /**
+   * Equity baseline for total_pnl (equity - initial_equity), seeded once by a future
+   * reset/init path. Read-only from SnapshotService.takeSnapshot — that path NEVER
+   * writes it. Undefined until seeded (older/never-reset paper wallets), in which case
+   * total_pnl honestly reports 0 rather than a fabricated baseline.
+   */
+  initial_equity?: number;
   /** High-water-mark equity — the highest equity ever recorded for this paper portfolio. */
   hwm?: number;
   /**
