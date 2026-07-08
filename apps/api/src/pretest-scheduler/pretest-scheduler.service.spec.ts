@@ -1,227 +1,296 @@
+import { Test, TestingModule } from '@nestjs/testing';
 import { PretestSchedulerService } from './pretest-scheduler.service';
-import type { KvService } from '../common/kv.service';
-import type { PretestService } from '../pretest/pretest.service';
+import { KvService } from '../common/kv.service';
+import { PretestService } from '../pretest/pretest.service';
 
-function makeKv(
-  kvData: Record<string, string | null> = {},
-): jest.Mocked<Pick<KvService, 'get' | 'set' | 'delete'>> {
-  return {
-    get: jest.fn().mockImplementation((key: string) => Promise.resolve(kvData[key] ?? null)),
-    set: jest.fn().mockResolvedValue(undefined),
-    delete: jest.fn().mockResolvedValue(undefined),
-  };
-}
+describe('PretestSchedulerService', () => {
+  let service: PretestSchedulerService;
+  let kv: { get: jest.Mock; set: jest.Mock };
+  let pretest: { runAllActive: jest.Mock };
 
-function makePretest(
-  impl?: () => Promise<Array<{ id: string; name: string; ok: boolean; error?: string }>>,
-): jest.Mocked<Pick<PretestService, 'runAllActive'>> {
-  return {
-    runAllActive: impl
-      ? jest.fn(impl)
-      : jest.fn().mockResolvedValue([{ id: 'p1', name: 'P1', ok: true }]),
-  };
-}
+  beforeEach(async () => {
+    kv = { get: jest.fn(), set: jest.fn() };
+    pretest = { runAllActive: jest.fn() };
 
-function makeService(
-  kv: ReturnType<typeof makeKv>,
-  pretest: ReturnType<typeof makePretest>,
-): PretestSchedulerService {
-  return new PretestSchedulerService(
-    kv as unknown as KvService,
-    pretest as unknown as PretestService,
-  );
-}
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        PretestSchedulerService,
+        { provide: KvService, useValue: kv },
+        { provide: PretestService, useValue: pretest },
+      ],
+    }).compile();
 
-/** Invokes the private tick() method directly (no real timers). */
-async function callTick(service: PretestSchedulerService): Promise<void> {
-  return (service as unknown as { tick: () => Promise<void> }).tick();
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-describe('PretestSchedulerService — interval + defaults', () => {
-  it('runs pretest.runAllActive() when the configured interval has elapsed', async () => {
-    const kv = makeKv({ 'pretest.scheduler_interval_ms': '60000' });
-    const pretest = makePretest();
-    const service = makeService(kv, pretest);
-
-    // Force lastRunAt into the past so the first tick is due.
-    (service as unknown as { lastRunAt: number | null }).lastRunAt = Date.now() - 61_000;
-
-    await callTick(service);
-
-    expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
+    service = module.get(PretestSchedulerService);
   });
 
-  it('defaults to a 6-hour interval when KV is unset', async () => {
-    const kv = makeKv();
-    const pretest = makePretest();
-    const service = makeService(kv, pretest);
-
-    (service as unknown as { lastRunAt: number | null }).lastRunAt = Date.now() - 1000;
-
-    await callTick(service);
-
-    // 1000ms elapsed is nowhere near the 6h default → must NOT run yet.
-    expect(pretest.runAllActive).not.toHaveBeenCalled();
+  afterEach(() => {
+    service.onModuleDestroy();
+    jest.useRealTimers();
   });
 
-  it('Fix B — default interval is exactly 6 hours (raised from 60min to cut pretest LLM calls 6x)', async () => {
-    const kv = makeKv();
-    const pretest = makePretest();
-    const service = makeService(kv, pretest);
+  const tick = () => (service as unknown as { tick: () => Promise<void> }).tick();
 
-    const SIX_HOURS_MS = 6 * 60 * 60_000;
-
-    // Just under 6h elapsed → must NOT run yet.
-    (service as unknown as { lastRunAt: number | null }).lastRunAt =
-      Date.now() - (SIX_HOURS_MS - 1000);
-    await callTick(service);
-    expect(pretest.runAllActive).not.toHaveBeenCalled();
-
-    // Just over 6h elapsed → must run.
-    (service as unknown as { lastRunAt: number | null }).lastRunAt =
-      Date.now() - (SIX_HOURS_MS + 1000);
-    await callTick(service);
-    expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
-  });
-
-  it('does NOT run before the interval has elapsed', async () => {
-    const kv = makeKv({ 'pretest.scheduler_interval_ms': '60000' });
-    const pretest = makePretest();
-    const service = makeService(kv, pretest);
-
-    (service as unknown as { lastRunAt: number | null }).lastRunAt = Date.now();
-
-    await callTick(service);
-
-    expect(pretest.runAllActive).not.toHaveBeenCalled();
-  });
-
-  it('interval <= 0 disables the scheduler entirely', async () => {
-    const kv = makeKv({ 'pretest.scheduler_interval_ms': '0' });
-    const pretest = makePretest();
-    const service = makeService(kv, pretest);
-
-    (service as unknown as { lastRunAt: number | null }).lastRunAt = Date.now() - 10 * 3600_000;
-
-    await callTick(service);
-
-    expect(pretest.runAllActive).not.toHaveBeenCalled();
-  });
-
-  it('a negative interval also disables the scheduler', async () => {
-    const kv = makeKv({ 'pretest.scheduler_interval_ms': '-5' });
-    const pretest = makePretest();
-    const service = makeService(kv, pretest);
-
-    (service as unknown as { lastRunAt: number | null }).lastRunAt = Date.now() - 10 * 3600_000;
-
-    await callTick(service);
-
-    expect(pretest.runAllActive).not.toHaveBeenCalled();
-  });
-});
-
-describe('PretestSchedulerService — overlap guard', () => {
-  it('skips a tick while a previous run is still in flight', async () => {
-    const kv = makeKv({ 'pretest.scheduler_interval_ms': '60000' });
-    let resolveRun!: () => void;
-    const inFlight = new Promise<Array<{ id: string; name: string; ok: boolean }>>((resolve) => {
-      resolveRun = () => resolve([{ id: 'p1', name: 'P1', ok: true }]);
+  // _currentSlot / _isDue are private pure helpers; we test them directly
+  // because their arithmetic is the core contract of the fixed-slot scheduler.
+  describe('slot arithmetic', () => {
+    it('currentSlot floors time to multiples of the interval since epoch', () => {
+      const interval = 4 * 60 * 60_000; // 4h
+      const t = 4 * interval + 12 * 60_000; // 4 slots + 12 min
+      expect(
+        (service as unknown as { _currentSlot: (n: number, i: number) => number })._currentSlot(
+          t,
+          interval,
+        ),
+      ).toBe(4 * interval);
     });
-    const pretest = makePretest(() => inFlight);
-    const service = makeService(kv, pretest);
-    (service as unknown as { lastRunAt: number | null }).lastRunAt = Date.now() - 61_000;
 
-    const firstTick = callTick(service);
-    // Second tick arrives while the first is still awaiting runAllActive.
-    await callTick(service);
+    it('currentSlot with 1h interval aligns to wall-clock hours', () => {
+      const interval = 3_600_000;
+      const t = 5 * interval + 123_456;
+      expect(
+        (service as unknown as { _currentSlot: (n: number, i: number) => number })._currentSlot(
+          t,
+          interval,
+        ),
+      ).toBe(5 * interval);
+    });
 
-    expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
+    it('isDue is true when there is no previous run', () => {
+      expect(
+        (
+          service as unknown as { _isDue: (n: number, i: number, l: number | null) => boolean }
+        )._isDue(1_000, 100, null),
+      ).toBe(true);
+    });
 
-    resolveRun();
-    await firstTick;
+    it('isDue is true when current slot is strictly after last run', () => {
+      const interval = 100;
+      expect(
+        (
+          service as unknown as { _isDue: (n: number, i: number, l: number | null) => boolean }
+        )._isDue(250, interval, 100),
+      ).toBe(true);
+    });
+
+    it('isDue is false when current slot equals last run', () => {
+      const interval = 100;
+      expect(
+        (
+          service as unknown as { _isDue: (n: number, i: number, l: number | null) => boolean }
+        )._isDue(199, interval, 100),
+      ).toBe(false);
+    });
+
+    it('isDue is false when still inside the same slot', () => {
+      const interval = 100;
+      expect(
+        (
+          service as unknown as { _isDue: (n: number, i: number, l: number | null) => boolean }
+        )._isDue(150, interval, 100),
+      ).toBe(false);
+    });
+
+    it('currentSlot at the exact boundary belongs to the new slot', () => {
+      const interval = 100;
+      expect(
+        (service as unknown as { _currentSlot: (n: number, i: number) => number })._currentSlot(
+          300,
+          interval,
+        ),
+      ).toBe(300);
+      expect(
+        (
+          service as unknown as { _isDue: (n: number, i: number, l: number | null) => boolean }
+        )._isDue(300, interval, 200),
+      ).toBe(true);
+      expect(
+        (
+          service as unknown as { _isDue: (n: number, i: number, l: number | null) => boolean }
+        )._isDue(300, interval, 300),
+      ).toBe(false);
+    });
   });
 
-  it('the running flag is released after completion, allowing a later tick to run again', async () => {
-    const kv = makeKv({ 'pretest.scheduler_interval_ms': '60000' });
-    const pretest = makePretest();
-    const service = makeService(kv, pretest);
-    (service as unknown as { lastRunAt: number | null }).lastRunAt = Date.now() - 61_000;
+  describe('tick execution', () => {
+    it('does NOT run at boot time inside the same slot', async () => {
+      const interval = 4 * 60 * 60_000;
+      const now = 5 * interval + 5 * 60_000; // 5 slots + 5 min
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      jest.setSystemTime(now);
 
-    await callTick(service);
-    expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
+      kv.get.mockResolvedValue(String(interval));
+      await service.onModuleInit();
 
-    (service as unknown as { lastRunAt: number | null }).lastRunAt = Date.now() - 61_000;
-    await callTick(service);
-    expect(pretest.runAllActive).toHaveBeenCalledTimes(2);
-  });
-});
-
-describe('PretestSchedulerService — fail-soft', () => {
-  it('never throws out of tick() when runAllActive rejects, and releases the running flag', async () => {
-    const kv = makeKv({ 'pretest.scheduler_interval_ms': '60000' });
-    const pretest = makePretest(() => Promise.reject(new Error('boom')));
-    const service = makeService(kv, pretest);
-    (service as unknown as { lastRunAt: number | null }).lastRunAt = Date.now() - 61_000;
-
-    await expect(callTick(service)).resolves.not.toThrow();
-
-    // Running flag must have been released — a subsequent due tick can run again.
-    (service as unknown as { lastRunAt: number | null }).lastRunAt = Date.now() - 61_000;
-    const pretest2 = makePretest();
-    (service as unknown as { pretest: unknown }).pretest = pretest2;
-    await callTick(service);
-    expect(pretest2.runAllActive).toHaveBeenCalledTimes(1);
-  });
-
-  it('never throws out of tick() when the KV read rejects', async () => {
-    const kv = {
-      get: jest.fn().mockRejectedValue(new Error('kv down')),
-      set: jest.fn(),
-      delete: jest.fn(),
-    } as unknown as KvService;
-    const pretest = makePretest();
-    const service = makeService(kv as unknown as ReturnType<typeof makeKv>, pretest);
-
-    await expect(callTick(service)).resolves.not.toThrow();
-    expect(pretest.runAllActive).not.toHaveBeenCalled();
-  });
-});
-
-describe('PretestSchedulerService — lifecycle', () => {
-  it('onModuleInit does NOT run immediately — first run happens one interval later', () => {
-    jest.useFakeTimers();
-    try {
-      const kv = makeKv({ 'pretest.scheduler_interval_ms': '60000' });
-      const pretest = makePretest();
-      const service = makeService(kv, pretest);
-
-      service.onModuleInit();
+      pretest.runAllActive.mockResolvedValue([]);
+      await tick();
 
       expect(pretest.runAllActive).not.toHaveBeenCalled();
-      service.onModuleDestroy();
-    } finally {
-      jest.useRealTimers();
-    }
-  });
+    });
 
-  it('onModuleDestroy clears the interval timer', () => {
-    jest.useFakeTimers();
-    try {
-      const clearSpy = jest.spyOn(global, 'clearInterval');
-      const kv = makeKv();
-      const pretest = makePretest();
-      const service = makeService(kv, pretest);
+    it('runs when the next slot boundary is reached', async () => {
+      const interval = 4 * 60 * 60_000;
+      const boot = 5 * interval + 5 * 60_000;
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      jest.setSystemTime(boot);
 
-      service.onModuleInit();
-      service.onModuleDestroy();
+      kv.get.mockResolvedValue(String(interval));
+      await service.onModuleInit();
 
-      expect(clearSpy).toHaveBeenCalled();
-      clearSpy.mockRestore();
-    } finally {
-      jest.useRealTimers();
-    }
+      pretest.runAllActive.mockResolvedValue([]);
+
+      // Advance to the next slot boundary
+      jest.setSystemTime(6 * interval);
+      await tick();
+
+      expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
+    });
+
+    it('runs once per slot even if tick is called multiple times', async () => {
+      const interval = 4 * 60 * 60_000;
+      const boot = 5 * interval + 1_000;
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      jest.setSystemTime(boot);
+
+      kv.get.mockResolvedValue(String(interval));
+      await service.onModuleInit();
+
+      pretest.runAllActive.mockResolvedValue([]);
+
+      jest.setSystemTime(6 * interval);
+      await tick();
+      await tick();
+      await tick();
+
+      expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
+    });
+
+    it('skips to the current slot after a long downtime (no catch-up storm)', async () => {
+      const interval = 4 * 60 * 60_000;
+      const boot = 5 * interval + 5 * 60_000;
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      jest.setSystemTime(boot);
+
+      kv.get.mockResolvedValue(String(interval));
+      await service.onModuleInit();
+
+      pretest.runAllActive.mockResolvedValue([]);
+
+      // Jump 3 slots ahead (12h downtime)
+      jest.setSystemTime(9 * interval);
+      await tick();
+
+      expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
+      // Next tick in the same slot should not run again
+      await tick();
+      expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
+    });
+
+    it('does nothing when scheduler is disabled', async () => {
+      kv.get.mockResolvedValue('-1');
+      await service.onModuleInit();
+      pretest.runAllActive.mockResolvedValue([]);
+
+      await tick();
+
+      expect(pretest.runAllActive).not.toHaveBeenCalled();
+    });
+
+    it('is resilient to runAllActive failure and schedules the next slot', async () => {
+      const interval = 4 * 60 * 60_000;
+      const boot = 5 * interval + 5 * 60_000;
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      jest.setSystemTime(boot);
+
+      kv.get.mockResolvedValue(String(interval));
+      await service.onModuleInit();
+
+      pretest.runAllActive.mockRejectedValue(new Error('boom'));
+
+      jest.setSystemTime(6 * interval);
+      await expect(tick()).resolves.not.toThrow();
+
+      // After failure, next slot should still be able to run
+      pretest.runAllActive.mockResolvedValue([]);
+      jest.setSystemTime(7 * interval);
+      await tick();
+      expect(pretest.runAllActive).toHaveBeenCalledTimes(2);
+    });
+
+    it('skips a tick while a previous run is still in flight (overlap guard)', async () => {
+      const interval = 4 * 60 * 60_000;
+      const boot = 5 * interval + 5 * 60_000;
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      jest.setSystemTime(boot);
+
+      kv.get.mockResolvedValue(String(interval));
+      await service.onModuleInit();
+
+      // Hold the first run unresolved
+      let releaseRun: (value: unknown[]) => void;
+      const runPromise = new Promise<unknown[]>((resolve) => {
+        releaseRun = resolve;
+      });
+      pretest.runAllActive.mockReturnValue(runPromise);
+
+      jest.setSystemTime(6 * interval);
+      const firstTick = tick();
+
+      // Second tick while the first is still pending must not start another run
+      await tick();
+      expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
+
+      releaseRun!([]);
+      await firstTick;
+    });
+
+    it('adapts to an interval change at the next tick', async () => {
+      const interval4h = 4 * 60 * 60_000;
+      const interval6h = 6 * 60 * 60_000;
+      const boot = 2 * interval4h + 5 * 60_000; // 08:05 with 4h slots
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      jest.setSystemTime(boot);
+
+      // Start with 4h interval
+      kv.get.mockResolvedValue(String(interval4h));
+      await service.onModuleInit();
+      pretest.runAllActive.mockResolvedValue([]);
+
+      // Next 4h slot (12:00) runs
+      jest.setSystemTime(3 * interval4h);
+      await tick();
+      expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
+
+      // Switch to 6h interval while inside the 12:00-18:00 window.
+      // With 6h slots the boundaries are 12:00 and 18:00, so the current slot
+      // is still 12:00 and no new run should happen yet.
+      kv.get.mockResolvedValue(String(interval6h));
+      jest.setSystemTime(3 * interval4h + 30 * 60_000); // 12:30
+      await tick();
+      expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
+
+      // 18:00 boundary (6h slot) runs
+      jest.setSystemTime(3 * interval6h);
+      await tick();
+      expect(pretest.runAllActive).toHaveBeenCalledTimes(2);
+    });
+
+    it('falls back to the default interval when KV read fails during init', async () => {
+      const defaultInterval = 6 * 60 * 60_000;
+      // Boot at 05:00 with default 6h slots -> slot 00:00
+      const boot = defaultInterval + 5 * 60 * 60_000;
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      jest.setSystemTime(boot);
+
+      // First KV read (onModuleInit) fails; subsequent reads use the default interval.
+      kv.get.mockRejectedValueOnce(new Error('KV down'));
+      kv.get.mockResolvedValue(String(defaultInterval));
+      await service.onModuleInit();
+      pretest.runAllActive.mockResolvedValue([]);
+
+      // Next 6h slot (12:00) runs
+      jest.setSystemTime(2 * defaultInterval);
+      await tick();
+      expect(pretest.runAllActive).toHaveBeenCalledTimes(1);
+    });
   });
 });
