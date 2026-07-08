@@ -796,6 +796,7 @@ describe('PretestService._readPolicy (Phase 2)', () => {
         slippage_pct: 0,
         commission_pct: 0,
         borrow_cost_pct: 0.0001,
+        execution_mode: 'llm_gated',
       });
     });
   });
@@ -4294,6 +4295,7 @@ describe('PretestService — short-selling fill model', () => {
         slippage_pct: 0,
         commission_pct: 0,
         borrow_cost_pct: 0, // isolate MTM from borrow-cost accrual for this assertion
+        execution_mode: 'llm_gated',
       });
 
       // TSLA dropped to 180: short is profitable. Liability = 10*180=1800.
@@ -4317,6 +4319,7 @@ describe('PretestService — short-selling fill model', () => {
         slippage_pct: 0,
         commission_pct: 0,
         borrow_cost_pct: 0.001, // 0.1% of short notional per tick
+        execution_mode: 'llm_gated',
       });
 
       const expected_borrow_cost = 10 * 200 * 0.001; // |qty| * mark_price * rate
@@ -4336,6 +4339,7 @@ describe('PretestService — short-selling fill model', () => {
         slippage_pct: 0,
         commission_pct: 0,
         borrow_cost_pct: 0.001,
+        execution_mode: 'llm_gated',
       });
 
       expect(state.cash).toBe(5_000); // unchanged — no short, no borrow fee
@@ -4452,6 +4456,16 @@ function makeVolTargetRow(overrides: {
     is_active: true,
     created_at: new Date(),
     updated_at: new Date(),
+  };
+}
+
+/** Shared synthetic `*_hold_signal` fixture used by passive-holder + execution_mode tests. */
+function makePassiveHoldSignal(symbol: string) {
+  return {
+    type: 'broad_index_hold_signal',
+    symbol,
+    action: 'long',
+    reason: 'broad-index-hold: unconditional buy-and-hold, no ranking',
   };
 }
 
@@ -4903,15 +4917,6 @@ describe('PretestService.runCycle — passive-holder deterministic execution', (
         signalsEmitted: [],
       }),
     } as unknown as AgentsService;
-  }
-
-  function makePassiveHoldSignal(symbol: string) {
-    return {
-      type: 'broad_index_hold_signal',
-      symbol,
-      action: 'long',
-      reason: 'broad-index-hold: unconditional buy-and-hold, no ranking',
-    };
   }
 
   it('produces a BUY fill for the held symbol even when the LLM returns ZERO tool_calls', async () => {
@@ -5919,5 +5924,217 @@ describe('PretestService.getNavHistory (nav-data-collection F2)', () => {
         take: 500,
       }),
     );
+  });
+});
+
+// ── Deterministic execution mode (deterministic-mode-divergence change) ───────
+//
+// Passive portfolios (broad-index-hold + risk-manager) whose trades are
+// synthesized deterministically by `_synthesizePassiveHoldToolCalls` never
+// actually need the LLM's judgment — its output is provably inessential for
+// them, yet every pretest cycle still burns an LLM call. `execution_mode:
+// 'deterministic'` (read from plugin_configs['__pretest_policy__']) lets a
+// portfolio skip `agents.runGovernedTurn` entirely: the pipeline proceeds with
+// an empty LLM tool_calls list, so passive-hold synthesis, kernel risk floor,
+// vol-target rebalance, fills and snapshot all still run identically.
+// Absent key defaults to 'llm_gated' — byte-identical current behavior.
+
+describe('PretestService._readPolicy — execution_mode (deterministic-mode-divergence)', () => {
+  it('no __pretest_policy__ key defaults execution_mode to "llm_gated"', () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+    const svc = makeService(gateway);
+    const portfolio = makePortfolioWithPolicy();
+
+    const policy = asPrivate(svc)._readPolicy(portfolio);
+
+    expect(policy.execution_mode).toBe('llm_gated');
+  });
+
+  it('execution_mode:"deterministic" is read through verbatim', () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+    const svc = makeService(gateway);
+    const portfolio = makePortfolioWithPolicy({ execution_mode: 'deterministic' });
+
+    const policy = asPrivate(svc)._readPolicy(portfolio);
+
+    expect(policy.execution_mode).toBe('deterministic');
+  });
+
+  it('execution_mode:"llm_gated" is read through verbatim (explicit default)', () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+    const svc = makeService(gateway);
+    const portfolio = makePortfolioWithPolicy({ execution_mode: 'llm_gated' });
+
+    const policy = asPrivate(svc)._readPolicy(portfolio);
+
+    expect(policy.execution_mode).toBe('llm_gated');
+  });
+
+  it('an unrecognized execution_mode value fails safe to "llm_gated"', () => {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('X', 100)));
+    const svc = makeService(gateway);
+    const portfolio = makePortfolioWithPolicy({ execution_mode: 'bogus_mode' });
+
+    const policy = asPrivate(svc)._readPolicy(portfolio);
+
+    expect(policy.execution_mode).toBe('llm_gated');
+  });
+});
+
+describe('PretestService.runCycle — execution_mode:"deterministic" skips the LLM (deterministic-mode-divergence)', () => {
+  function wirePassiveHoldPortfolio(
+    executionMode: string | undefined,
+    agents: AgentsService,
+  ): { svc: PretestService; db: PrismaService } {
+    const gateway = makeGateway(() => Promise.resolve(makeQuote('SPY', 100)));
+    const memory = {
+      toContextString: jest.fn().mockResolvedValue(''),
+    } as unknown as ContextMemoryService;
+    const plugins = {
+      findActive: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+      findAll: jest.fn().mockResolvedValue([
+        { id: 'broad-index-hold', type: 'skill', config: {} },
+        { id: 'risk-manager', type: 'discipline', config: {} },
+      ]),
+    } as unknown as PluginsService;
+    const sandbox = {
+      runCycle: jest.fn().mockResolvedValue({
+        ok: true,
+        result: { pending_signals: [makePassiveHoldSignal('SPY')] },
+      }),
+      call: jest.fn().mockResolvedValue({ ok: true, result: {} }),
+    } as unknown as SandboxGateway;
+    const policyConfig: Record<string, unknown> = { sizing_pct: 0.05 };
+    if (executionMode !== undefined) policyConfig['execution_mode'] = executionMode;
+    const row = makeVolTargetRow({
+      plugin_configs: { __pretest_policy__: policyConfig },
+      state: makeState({ equity: 100_000, cash: 100_000 }),
+    });
+    const db = {
+      pretestPortfolio: {
+        findUnique: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue(row),
+      },
+    } as unknown as PrismaService;
+
+    const svc = new PretestService(
+      db,
+      sandbox,
+      plugins,
+      { complete: jest.fn() } as unknown as LlmService,
+      memory,
+      gateway,
+      agents,
+      makeStubKv(),
+      makeStubAudit(),
+    );
+    return { svc, db };
+  }
+
+  it('execution_mode:"deterministic" — runGovernedTurn is never called, passive-hold trade still fills', async () => {
+    const agents = {
+      runGovernedTurn: jest.fn().mockResolvedValue({
+        cycle_id: 'should-not-be-used',
+        text: 'should not appear',
+        tool_calls: [],
+        decisions: [],
+        sandbox_results: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+        llm_response: {
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        },
+        signalsEmitted: [],
+      }),
+    } as unknown as AgentsService;
+
+    const { svc } = wirePassiveHoldPortfolio('deterministic', agents);
+
+    const { trades_simulated, llm_text } = await svc.runCycle('vt-portfolio');
+
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(agents.runGovernedTurn).not.toHaveBeenCalled();
+    expect(trades_simulated).toHaveLength(1);
+    expect(trades_simulated[0].symbol).toBe('SPY');
+    expect(trades_simulated[0].action).toBe('buy');
+    // deterministic skip never produced any LLM text
+    expect(llm_text).toBe('');
+  });
+
+  it('execution_mode:"llm_gated" (explicit) — runGovernedTurn IS called (unchanged behavior)', async () => {
+    const agents = {
+      runGovernedTurn: jest.fn().mockResolvedValue({
+        cycle_id: 'c',
+        text: 'llm analysis',
+        tool_calls: [],
+        decisions: [],
+        sandbox_results: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+        llm_response: {
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        },
+        signalsEmitted: [],
+      }),
+    } as unknown as AgentsService;
+
+    const { svc } = wirePassiveHoldPortfolio('llm_gated', agents);
+
+    const { trades_simulated, llm_text } = await svc.runCycle('vt-portfolio');
+
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(agents.runGovernedTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'pretest', virtual_only: true }),
+    );
+    expect(trades_simulated).toHaveLength(1);
+    expect(trades_simulated[0].symbol).toBe('SPY');
+    expect(llm_text).toBe('llm analysis');
+  });
+
+  it('absent __pretest_policy__.execution_mode — runGovernedTurn IS called (backward-compat regression)', async () => {
+    const agents = {
+      runGovernedTurn: jest.fn().mockResolvedValue({
+        cycle_id: 'c',
+        text: 'llm analysis default',
+        tool_calls: [],
+        decisions: [],
+        sandbox_results: [],
+        backend: 'api',
+        skills_read: [],
+        skills_written: [],
+        llm_response: {
+          text: '',
+          tool_calls: [],
+          backend: 'api',
+          skills_read: [],
+          skills_written: [],
+        },
+        signalsEmitted: [],
+      }),
+    } as unknown as AgentsService;
+
+    const { svc } = wirePassiveHoldPortfolio(undefined, agents);
+
+    const { trades_simulated, llm_text } = await svc.runCycle('vt-portfolio');
+
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(agents.runGovernedTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'pretest', virtual_only: true }),
+    );
+    expect(trades_simulated).toHaveLength(1);
+    expect(llm_text).toBe('llm analysis default');
   });
 });
