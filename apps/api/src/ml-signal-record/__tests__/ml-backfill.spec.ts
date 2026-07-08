@@ -12,45 +12,59 @@
 import { SnapshotService } from '../../snapshot/snapshot.service';
 import { MlSignalRecordService } from '../ml-signal-record.service';
 import type { PrismaService } from '../../prisma/prisma.service';
-import type { ProviderGatewayService, Portfolio } from '../../providers/provider-gateway.service';
+import type { ProviderGatewayService } from '../../providers/provider-gateway.service';
 import type { LongTermMemoryService } from '../../long-term-memory/long-term-memory.service';
 
 const CYCLE_ID = 'ml-snap-cycle-001';
 
-const fakePortfolio: Portfolio = {
-  provider_id: 'alpaca',
+// kernel-nav-source: takeSnapshot now reads the kernel's own paper wallet (Prisma
+// `portfolio` row named 'paper') instead of gateway.getPortfolio(null). The stored
+// PaperState carries no total_pnl, so snapshots persist total_pnl 0 (schema default)
+// and the backfill receives pnl 0 + the stored paper equity.
+const fakePaperState = {
   equity: 10500,
   cash: 5000,
-  buying_power: 5000,
-  positions: [],
-  total_market_value: 5500,
-  total_pnl: 500,
-  ts: new Date().toISOString(),
+  positions: [] as unknown[],
+  hwm: 10500,
+};
+
+const fakePaperRow = {
+  name: 'paper',
+  data: JSON.stringify(fakePaperState),
+  updatedAt: new Date(),
 };
 
 const fakeEntry = {
   id: 'snap-ml-1',
   ts: new Date(),
   cycle_id: CYCLE_ID,
-  provider_id: 'alpaca',
+  provider_id: 'kernel-paper',
   equity: 10500,
   cash: 5000,
   positions: '[]',
-  total_pnl: 500,
+  total_pnl: 0,
   meta: null,
 };
 
 function makeGateway(): jest.Mocked<Pick<ProviderGatewayService, 'getPortfolio'>> {
   return {
-    getPortfolio: jest.fn().mockResolvedValue(fakePortfolio),
+    getPortfolio: jest.fn().mockResolvedValue(undefined),
   };
 }
 
-function makePrisma(): jest.Mocked<Pick<PrismaService, 'navSnapshot'>> {
+interface MockPrisma {
+  navSnapshot: jest.Mocked<Pick<PrismaService['navSnapshot'], 'create'>>;
+  portfolio: jest.Mocked<Pick<PrismaService['portfolio'], 'findUnique'>>;
+}
+
+function makePrisma(): MockPrisma {
   return {
     navSnapshot: {
       create: jest.fn().mockResolvedValue(fakeEntry),
-    } as unknown as PrismaService['navSnapshot'],
+    },
+    portfolio: {
+      findUnique: jest.fn().mockResolvedValue(fakePaperRow),
+    },
   };
 }
 
@@ -104,8 +118,8 @@ describe('SnapshotService + MlSignalRecordService (ml-feature-extractor-s1)', ()
     expect(mlSvc.updateOutcomeAggregate).toHaveBeenCalledTimes(1);
     expect(mlSvc.updateOutcomeAggregate).toHaveBeenCalledWith(
       CYCLE_ID,
-      fakePortfolio.total_pnl,
-      fakePortfolio.equity,
+      fakeEntry.total_pnl,
+      fakePaperState.equity,
     );
   });
 
@@ -118,7 +132,7 @@ describe('SnapshotService + MlSignalRecordService (ml-feature-extractor-s1)', ()
     const result = await svc.takeSnapshot(CYCLE_ID);
 
     expect(result).toBeDefined();
-    expect(result!.total_pnl).toBe(500);
+    expect(result!.total_pnl).toBe(fakeEntry.total_pnl);
   });
 
   it('@Optional absent (no mlSignalRecord) → takeSnapshot runs fine, no crash', async () => {
@@ -159,8 +173,8 @@ describe('SnapshotService + MlSignalRecordService (ml-feature-extractor-s1)', ()
     const [calledCycleId, calledPnl, calledEquity] = (mlSvc.updateOutcomeAggregate as jest.Mock)
       .mock.calls[0] as [string, number, number];
     expect(calledCycleId).toBe(CYCLE_ID);
-    expect(calledPnl).toBe(fakePortfolio.total_pnl); // realized AFTER the decision
-    expect(calledEquity).toBe(fakePortfolio.equity); // realized AFTER the decision
+    expect(calledPnl).toBe(fakeEntry.total_pnl); // realized AFTER the decision
+    expect(calledEquity).toBe(fakePaperState.equity); // realized AFTER the decision
   });
 
   it('both LTM and ML backfill are called in same takeSnapshot (no interference)', async () => {
@@ -174,13 +188,13 @@ describe('SnapshotService + MlSignalRecordService (ml-feature-extractor-s1)', ()
 
     expect(ltm.updateOutcome).toHaveBeenCalledWith(
       CYCLE_ID,
-      fakePortfolio.total_pnl,
-      fakePortfolio.equity,
+      fakeEntry.total_pnl,
+      fakePaperState.equity,
     );
     expect(mlSvc.updateOutcomeAggregate).toHaveBeenCalledWith(
       CYCLE_ID,
-      fakePortfolio.total_pnl,
-      fakePortfolio.equity,
+      fakeEntry.total_pnl,
+      fakePaperState.equity,
     );
   });
 });
