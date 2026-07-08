@@ -197,3 +197,57 @@ describe('SandboxGateway — netns isolation wiring', () => {
     jest.useRealTimers();
   });
 });
+
+// ── getIsolationStatus() — panel-honesty Fix 2: public accessor for runtime visibility ──
+
+describe('SandboxGateway.getIsolationStatus() — public accessor reflecting internal state', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('auto + detected → { mode: "auto", active: true }', async () => {
+    detectNetnsIsolationMock.mockResolvedValue(true);
+    const cfg = makeCfg({ SANDBOX_NETNS_ISOLATION: 'auto' });
+    const gateway = new SandboxGateway(cfg);
+
+    await gateway.onModuleInit();
+
+    expect(gateway.getIsolationStatus()).toEqual({ mode: 'auto', active: true });
+  });
+
+  it('auto + not detected (silent degrade) → { mode: "auto", active: false }', async () => {
+    detectNetnsIsolationMock.mockResolvedValue(false);
+    const cfg = makeCfg({ SANDBOX_NETNS_ISOLATION: 'auto' });
+    const gateway = new SandboxGateway(cfg);
+
+    await gateway.onModuleInit();
+
+    expect(gateway.getIsolationStatus()).toEqual({ mode: 'auto', active: false });
+  });
+
+  it('off → { mode: "off", active: false }', async () => {
+    const cfg = makeCfg({ SANDBOX_NETNS_ISOLATION: 'off' });
+    const gateway = new SandboxGateway(cfg);
+
+    await gateway.onModuleInit();
+
+    expect(gateway.getIsolationStatus()).toEqual({ mode: 'off', active: false });
+  });
+
+  it('require + detected → { mode: "require", active: true }', async () => {
+    detectNetnsIsolationMock.mockResolvedValue(true);
+    const cfg = makeCfg({ SANDBOX_NETNS_ISOLATION: 'require' });
+    const gateway = new SandboxGateway(cfg);
+
+    await gateway.onModuleInit();
+
+    expect(gateway.getIsolationStatus()).toEqual({ mode: 'require', active: true });
+  });
+
+  it('before onModuleInit runs, reflects the not-yet-active default without throwing', () => {
+    const cfg = makeCfg({ SANDBOX_NETNS_ISOLATION: 'auto' });
+    const gateway = new SandboxGateway(cfg);
+
+    expect(gateway.getIsolationStatus()).toEqual({ mode: 'auto', active: false });
+  });
+});

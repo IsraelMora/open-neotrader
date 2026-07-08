@@ -17,7 +17,13 @@ import type { PluginEventsService } from '../plugins/plugin-events.service';
 import type { AuditService } from '../audit/audit.service';
 import type { CycleExecutorService } from '../cycle/cycle-executor.service';
 import type { ProviderGatewayService } from '../providers/provider-gateway.service';
+import type { Alert } from '../alerts/alerts.service';
+import type { AlertsService } from '../alerts/alerts.service';
 import { REAL_EXECUTION_HALTED_KEY } from '../common/real-execution-halt.util';
+
+function makeAlertsStub(active: Alert[] = []): AlertsService {
+  return { getActive: jest.fn().mockResolvedValue(active) } as unknown as AlertsService;
+}
 
 // Placeholder: real tests for getConfig/saveConfig/chat can be added here.
 // For now this file confirms the module is importable and the moved tests are gone.
@@ -47,6 +53,7 @@ function makeSvcForSkills(plugins: PluginsService): PanelService {
     {} as unknown as AuditService,
     { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
     {} as unknown as ProviderGatewayService,
+    makeAlertsStub(),
   );
 }
 
@@ -130,6 +137,7 @@ interface DoctorDeps {
   sandboxOk: boolean;
   llmReady: boolean;
   halted?: boolean;
+  netns?: { mode: string; active: boolean };
 }
 
 function makeSvcForDoctor(deps: DoctorDeps): PanelService {
@@ -163,12 +171,14 @@ function makeSvcForDoctor(deps: DoctorDeps): PanelService {
     } as unknown as LlmService,
     {
       call: jest.fn().mockResolvedValue(deps.sandboxOk ? { ok: true } : null),
+      getIsolationStatus: jest.fn().mockReturnValue(deps.netns ?? { mode: 'auto', active: true }),
     } as unknown as SandboxGateway,
     { findAll: jest.fn().mockResolvedValue(pluginRows) } as unknown as PluginsService,
     {} as unknown as PluginEventsService,
     {} as unknown as AuditService,
     { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
     {} as unknown as ProviderGatewayService,
+    makeAlertsStub(),
   );
 }
 
@@ -267,6 +277,97 @@ describe('PanelService.doctor() — checks[] contract (panel-backend-drift Fix 2
   });
 });
 
+// ── doctor() — sandbox_netns check (panel-honesty Fix 2) ────────────────────────
+
+describe('PanelService.doctor() — sandbox_netns check (panel-honesty Fix 2)', () => {
+  it('mode=auto, active=true → ok', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'auto', active: true },
+    });
+
+    const result = await svc.doctor();
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_netns']).toMatchObject({ ok: true, level: 'ok' });
+  });
+
+  it('mode=auto, active=false → warn (silent degrade, now visible)', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'auto', active: false },
+    });
+
+    const result = await svc.doctor();
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_netns']).toMatchObject({ ok: false, level: 'warn' });
+  });
+
+  it('mode=off, active=false → ok (explicit operator choice, not a failure)', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'off', active: false },
+    });
+
+    const result = await svc.doctor();
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_netns']).toMatchObject({ ok: false, level: 'ok' });
+  });
+
+  it('mode=require, active=false → error (defensive — should not actually occur)', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'require', active: false },
+    });
+
+    const result = await svc.doctor();
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_netns']).toMatchObject({ ok: false, level: 'error' });
+  });
+
+  it('mode=require, active=true → ok', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'require', active: true },
+    });
+
+    const result = await svc.doctor();
+    const byName = Object.fromEntries(result.checks.map((c) => [c.name, c]));
+    expect(byName['sandbox_netns']).toMatchObject({ ok: true, level: 'ok' });
+  });
+
+  it('preserves every previously-existing check alongside the new sandbox_netns check', async () => {
+    const svc = makeSvcForDoctor({
+      plugins: { active: 1, total: 1 },
+      sandboxOk: true,
+      llmReady: true,
+      netns: { mode: 'auto', active: true },
+    });
+
+    const result = await svc.doctor();
+    const cmp = (a: string, b: string) => a.localeCompare(b);
+    const names = result.checks.map((c) => c.name).sort(cmp);
+    expect(names).toEqual(
+      [
+        'sandbox_reachable',
+        'llm_ready',
+        'plugins_active',
+        'real_execution_halted',
+        'sandbox_netns',
+      ].sort(cmp),
+    );
+  });
+});
+
 // ── checkUniverseSymbol() — panel-backend-drift Fix 3: real data verification ──
 
 function makeSvcForUniverse(
@@ -287,6 +388,7 @@ function makeSvcForUniverse(
     {} as unknown as AuditService,
     { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
     gateway as unknown as ProviderGatewayService,
+    makeAlertsStub(),
   );
 }
 
@@ -385,5 +487,142 @@ describe('PanelService.checkUniverseSymbol() — real OHLCV verification (Fix 3)
     expect(result.registered).toBe(true);
     expect(result.meta).toEqual({ kind: 'equity' });
     expect(result.ok).toBe(true);
+  });
+});
+
+// ── getNotifications() — surfaces AlertsService active alerts (panel-honesty) ──
+
+function makeAlert(overrides: Partial<Alert> = {}): Alert {
+  return {
+    id: 'alert-1',
+    ts: new Date('2026-01-01T00:00:00.000Z'),
+    type: 'BROKER_DRIFT',
+    severity: 'CRITICAL',
+    symbol: null,
+    message: 'broker drift detected',
+    meta: null,
+    resolved: false,
+    ...overrides,
+  };
+}
+
+function makeSvcForNotifications(
+  alertsSvc: AlertsService,
+  cfgNotifs: { level: string; title: string; source: string; body: string; ts: string }[] = [],
+): PanelService {
+  const configEntry = {
+    findUnique: jest.fn().mockImplementation(({ where: { key } }: { where: { key: string } }) => {
+      if (key === 'notifications') {
+        return Promise.resolve({ key, value: JSON.stringify(cfgNotifs) });
+      }
+      return Promise.resolve(null);
+    }),
+  };
+
+  return new PanelService(
+    { configEntry } as unknown as PrismaService,
+    {} as unknown as AgentsService,
+    {
+      getReadiness: jest.fn().mockReturnValue({ credentialPresent: true }),
+    } as unknown as LlmService,
+    {
+      call: jest.fn().mockResolvedValue({ ok: true }),
+      getIsolationStatus: jest.fn().mockReturnValue({ mode: 'auto', active: true }),
+    } as unknown as SandboxGateway,
+    {
+      findAll: jest.fn().mockResolvedValue([{ id: 'p1', active: true }]),
+    } as unknown as PluginsService,
+    {} as unknown as PluginEventsService,
+    {} as unknown as AuditService,
+    { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
+    {} as unknown as ProviderGatewayService,
+    alertsSvc,
+  );
+}
+
+describe('PanelService.getNotifications() — surfaces active alerts (panel-honesty)', () => {
+  it('maps a CRITICAL active alert to level=error, source=alerts, and counts it in n_errors', async () => {
+    const alertsSvc = makeAlertsStub([makeAlert({ severity: 'CRITICAL', message: 'drift!' })]);
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+
+    const alertItem = result.items.find((i) => i.source === 'alerts');
+    expect(alertItem).toMatchObject({ level: 'error', source: 'alerts', body: 'drift!' });
+    expect(result.n_errors).toBeGreaterThanOrEqual(1);
+  });
+
+  it('maps a HIGH severity active alert to level=warn and counts it in n_warnings', async () => {
+    const alertsSvc = makeAlertsStub([makeAlert({ severity: 'HIGH', message: 'careful' })]);
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+
+    const alertItem = result.items.find((i) => i.source === 'alerts');
+    expect(alertItem).toMatchObject({ level: 'warn', source: 'alerts' });
+    expect(result.n_warnings).toBeGreaterThanOrEqual(1);
+  });
+
+  it('maps MEDIUM and LOW severity to level=info', async () => {
+    const alertsSvc = makeAlertsStub([makeAlert({ severity: 'MEDIUM', message: 'fyi' })]);
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+
+    const alertItem = result.items.find((i) => i.source === 'alerts');
+    expect(alertItem).toMatchObject({ level: 'info', source: 'alerts' });
+
+    const alertsSvcLow = makeAlertsStub([makeAlert({ severity: 'LOW', message: 'fyi' })]);
+    const svcLow = makeSvcForNotifications(alertsSvcLow);
+    const resultLow = await svcLow.getNotifications();
+    const alertItemLow = resultLow.items.find((i) => i.source === 'alerts');
+    expect(alertItemLow).toMatchObject({ level: 'info', source: 'alerts' });
+  });
+
+  it('only queries active (unresolved) alerts — never getRecent', async () => {
+    const getActive = jest.fn().mockResolvedValue([]);
+    const getRecent = jest.fn();
+    const alertsSvc = { getActive, getRecent } as unknown as AlertsService;
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    await svc.getNotifications();
+
+    expect(getActive).toHaveBeenCalledTimes(1);
+    expect(getRecent).not.toHaveBeenCalled();
+  });
+
+  it('excludes resolved alerts (getActive never returns resolved=true entries)', async () => {
+    const alertsSvc = makeAlertsStub([]);
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+
+    expect(result.items.find((i) => i.source === 'alerts')).toBeUndefined();
+  });
+
+  it('fail-soft: if AlertsService.getActive throws, getNotifications still returns previous behavior without throwing', async () => {
+    const alertsSvc = {
+      getActive: jest.fn().mockRejectedValue(new Error('db down')),
+    } as unknown as AlertsService;
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+
+    expect(result.items.find((i) => i.source === 'alerts')).toBeUndefined();
+    expect(typeof result.n_errors).toBe('number');
+    expect(typeof result.n_warnings).toBe('number');
+  });
+
+  it('does not change the existing item shape ({level, title, source, body, ts})', async () => {
+    const alertsSvc = makeAlertsStub([makeAlert()]);
+    const svc = makeSvcForNotifications(alertsSvc);
+
+    const result = await svc.getNotifications();
+    const alertItem = result.items.find((i) => i.source === 'alerts');
+
+    const cmp = (a: string, b: string) => a.localeCompare(b);
+    expect(Object.keys(alertItem!).sort(cmp)).toEqual(
+      ['level', 'title', 'source', 'body', 'ts'].sort(cmp),
+    );
   });
 });

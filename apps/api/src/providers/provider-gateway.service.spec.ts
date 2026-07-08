@@ -95,6 +95,9 @@ function makeTiingoManifest(): ProviderManifestShape {
   };
 }
 
+// NOTE: no plugin manifest in this repo ever declares format="binance" — this is a
+// synthetic manifest kept only to prove the (now-removed) normalizer dead-code
+// branches fall back to standard unknown-format handling instead of crashing.
 function makeBinanceManifest(): ProviderManifestShape {
   return {
     plugin: { id: 'binance', name: 'Binance', type: 'provider' },
@@ -107,6 +110,9 @@ function makeBinanceManifest(): ProviderManifestShape {
       endpoints: {
         quote: '{base_url}/api/v3/ticker/price?symbol={symbol}',
         ohlcv: '{base_url}/api/v3/klines?symbol={symbol}&interval={tf}&limit={limit}',
+        portfolio: '{base_url}/api/v3/account',
+        positions: '{base_url}/fapi/v2/positionRisk',
+        orders: '{base_url}/api/v3/order',
       },
     },
   };
@@ -501,7 +507,7 @@ describe('ProviderGatewayService — normalizeQuote', () => {
     expect(quote.last).toBe(150);
   });
 
-  it('Binance format: bid, ask, last all equal to the price field', async () => {
+  it('format="binance" (dead normalizer branch removed): falls back to the standard unknown-format zero Quote, no throw', async () => {
     process.env['BINANCE_KEY'] = 'binance-k1';
     const svc = setupServiceForFormat('binance', makeBinanceManifest());
 
@@ -512,10 +518,13 @@ describe('ProviderGatewayService — normalizeQuote', () => {
 
     const quote = await svc.getQuote('binance', 'BTCUSDT');
 
+    // No plugin manifest ever declares format="binance" — this normalizer branch was
+    // dead code and has been removed. The format now hits the same fallback path as
+    // any other unrecognized format: a zero Quote, never a throw.
     expect(quote.symbol).toBe('BTCUSDT');
-    expect(quote.bid).toBe(45000.5);
-    expect(quote.ask).toBe(45000.5);
-    expect(quote.last).toBe(45000.5);
+    expect(quote.bid).toBe(0);
+    expect(quote.ask).toBe(0);
+    expect(quote.last).toBe(0);
   });
 
   it('unknown format: returns zero Quote without throwing', async () => {
@@ -604,6 +613,89 @@ describe('ProviderGatewayService — getOhlcv cache integration', () => {
 
     expect(result).toHaveLength(3); // 5 fetched → sliced to 3
     expect(result[result.length - 1].close).toBe(5); // keeps the LAST (most recent) bars
+  });
+});
+
+// ── Dead 'binance' normalizer branches removed (ohlcv/portfolio/order) ────────
+// No plugin manifest declares format="binance" — these prove the removed
+// branches now fall back to the same standard unknown-format handling as any
+// other unrecognized format, without throwing or behaving specially.
+
+function makeBinanceBackedService(cacheOverride?: Partial<OhlcvCacheService>): {
+  svc: ProviderGatewayService;
+  cache: OhlcvCacheService;
+} {
+  process.env['BINANCE_KEY'] = 'binance-k1';
+  const built = makeService(['binance'], { binance: makeBinanceManifest() }, cacheOverride);
+  built.svc.onModuleInit();
+  return built;
+}
+
+describe('ProviderGatewayService — format="binance" ohlcv/portfolio/order fallback', () => {
+  afterEach(() => {
+    delete process.env['BINANCE_KEY'];
+  });
+
+  it('normalizeBars: format="binance" no longer parses klines specially — falls back to the generic array parser without throwing', async () => {
+    const setOhlcv = jest.fn();
+    const { svc } = makeBinanceBackedService({
+      getOhlcv: jest.fn().mockReturnValue(null),
+      setOhlcv,
+    });
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue([[1700000000000, '100', '105', '99', '104', '10']]),
+    });
+
+    const bars = await svc.getOhlcv('binance', 'BTCUSDT', '1d', 200);
+
+    // Klines are arrays, not objects — the generic fallback (which reads b['o']/b['open']
+    // etc.) can't find those fields on an array and defaults numeric fields to 0. The
+    // important behavioral contract is: no throw, no Binance-specific parsing.
+    expect(bars).toHaveLength(1);
+    expect(bars[0].open).toBe(0);
+    expect(bars[0].close).toBe(0);
+    expect(setOhlcv).toHaveBeenCalled();
+  });
+
+  it('normalizePortfolio: format="binance" no longer parses wallet/positions specially — falls back to zeroed portfolio', async () => {
+    const { svc } = makeBinanceBackedService();
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ totalWalletBalance: '10000', availableBalance: '8000' }),
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: jest
+        .fn()
+        .mockResolvedValue([
+          { symbol: 'BTCUSDT', positionAmt: '1.5', entryPrice: '40000', unrealizedProfit: '100' },
+        ]),
+    });
+
+    const portfolio = await svc.getPortfolio('binance');
+
+    // The Binance-specific wallet/position fields (totalWalletBalance, positionAmt, ...)
+    // are no longer read — nothing matches, so the normalizer falls through to the
+    // zeroed default (same as any other unrecognized format).
+    expect(portfolio.equity).toBe(0);
+    expect(portfolio.cash).toBe(0);
+    expect(portfolio.positions).toEqual([]);
+  });
+
+  it('placeOrder: format="binance" no longer dispatches to HMAC order placement — throws the standard "not implemented for format" error', async () => {
+    const { svc } = makeBinanceBackedService();
+
+    await expect(
+      svc.placeOrder('binance', {
+        symbol: 'BTCUSDT',
+        qty: 1,
+        side: 'buy',
+        type: 'market',
+        clientOrderId: 'nt-1',
+      }),
+    ).rejects.toThrow(/no implementada para formato/i);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
