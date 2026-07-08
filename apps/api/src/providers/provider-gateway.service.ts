@@ -408,34 +408,6 @@ export class ProviderGatewayService implements OnModuleInit {
         unrealized_pnl: Number(p.unrealized_pl),
         side: p.side === 'short' ? 'short' : 'long',
       }));
-    } else if (format === 'binance') {
-      const acc = account as { totalWalletBalance?: string; availableBalance?: string } | null;
-      equity = Number(acc?.totalWalletBalance ?? 0);
-      cash = Number(acc?.availableBalance ?? 0);
-      buying_power = cash;
-
-      const rows = Array.isArray(positionsRaw)
-        ? (positionsRaw as {
-            symbol: string;
-            positionAmt: string;
-            entryPrice: string;
-            unrealizedProfit: string;
-            notional?: string;
-          }[])
-        : [];
-      positions = rows
-        .filter((p) => Number(p.positionAmt) !== 0)
-        .map((p) => {
-          const qty = Number(p.positionAmt);
-          return {
-            symbol: p.symbol,
-            qty,
-            avg_entry: Number(p.entryPrice),
-            market_value: Math.abs(Number(p.notional ?? 0)),
-            unrealized_pnl: Number(p.unrealizedProfit),
-            side: qty >= 0 ? 'long' : 'short',
-          };
-        });
     }
 
     const total_market_value = positions.reduce((s, p) => s + p.market_value, 0);
@@ -471,7 +443,6 @@ export class ProviderGatewayService implements OnModuleInit {
   /**
    * Ejecuta una orden en el broker.
    * Solo disponible en providers que declaren `[api.endpoints] orders`.
-   * Para Binance: firma HMAC SHA256 automáticamente.
    */
   async placeOrder(
     pluginId: string | null,
@@ -494,9 +465,6 @@ export class ProviderGatewayService implements OnModuleInit {
     const fmt = manifest.api.format;
     if (fmt === 'alpaca') {
       return this.placeAlpacaOrder(manifest, order);
-    }
-    if (fmt === 'binance') {
-      return this.placeBinanceOrder(manifest, order);
     }
     throw new Error(`Ejecución de órdenes no implementada para formato "${fmt}"`);
   }
@@ -542,58 +510,6 @@ export class ProviderGatewayService implements OnModuleInit {
       throw new Error(`Alpaca order ${res.status}: ${await res.text()}`);
     }
     return res.json() as Promise<Record<string, unknown>>;
-  }
-
-  private async placeBinanceOrder(
-    manifest: ProviderManifest,
-    order: {
-      symbol: string;
-      qty: number;
-      side: string;
-      type: string;
-      limitPrice?: number;
-      timeInForce?: string;
-    },
-  ): Promise<Record<string, unknown>> {
-    const api = manifest.api;
-    const apiKey = api.auth_key_env ? (process.env[api.auth_key_env] ?? '') : '';
-    const apiSecret = api.auth_secret_env ? (process.env[api.auth_secret_env] ?? '') : '';
-
-    const params: Record<string, string> = {
-      symbol: order.symbol.replace('/', ''),
-      side: order.side.toUpperCase(),
-      type: order.type === 'limit' ? 'LIMIT' : 'MARKET',
-      quantity: String(order.qty),
-      timestamp: String(Date.now()),
-      recvWindow: '5000',
-    };
-    if (order.type === 'limit' && order.limitPrice != null) {
-      params['price'] = String(order.limitPrice);
-      params['timeInForce'] = order.timeInForce?.toUpperCase() ?? 'GTC';
-    }
-
-    // HMAC SHA256 signature requerida por Binance
-    const queryString = new URLSearchParams(params).toString();
-    const signature = await this.hmacSha256(queryString, apiSecret);
-    const url = `${api.base_url}/api/v3/order?${queryString}&signature=${signature}`;
-
-    const res = await globalThis.fetch(url, {
-      method: 'POST',
-      signal: AbortSignal.timeout(10_000),
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'X-MBX-APIKEY': apiKey,
-      },
-    });
-    if (!res.ok) {
-      throw new Error(`Binance order ${res.status}: ${await res.text()}`);
-    }
-    return res.json() as Promise<Record<string, unknown>>;
-  }
-
-  private async hmacSha256(data: string, secret: string): Promise<string> {
-    const crypto = await import('node:crypto');
-    return crypto.createHmac('sha256', secret).update(data).digest('hex');
   }
 
   // ── HTTP core ─────────────────────────────────────────────────────────────
@@ -1007,18 +923,6 @@ export class ProviderGatewayService implements OnModuleInit {
         volume: r[5] ?? 0,
       }));
     }
-    if (format === 'binance') {
-      // Binance klines: [[openTime, open, high, low, close, volume, ...], ...]
-      const rows = Array.isArray(raw) ? (raw as (string | number)[][]) : [];
-      return rows.map((r) => ({
-        ts: new Date(Number(r[0])).toISOString(),
-        open: Number(r[1]),
-        high: Number(r[2]),
-        low: Number(r[3]),
-        close: Number(r[4]),
-        volume: Number(r[5]),
-      }));
-    }
     // Yahoo Finance: estructura chart.result[0] con timestamps + indicators
     if (format === 'generic') {
       const bars = this.normalizeYahooBars(raw, requestedInterval);
@@ -1113,12 +1017,6 @@ export class ProviderGatewayService implements OnModuleInit {
         timestamp: new Date().toISOString(),
       };
       return { symbol, bid: q.bidPrice, ask: q.askPrice, last: q.last, ts: q.timestamp };
-    }
-    if (format === 'binance') {
-      // Binance ticker/price: { symbol, price }
-      const data = raw as { price?: string; symbol?: string };
-      const last = Number(data.price ?? 0);
-      return { symbol, bid: last, ask: last, last, ts: new Date().toISOString() };
     }
     if (format === 'generic') {
       // Yahoo Finance: extraer último close del chart

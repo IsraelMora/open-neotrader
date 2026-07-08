@@ -171,9 +171,7 @@ function makeSvcForDoctor(deps: DoctorDeps): PanelService {
     } as unknown as LlmService,
     {
       call: jest.fn().mockResolvedValue(deps.sandboxOk ? { ok: true } : null),
-      getIsolationStatus: jest
-        .fn()
-        .mockReturnValue(deps.netns ?? { mode: 'auto', active: true }),
+      getIsolationStatus: jest.fn().mockReturnValue(deps.netns ?? { mode: 'auto', active: true }),
     } as unknown as SandboxGateway,
     { findAll: jest.fn().mockResolvedValue(pluginRows) } as unknown as PluginsService,
     {} as unknown as PluginEventsService,
@@ -356,9 +354,16 @@ describe('PanelService.doctor() — sandbox_netns check (panel-honesty Fix 2)', 
     });
 
     const result = await svc.doctor();
-    const names = result.checks.map((c) => c.name).sort();
+    const cmp = (a: string, b: string) => a.localeCompare(b);
+    const names = result.checks.map((c) => c.name).sort(cmp);
     expect(names).toEqual(
-      ['sandbox_reachable', 'llm_ready', 'plugins_active', 'real_execution_halted', 'sandbox_netns'].sort(),
+      [
+        'sandbox_reachable',
+        'llm_ready',
+        'plugins_active',
+        'real_execution_halted',
+        'sandbox_netns',
+      ].sort(cmp),
     );
   });
 });
@@ -517,12 +522,16 @@ function makeSvcForNotifications(
   return new PanelService(
     { configEntry } as unknown as PrismaService,
     {} as unknown as AgentsService,
-    { getReadiness: jest.fn().mockReturnValue({ credentialPresent: true }) } as unknown as LlmService,
+    {
+      getReadiness: jest.fn().mockReturnValue({ credentialPresent: true }),
+    } as unknown as LlmService,
     {
       call: jest.fn().mockResolvedValue({ ok: true }),
       getIsolationStatus: jest.fn().mockReturnValue({ mode: 'auto', active: true }),
     } as unknown as SandboxGateway,
-    { findAll: jest.fn().mockResolvedValue([{ id: 'p1', active: true }]) } as unknown as PluginsService,
+    {
+      findAll: jest.fn().mockResolvedValue([{ id: 'p1', active: true }]),
+    } as unknown as PluginsService,
     {} as unknown as PluginEventsService,
     {} as unknown as AuditService,
     { getRunStatus: jest.fn() } as unknown as CycleExecutorService,
@@ -567,16 +576,14 @@ describe('PanelService.getNotifications() — surfaces active alerts (panel-hone
   });
 
   it('only queries active (unresolved) alerts — never getRecent', async () => {
+    const getActive = jest.fn().mockResolvedValue([]);
     const getRecent = jest.fn();
-    const alertsSvc = {
-      getActive: jest.fn().mockResolvedValue([]),
-      getRecent,
-    } as unknown as AlertsService;
+    const alertsSvc = { getActive, getRecent } as unknown as AlertsService;
     const svc = makeSvcForNotifications(alertsSvc);
 
     await svc.getNotifications();
 
-    expect(alertsSvc.getActive).toHaveBeenCalledTimes(1);
+    expect(getActive).toHaveBeenCalledTimes(1);
     expect(getRecent).not.toHaveBeenCalled();
   });
 
@@ -609,8 +616,9 @@ describe('PanelService.getNotifications() — surfaces active alerts (panel-hone
     const result = await svc.getNotifications();
     const alertItem = result.items.find((i) => i.source === 'alerts');
 
-    expect(Object.keys(alertItem!).sort()).toEqual(
-      ['level', 'title', 'source', 'body', 'ts'].sort(),
+    const cmp = (a: string, b: string) => a.localeCompare(b);
+    expect(Object.keys(alertItem!).sort(cmp)).toEqual(
+      ['level', 'title', 'source', 'body', 'ts'].sort(cmp),
     );
   });
 });
